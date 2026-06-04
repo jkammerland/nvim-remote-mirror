@@ -1,0 +1,17 @@
+[package]
+name = "nrm-agent"
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+blake3.workspace = true
+clap.workspace = true
+ignore.workspace = true
+nrm-protocol = { path = "../nrm-protocol" }
+serde.workspace = true
+walkdir.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

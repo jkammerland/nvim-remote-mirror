@@ -1,0 +1,53 @@
+if vim.g.loaded_nvim_remote_mirror then
+  return
+end
+vim.g.loaded_nvim_remote_mirror = true
+
+local nrm = require("nvim_remote_mirror")
+
+vim.api.nvim_create_user_command("RemoteConnect", function(opts)
+  nrm.connect(opts.args)
+end, {
+  nargs = "?",
+  complete = "file",
+})
+
+vim.api.nvim_create_user_command("RemoteDisconnect", function()
+  nrm.disconnect()
+end, {})
+
+vim.api.nvim_create_user_command("RemoteOpen", function(opts)
+  nrm.open(opts.args)
+end, {
+  nargs = 1,
+  complete = "file",
+})
+
+vim.api.nvim_create_user_command("RemoteScan", function(opts)
+  local limit = tonumber(opts.args)
+  nrm.scan(limit)
+end, {
+  nargs = "?",
+})
+
+vim.api.nvim_create_user_command("RemoteGrep", function(opts)
+  nrm.grep(opts.args)
+end, {
+  nargs = 1,
+})
+
+vim.api.nvim_create_user_command("RemotePrefetch", function(opts)
+  local paths = vim.split(opts.args, "%s+", { trimempty = true })
+  nrm.prefetch(paths)
+end, {
+  nargs = "+",
+  complete = "file",
+})
+
+vim.api.nvim_create_user_command("RemoteFlush", function()
+  nrm.flush_buffer(0)
+end, {})
+
+vim.api.nvim_create_user_command("RemoteStatus", function()
+  nrm.status()
+end, {})

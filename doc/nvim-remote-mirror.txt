@@ -1,0 +1,67 @@
+*nvim-remote-mirror.txt*    Local-first remote development for Neovim
+
+==============================================================================
+CONTENTS                                      *nvim-remote-mirror-contents*
+
+1. Goal                                      |nvim-remote-mirror-goal|
+2. Commands                                  |nvim-remote-mirror-commands|
+3. Configuration                             |nvim-remote-mirror-config|
+4. LSP                                       |nvim-remote-mirror-lsp|
+
+==============================================================================
+GOAL                                            *nvim-remote-mirror-goal*
+
+Keep Neovim editing local over slow or unstable SSH links while a sidecar and
+remote agent lazily hydrate a checksum-verified local mirror.
+
+==============================================================================
+COMMANDS                                      *nvim-remote-mirror-commands*
+
+:RemoteConnect [target]
+    Connect to a local path or ssh://host/absolute/path target.
+
+:RemoteOpen {path}
+    Hydrate a workspace-relative file into the local mirror and edit it.
+
+:RemoteGrep {query}
+    Run grep on the remote agent and populate the quickfix list.
+
+:RemotePrefetch {path...}
+    Hydrate one or more workspace-relative files in the background request.
+
+:RemoteFlush
+    Flush the current remote buffer to the remote workspace using checksum
+    compare-and-swap.
+
+:RemoteStatus
+    Show known, cached, dirty, and pending mirror counts.
+
+:RemoteDisconnect
+    Stop the sidecar and agent.
+
+==============================================================================
+CONFIGURATION                                  *nvim-remote-mirror-config*
+
+>
+  require("nvim_remote_mirror").setup({
+    sidecar = "/path/to/nrm-sidecar",
+    agent = "/path/to/nrm-agent",
+    state_dir = "/path/to/state",
+    grep_limit = 200,
+  })
+<
+
+==============================================================================
+LSP                                                *nvim-remote-mirror-lsp*
+
+After :RemoteConnect completes, use lsp_client_config() to run a language
+server on the remote side while Neovim receives local mirror paths.
+
+>
+  local nrm = require("nvim_remote_mirror")
+  vim.lsp.start(nrm.lsp_client_config({ "rust-analyzer" }, {
+    name = "remote-rust-analyzer",
+  }))
+<
+
+vim:tw=78:ts=8:ft=help:norl:

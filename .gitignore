@@ -1,0 +1,5 @@
+/target/
+/.cache/
+/.nrm-state/
+*.swp
+*.swo

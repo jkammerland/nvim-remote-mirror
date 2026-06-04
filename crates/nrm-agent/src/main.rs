@@ -1,0 +1,420 @@
+use anyhow::{bail, Context, Result};
+use clap::{Parser, Subcommand};
+use ignore::WalkBuilder;
+use nrm_protocol::{
+    read_frame, write_frame, CapabilitySet, FileMeta, Request, Response, SaveApplied, SaveConflict,
+    SaveOutcome, SearchHit, PROTOCOL_VERSION,
+};
+use std::fs::{self, File};
+use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::path::{Component, Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+#[derive(Debug, Parser)]
+#[command(version, about = "Remote workspace agent for nvim-remote-mirror")]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    Serve {
+        #[arg(long)]
+        root: PathBuf,
+    },
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    match cli.command {
+        Command::Serve { root } => serve(root),
+    }
+}
+
+fn serve(root: PathBuf) -> Result<()> {
+    let root = root
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize root {}", root.display()))?;
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let mut reader = stdin.lock();
+    let mut writer = stdout.lock();
+
+    loop {
+        let request = match read_frame::<_, Request>(&mut reader) {
+            Ok(request) => request,
+            Err(error) => {
+                eprintln!("nrm-agent: failed to read frame: {error}");
+                break;
+            }
+        };
+
+        let shutdown = matches!(request, Request::Shutdown);
+        let response = match handle_request(&root, request) {
+            Ok(response) => response,
+            Err(error) => Response::Error {
+                message: error.to_string(),
+            },
+        };
+        write_frame(&mut writer, &response)?;
+        if shutdown {
+            break;
+        }
+    }
+
+    Ok(())
+}
+
+fn handle_request(root: &Path, request: Request) -> Result<Response> {
+    match request {
+        Request::Hello {
+            protocol_version, ..
+        } => {
+            if protocol_version != PROTOCOL_VERSION {
+                bail!(
+                    "protocol version mismatch: client={protocol_version} agent={PROTOCOL_VERSION}"
+                );
+            }
+            Ok(Response::Hello {
+                agent_version: env!("CARGO_PKG_VERSION").to_string(),
+                protocol_version: PROTOCOL_VERSION,
+                capabilities: CapabilitySet::v1_agent(),
+            })
+        }
+        Request::Scan { limit } => scan(root, limit),
+        Request::Stat { path } => {
+            let abs = resolve_remote_path(root, &path)?;
+            Ok(Response::Stat {
+                meta: if abs.exists() {
+                    Some(file_meta(root, &abs, false)?)
+                } else {
+                    None
+                },
+            })
+        }
+        Request::Checksum { path } => {
+            let abs = resolve_remote_path(root, &path)?;
+            let hash = if abs.is_file() {
+                Some(hash_file(&abs)?)
+            } else {
+                None
+            };
+            Ok(Response::Checksum { path, hash })
+        }
+        Request::ReadFile { path, offset, len } => read_file(root, path, offset, len),
+        Request::Grep { query, limit } => grep(root, &query, limit),
+        Request::WriteFileCas {
+            path,
+            expected_hash,
+            content,
+        } => write_file_cas(root, path, expected_hash, content),
+        Request::Shutdown => Ok(Response::Ack),
+    }
+}
+
+fn scan(root: &Path, limit: usize) -> Result<Response> {
+    let mut entries = Vec::new();
+    let mut truncated = false;
+
+    for entry in WalkBuilder::new(root)
+        .hidden(false)
+        .parents(true)
+        .git_ignore(true)
+        .git_exclude(true)
+        .build()
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if path == root {
+            continue;
+        }
+        if entries.len() >= limit {
+            truncated = true;
+            break;
+        }
+        entries.push(file_meta(root, path, false)?);
+    }
+
+    Ok(Response::Scan { entries, truncated })
+}
+
+fn read_file(root: &Path, path: String, offset: u64, len: Option<u64>) -> Result<Response> {
+    let abs = resolve_remote_path(root, &path)?;
+    if !abs.is_file() {
+        bail!("{path} is not a regular file");
+    }
+
+    let mut file = File::open(&abs)?;
+    let file_len = file.metadata()?.len();
+    if offset > file_len {
+        bail!("offset {offset} exceeds file length {file_len}");
+    }
+    file.seek(SeekFrom::Start(offset))?;
+
+    let read_len = len.unwrap_or(file_len - offset).min(file_len - offset);
+    let mut content = vec![0_u8; read_len as usize];
+    file.read_exact(&mut content)?;
+    let eof = offset + read_len >= file_len;
+    let hash = hash_file(&abs)?;
+    let meta = file_meta(root, &abs, true)?;
+
+    Ok(Response::ReadFile {
+        path,
+        offset,
+        eof,
+        content,
+        hash,
+        meta,
+    })
+}
+
+fn grep(root: &Path, query: &str, limit: usize) -> Result<Response> {
+    if query.is_empty() {
+        return Ok(Response::Grep {
+            hits: Vec::new(),
+            truncated: false,
+        });
+    }
+
+    let mut hits = Vec::new();
+    let mut truncated = false;
+    for entry in WalkBuilder::new(root)
+        .hidden(false)
+        .parents(true)
+        .git_ignore(true)
+        .git_exclude(true)
+        .build()
+    {
+        let entry = entry?;
+        if hits.len() >= limit {
+            truncated = true;
+            break;
+        }
+        let path = entry.path();
+        if !path.is_file() || likely_binary(path)? {
+            continue;
+        }
+        let text = match fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(_) => continue,
+        };
+        for (line_idx, line) in text.lines().enumerate() {
+            if let Some(byte_idx) = line.find(query) {
+                hits.push(SearchHit {
+                    path: relative_path(root, path)?,
+                    line: line_idx as u64 + 1,
+                    column: byte_idx as u64 + 1,
+                    text: line.to_string(),
+                });
+                if hits.len() >= limit {
+                    truncated = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    Ok(Response::Grep { hits, truncated })
+}
+
+fn write_file_cas(
+    root: &Path,
+    path: String,
+    expected_hash: Option<String>,
+    content: Vec<u8>,
+) -> Result<Response> {
+    let abs = resolve_remote_path(root, &path)?;
+    let actual_hash = if abs.exists() && abs.is_file() {
+        Some(hash_file(&abs)?)
+    } else {
+        None
+    };
+
+    if actual_hash != expected_hash {
+        let remote_content = if abs.is_file() {
+            fs::read(&abs).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        return Ok(Response::WriteFileCas {
+            outcome: SaveOutcome::Conflict(SaveConflict {
+                path,
+                expected_hash,
+                actual_hash,
+                remote_content,
+            }),
+        });
+    }
+
+    if let Some(parent) = abs.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = abs.with_extension(format!(
+        "nrm-tmp-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    {
+        let mut file = File::create(&tmp)?;
+        file.write_all(&content)?;
+        file.sync_all()?;
+    }
+    fs::rename(&tmp, &abs)?;
+    let new_hash = hash_file(&abs)?;
+    let meta = file_meta(root, &abs, true)?;
+
+    Ok(Response::WriteFileCas {
+        outcome: SaveOutcome::Applied(SaveApplied {
+            path,
+            new_hash,
+            size: meta.size,
+            mtime_ms: meta.mtime_ms,
+        }),
+    })
+}
+
+fn resolve_remote_path(root: &Path, path: &str) -> Result<PathBuf> {
+    let relative = normalize_relative_path(path)?;
+    Ok(root.join(relative))
+}
+
+fn normalize_relative_path(path: &str) -> Result<PathBuf> {
+    let path = Path::new(path);
+    if path.is_absolute() {
+        bail!("remote paths must be workspace-relative");
+    }
+    let mut clean = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => clean.push(part),
+            Component::CurDir => {}
+            Component::ParentDir => bail!("remote path must not contain '..'"),
+            Component::RootDir | Component::Prefix(_) => bail!("remote path must be relative"),
+        }
+    }
+    if clean.as_os_str().is_empty() {
+        bail!("remote path must not be empty");
+    }
+    Ok(clean)
+}
+
+fn file_meta(root: &Path, path: &Path, include_hash: bool) -> Result<FileMeta> {
+    let metadata = fs::symlink_metadata(path)?;
+    let hash = if include_hash && metadata.is_file() {
+        Some(hash_file(path)?)
+    } else {
+        None
+    };
+    Ok(FileMeta {
+        path: relative_path(root, path)?,
+        size: metadata.len(),
+        mtime_ms: metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .map(|duration| duration.as_millis() as i64)
+            .unwrap_or(0),
+        mode: platform_mode(&metadata),
+        is_dir: metadata.is_dir(),
+        is_symlink: metadata.file_type().is_symlink(),
+        hash,
+    })
+}
+
+fn relative_path(root: &Path, path: &Path) -> Result<String> {
+    let relative = path.strip_prefix(root)?;
+    Ok(relative.to_string_lossy().replace('\\', "/"))
+}
+
+fn hash_file(path: &Path) -> Result<String> {
+    let mut file = File::open(path)?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+fn likely_binary(path: &Path) -> Result<bool> {
+    let mut file = File::open(path)?;
+    let mut buffer = [0_u8; 1024];
+    let read = file.read(&mut buffer)?;
+    Ok(buffer[..read].contains(&0))
+}
+
+#[cfg(unix)]
+fn platform_mode(metadata: &fs::Metadata) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    metadata.permissions().mode()
+}
+
+#[cfg(not(unix))]
+fn platform_mode(_: &fs::Metadata) -> u32 {
+    0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn rejects_path_traversal() {
+        assert!(normalize_relative_path("../secret").is_err());
+        assert!(normalize_relative_path("/secret").is_err());
+    }
+
+    #[test]
+    fn write_cas_reports_conflict_when_hash_changes() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.txt"), "one").unwrap();
+        let stale_hash = "not-current".to_string();
+
+        let response = write_file_cas(
+            root,
+            "a.txt".to_string(),
+            Some(stale_hash.clone()),
+            b"two".to_vec(),
+        )
+        .unwrap();
+
+        match response {
+            Response::WriteFileCas {
+                outcome: SaveOutcome::Conflict(conflict),
+            } => {
+                assert_eq!(conflict.expected_hash, Some(stale_hash));
+                assert_eq!(conflict.remote_content, b"one");
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+        assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "one");
+    }
+
+    #[test]
+    fn write_cas_applies_when_hash_matches() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.txt"), "one").unwrap();
+        let hash = hash_file(&root.join("a.txt")).unwrap();
+
+        let response =
+            write_file_cas(root, "a.txt".to_string(), Some(hash), b"two".to_vec()).unwrap();
+
+        assert!(matches!(
+            response,
+            Response::WriteFileCas {
+                outcome: SaveOutcome::Applied(_)
+            }
+        ));
+        assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "two");
+    }
+}
