@@ -59,6 +59,7 @@ M.last_target = nil
 M.reconnect_attempts = 0
 M.reconnect_generation = 0
 M.grep_generation = 0
+M.find_generation = 0
 M.deferred_flushes = {}
 M.background_mirror_running = false
 M.background_mirror_generation = 0
@@ -1295,12 +1296,25 @@ end
 function M.find(query, opts)
   opts = opts or {}
   query = query or ""
+  M.find_generation = M.find_generation + 1
+  local generation = M.find_generation
+  local client = M.client
+  local function is_current()
+    return generation == M.find_generation and M.client == client
+  end
+
   M.request("find_paths", {
     query = query,
     limit = opts.limit or M.config.find_limit,
   }, function(err, result)
+    if not is_current() then
+      return
+    end
     if err then
       notify(err, vim.log.levels.ERROR)
+      return
+    end
+    if result and result.preempted then
       return
     end
     local items = {}
@@ -1316,6 +1330,9 @@ function M.find(query, opts)
       end
     end
     vim.schedule(function()
+      if not is_current() then
+        return
+      end
       vim.fn.setqflist({}, " ", { title = "RemoteFind " .. query, items = items })
       vim.cmd.copen()
       if result.truncated then
