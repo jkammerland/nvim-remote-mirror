@@ -29,6 +29,7 @@ M.config = {
   grep_cache_max_total_bytes = 8 * 1024 * 1024,
   request_timeout_ms = 30000,
   ssh_connect_timeout_seconds = 10,
+  open_batch_max_file_bytes = 4 * 1024 * 1024,
   prefetch_max_file_bytes = 4 * 1024 * 1024,
   prefetch_max_total_bytes = 16 * 1024 * 1024,
   open_prefetch_related = false,
@@ -851,33 +852,41 @@ function setup_mirror_autohydrate(client)
         return
       end
 
-      M.request("open", { path = relative_path, force = false }, function(err, result)
-        if err then
-          notify("failed to hydrate " .. relative_path .. ": " .. err, vim.log.levels.ERROR)
-          return
+      M.request(
+        "open",
+        {
+          path = relative_path,
+          force = false,
+          batch_max_file_bytes = M.config.open_batch_max_file_bytes,
+        },
+        function(err, result)
+          if err then
+            notify("failed to hydrate " .. relative_path .. ": " .. err, vim.log.levels.ERROR)
+            return
+          end
+          if not result or result.preempted then
+            return
+          end
+          vim.schedule(function()
+            if M.client ~= client or client.closing or not vim.api.nvim_buf_is_valid(bufnr) then
+              return
+            end
+            if normalize_local_path(vim.api.nvim_buf_get_name(bufnr)) ~= local_path then
+              return
+            end
+            if vim.api.nvim_get_option_value("modified", { buf = bufnr }) then
+              notify("skipped hydrate for modified mirror buffer " .. relative_path, vim.log.levels.WARN)
+              return
+            end
+            if apply_mirror_file_to_buffer(bufnr, result.local_path, result) then
+              warn_cached_open(result)
+              vim.defer_fn(function()
+                prefetch_related(result.path)
+              end, 20)
+            end
+          end)
         end
-        if not result or result.preempted then
-          return
-        end
-        vim.schedule(function()
-          if M.client ~= client or client.closing or not vim.api.nvim_buf_is_valid(bufnr) then
-            return
-          end
-          if normalize_local_path(vim.api.nvim_buf_get_name(bufnr)) ~= local_path then
-            return
-          end
-          if vim.api.nvim_get_option_value("modified", { buf = bufnr }) then
-            notify("skipped hydrate for modified mirror buffer " .. relative_path, vim.log.levels.WARN)
-            return
-          end
-          if apply_mirror_file_to_buffer(bufnr, result.local_path, result) then
-            warn_cached_open(result)
-            vim.defer_fn(function()
-              prefetch_related(result.path)
-            end, 20)
-          end
-        end)
-      end)
+      )
     end,
   })
 end
@@ -918,7 +927,11 @@ end
 
 function M.open(path, opts)
   opts = opts or {}
-  M.request("open", { path = path, force = opts.force == true }, function(err, result)
+  M.request("open", {
+    path = path,
+    force = opts.force == true,
+    batch_max_file_bytes = opts.batch_max_file_bytes or M.config.open_batch_max_file_bytes,
+  }, function(err, result)
     if err then
       notify(err, vim.log.levels.ERROR)
       return

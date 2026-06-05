@@ -106,6 +106,7 @@ CONFIGURATION                                  *nvim-remote-mirror-config*
     grep_cache_max_total_bytes = 8 * 1024 * 1024,
     request_timeout_ms = 30000,
     ssh_connect_timeout_seconds = 10,
+    open_batch_max_file_bytes = 4 * 1024 * 1024,
     prefetch_max_file_bytes = 4 * 1024 * 1024,
     prefetch_max_total_bytes = 16 * 1024 * 1024,
     open_prefetch_related = false,
@@ -140,6 +141,8 @@ background_mirror controls the idle mirror builder; set it false and use
 :RemoteMirrorStart manually on especially fragile links. Each background tick
 scans metadata, hydrates a tiny clean-file batch, then validates a tiny
 oldest-check cached-file batch against the remote checksum.
+open_batch_max_file_bytes controls how large a direct uncached open may be
+before it falls back from one-request batch read hydration to chunked reads.
 auto_hydrate_mirror_buffers makes LSP jumps into missing local mirror files call
 the sidecar open path and hydrate the corresponding remote file.
 

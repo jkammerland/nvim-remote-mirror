@@ -161,8 +161,25 @@ enum SaveAttempt {
     },
 }
 
+enum HydrationMode {
+    Batch,
+    Chunked,
+}
+
+impl HydrationMode {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Batch => "batch",
+            Self::Chunked => "chunked",
+        }
+    }
+}
+
 enum HydrateOutcome {
-    Hydrated(MirrorEntry),
+    Hydrated {
+        entry: MirrorEntry,
+        mode: HydrationMode,
+    },
     Preempted,
 }
 
@@ -3233,6 +3250,10 @@ impl Sidecar {
             .get("force")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let batch_max_file_bytes = params
+            .get("batch_max_file_bytes")
+            .and_then(Value::as_u64)
+            .unwrap_or(DEFAULT_BATCH_MAX_FILE_BYTES);
         if let Some(mut entry) = self.mirror.get(path)? {
             if entry.state == "hydrated" {
                 let mut restored_from_snapshot = false;
@@ -3270,8 +3291,8 @@ impl Sidecar {
                 }
             }
         }
-        let hydrated = match self.hydrate(path, Some(preempt_epoch))? {
-            HydrateOutcome::Hydrated(hydrated) => hydrated,
+        let hydrated = match self.open_hydrate(path, batch_max_file_bytes, preempt_epoch)? {
+            HydrateOutcome::Hydrated { entry, mode } => (entry, mode),
             HydrateOutcome::Preempted => {
                 return Ok(json!({
                     "path": path,
@@ -3279,6 +3300,7 @@ impl Sidecar {
                 }));
             }
         };
+        let (hydrated, mode) = hydrated;
         Ok(json!({
             "path": hydrated.relative_path,
             "local_path": hydrated.local_path.to_string_lossy(),
@@ -3286,6 +3308,7 @@ impl Sidecar {
             "size": hydrated.size,
             "validation_state": hydrated.validation_state,
             "validated_at_ms": hydrated.validated_at_ms,
+            "hydrated_via": mode.as_str(),
             "cached": false
         }))
     }
@@ -3311,6 +3334,59 @@ impl Sidecar {
             "force_skipped": force_skipped,
             "restored_from_snapshot": restored_from_snapshot
         })
+    }
+
+    fn open_hydrate(
+        &mut self,
+        path: &str,
+        batch_max_file_bytes: u64,
+        preempt_epoch: u64,
+    ) -> Result<HydrateOutcome> {
+        if batch_max_file_bytes > 0 {
+            if let Some(outcome) =
+                self.hydrate_open_batch(path, batch_max_file_bytes, preempt_epoch)?
+            {
+                return Ok(outcome);
+            }
+        }
+        self.hydrate(path, Some(preempt_epoch))
+    }
+
+    fn hydrate_open_batch(
+        &mut self,
+        path: &str,
+        max_file_bytes: u64,
+        preempt_epoch: u64,
+    ) -> Result<Option<HydrateOutcome>> {
+        let request = Request::ReadFiles {
+            paths: vec![path.to_string()],
+            max_file_bytes,
+            max_total_bytes: max_file_bytes,
+        };
+        let response = match self
+            .agent
+            .request_maybe_preemptible_since(request, preempt_epoch)?
+        {
+            AgentRequestOutcome::Response(response) => response,
+            AgentRequestOutcome::Preempted => return Ok(Some(HydrateOutcome::Preempted)),
+        };
+        match response {
+            Response::ReadFiles { mut files, .. } => {
+                let Some(file) = files.pop() else {
+                    return Ok(None);
+                };
+                let path = file.path.clone();
+                self.record_batch_file(file)?;
+                let entry = self.mirror.get(&path)?.ok_or_else(|| {
+                    anyhow!("batch-open file was not recorded in mirror metadata")
+                })?;
+                Ok(Some(HydrateOutcome::Hydrated {
+                    entry,
+                    mode: HydrationMode::Batch,
+                }))
+            }
+            other => bail!("unexpected batch open response: {other:?}"),
+        }
     }
 
     fn prefetch(&mut self, params: Value, preempt_epoch: u64) -> Result<Value> {
@@ -3487,35 +3563,50 @@ impl Sidecar {
 
     fn record_batch_file(&self, file: BatchReadFile) -> Result<()> {
         let local_path = self.mirror.local_path(&file.path)?;
-        if let Some(entry) = self.mirror.get(&file.path)? {
-            let (entry, _) = self.mirror.sync_cached_file_integrity(&entry)?;
-            if entry.dirty {
-                bail!("skipped dirty local mirror file");
-            }
-        }
         if let Some(parent) = local_path.parent() {
             fs::create_dir_all(parent)?;
         }
         let part_path = local_path.with_extension("nrm-batch-part");
-        {
+        let result = (|| -> Result<()> {
             let mut part = File::create(&part_path)?;
             part.write_all(&file.content)?;
             part.sync_all()?;
-        }
-        let local_hash = hash_file(&part_path)?;
-        if local_hash != file.hash {
+            drop(part);
+            let local_hash = hash_file(&part_path)?;
+            if local_hash != file.hash {
+                bail!(
+                    "batch hydration hash mismatch for {}: local={local_hash} remote={}",
+                    file.path,
+                    file.hash
+                );
+            }
+            self.ensure_hydration_target_clean(&file.path, &local_path)?;
+            fs::rename(&part_path, &local_path)?;
+            self.mirror
+                .record_hydrated(&file.meta, &file.hash, &local_hash)?;
+            self.mirror
+                .replace_search_index_from_bytes(&file.path, &local_hash, &file.content)?;
+            Ok(())
+        })();
+        if let Err(error) = result {
             let _ = fs::remove_file(&part_path);
-            bail!(
-                "batch hydration hash mismatch for {}: local={local_hash} remote={}",
-                file.path,
-                file.hash
-            );
+            return Err(error);
         }
-        fs::rename(&part_path, &local_path)?;
-        self.mirror
-            .record_hydrated(&file.meta, &file.hash, &local_hash)?;
-        self.mirror
-            .replace_search_index_from_bytes(&file.path, &local_hash, &file.content)?;
+        Ok(())
+    }
+
+    fn ensure_hydration_target_clean(&self, path: &str, local_path: &Path) -> Result<()> {
+        if let Some(entry) = self.mirror.get(path)? {
+            if entry.local_path.exists() && entry.state != "hydrated" {
+                bail!("skipped existing local mirror file without hydrated metadata");
+            }
+            let (entry, _) = self.mirror.sync_cached_file_integrity(&entry)?;
+            if entry.dirty {
+                bail!("skipped dirty local mirror file");
+            }
+        } else if local_path.exists() {
+            bail!("skipped existing unmanaged local mirror file");
+        }
         Ok(())
     }
 
@@ -4198,6 +4289,7 @@ impl Sidecar {
                     "local hydration hash mismatch for {path}: local={local_hash} remote={remote_hash}"
                 );
             }
+            self.ensure_hydration_target_clean(path, &local_path)?;
             Ok(Some((meta, remote_hash, local_hash)))
         })();
         let Some((meta, remote_hash, local_hash)) = (match hydrated {
@@ -4222,7 +4314,10 @@ impl Sidecar {
             .unwrap_or(meta.size);
         self.mirror
             .rebuild_search_index_from_local_file(&hydrated, &local_hash, file_len)?;
-        Ok(HydrateOutcome::Hydrated(hydrated))
+        Ok(HydrateOutcome::Hydrated {
+            entry: hydrated,
+            mode: HydrationMode::Chunked,
+        })
     }
 }
 
@@ -5734,8 +5829,70 @@ mod tests {
 
         assert!(error.contains("skipped dirty local mirror file"));
         assert_eq!(fs::read(local_path).unwrap(), b"local edit");
+        assert!(!sidecar
+            .mirror
+            .local_path("a.txt")
+            .unwrap()
+            .with_extension("nrm-batch-part")
+            .exists());
         assert_eq!(sidecar.mirror.pending_save_count().unwrap(), 1);
         assert!(sidecar.mirror.get("a.txt").unwrap().unwrap().dirty);
+    }
+
+    #[test]
+    fn batch_hydrate_skips_unmanaged_existing_local_file() {
+        let dir = tempdir().unwrap();
+        let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
+        let local_path = mirror.local_path("a.txt").unwrap();
+        fs::create_dir_all(local_path.parent().unwrap()).unwrap();
+        fs::write(&local_path, b"local edit").unwrap();
+        let sidecar = test_sidecar(mirror);
+        let remote_hash = hash_bytes(b"remote new");
+
+        let error = sidecar
+            .record_batch_file(BatchReadFile {
+                path: "a.txt".to_string(),
+                content: b"remote new".to_vec(),
+                hash: remote_hash.clone(),
+                meta: test_meta("a.txt", &remote_hash, b"remote new".len() as u64),
+            })
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("skipped existing unmanaged local mirror file"));
+        assert_eq!(fs::read(local_path).unwrap(), b"local edit");
+        assert!(!sidecar
+            .mirror
+            .local_path("a.txt")
+            .unwrap()
+            .with_extension("nrm-batch-part")
+            .exists());
+    }
+
+    #[test]
+    fn batch_hydrate_hash_mismatch_removes_partial_file() {
+        let dir = tempdir().unwrap();
+        let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
+        let sidecar = test_sidecar(mirror);
+
+        let error = sidecar
+            .record_batch_file(BatchReadFile {
+                path: "a.txt".to_string(),
+                content: b"remote new".to_vec(),
+                hash: "not-the-content-hash".to_string(),
+                meta: test_meta("a.txt", "not-the-content-hash", b"remote new".len() as u64),
+            })
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("batch hydration hash mismatch"));
+        assert!(!sidecar
+            .mirror
+            .local_path("a.txt")
+            .unwrap()
+            .with_extension("nrm-batch-part")
+            .exists());
+        assert!(sidecar.mirror.get("a.txt").unwrap().is_none());
     }
 
     #[test]
