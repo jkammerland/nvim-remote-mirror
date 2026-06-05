@@ -176,6 +176,9 @@ Current transport state:
   compare-and-swap writes, and sidecar fast-path responses for cached mirror
   opens/status while remote worker requests are in flight. Disconnect interrupts
   the current agent/SSH process group on Unix so shutdown is not pinned to the
-  normal request timeout.
+  normal request timeout. Deferred sidecar work uses separate interactive and
+  background queues so explicit opens/saves are not rejected by, or drained
+  behind, queued prefetch, scan, or refresh work.
 - pending: per-request cancellation, true multiplexing, streaming results, and
-  broader backpressure.
+  broader backpressure. Priority queues do not preempt a background request
+  after it has already started on the serial SSH/agent connection.

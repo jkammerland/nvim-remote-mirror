@@ -8,7 +8,7 @@ use nrm_protocol::{
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read, Write};
 #[cfg(unix)]
@@ -17,7 +17,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    mpsc, Arc, Mutex,
+    mpsc, Arc, Condvar, Mutex,
 };
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -27,6 +27,8 @@ const SAVE_UPLOAD_CHUNK_BYTES: usize = 1024 * 1024;
 const DEFAULT_BATCH_MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
 const DEFAULT_BATCH_MAX_TOTAL_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_SAVE_PAYLOAD_BYTES: usize = MAX_FRAME_LEN - (1024 * 1024);
+const REMOTE_INTERACTIVE_QUEUE_CAPACITY: usize = 128;
+const REMOTE_BACKGROUND_QUEUE_CAPACITY: usize = 128;
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Local sidecar for nvim-remote-mirror")]
@@ -578,7 +580,10 @@ impl Mirror {
               is_dir=excluded.is_dir,
               is_symlink=excluded.is_symlink,
               metadata_kind_known=1,
-              remote_hash=COALESCE(excluded.remote_hash, files.remote_hash),
+              remote_hash=CASE
+                WHEN files.state = 'hydrated' THEN files.remote_hash
+                ELSE COALESCE(excluded.remote_hash, files.remote_hash)
+              END,
               state=CASE WHEN files.state = 'hydrated' THEN files.state ELSE excluded.state END,
               updated_at_ms=excluded.updated_at_ms
             ",
@@ -1206,9 +1211,190 @@ struct PendingHazard {
     unknown_content_mutation: bool,
 }
 
+#[derive(Debug, Default)]
+struct RequestInterest {
+    exact_paths: Vec<String>,
+    unknown_content: bool,
+}
+
+#[derive(Debug)]
 struct RemoteWork {
     request: ClientRequest,
     hazard: PendingHazard,
+    priority: RemotePriority,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum RemotePriority {
+    Interactive,
+    Background,
+}
+
+struct RemoteQueue {
+    state: Mutex<RemoteQueueState>,
+    ready: Condvar,
+    interactive_capacity: usize,
+    background_capacity: usize,
+}
+
+struct RemoteQueueState {
+    queue: VecDeque<RemoteWork>,
+    interactive_len: usize,
+    background_len: usize,
+    closed: bool,
+}
+
+impl RemotePriority {
+    fn for_request(request: &ClientRequest) -> Self {
+        match request.method.as_str() {
+            "prefetch" | "prefetch_related" | "refresh" | "scan" => Self::Background,
+            _ => Self::Interactive,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Interactive => "interactive",
+            Self::Background => "background",
+        }
+    }
+}
+
+impl RemoteQueue {
+    fn new(interactive_capacity: usize, background_capacity: usize) -> Self {
+        Self {
+            state: Mutex::new(RemoteQueueState {
+                queue: VecDeque::new(),
+                interactive_len: 0,
+                background_len: 0,
+                closed: false,
+            }),
+            ready: Condvar::new(),
+            interactive_capacity,
+            background_capacity,
+        }
+    }
+
+    fn try_push(&self, work: RemoteWork) -> Result<(), RemoteWork> {
+        let priority = work.priority;
+        let mut state = self.state.lock().expect("remote queue mutex poisoned");
+        if state.closed {
+            return Err(work);
+        }
+
+        match priority {
+            RemotePriority::Interactive => {
+                if state.interactive_len >= self.interactive_capacity {
+                    Err(work)
+                } else {
+                    state.interactive_len += 1;
+                    state.queue.push_back(work);
+                    self.ready.notify_one();
+                    Ok(())
+                }
+            }
+            RemotePriority::Background => {
+                if state.background_len >= self.background_capacity {
+                    Err(work)
+                } else {
+                    state.background_len += 1;
+                    state.queue.push_back(work);
+                    self.ready.notify_one();
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    fn pop(&self) -> Option<RemoteWork> {
+        let mut state = self.state.lock().expect("remote queue mutex poisoned");
+        loop {
+            if let Some(index) = state.next_ready_index() {
+                return Some(state.remove(index));
+            }
+            if state.closed {
+                return None;
+            }
+            state = self
+                .ready
+                .wait(state)
+                .expect("remote queue mutex poisoned while waiting");
+        }
+    }
+
+    fn shutdown_and_drain(&self) -> Vec<RemoteWork> {
+        let mut state = self.state.lock().expect("remote queue mutex poisoned");
+        state.closed = true;
+        let drained = state.drain_all();
+        self.ready.notify_all();
+        drained
+    }
+
+    fn close_and_drain_background(&self) -> Vec<RemoteWork> {
+        let mut state = self.state.lock().expect("remote queue mutex poisoned");
+        state.closed = true;
+        let mut kept = VecDeque::new();
+        let mut drained = Vec::new();
+        while let Some(work) = state.queue.pop_front() {
+            if work.priority == RemotePriority::Background {
+                drained.push(work);
+            } else {
+                kept.push_back(work);
+            }
+        }
+        state.queue = kept;
+        state.background_len = 0;
+        state.interactive_len = state.queue.len();
+        self.ready.notify_all();
+        drained
+    }
+}
+
+impl RemoteQueueState {
+    fn next_ready_index(&self) -> Option<usize> {
+        let interactive_index = self
+            .queue
+            .iter()
+            .position(|work| work.priority == RemotePriority::Interactive);
+        let Some(interactive_index) = interactive_index else {
+            return (!self.queue.is_empty()).then_some(0);
+        };
+
+        let interactive = &self.queue[interactive_index];
+        let conflicting_background = self
+            .queue
+            .iter()
+            .take(interactive_index)
+            .position(|work| work.blocks_later(interactive));
+        Some(conflicting_background.unwrap_or(interactive_index))
+    }
+
+    fn remove(&mut self, index: usize) -> RemoteWork {
+        let work = self
+            .queue
+            .remove(index)
+            .expect("remote queue index disappeared");
+        self.decrement(work.priority);
+        work
+    }
+
+    fn drain_all(&mut self) -> Vec<RemoteWork> {
+        let drained = self.queue.drain(..).collect();
+        self.interactive_len = 0;
+        self.background_len = 0;
+        drained
+    }
+
+    fn decrement(&mut self, priority: RemotePriority) {
+        match priority {
+            RemotePriority::Interactive => {
+                self.interactive_len = self.interactive_len.saturating_sub(1)
+            }
+            RemotePriority::Background => {
+                self.background_len = self.background_len.saturating_sub(1)
+            }
+        }
+    }
 }
 
 impl PendingRemote {
@@ -1280,8 +1466,68 @@ impl PendingHazard {
                     .unwrap_or(true),
             },
             "flush" => path_hazard(request.params.get("path").and_then(Value::as_str)),
+            "flush_queue" => Self {
+                exact_paths: Vec::new(),
+                unknown_content_mutation: true,
+            },
             _ => Self::default(),
         }
+    }
+
+    fn conflicts_with_interest(&self, interest: &RequestInterest) -> bool {
+        if self.unknown_content_mutation && interest.has_content_interest() {
+            return true;
+        }
+        if interest.unknown_content {
+            return self.unknown_content_mutation || !self.exact_paths.is_empty();
+        }
+        self.exact_paths
+            .iter()
+            .any(|path| interest.exact_paths.iter().any(|other| other == path))
+    }
+}
+
+impl RequestInterest {
+    fn for_request(request: &ClientRequest) -> Self {
+        match request.method.as_str() {
+            "open" | "validate" => {
+                request_path_interest(request.params.get("path").and_then(Value::as_str))
+            }
+            "prefetch" => {
+                let mut paths = Vec::new();
+                if let Some(values) = request.params.get("paths").and_then(Value::as_array) {
+                    for value in values {
+                        if let Some(path) = value.as_str().and_then(normalized_path_string) {
+                            paths.push(path);
+                        }
+                    }
+                }
+                Self {
+                    exact_paths: paths,
+                    unknown_content: false,
+                }
+            }
+            "grep" => Self {
+                exact_paths: Vec::new(),
+                unknown_content: request
+                    .params
+                    .get("hydrate")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true),
+            },
+            _ => Self::default(),
+        }
+    }
+
+    fn has_content_interest(&self) -> bool {
+        self.unknown_content || !self.exact_paths.is_empty()
+    }
+}
+
+impl RemoteWork {
+    fn blocks_later(&self, later: &RemoteWork) -> bool {
+        self.hazard
+            .conflicts_with_interest(&RequestInterest::for_request(&later.request))
     }
 }
 
@@ -1289,6 +1535,13 @@ fn path_hazard(path: Option<&str>) -> PendingHazard {
     PendingHazard {
         exact_paths: path.and_then(normalized_path_string).into_iter().collect(),
         unknown_content_mutation: false,
+    }
+}
+
+fn request_path_interest(path: Option<&str>) -> RequestInterest {
+    RequestInterest {
+        exact_paths: path.and_then(normalized_path_string).into_iter().collect(),
+        unknown_content: false,
     }
 }
 
@@ -2385,18 +2638,25 @@ fn run_server(
         Ok(())
     });
 
-    let (remote_tx, remote_rx) = mpsc::sync_channel::<RemoteWork>(128);
+    let remote_queue = Arc::new(RemoteQueue::new(
+        REMOTE_INTERACTIVE_QUEUE_CAPACITY,
+        REMOTE_BACKGROUND_QUEUE_CAPACITY,
+    ));
     let remote_response_tx = response_tx.clone();
     let remote_pending = Arc::clone(&pending_remote);
     let remote_interrupt = agent_interrupt.clone();
+    let remote_worker_queue = Arc::clone(&remote_queue);
     let remote_worker = thread::spawn(move || {
         let mut sidecar = sidecar;
-        for work in remote_rx {
-            let RemoteWork { request, hazard } = work;
+        while let Some(work) = remote_worker_queue.pop() {
+            let RemoteWork {
+                request, hazard, ..
+            } = work;
             if remote_interrupt.is_shutdown_requested() {
                 if let Ok(mut pending) = remote_pending.lock() {
                     pending.clear(&hazard);
                 }
+                clear_pending_hazards(&remote_pending, remote_worker_queue.shutdown_and_drain());
                 break;
             }
             let should_shutdown = matches!(request.method.as_str(), "shutdown" | "disconnect");
@@ -2406,6 +2666,7 @@ fn run_server(
             }
             try_send_client_response(&remote_response_tx, response);
             if should_shutdown || remote_interrupt.is_shutdown_requested() {
+                clear_pending_hazards(&remote_pending, remote_worker_queue.shutdown_and_drain());
                 break;
             }
         }
@@ -2435,6 +2696,7 @@ fn run_server(
         let should_shutdown = matches!(request.method.as_str(), "shutdown" | "disconnect");
         if should_shutdown {
             agent_interrupt.request_shutdown();
+            clear_pending_hazards(&pending_remote, remote_queue.shutdown_and_drain());
             try_send_client_response(
                 &response_tx,
                 ClientResponse {
@@ -2458,13 +2720,13 @@ fn run_server(
                 if let Ok(mut pending) = pending_remote.lock() {
                     pending.register(&hazard);
                 }
-                let work = RemoteWork { request, hazard };
-                if let Err(error) = remote_tx.try_send(work) {
-                    let work = match error {
-                        mpsc::TrySendError::Full(work) | mpsc::TrySendError::Disconnected(work) => {
-                            work
-                        }
-                    };
+                let priority = RemotePriority::for_request(&request);
+                let work = RemoteWork {
+                    request,
+                    hazard,
+                    priority,
+                };
+                if let Err(work) = remote_queue.try_push(work) {
                     if let Ok(mut pending) = pending_remote.lock() {
                         pending.clear(&work.hazard);
                     }
@@ -2474,7 +2736,10 @@ fn run_server(
                             id: work.request.id,
                             ok: false,
                             result: None,
-                            error: Some("remote worker is busy or not available".to_string()),
+                            error: Some(format!(
+                                "remote {} queue is full or not available",
+                                work.priority.label()
+                            )),
                         },
                     );
                 }
@@ -2485,7 +2750,7 @@ fn run_server(
         }
     }
 
-    drop(remote_tx);
+    clear_pending_hazards(&pending_remote, remote_queue.close_and_drain_background());
     let _ = remote_worker.join();
     drop(response_tx);
     match writer.join() {
@@ -2515,6 +2780,17 @@ fn result_to_client_response(id: u64, result: Result<Value>) -> ClientResponse {
             result: None,
             error: Some(error.to_string()),
         },
+    }
+}
+
+fn clear_pending_hazards(pending_remote: &Arc<Mutex<PendingRemote>>, works: Vec<RemoteWork>) {
+    if works.is_empty() {
+        return;
+    }
+    if let Ok(mut pending) = pending_remote.lock() {
+        for work in works {
+            pending.clear(&work.hazard);
+        }
     }
 }
 
@@ -2843,6 +3119,23 @@ mod tests {
         assert_eq!(entry.remote_hash.as_deref(), Some("abc"));
         assert_eq!(entry.state, "hydrated");
         assert_eq!(entry.validation_state, "valid");
+    }
+
+    #[test]
+    fn metadata_scan_does_not_move_hydrated_base_hash() {
+        let dir = tempdir().unwrap();
+        let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
+        mirror
+            .record_hydrated(&test_meta("src/main.rs", "opened", 6), "opened", "opened")
+            .unwrap();
+
+        mirror
+            .upsert_metadata(&test_meta("src/main.rs", "remote-newer", 12), "metadata")
+            .unwrap();
+
+        let entry = mirror.get("src/main.rs").unwrap().unwrap();
+        assert_eq!(entry.remote_hash.as_deref(), Some("opened"));
+        assert_eq!(entry.state, "hydrated");
     }
 
     #[test]
@@ -3199,6 +3492,165 @@ mod tests {
 
         pending.lock().unwrap().clear(&hazard);
         assert!(matches!(fast.try_handle(&cached), FastHandle::Handled(_)));
+    }
+
+    fn test_client_request(id: u64, method: &str, params: Value) -> ClientRequest {
+        ClientRequest {
+            id,
+            method: method.to_string(),
+            params,
+        }
+    }
+
+    fn test_remote_work(id: u64, method: &str) -> RemoteWork {
+        let request = test_client_request(id, method, json!({}));
+        test_remote_work_from_request(request)
+    }
+
+    fn test_remote_work_from_request(request: ClientRequest) -> RemoteWork {
+        let hazard = PendingHazard::for_request(&request);
+        let priority = RemotePriority::for_request(&request);
+        RemoteWork {
+            request,
+            hazard,
+            priority,
+        }
+    }
+
+    #[test]
+    fn remote_queue_prioritizes_interactive_and_preserves_fifo() {
+        let queue = RemoteQueue::new(8, 8);
+        queue.try_push(test_remote_work(1, "prefetch")).unwrap();
+        queue.try_push(test_remote_work(2, "open")).unwrap();
+        queue.try_push(test_remote_work(3, "flush")).unwrap();
+        queue
+            .try_push(test_remote_work(4, "prefetch_related"))
+            .unwrap();
+
+        assert_eq!(queue.pop().unwrap().request.id, 2);
+        assert_eq!(queue.pop().unwrap().request.id, 3);
+        assert_eq!(queue.pop().unwrap().request.id, 1);
+        assert_eq!(queue.pop().unwrap().request.id, 4);
+
+        queue.shutdown_and_drain();
+        assert!(queue.pop().is_none());
+    }
+
+    #[test]
+    fn remote_queue_preserves_fifo_for_conflicting_background_work() {
+        let queue = RemoteQueue::new(8, 8);
+        queue
+            .try_push(test_remote_work_from_request(test_client_request(
+                1,
+                "prefetch",
+                json!({"paths": ["src/main.rs"]}),
+            )))
+            .unwrap();
+        queue
+            .try_push(test_remote_work_from_request(test_client_request(
+                2,
+                "open",
+                json!({"path": "src/main.rs"}),
+            )))
+            .unwrap();
+
+        assert_eq!(queue.pop().unwrap().request.id, 1);
+        assert_eq!(queue.pop().unwrap().request.id, 2);
+        queue.shutdown_and_drain();
+    }
+
+    #[test]
+    fn remote_queue_flush_bypasses_conflicting_background_hydration() {
+        let queue = RemoteQueue::new(8, 8);
+        queue
+            .try_push(test_remote_work_from_request(test_client_request(
+                1,
+                "prefetch",
+                json!({"paths": ["src/main.rs"]}),
+            )))
+            .unwrap();
+        queue
+            .try_push(test_remote_work_from_request(test_client_request(
+                2,
+                "flush",
+                json!({"path": "src/main.rs"}),
+            )))
+            .unwrap();
+
+        assert_eq!(queue.pop().unwrap().request.id, 2);
+        assert_eq!(queue.pop().unwrap().request.id, 1);
+        queue.shutdown_and_drain();
+    }
+
+    #[test]
+    fn remote_queue_background_capacity_does_not_block_interactive() {
+        let queue = RemoteQueue::new(1, 1);
+        queue.try_push(test_remote_work(1, "prefetch")).unwrap();
+        let rejected_background = queue
+            .try_push(test_remote_work(2, "prefetch_related"))
+            .unwrap_err();
+        assert_eq!(rejected_background.priority, RemotePriority::Background);
+
+        queue.try_push(test_remote_work(3, "open")).unwrap();
+        let rejected_interactive = queue.try_push(test_remote_work(4, "flush")).unwrap_err();
+        assert_eq!(rejected_interactive.priority, RemotePriority::Interactive);
+
+        assert_eq!(queue.pop().unwrap().request.id, 3);
+        assert_eq!(queue.pop().unwrap().request.id, 1);
+        queue.shutdown_and_drain();
+    }
+
+    #[test]
+    fn remote_queue_shutdown_drains_queued_hazards() {
+        let pending = Arc::new(Mutex::new(PendingRemote::default()));
+        let queue = RemoteQueue::new(8, 8);
+        let request = test_client_request(1, "open", json!({"path": "src/main.rs", "force": true}));
+        let hazard = PendingHazard::for_request(&request);
+        pending.lock().unwrap().register(&hazard);
+        queue
+            .try_push(RemoteWork {
+                request,
+                hazard,
+                priority: RemotePriority::Interactive,
+            })
+            .unwrap();
+
+        assert!(pending.lock().unwrap().blocks_path("src/main.rs"));
+        clear_pending_hazards(&pending, queue.shutdown_and_drain());
+
+        assert!(!pending.lock().unwrap().blocks_path("src/main.rs"));
+        assert!(queue.pop().is_none());
+    }
+
+    #[test]
+    fn remote_queue_close_keeps_interactive_work_and_drains_background() {
+        let queue = RemoteQueue::new(8, 8);
+        queue.try_push(test_remote_work(1, "prefetch")).unwrap();
+        queue
+            .try_push(test_remote_work_from_request(test_client_request(
+                2,
+                "flush",
+                json!({"path": "src/main.rs"}),
+            )))
+            .unwrap();
+
+        let drained = queue.close_and_drain_background();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].request.id, 1);
+        assert_eq!(queue.pop().unwrap().request.id, 2);
+        assert!(queue.pop().is_none());
+    }
+
+    #[test]
+    fn flush_queue_blocks_cached_opens_while_pending() {
+        let hazard = PendingHazard::for_request(&test_client_request(1, "flush_queue", json!({})));
+        let mut pending = PendingRemote::default();
+        pending.register(&hazard);
+
+        assert!(pending.blocks_path("src/main.rs"));
+
+        pending.clear(&hazard);
+        assert!(!pending.blocks_path("src/main.rs"));
     }
 
     #[test]
