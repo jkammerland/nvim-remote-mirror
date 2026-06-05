@@ -52,6 +52,8 @@ This first implementation covers:
 - batched prefetch hydration with per-file and total byte caps.
 - batched mirror refresh to mark cached files valid, stale, or deleted.
 - remote grep that batch-hydrates result files for local quickfix jumps.
+- local mirror rehash before cached reads or batch overwrites, with
+  out-of-band local edits snapshotted and queued as dirty saves.
 - durable local save snapshots with checksum-aware flush/retry and conflict detection.
 - chunked compare-and-swap uploads for large remote saves.
 - basic Neovim commands.
@@ -168,6 +170,13 @@ Small saves use one RPC request. Large saves stream through a chunked
 compare-and-swap upload: the agent checks the remote base hash before accepting
 chunks, verifies the uploaded content hash, rechecks the remote base hash, then
 renames the temp file into place.
+
+Before cached opens, cached grep, validation, or batch hydration overwrites use
+an existing local mirror file, the sidecar rehashes the local bytes against the
+recorded mirror hash. If the file changed outside the normal save path, the
+current bytes are snapshotted, queued as a dirty save, and served as local truth
+instead of being reported as a clean cache hit or overwritten by background
+hydration.
 
 Use `:RemoteValidate [path]` to compare cached mirror metadata with the remote
 hash. Stale cached files are marked in the mirror and opened from cache by

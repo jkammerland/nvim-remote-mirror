@@ -918,14 +918,15 @@ impl Mirror {
         self.db.execute(
             "
             UPDATE files SET
+              size=?3,
               local_hash=?2,
               dirty=1,
               validation_state='dirty',
               last_error=NULL,
-              updated_at_ms=?3
+              updated_at_ms=?4
             WHERE relative_path=?1
             ",
-            params![relative_path, local_hash, now_ms()],
+            params![relative_path, local_hash, content.len() as i64, now_ms()],
         )?;
         self.db.execute(
             "
@@ -969,6 +970,73 @@ impl Mirror {
             entry.remote_hash.as_deref(),
             &content,
         )
+    }
+
+    fn sync_cached_file_integrity(&self, entry: &MirrorEntry) -> Result<(MirrorEntry, bool)> {
+        if entry.state != "hydrated" || !entry.local_path.is_file() {
+            return Ok((entry.clone(), false));
+        }
+
+        let actual_hash = hash_file(&entry.local_path).with_context(|| {
+            format!(
+                "failed to hash local mirror file {}",
+                entry.local_path.display()
+            )
+        })?;
+        let recorded_hash = entry.local_hash.as_deref().or(entry.remote_hash.as_deref());
+        if recorded_hash == Some(actual_hash.as_str()) {
+            if entry.local_hash.as_deref() == Some(actual_hash.as_str()) {
+                return Ok((entry.clone(), false));
+            }
+            self.record_clean_local_hash(entry, &actual_hash)?;
+            let updated = self
+                .get(&entry.relative_path)?
+                .ok_or_else(|| anyhow!("verified file lost mirror metadata"))?;
+            return Ok((updated, false));
+        }
+
+        let content = fs::read(&entry.local_path).with_context(|| {
+            format!(
+                "failed to read modified local mirror file {}",
+                entry.local_path.display()
+            )
+        })?;
+        let content_hash = hash_bytes(&content);
+        if recorded_hash == Some(content_hash.as_str()) {
+            self.record_clean_local_hash(entry, &content_hash)?;
+            let updated = self
+                .get(&entry.relative_path)?
+                .ok_or_else(|| anyhow!("verified file lost mirror metadata"))?;
+            return Ok((updated, false));
+        }
+
+        let queued = self.enqueue_save(
+            &entry.relative_path,
+            &content_hash,
+            entry.remote_hash.as_deref(),
+            &content,
+        )?;
+        let updated = self
+            .get(&queued.relative_path)?
+            .ok_or_else(|| anyhow!("queued modified file lost mirror metadata"))?;
+        Ok((updated, true))
+    }
+
+    fn record_clean_local_hash(&self, entry: &MirrorEntry, local_hash: &str) -> Result<()> {
+        let size = fs::metadata(&entry.local_path)
+            .map(|metadata| metadata.len() as i64)
+            .unwrap_or(entry.size as i64);
+        self.db.execute(
+            "
+            UPDATE files SET
+              size=?2,
+              local_hash=?3,
+              updated_at_ms=?4
+            WHERE relative_path=?1 AND dirty=0
+            ",
+            params![entry.relative_path, size, local_hash, now_ms()],
+        )?;
+        Ok(())
     }
 
     fn write_save_snapshot(
@@ -1439,6 +1507,7 @@ impl Mirror {
                 truncated = true;
                 break;
             }
+            let (entry, _) = self.sync_cached_file_integrity(&entry)?;
             if !entry.local_path.is_file() {
                 continue;
             }
@@ -2145,6 +2214,8 @@ impl FastState {
             if !entry.local_path.exists() {
                 return Ok(None);
             }
+            let (synced_entry, _) = mirror.sync_cached_file_integrity(&entry)?;
+            entry = synced_entry;
             if entry.dirty {
                 return Ok(Some(Sidecar::cached_open_response(
                     &entry,
@@ -2357,6 +2428,8 @@ impl Sidecar {
                         .ok_or_else(|| anyhow!("restored file lost mirror metadata"))?;
                 }
                 if entry.local_path.exists() {
+                    let (synced_entry, _) = self.mirror.sync_cached_file_integrity(&entry)?;
+                    entry = synced_entry;
                     if entry.dirty {
                         return Ok(Self::cached_open_response(
                             &entry,
@@ -2494,6 +2567,7 @@ impl Sidecar {
             .to_string_lossy()
             .replace('\\', "/");
         if let Some(entry) = self.mirror.get(&path)? {
+            let (entry, _) = self.mirror.sync_cached_file_integrity(&entry)?;
             if entry.dirty {
                 bail!("skipped dirty local mirror file");
             }
@@ -2558,6 +2632,12 @@ impl Sidecar {
 
     fn record_batch_file(&self, file: BatchReadFile) -> Result<()> {
         let local_path = self.mirror.local_path(&file.path)?;
+        if let Some(entry) = self.mirror.get(&file.path)? {
+            let (entry, _) = self.mirror.sync_cached_file_integrity(&entry)?;
+            if entry.dirty {
+                bail!("skipped dirty local mirror file");
+            }
+        }
         if let Some(parent) = local_path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -2638,6 +2718,7 @@ impl Sidecar {
                 .to_string_lossy()
                 .replace('\\', "/");
             if let Some(entry) = self.mirror.get(&path)? {
+                let (entry, _) = self.mirror.sync_cached_file_integrity(&entry)?;
                 if entry.dirty {
                     continue;
                 }
@@ -2650,7 +2731,12 @@ impl Sidecar {
     fn grep_hits_with_local_paths(&self, hits: Vec<nrm_protocol::SearchHit>) -> Result<Vec<Value>> {
         let mut values = Vec::with_capacity(hits.len());
         for hit in hits {
-            let entry = self.mirror.get(&hit.path)?;
+            let entry = self
+                .mirror
+                .get(&hit.path)?
+                .map(|entry| self.mirror.sync_cached_file_integrity(&entry))
+                .transpose()?
+                .map(|(entry, _)| entry);
             let local_path = entry
                 .as_ref()
                 .filter(|entry| {
@@ -2967,10 +3053,14 @@ impl Sidecar {
 
     fn validate(&mut self, params: Value) -> Result<Value> {
         let path = required_string(&params, "path")?;
-        let entry = self
+        let mut entry = self
             .mirror
             .get(path)?
             .ok_or_else(|| anyhow!("{path} is not known in the mirror"))?;
+        if entry.state == "hydrated" && entry.local_path.is_file() {
+            let (synced_entry, _) = self.mirror.sync_cached_file_integrity(&entry)?;
+            entry = synced_entry;
+        }
         if entry.dirty {
             self.mirror
                 .record_validation(&entry.relative_path, "dirty", None, None)?;
@@ -3116,10 +3206,14 @@ impl Sidecar {
     }
 
     fn record_validation_file(&self, file: BatchValidateFile) -> Result<&'static str> {
-        let entry = self
+        let mut entry = self
             .mirror
             .get(&file.path)?
             .ok_or_else(|| anyhow!("{} is not known in the mirror", file.path))?;
+        if entry.state == "hydrated" && entry.local_path.is_file() {
+            let (synced_entry, _) = self.mirror.sync_cached_file_integrity(&entry)?;
+            entry = synced_entry;
+        }
         if entry.dirty {
             self.mirror
                 .record_validation(&entry.relative_path, "dirty", None, None)?;
@@ -3928,6 +4022,19 @@ mod tests {
         }
     }
 
+    fn record_hydrated_content(mirror: &Mirror, path: &str, content: &[u8]) -> PathBuf {
+        let hash = hash_bytes(content);
+        mirror
+            .record_hydrated(&test_meta(path, &hash, content.len() as u64), &hash, &hash)
+            .unwrap();
+        let local_path = mirror.local_path(path).unwrap();
+        if let Some(parent) = local_path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(&local_path, content).unwrap();
+        local_path
+    }
+
     #[test]
     fn local_paths_reject_traversal() {
         let dir = tempdir().unwrap();
@@ -3956,12 +4063,7 @@ mod tests {
         let remote_root = remote_dir.path().join("repo");
         let key = workspace_key(None, &remote_root);
         let mirror = Mirror::open(Some(state_dir.path().to_path_buf()), &key).unwrap();
-        mirror
-            .record_hydrated(&test_meta("src/main.rs", "hash", 4), "hash", "hash")
-            .unwrap();
-        let local_path = mirror.local_path("src/main.rs").unwrap();
-        fs::create_dir_all(local_path.parent().unwrap()).unwrap();
-        fs::write(&local_path, b"main").unwrap();
+        let local_path = record_hydrated_content(&mirror, "src/main.rs", b"main");
         drop(mirror);
 
         let mut sidecar = Sidecar::new(
@@ -4030,12 +4132,7 @@ mod tests {
     fn grep_cache_searches_hydrated_and_dirty_local_files() {
         let dir = tempdir().unwrap();
         let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
-        mirror
-            .record_hydrated(&test_meta("src/main.rs", "base", 4), "base", "base")
-            .unwrap();
-        let main_path = mirror.local_path("src/main.rs").unwrap();
-        fs::create_dir_all(main_path.parent().unwrap()).unwrap();
-        fs::write(&main_path, b"fn cached_hit() {}\n").unwrap();
+        record_hydrated_content(&mirror, "src/main.rs", b"fn cached_hit() {}\n");
 
         mirror
             .record_hydrated(&test_meta("src/dirty.rs", "base", 4), "base", "base")
@@ -4052,11 +4149,7 @@ mod tests {
             )
             .unwrap();
 
-        mirror
-            .record_hydrated(&test_meta("src/binary.rs", "bin", 3), "bin", "bin")
-            .unwrap();
-        let binary_path = mirror.local_path("src/binary.rs").unwrap();
-        fs::write(&binary_path, b"\xff\x00hit").unwrap();
+        record_hydrated_content(&mirror, "src/binary.rs", b"\xff\x00hit");
 
         let result = mirror
             .grep_cache(&json!({"query": "hit", "limit": 10}))
@@ -4080,11 +4173,7 @@ mod tests {
     fn grep_cache_respects_hit_limit() {
         let dir = tempdir().unwrap();
         let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
-        mirror
-            .record_hydrated(&test_meta("a.rs", "a", 1), "a", "a")
-            .unwrap();
-        let a_path = mirror.local_path("a.rs").unwrap();
-        fs::write(&a_path, b"hit one\nhit two\n").unwrap();
+        record_hydrated_content(&mirror, "a.rs", b"hit one\nhit two\n");
 
         let result = mirror
             .grep_cache(&json!({"query": "hit", "limit": 1}))
@@ -4099,16 +4188,8 @@ mod tests {
     fn grep_cache_reports_file_limit_truncation() {
         let dir = tempdir().unwrap();
         let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
-        mirror
-            .record_hydrated(&test_meta("a.rs", "a", 1), "a", "a")
-            .unwrap();
-        let a_path = mirror.local_path("a.rs").unwrap();
-        fs::write(&a_path, b"no match\n").unwrap();
-        mirror
-            .record_hydrated(&test_meta("b.rs", "b", 1), "b", "b")
-            .unwrap();
-        let b_path = mirror.local_path("b.rs").unwrap();
-        fs::write(&b_path, b"hit beyond cutoff\n").unwrap();
+        record_hydrated_content(&mirror, "a.rs", b"no match\n");
+        record_hydrated_content(&mirror, "b.rs", b"hit beyond cutoff\n");
 
         let result = mirror
             .grep_cache(&json!({"query": "hit", "limit": 10, "max_files": 1}))
@@ -4125,11 +4206,7 @@ mod tests {
     fn remote_grep_paths_skip_dirty_and_stale_mirror_entries() {
         let dir = tempdir().unwrap();
         let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
-        mirror
-            .record_hydrated(&test_meta("clean.rs", "clean", 1), "clean", "clean")
-            .unwrap();
-        let clean_path = mirror.local_path("clean.rs").unwrap();
-        fs::write(&clean_path, b"hit clean\n").unwrap();
+        let clean_path = record_hydrated_content(&mirror, "clean.rs", b"hit clean\n");
 
         mirror
             .record_hydrated(&test_meta("dirty.rs", "base", 1), "base", "base")
@@ -4141,11 +4218,7 @@ mod tests {
             .enqueue_save("dirty.rs", &dirty_hash, Some("base"), b"hit dirty\n")
             .unwrap();
 
-        mirror
-            .record_hydrated(&test_meta("stale.rs", "old", 1), "old", "old")
-            .unwrap();
-        let stale_path = mirror.local_path("stale.rs").unwrap();
-        fs::write(&stale_path, b"hit stale\n").unwrap();
+        record_hydrated_content(&mirror, "stale.rs", b"hit stale\n");
         mirror
             .record_validation("stale.rs", "stale", Some("new"), None)
             .unwrap();
@@ -4292,6 +4365,32 @@ mod tests {
     }
 
     #[test]
+    fn open_snapshots_out_of_band_cache_edit_before_serving() {
+        let dir = tempdir().unwrap();
+        let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
+        let base_hash = hash_bytes(b"base");
+        let local_path = record_hydrated_content(&mirror, "a.txt", b"base");
+        fs::write(&local_path, b"local edit").unwrap();
+
+        let mut sidecar = test_sidecar(mirror);
+        let result = sidecar.open(json!({"path": "a.txt"})).unwrap();
+        let entry = sidecar.mirror.get("a.txt").unwrap().unwrap();
+        let queued = sidecar.mirror.pending_save_entries(Some(1)).unwrap();
+
+        assert_eq!(result["cached"], true);
+        assert_eq!(result["dirty"], true);
+        assert_eq!(result["cache_reason"], "dirty");
+        assert_eq!(entry.validation_state, "dirty");
+        assert_eq!(
+            entry.local_hash.as_deref(),
+            Some(hash_bytes(b"local edit").as_str())
+        );
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].expected_hash.as_deref(), Some(base_hash.as_str()));
+        assert_eq!(fs::read(&queued[0].snapshot_path).unwrap(), b"local edit");
+    }
+
+    #[test]
     fn open_restores_missing_dirty_file_from_latest_snapshot() {
         let dir = tempdir().unwrap();
         let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
@@ -4323,10 +4422,7 @@ mod tests {
     fn open_returns_stale_cache_without_force() {
         let dir = tempdir().unwrap();
         let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
-        let meta = test_meta("a.txt", "local", 5);
-        mirror.record_hydrated(&meta, "local", "local").unwrap();
-        let local_path = mirror.local_path("a.txt").unwrap();
-        fs::write(&local_path, b"local").unwrap();
+        record_hydrated_content(&mirror, "a.txt", b"local");
         mirror
             .record_validation("a.txt", "stale", None, Some("remote hash differs"))
             .unwrap();
@@ -4345,10 +4441,7 @@ mod tests {
     fn open_returns_deleted_cache_without_force() {
         let dir = tempdir().unwrap();
         let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
-        let meta = test_meta("a.txt", "local", 5);
-        mirror.record_hydrated(&meta, "local", "local").unwrap();
-        let local_path = mirror.local_path("a.txt").unwrap();
-        fs::write(&local_path, b"local").unwrap();
+        record_hydrated_content(&mirror, "a.txt", b"local");
         mirror
             .record_validation(
                 "a.txt",
@@ -4388,6 +4481,49 @@ mod tests {
         let entry = sidecar.mirror.get("a.txt").unwrap().unwrap();
         assert!(entry.dirty);
         assert_eq!(entry.validation_state, "dirty");
+    }
+
+    #[test]
+    fn validate_marks_out_of_band_cache_edit_dirty_without_remote_request() {
+        let dir = tempdir().unwrap();
+        let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
+        let local_path = record_hydrated_content(&mirror, "a.txt", b"base");
+        fs::write(&local_path, b"local edit").unwrap();
+
+        let mut sidecar = test_sidecar(mirror);
+        let result = sidecar.validate(json!({"path": "a.txt"})).unwrap();
+        let entry = sidecar.mirror.get("a.txt").unwrap().unwrap();
+
+        assert_eq!(result["status"], "dirty");
+        assert_eq!(result["skipped"], true);
+        assert_eq!(sidecar.mirror.pending_save_count().unwrap(), 1);
+        assert!(entry.dirty);
+        assert_eq!(entry.validation_state, "dirty");
+    }
+
+    #[test]
+    fn batch_hydrate_skips_out_of_band_cache_edit() {
+        let dir = tempdir().unwrap();
+        let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
+        let local_path = record_hydrated_content(&mirror, "a.txt", b"base");
+        fs::write(&local_path, b"local edit").unwrap();
+        let sidecar = test_sidecar(mirror);
+        let remote_hash = hash_bytes(b"remote new");
+
+        let error = sidecar
+            .record_batch_file(BatchReadFile {
+                path: "a.txt".to_string(),
+                content: b"remote new".to_vec(),
+                hash: remote_hash.clone(),
+                meta: test_meta("a.txt", &remote_hash, b"remote new".len() as u64),
+            })
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("skipped dirty local mirror file"));
+        assert_eq!(fs::read(local_path).unwrap(), b"local edit");
+        assert_eq!(sidecar.mirror.pending_save_count().unwrap(), 1);
+        assert!(sidecar.mirror.get("a.txt").unwrap().unwrap().dirty);
     }
 
     #[test]
@@ -4466,12 +4602,7 @@ mod tests {
     fn fast_state_serves_cached_open_and_status_from_reopened_mirror() {
         let dir = tempdir().unwrap();
         let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
-        mirror
-            .record_hydrated(&test_meta("src/main.rs", "hash", 4), "hash", "hash")
-            .unwrap();
-        let local_path = mirror.local_path("src/main.rs").unwrap();
-        fs::create_dir_all(local_path.parent().unwrap()).unwrap();
-        fs::write(&local_path, b"main").unwrap();
+        let local_path = record_hydrated_content(&mirror, "src/main.rs", b"main");
         let sidecar = test_sidecar(mirror);
         let fast =
             FastState::from_sidecar(&sidecar, Arc::new(Mutex::new(PendingRemote::default())));
@@ -4507,12 +4638,8 @@ mod tests {
     fn fast_state_serves_grep_cache_from_reopened_mirror() {
         let dir = tempdir().unwrap();
         let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
-        mirror
-            .record_hydrated(&test_meta("src/main.rs", "hash", 4), "hash", "hash")
-            .unwrap();
-        let local_path = mirror.local_path("src/main.rs").unwrap();
-        fs::create_dir_all(local_path.parent().unwrap()).unwrap();
-        fs::write(&local_path, b"fn cached_symbol() {}\n").unwrap();
+        let local_path =
+            record_hydrated_content(&mirror, "src/main.rs", b"fn cached_symbol() {}\n");
         let sidecar = test_sidecar(mirror);
         let fast =
             FastState::from_sidecar(&sidecar, Arc::new(Mutex::new(PendingRemote::default())));
@@ -4571,12 +4698,7 @@ mod tests {
     fn fast_state_defers_force_or_uncached_open() {
         let dir = tempdir().unwrap();
         let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
-        mirror
-            .record_hydrated(&test_meta("src/main.rs", "hash", 4), "hash", "hash")
-            .unwrap();
-        let local_path = mirror.local_path("src/main.rs").unwrap();
-        fs::create_dir_all(local_path.parent().unwrap()).unwrap();
-        fs::write(&local_path, b"main").unwrap();
+        record_hydrated_content(&mirror, "src/main.rs", b"main");
         let sidecar = test_sidecar(mirror);
         let fast =
             FastState::from_sidecar(&sidecar, Arc::new(Mutex::new(PendingRemote::default())));
@@ -4637,12 +4759,7 @@ mod tests {
     fn fast_state_defers_open_blocked_by_pending_remote_hazard() {
         let dir = tempdir().unwrap();
         let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
-        mirror
-            .record_hydrated(&test_meta("src/main.rs", "hash", 4), "hash", "hash")
-            .unwrap();
-        let local_path = mirror.local_path("src/main.rs").unwrap();
-        fs::create_dir_all(local_path.parent().unwrap()).unwrap();
-        fs::write(&local_path, b"main").unwrap();
+        record_hydrated_content(&mirror, "src/main.rs", b"main");
         let sidecar = test_sidecar(mirror);
         let pending = Arc::new(Mutex::new(PendingRemote::default()));
         let fast = FastState::from_sidecar(&sidecar, Arc::clone(&pending));
