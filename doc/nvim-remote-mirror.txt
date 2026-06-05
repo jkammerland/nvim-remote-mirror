@@ -21,6 +21,7 @@ COMMANDS                                      *nvim-remote-mirror-commands*
     Connect to a local path or ssh://host/absolute/path target. Startup uses
     the durable local mirror first; the remote agent handshake is lazy, so
     cached opens, cached grep, and status can work while SSH is unreachable.
+    Failed remote attempts use a short backoff before trying SSH again.
 
 :RemoteReconnect
     Reconnect to the last remote target, reusing the durable mirror and

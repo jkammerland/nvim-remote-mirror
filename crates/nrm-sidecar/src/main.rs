@@ -30,6 +30,7 @@ const DEFAULT_BATCH_MAX_TOTAL_BYTES: u64 = 16 * 1024 * 1024;
 const DEFAULT_GREP_CACHE_MAX_FILES: usize = 2_000;
 const DEFAULT_GREP_CACHE_MAX_FILE_BYTES: u64 = 512 * 1024;
 const DEFAULT_GREP_CACHE_MAX_TOTAL_BYTES: u64 = 8 * 1024 * 1024;
+const REMOTE_UNAVAILABLE_BACKOFF_MS: u64 = 2_000;
 const MAX_SAVE_PAYLOAD_BYTES: usize = MAX_FRAME_LEN - (1024 * 1024);
 const REMOTE_INTERACTIVE_QUEUE_CAPACITY: usize = 128;
 const REMOTE_BACKGROUND_QUEUE_CAPACITY: usize = 128;
@@ -250,6 +251,8 @@ struct AgentClient {
     preempt: AgentPreempt,
     worker: Option<AgentWorker>,
     handshake_complete: bool,
+    unavailable_until: Option<Instant>,
+    last_remote_error: Option<String>,
     next_id: RequestId,
 }
 
@@ -274,6 +277,8 @@ impl AgentClient {
             preempt: AgentPreempt::default(),
             worker: None,
             handshake_complete: false,
+            unavailable_until: None,
+            last_remote_error: None,
             next_id: 1,
         }
     }
@@ -369,6 +374,45 @@ impl AgentClient {
         self.handshake_complete
     }
 
+    fn remote_backoff(&self) -> Option<(u64, String)> {
+        let until = self.unavailable_until?;
+        let now = Instant::now();
+        if now >= until {
+            return None;
+        }
+        let remaining_ms = until
+            .duration_since(now)
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64;
+        let error = self
+            .last_remote_error
+            .clone()
+            .unwrap_or_else(|| "last remote attempt failed".to_string());
+        Some((remaining_ms, error))
+    }
+
+    fn check_remote_backoff(&mut self) -> Result<()> {
+        if let Some((remaining_ms, error)) = self.remote_backoff() {
+            bail!("remote unavailable; retry after {remaining_ms} ms: {error}");
+        }
+        self.unavailable_until = None;
+        Ok(())
+    }
+
+    fn mark_remote_unavailable(&mut self, error: impl Into<String>) -> anyhow::Error {
+        self.handshake_complete = false;
+        let error = error.into();
+        self.last_remote_error = Some(error.clone());
+        self.unavailable_until =
+            Some(Instant::now() + Duration::from_millis(REMOTE_UNAVAILABLE_BACKOFF_MS));
+        anyhow!(error)
+    }
+
+    fn clear_remote_unavailable(&mut self) {
+        self.unavailable_until = None;
+        self.last_remote_error = None;
+    }
+
     fn preempt_epoch(&self) -> u64 {
         self.preempt.epoch()
     }
@@ -387,6 +431,7 @@ impl AgentClient {
         preemptible: bool,
         preempt_epoch: u64,
     ) -> Result<AgentRequestOutcome> {
+        self.check_remote_backoff()?;
         if !matches!(request, Request::Hello { .. }) && !self.handshake_complete {
             if let Some(outcome) = self.ensure_handshake(preemptible, preempt_epoch)? {
                 return Ok(outcome);
@@ -416,11 +461,14 @@ impl AgentClient {
         match outcome {
             AgentRequestOutcome::Response(Response::Hello { .. }) => {
                 self.handshake_complete = true;
+                self.clear_remote_unavailable();
                 Ok(None)
             }
             AgentRequestOutcome::Response(other) => {
                 self.kill_worker();
-                bail!("unexpected hello response from agent: {other:?}");
+                Err(self.mark_remote_unavailable(format!(
+                    "unexpected hello response from agent: {other:?}"
+                )))
             }
             AgentRequestOutcome::Preempted => Ok(Some(AgentRequestOutcome::Preempted)),
         }
@@ -430,11 +478,14 @@ impl AgentClient {
         match outcome {
             AgentRequestOutcome::Response(Response::Hello { .. }) => {
                 self.handshake_complete = true;
+                self.clear_remote_unavailable();
                 Ok(())
             }
             AgentRequestOutcome::Response(other) => {
                 self.kill_worker();
-                bail!("unexpected hello response from agent: {other:?}");
+                Err(self.mark_remote_unavailable(format!(
+                    "unexpected hello response from agent: {other:?}"
+                )))
             }
             AgentRequestOutcome::Preempted => Ok(()),
         }
@@ -453,7 +504,10 @@ impl AgentClient {
         self.next_id = self.next_id.wrapping_add(1).max(1);
         let (reply, reply_rx) = mpsc::channel();
         for attempt in 0..2 {
-            let tx = self.ensure_worker()?.tx.clone();
+            let tx = match self.ensure_worker() {
+                Ok(worker) => worker.tx.clone(),
+                Err(error) => return Err(self.mark_remote_unavailable(error.to_string())),
+            };
             let command = AgentWorkerCommand {
                 id,
                 request: request.clone(),
@@ -465,7 +519,9 @@ impl AgentClient {
             self.worker = None;
             self.handshake_complete = false;
             if attempt == 1 {
-                bail!("agent worker exited before request {id} could be sent");
+                return Err(self.mark_remote_unavailable(format!(
+                    "agent worker exited before request {id} could be sent"
+                )));
             }
         }
 
@@ -490,10 +546,10 @@ impl AgentClient {
             let elapsed = started.elapsed();
             if elapsed >= timeout {
                 self.kill_worker();
-                bail!(
+                return Err(self.mark_remote_unavailable(format!(
                     "agent request {id} timed out after {} ms",
                     timeout.as_millis()
-                );
+                )));
             }
             let remaining = timeout.saturating_sub(elapsed);
             let wait = remaining.min(Duration::from_millis(25));
@@ -504,7 +560,9 @@ impl AgentClient {
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     self.worker = None;
                     self.handshake_complete = false;
-                    bail!("agent worker exited while request {id} was pending");
+                    return Err(self.mark_remote_unavailable(format!(
+                        "agent worker exited while request {id} was pending"
+                    )));
                 }
             }
         }
@@ -517,7 +575,7 @@ impl AgentClient {
             AgentWorkerReply::Error(message) => {
                 self.worker = None;
                 self.handshake_complete = false;
-                Err(anyhow!(message))
+                Err(self.mark_remote_unavailable(message))
             }
         }
     }
@@ -2214,6 +2272,15 @@ impl Sidecar {
                 "remote_available": true
             });
         }
+        if let Some((retry_after_ms, error)) = self.agent.remote_backoff() {
+            return json!({
+                "remote_status": "unavailable",
+                "remote_checked": true,
+                "remote_available": false,
+                "retry_after_ms": retry_after_ms,
+                "remote_error": error
+            });
+        }
 
         match self.agent.request(Request::Hello {
             client_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -2241,6 +2308,7 @@ impl Sidecar {
                 "remote_status": "unavailable",
                 "remote_checked": true,
                 "remote_available": false,
+                "retry_after_ms": self.agent.remote_backoff().map(|(remaining, _)| remaining).unwrap_or(0),
                 "remote_error": error.to_string()
             }),
         }
@@ -3929,6 +3997,10 @@ mod tests {
         assert_eq!(probe["remote_status"], "unavailable");
         assert_eq!(probe["remote_checked"], true);
         assert_eq!(probe["remote_available"], false);
+        assert!(probe["retry_after_ms"].as_u64().unwrap() > 0);
+        let probe = sidecar.remote_probe();
+        assert_eq!(probe["remote_status"], "unavailable");
+        assert!(probe["retry_after_ms"].as_u64().unwrap() > 0);
 
         let error = sidecar
             .scan(json!({"limit": 1}), 0)
@@ -5019,6 +5091,41 @@ mod tests {
 
         assert!(error.contains("shutdown"));
         assert!(interrupt.child.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn agent_request_uses_backoff_after_launch_failure() {
+        let dir = tempdir().unwrap();
+        let mut client = AgentClient::new(
+            dir.path()
+                .join("missing-agent")
+                .to_string_lossy()
+                .to_string(),
+            None,
+            dir.path().to_path_buf(),
+            Duration::from_secs(30),
+            1,
+            AgentInterrupt::default(),
+        );
+
+        let first = client
+            .request(Request::Hello {
+                client_version: "test".to_string(),
+                protocol_version: PROTOCOL_VERSION,
+            })
+            .unwrap_err()
+            .to_string();
+        let second = client
+            .request(Request::Hello {
+                client_version: "test".to_string(),
+                protocol_version: PROTOCOL_VERSION,
+            })
+            .unwrap_err()
+            .to_string();
+
+        assert!(first.contains("failed to launch agent"));
+        assert!(second.contains("remote unavailable; retry after"));
+        assert!(second.contains("failed to launch agent"));
     }
 
     #[cfg(unix)]

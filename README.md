@@ -193,7 +193,9 @@ Current transport state:
   compare-and-swap writes, and sidecar fast-path responses for cached mirror
   opens/status while remote worker requests are in flight. Sidecar startup is
   local-mirror-only; the remote agent handshake is lazy so cached work survives
-  disconnected SSH. Disconnect interrupts
+  disconnected SSH. Failed remote attempts enter a short unavailable backoff so
+  repeated remote-dependent commands fail quickly while cached operations stay
+  local. Disconnect interrupts
   the current agent/SSH process group on Unix so shutdown is not pinned to the
   normal request timeout. Deferred sidecar work uses separate interactive and
   background queues so explicit opens/saves are not rejected by, or drained
