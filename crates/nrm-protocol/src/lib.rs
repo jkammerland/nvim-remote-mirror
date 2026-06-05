@@ -1,8 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 pub const MAX_FRAME_LEN: usize = 64 * 1024 * 1024;
+pub const MAX_CONFLICT_CONTENT_BYTES: usize = 4 * 1024 * 1024;
 
 pub type RequestId = u64;
 
@@ -96,6 +97,8 @@ pub struct SaveConflict {
     pub expected_hash: Option<String>,
     pub actual_hash: Option<String>,
     pub remote_content: Vec<u8>,
+    pub remote_content_truncated: bool,
+    pub remote_size: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -446,6 +449,28 @@ mod tests {
 
         let decoded: RpcMessage = read_frame(&mut Cursor::new(bytes)).unwrap();
         assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn round_trips_truncated_save_conflict_response() {
+        let response = RpcMessage::Response {
+            id: 11,
+            response: Response::WriteFileCas {
+                outcome: SaveOutcome::Conflict(SaveConflict {
+                    path: "large.bin".to_string(),
+                    expected_hash: Some("old".to_string()),
+                    actual_hash: Some("new".to_string()),
+                    remote_content: vec![1, 2, 3],
+                    remote_content_truncated: true,
+                    remote_size: Some(99),
+                }),
+            },
+        };
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &response).unwrap();
+
+        let decoded: RpcMessage = read_frame(&mut Cursor::new(bytes)).unwrap();
+        assert_eq!(decoded, response);
     }
 
     #[test]

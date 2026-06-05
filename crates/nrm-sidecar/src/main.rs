@@ -154,6 +154,9 @@ enum SaveAttempt {
         expected_hash: Option<String>,
         actual_hash: Option<String>,
         remote_path: PathBuf,
+        remote_content_truncated: bool,
+        remote_size: Option<u64>,
+        remote_content_bytes: usize,
     },
     Queued {
         path: String,
@@ -2003,12 +2006,18 @@ impl Mirror {
         queue_id: i64,
         relative_path: &str,
         remote_content: &[u8],
+        remote_content_truncated: bool,
         message: &str,
     ) -> Result<PathBuf> {
         let safe_name = relative_path.replace(['/', '\\'], "__");
+        let suffix = if remote_content_truncated {
+            "partial"
+        } else {
+            "full"
+        };
         let path = self
             .conflicts_root
-            .join(format!("{safe_name}.remote.{}", now_ms()));
+            .join(format!("{safe_name}.remote.{suffix}.{}", now_ms()));
         fs::write(&path, remote_content)?;
         self.db.execute(
             "
@@ -4173,18 +4182,34 @@ impl Sidecar {
                 })
             }
             SaveOutcome::Conflict(conflict) => {
-                let message = "remote content changed before queued save was applied";
+                let remote_content_bytes = conflict.remote_content.len();
+                let message = if conflict.remote_content_truncated {
+                    format!(
+                        "remote content changed before queued save was applied; saved first {} of {} remote bytes",
+                        remote_content_bytes,
+                        conflict
+                            .remote_size
+                            .map(|size| size.to_string())
+                            .unwrap_or_else(|| "unknown".to_string())
+                    )
+                } else {
+                    "remote content changed before queued save was applied".to_string()
+                };
                 let conflict_path = self.mirror.record_save_conflict(
                     queue_id,
                     &conflict.path,
                     &conflict.remote_content,
-                    message,
+                    conflict.remote_content_truncated,
+                    &message,
                 )?;
                 Ok(SaveAttempt::Conflict {
                     path: conflict.path,
                     expected_hash: conflict.expected_hash,
                     actual_hash: conflict.actual_hash,
                     remote_path: conflict_path,
+                    remote_content_truncated: conflict.remote_content_truncated,
+                    remote_size: conflict.remote_size,
+                    remote_content_bytes,
                 })
             }
         }
@@ -4203,12 +4228,18 @@ impl Sidecar {
                 expected_hash,
                 actual_hash,
                 remote_path,
+                remote_content_truncated,
+                remote_size,
+                remote_content_bytes,
             } => json!({
                 "status": "conflict",
                 "path": path,
                 "expected_hash": expected_hash,
                 "actual_hash": actual_hash,
-                "remote_path": remote_path.to_string_lossy()
+                "remote_path": remote_path.to_string_lossy(),
+                "remote_content_truncated": remote_content_truncated,
+                "remote_size": remote_size,
+                "remote_content_bytes": remote_content_bytes
             }),
             SaveAttempt::Queued { path, reason } => json!({
                 "status": "queued",
@@ -6025,6 +6056,48 @@ mod tests {
         assert_eq!(saves[1].expected_hash.as_deref(), Some(first_hash.as_str()));
         assert_eq!(fs::read(&saves[0].snapshot_path).unwrap(), b"dirty one");
         assert_eq!(fs::read(&saves[1].snapshot_path).unwrap(), b"dirty two");
+    }
+
+    #[test]
+    fn save_conflict_reports_truncated_remote_copy() {
+        let dir = tempdir().unwrap();
+        let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
+        record_hydrated_content(&mirror, "a.txt", b"base");
+        let dirty_hash = hash_bytes(b"dirty");
+        let queued = mirror
+            .enqueue_save("a.txt", &dirty_hash, Some("base"), b"dirty")
+            .unwrap();
+        let sidecar = test_sidecar(mirror);
+
+        let attempt = sidecar
+            .record_save_outcome(
+                queued.id,
+                SaveOutcome::Conflict(nrm_protocol::SaveConflict {
+                    path: "a.txt".to_string(),
+                    expected_hash: Some("base".to_string()),
+                    actual_hash: Some("remote".to_string()),
+                    remote_content: b"remote prefix".to_vec(),
+                    remote_content_truncated: true,
+                    remote_size: Some(10_000),
+                }),
+            )
+            .unwrap();
+        let value = Sidecar::save_attempt_to_json(attempt).unwrap();
+
+        assert_eq!(value["status"], "conflict");
+        assert_eq!(value["remote_content_truncated"], true);
+        assert_eq!(value["remote_size"], 10_000);
+        assert_eq!(value["remote_content_bytes"], 13);
+        let conflict_path = PathBuf::from(value["remote_path"].as_str().unwrap());
+        assert!(conflict_path.to_string_lossy().contains(".partial."));
+        assert_eq!(fs::read(conflict_path).unwrap(), b"remote prefix");
+        let entry = sidecar.mirror.get("a.txt").unwrap().unwrap();
+        assert_eq!(entry.validation_state, "conflict");
+        assert!(entry
+            .last_error
+            .as_deref()
+            .unwrap()
+            .contains("saved first 13 of 10000 remote bytes"));
     }
 
     #[test]

@@ -210,6 +210,11 @@ Small saves use one RPC request. Large saves stream through a chunked
 compare-and-swap upload: the agent checks the remote base hash before accepting
 chunks, verifies the uploaded content hash, rechecks the remote base hash, then
 renames the temp file into place.
+If a compare-and-swap conflict occurs, the local save snapshot stays preserved
+as local truth. Small remote conflict copies are stored completely under
+`conflicts/`; large remote conflict copies are capped to a protocol-bounded
+prefix and reported with `remote_content_truncated`, `remote_size`, and
+`remote_content_bytes` so a conflict cannot exceed the agent frame budget.
 
 Before cached opens, cached grep, validation, or batch hydration overwrites use
 an existing local mirror file, the sidecar rehashes the local bytes against the

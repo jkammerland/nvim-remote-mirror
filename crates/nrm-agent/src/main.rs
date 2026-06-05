@@ -4,7 +4,7 @@ use ignore::WalkBuilder;
 use nrm_protocol::{
     read_frame, write_frame, BatchReadError, BatchReadFile, BatchValidateFile, CapabilitySet,
     FileMeta, Request, Response, RpcError, RpcMessage, SaveApplied, SaveConflict, SaveOutcome,
-    SearchHit, WriteStartOutcome, WriteStarted, PROTOCOL_VERSION,
+    SearchHit, WriteStartOutcome, WriteStarted, MAX_CONFLICT_CONTENT_BYTES, PROTOCOL_VERSION,
 };
 use std::collections::HashMap;
 use std::fs::{self, File};
@@ -457,18 +457,8 @@ fn write_file_cas(
     };
 
     if actual_hash != expected_hash {
-        let remote_content = if abs.is_file() {
-            fs::read(&abs).unwrap_or_default()
-        } else {
-            Vec::new()
-        };
         return Ok(Response::WriteFileCas {
-            outcome: SaveOutcome::Conflict(SaveConflict {
-                path,
-                expected_hash,
-                actual_hash,
-                remote_content,
-            }),
+            outcome: SaveOutcome::Conflict(save_conflict(path, expected_hash, actual_hash, &abs)),
         });
     }
 
@@ -516,18 +506,13 @@ fn begin_write_file_cas(
     };
 
     if actual_hash != expected_hash {
-        let remote_content = if abs.is_file() {
-            fs::read(&abs).unwrap_or_default()
-        } else {
-            Vec::new()
-        };
         return Ok(Response::BeginWriteFileCas {
-            outcome: WriteStartOutcome::Conflict(SaveConflict {
+            outcome: WriteStartOutcome::Conflict(save_conflict(
                 path,
                 expected_hash,
                 actual_hash,
-                remote_content,
-            }),
+                &abs,
+            )),
         });
     }
 
@@ -626,19 +611,14 @@ fn finish_write_file_cas(state: &mut AgentState, upload_id: String) -> Result<Re
         None
     };
     if actual_hash != upload.expected_hash {
-        let remote_content = if abs.is_file() {
-            fs::read(&abs).unwrap_or_default()
-        } else {
-            Vec::new()
-        };
         let _ = fs::remove_file(&upload.tmp_path);
         return Ok(Response::FinishWriteFileCas {
-            outcome: SaveOutcome::Conflict(SaveConflict {
-                path: upload.path,
-                expected_hash: upload.expected_hash,
+            outcome: SaveOutcome::Conflict(save_conflict(
+                upload.path,
+                upload.expected_hash,
                 actual_hash,
-                remote_content,
-            }),
+                &abs,
+            )),
         });
     }
 
@@ -667,6 +647,41 @@ fn abort_write_file_cas(state: &mut AgentState, upload_id: String) -> Result<Res
         let _ = fs::remove_file(upload.tmp_path);
     }
     Ok(Response::AbortWriteFileCas { upload_id })
+}
+
+fn save_conflict(
+    path: String,
+    expected_hash: Option<String>,
+    actual_hash: Option<String>,
+    abs: &Path,
+) -> SaveConflict {
+    let (remote_content, remote_content_truncated, remote_size) = remote_conflict_content(abs);
+    SaveConflict {
+        path,
+        expected_hash,
+        actual_hash,
+        remote_content,
+        remote_content_truncated,
+        remote_size,
+    }
+}
+
+fn remote_conflict_content(abs: &Path) -> (Vec<u8>, bool, Option<u64>) {
+    if !abs.is_file() {
+        return (Vec::new(), false, None);
+    }
+    let remote_size = fs::metadata(abs).ok().map(|metadata| metadata.len());
+    let max_bytes = remote_size
+        .unwrap_or(MAX_CONFLICT_CONTENT_BYTES as u64)
+        .min(MAX_CONFLICT_CONTENT_BYTES as u64);
+    let mut remote_content = Vec::new();
+    if let Ok(file) = File::open(abs) {
+        let _ = file.take(max_bytes).read_to_end(&mut remote_content);
+    }
+    let remote_content_truncated = remote_size
+        .map(|size| size > remote_content.len() as u64)
+        .unwrap_or(false);
+    (remote_content, remote_content_truncated, remote_size)
 }
 
 fn resolve_remote_path(root: &Path, path: &str) -> Result<PathBuf> {
@@ -790,10 +805,43 @@ mod tests {
             } => {
                 assert_eq!(conflict.expected_hash, Some(stale_hash));
                 assert_eq!(conflict.remote_content, b"one");
+                assert!(!conflict.remote_content_truncated);
+                assert_eq!(conflict.remote_size, Some(3));
             }
             other => panic!("unexpected response: {other:?}"),
         }
         assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "one");
+    }
+
+    #[test]
+    fn write_cas_bounds_large_conflict_content() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let remote_content = vec![b'x'; MAX_CONFLICT_CONTENT_BYTES + 17];
+        fs::write(root.join("a.bin"), &remote_content).unwrap();
+
+        let response = write_file_cas(
+            root,
+            "a.bin".to_string(),
+            Some("not-current".to_string()),
+            b"two".to_vec(),
+        )
+        .unwrap();
+
+        match response {
+            Response::WriteFileCas {
+                outcome: SaveOutcome::Conflict(conflict),
+            } => {
+                assert_eq!(conflict.remote_content.len(), MAX_CONFLICT_CONTENT_BYTES);
+                assert!(conflict.remote_content.iter().all(|byte| *byte == b'x'));
+                assert!(conflict.remote_content_truncated);
+                assert_eq!(
+                    conflict.remote_size,
+                    Some((MAX_CONFLICT_CONTENT_BYTES + 17) as u64)
+                );
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
     }
 
     #[test]
@@ -1115,6 +1163,8 @@ mod tests {
             } => {
                 assert_eq!(conflict.expected_hash.as_deref(), Some("stale"));
                 assert_eq!(conflict.remote_content, b"remote");
+                assert!(!conflict.remote_content_truncated);
+                assert_eq!(conflict.remote_size, Some(6));
             }
             other => panic!("unexpected begin response: {other:?}"),
         }

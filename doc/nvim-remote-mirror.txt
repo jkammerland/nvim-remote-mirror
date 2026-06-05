@@ -155,6 +155,10 @@ recover_local_edits_on_connect scans hydrated local mirror files after reconnect
 and queues snapshots for changed bytes that were saved while the sidecar was
 unavailable, including crash-surviving saves that were never replayed from Lua
 memory. recover_local_edits_limit bounds each local scan page.
+Compare-and-swap conflicts keep the local save snapshot preserved as local
+truth. Small remote conflict copies are stored completely; large remote conflict
+copies are stored as a protocol-bounded prefix and reported with truncation
+metadata.
 open_batch_max_file_bytes controls how large a direct uncached open may be
 before it falls back from one-request batch read hydration to chunked reads.
 auto_hydrate_mirror_buffers makes LSP jumps into missing local mirror files call

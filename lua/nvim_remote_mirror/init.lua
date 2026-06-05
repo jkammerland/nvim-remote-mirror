@@ -1022,8 +1022,12 @@ local function flush_remote_path(path, opts)
     end
     if result.status == "conflict" then
       clear_deferred_flush(result.path or path)
+      local suffix = ""
+      if result.remote_content_truncated then
+        suffix = " (remote copy truncated; full remote size " .. tostring(result.remote_size or "unknown") .. " bytes)"
+      end
       notify(
-        "save conflict for " .. result.path .. "; remote copy stored at " .. result.remote_path,
+        "save conflict for " .. result.path .. "; remote copy stored at " .. result.remote_path .. suffix,
         vim.log.levels.ERROR
       )
       return
