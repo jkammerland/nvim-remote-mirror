@@ -3400,7 +3400,7 @@ fn run_server(
             if let Ok(mut pending) = remote_pending.lock() {
                 pending.clear(&hazard);
             }
-            try_send_client_response(&remote_response_tx, response);
+            send_client_response(&remote_response_tx, response);
             if should_shutdown || remote_interrupt.is_shutdown_requested() {
                 clear_pending_hazards(&remote_pending, remote_worker_queue.shutdown_and_drain());
                 break;
@@ -3416,7 +3416,7 @@ fn run_server(
         let mut request: ClientRequest = match serde_json::from_str(&line) {
             Ok(request) => request,
             Err(error) => {
-                try_send_client_response(
+                send_client_response(
                     &response_tx,
                     ClientResponse {
                         id: 0,
@@ -3433,7 +3433,7 @@ fn run_server(
         if should_shutdown {
             agent_interrupt.request_shutdown();
             clear_pending_hazards(&pending_remote, remote_queue.shutdown_and_drain());
-            try_send_client_response(
+            send_client_response(
                 &response_tx,
                 ClientResponse {
                     id: request.id,
@@ -3448,7 +3448,7 @@ fn run_server(
             request = match fast_state.prepare_flush(&request) {
                 Ok(request) => request,
                 Err(error) => {
-                    try_send_client_response(
+                    send_client_response(
                         &response_tx,
                         result_to_client_response(request.id, Err(error)),
                     );
@@ -3458,10 +3458,7 @@ fn run_server(
         }
         match fast_state.try_handle(&request) {
             FastHandle::Handled(result) => {
-                try_send_client_response(
-                    &response_tx,
-                    result_to_client_response(request.id, result),
-                );
+                send_client_response(&response_tx, result_to_client_response(request.id, result));
             }
             FastHandle::Defer => {
                 let hazard = PendingHazard::for_request(&request);
@@ -3507,7 +3504,7 @@ fn run_server(
                                 )),
                             }
                         };
-                        try_send_client_response(&response_tx, response);
+                        send_client_response(&response_tx, response);
                     }
                 }
             }
@@ -3578,7 +3575,7 @@ fn clear_pending_hazard_refs(pending_remote: &Arc<Mutex<PendingRemote>>, works: 
 
 fn send_preempted_responses(tx: &mpsc::SyncSender<ClientResponse>, works: Vec<RemoteWork>) {
     for work in works {
-        try_send_client_response(tx, preempted_client_response(work));
+        send_client_response(tx, preempted_client_response(work));
     }
 }
 
@@ -3637,11 +3634,8 @@ fn preempted_result(request: &ClientRequest) -> Value {
     }
 }
 
-fn try_send_client_response(
-    tx: &mpsc::SyncSender<ClientResponse>,
-    response: ClientResponse,
-) -> bool {
-    tx.try_send(response).is_ok()
+fn send_client_response(tx: &mpsc::SyncSender<ClientResponse>, response: ClientResponse) -> bool {
+    tx.send(response).is_ok()
 }
 
 fn run_lsp_proxy(
@@ -4041,6 +4035,37 @@ mod tests {
         let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
         assert!(mirror.local_path("../x").is_err());
         assert!(mirror.local_path("/x").is_err());
+    }
+
+    #[test]
+    fn client_response_send_applies_backpressure_instead_of_dropping() {
+        let (tx, rx) = mpsc::sync_channel(1);
+        let first = ClientResponse {
+            id: 1,
+            ok: true,
+            result: Some(json!({"ok": true})),
+            error: None,
+        };
+        let second = ClientResponse {
+            id: 2,
+            ok: true,
+            result: Some(json!({"ok": true})),
+            error: None,
+        };
+
+        assert!(send_client_response(&tx, first));
+        let (done_tx, done_rx) = mpsc::channel();
+        let tx_for_thread = tx.clone();
+        let sender = thread::spawn(move || {
+            let sent = send_client_response(&tx_for_thread, second);
+            done_tx.send(sent).unwrap();
+        });
+
+        assert!(done_rx.recv_timeout(Duration::from_millis(20)).is_err());
+        assert_eq!(rx.recv().unwrap().id, 1);
+        assert!(done_rx.recv_timeout(Duration::from_secs(1)).unwrap());
+        sender.join().unwrap();
+        assert_eq!(rx.recv().unwrap().id, 2);
     }
 
     #[test]

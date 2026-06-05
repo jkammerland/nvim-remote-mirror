@@ -236,11 +236,12 @@ Current transport state:
   compare-and-swap writes, and sidecar fast-path responses for cached mirror
   opens/status while remote worker requests are in flight. Neovim-side JSON RPC
   requests also use the configured request timeout to clean up pending callbacks
-  when a sidecar reply is lost. Sidecar startup is local-mirror-only; the remote
-  agent handshake is lazy so cached work survives disconnected SSH. Failed
-  remote attempts enter a short unavailable backoff so
-  repeated remote-dependent commands fail quickly while cached operations stay
-  local. Disconnect interrupts
+  when a sidecar reply is lost. Sidecar response delivery applies backpressure
+  instead of dropping completed replies when the writer is saturated. Sidecar
+  startup is local-mirror-only; the remote agent handshake is lazy so cached
+  work survives disconnected SSH. Failed remote attempts enter a short
+  unavailable backoff so repeated remote-dependent commands fail quickly while
+  cached operations stay local. Disconnect interrupts
   the current agent/SSH process group on Unix so shutdown is not pinned to the
   normal request timeout. Deferred sidecar work uses separate interactive and
   background queues so explicit opens/saves are not rejected by, or drained
@@ -248,4 +249,4 @@ Current transport state:
   requests can be preempted by interactive work by restarting the serial
   SSH/agent worker; save and explicit interactive requests are not preempted.
 - pending: general per-request cancellation, true multiplexing, streaming
-  results, and broader backpressure.
+  results, and transport-level flow control.
