@@ -27,6 +27,8 @@ M.config = {
   ssh_connect_timeout_seconds = 10,
   prefetch_max_file_bytes = 4 * 1024 * 1024,
   prefetch_max_total_bytes = 16 * 1024 * 1024,
+  open_prefetch_related = false,
+  open_prefetch_related_limit = 16,
 }
 
 M.client = nil
@@ -233,6 +235,37 @@ local function warn_cached_open(result)
   end
 end
 
+local function prefetch_related(anchor)
+  if not M.config.open_prefetch_related then
+    return
+  end
+  if not M.client then
+    return
+  end
+  M.request("prefetch_related", {
+    anchor = anchor,
+    limit = M.config.open_prefetch_related_limit,
+    max_file_bytes = M.config.prefetch_max_file_bytes,
+    max_total_bytes = M.config.prefetch_max_total_bytes,
+  }, function(err, result)
+    if err then
+      notify("related prefetch failed: " .. err, vim.log.levels.WARN)
+      return
+    end
+    local errors = #(result.errors or {})
+    if errors > 0 or result.truncated then
+      notify(
+        "related prefetch hydrated "
+          .. tostring(result.hydrated or 0)
+          .. " files with "
+          .. tostring(errors)
+          .. " errors",
+        vim.log.levels.WARN
+      )
+    end
+  end)
+end
+
 function M.open(path, opts)
   opts = opts or {}
   M.request("open", { path = path, force = opts.force == true }, function(err, result)
@@ -245,6 +278,9 @@ function M.open(path, opts)
       vim.b.nrm_remote_path = result.path
       vim.b.nrm_remote_hash = result.hash
       warn_cached_open(result)
+      vim.defer_fn(function()
+        prefetch_related(result.path)
+      end, 20)
     end)
   end)
 end

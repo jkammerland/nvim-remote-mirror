@@ -82,6 +82,8 @@ require("nvim_remote_mirror").setup({
   ssh_connect_timeout_seconds = 10,
   prefetch_max_file_bytes = 4 * 1024 * 1024,
   prefetch_max_total_bytes = 16 * 1024 * 1024,
+  open_prefetch_related = false,
+  open_prefetch_related_limit = 16,
 })
 ```
 
@@ -134,6 +136,10 @@ entries previously marked stale or deleted, so navigation does not block on a
 slow or unreachable remote. `:RemoteOpen!` forces a remote rehydrate for clean
 cached files. Dirty cached files are never overwritten by force; if their local
 file is missing, the sidecar restores the latest queued save snapshot instead.
+After opening, the plugin can issue an opt-in small related-file prefetch from
+existing mirror metadata, prioritizing same-directory and same-extension files.
+Enable that with `open_prefetch_related = true` and tune the batch with
+`open_prefetch_related_limit`.
 
 `:RemoteGrep` runs search on the remote agent, batch-hydrates matching files
 within the prefetch byte caps, and populates quickfix with local mirror paths

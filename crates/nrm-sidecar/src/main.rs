@@ -390,6 +390,9 @@ impl Mirror {
               size INTEGER NOT NULL,
               mtime_ms INTEGER NOT NULL,
               mode INTEGER NOT NULL,
+              is_dir INTEGER NOT NULL DEFAULT 0,
+              is_symlink INTEGER NOT NULL DEFAULT 0,
+              metadata_kind_known INTEGER NOT NULL DEFAULT 0,
               remote_hash TEXT,
               local_hash TEXT,
               state TEXT NOT NULL,
@@ -415,6 +418,9 @@ impl Mirror {
             ",
         )?;
         self.add_missing_column("files", "validated_at_ms", "INTEGER NOT NULL DEFAULT 0")?;
+        self.add_missing_column("files", "is_dir", "INTEGER NOT NULL DEFAULT 0")?;
+        self.add_missing_column("files", "is_symlink", "INTEGER NOT NULL DEFAULT 0")?;
+        self.add_missing_column("files", "metadata_kind_known", "INTEGER NOT NULL DEFAULT 0")?;
         self.add_missing_column(
             "files",
             "validation_state",
@@ -462,15 +468,19 @@ impl Mirror {
         self.db.execute(
             "
             INSERT INTO files (
-              relative_path, local_path, size, mtime_ms, mode, remote_hash,
+              relative_path, local_path, size, mtime_ms, mode, is_dir, is_symlink,
+              metadata_kind_known, remote_hash,
               local_hash, state, dirty, updated_at_ms
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, 0, ?8)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, ?8, NULL, ?9, 0, ?10)
             ON CONFLICT(relative_path) DO UPDATE SET
               local_path=excluded.local_path,
               size=excluded.size,
               mtime_ms=excluded.mtime_ms,
               mode=excluded.mode,
+              is_dir=excluded.is_dir,
+              is_symlink=excluded.is_symlink,
+              metadata_kind_known=1,
               remote_hash=COALESCE(excluded.remote_hash, files.remote_hash),
               state=CASE WHEN files.state = 'hydrated' THEN files.state ELSE excluded.state END,
               updated_at_ms=excluded.updated_at_ms
@@ -481,6 +491,8 @@ impl Mirror {
                 meta.size as i64,
                 meta.mtime_ms,
                 meta.mode as i64,
+                if meta.is_dir { 1_i64 } else { 0_i64 },
+                if meta.is_symlink { 1_i64 } else { 0_i64 },
                 meta.hash,
                 state,
                 now_ms()
@@ -494,15 +506,19 @@ impl Mirror {
         self.db.execute(
             "
             INSERT INTO files (
-              relative_path, local_path, size, mtime_ms, mode, remote_hash,
+              relative_path, local_path, size, mtime_ms, mode, is_dir, is_symlink,
+              metadata_kind_known, remote_hash,
               local_hash, state, dirty, validated_at_ms, validation_state, last_error, updated_at_ms
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'hydrated', 0, ?8, 'valid', NULL, ?8)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, ?8, ?9, 'hydrated', 0, ?10, 'valid', NULL, ?10)
             ON CONFLICT(relative_path) DO UPDATE SET
               local_path=excluded.local_path,
               size=excluded.size,
               mtime_ms=excluded.mtime_ms,
               mode=excluded.mode,
+              is_dir=excluded.is_dir,
+              is_symlink=excluded.is_symlink,
+              metadata_kind_known=1,
               remote_hash=excluded.remote_hash,
               local_hash=excluded.local_hash,
               state='hydrated',
@@ -518,6 +534,8 @@ impl Mirror {
                 meta.size as i64,
                 meta.mtime_ms,
                 meta.mode as i64,
+                if meta.is_dir { 1_i64 } else { 0_i64 },
+                if meta.is_symlink { 1_i64 } else { 0_i64 },
                 remote_hash,
                 local_hash,
                 now_ms()
@@ -931,6 +949,131 @@ impl Mirror {
         }
         Ok(paths)
     }
+
+    fn related_prefetch_paths(&self, anchor: &str, limit: usize) -> Result<Vec<String>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let limit = limit.min(100_000);
+        let anchor = normalize_relative_path(anchor)?
+            .to_string_lossy()
+            .replace('\\', "/");
+        let anchor_dir = parent_dir(&anchor);
+        let anchor_ext = file_extension(&anchor);
+        let dir_prefix = if anchor_dir.is_empty() {
+            String::new()
+        } else {
+            format!("{}/", anchor_dir)
+        };
+        let dir_prefix_len = dir_prefix.len() as i64;
+        let dir_like = if dir_prefix.is_empty() {
+            String::new()
+        } else {
+            format!("{}%", escape_sql_like(&dir_prefix))
+        };
+        let ext_like = if anchor_ext.is_empty() {
+            String::new()
+        } else {
+            format!("%.{}", escape_sql_like(&anchor_ext))
+        };
+        let mut paths = Vec::new();
+        self.push_related_prefetch_bucket(
+            &mut paths,
+            limit,
+            RelatedBucket::SameDirectoryAndExtension,
+            &anchor,
+            &dir_like,
+            dir_prefix_len,
+            &ext_like,
+        )?;
+        self.push_related_prefetch_bucket(
+            &mut paths,
+            limit,
+            RelatedBucket::SameDirectory,
+            &anchor,
+            &dir_like,
+            dir_prefix_len,
+            &ext_like,
+        )?;
+        self.push_related_prefetch_bucket(
+            &mut paths,
+            limit,
+            RelatedBucket::DescendantAndExtension,
+            &anchor,
+            &dir_like,
+            dir_prefix_len,
+            &ext_like,
+        )?;
+        self.push_related_prefetch_bucket(
+            &mut paths,
+            limit,
+            RelatedBucket::SameExtension,
+            &anchor,
+            &dir_like,
+            dir_prefix_len,
+            &ext_like,
+        )?;
+        self.push_related_prefetch_bucket(
+            &mut paths,
+            limit,
+            RelatedBucket::AnyMetadata,
+            &anchor,
+            &dir_like,
+            dir_prefix_len,
+            &ext_like,
+        )?;
+        Ok(paths)
+    }
+
+    fn push_related_prefetch_bucket(
+        &self,
+        paths: &mut Vec<String>,
+        limit: usize,
+        bucket: RelatedBucket,
+        anchor: &str,
+        dir_like: &str,
+        dir_prefix_len: i64,
+        ext_like: &str,
+    ) -> Result<()> {
+        if paths.len() >= limit {
+            return Ok(());
+        }
+        let query_limit = limit;
+        let mut statement = self.db.prepare(&format!(
+            "
+            SELECT relative_path FROM files
+            WHERE {}
+              AND relative_path != ?1
+              AND state != 'hydrated'
+              AND dirty = 0
+              AND is_dir = 0
+              AND is_symlink = 0
+              AND metadata_kind_known = 1
+              AND validation_state != 'deleted'
+            ORDER BY relative_path ASC
+            LIMIT ?5
+            ",
+            bucket.sql_predicate()
+        ))?;
+        let rows = statement.query_map(
+            params![
+                anchor,
+                dir_like,
+                dir_prefix_len,
+                ext_like,
+                query_limit as i64
+            ],
+            |row| row.get::<_, String>(0),
+        )?;
+        let existing: HashSet<String> = paths.iter().cloned().collect();
+        for row in rows {
+            let path = row?;
+            if !existing.contains(&path) && paths.len() < limit {
+                paths.push(path);
+            }
+        }
+        Ok(())
+    }
 }
 
 struct Sidecar {
@@ -989,6 +1132,7 @@ impl Sidecar {
             "scan" => self.scan(params),
             "open" => self.open(params),
             "prefetch" => self.prefetch(params),
+            "prefetch_related" => self.prefetch_related(params),
             "grep" => self.grep(params),
             "flush" => self.flush(params),
             "flush_queue" => self.flush_queue(),
@@ -1166,6 +1310,33 @@ impl Sidecar {
             self.batch_hydrate(requested_paths, max_file_bytes, max_total_bytes)?;
         errors.extend(batch_errors);
         Ok(json!({
+            "hydrated": hydrated,
+            "errors": errors,
+            "truncated": truncated,
+            "max_file_bytes": max_file_bytes,
+            "max_total_bytes": max_total_bytes
+        }))
+    }
+
+    fn prefetch_related(&mut self, params: Value) -> Result<Value> {
+        let anchor = required_string(&params, "anchor")?;
+        let limit = params.get("limit").and_then(Value::as_u64).unwrap_or(16) as usize;
+        let max_file_bytes = params
+            .get("max_file_bytes")
+            .and_then(Value::as_u64)
+            .unwrap_or(DEFAULT_BATCH_MAX_FILE_BYTES);
+        let max_total_bytes = params
+            .get("max_total_bytes")
+            .and_then(Value::as_u64)
+            .unwrap_or(DEFAULT_BATCH_MAX_TOTAL_BYTES);
+        let paths = self.mirror.related_prefetch_paths(anchor, limit)?;
+        let requested = paths.len();
+        let (hydrated, errors, truncated) =
+            self.batch_hydrate(paths.clone(), max_file_bytes, max_total_bytes)?;
+        Ok(json!({
+            "anchor": anchor,
+            "requested": requested,
+            "paths": paths,
             "hydrated": hydrated,
             "errors": errors,
             "truncated": truncated,
@@ -2112,6 +2283,62 @@ fn normalize_relative_path(path: &str) -> Result<PathBuf> {
     Ok(clean)
 }
 
+fn parent_dir(path: &str) -> String {
+    path.rsplit_once('/')
+        .map(|(parent, _)| parent.to_string())
+        .unwrap_or_default()
+}
+
+fn file_extension(path: &str) -> String {
+    let file_name = path.rsplit_once('/').map(|(_, name)| name).unwrap_or(path);
+    file_name
+        .rsplit_once('.')
+        .filter(|(stem, extension)| !stem.is_empty() && !extension.is_empty())
+        .map(|(_, extension)| extension.to_string())
+        .unwrap_or_default()
+}
+
+fn escape_sql_like(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '\\' | '%' | '_' => {
+                escaped.push('\\');
+                escaped.push(ch);
+            }
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RelatedBucket {
+    SameDirectoryAndExtension,
+    SameDirectory,
+    DescendantAndExtension,
+    SameExtension,
+    AnyMetadata,
+}
+
+impl RelatedBucket {
+    fn sql_predicate(self) -> &'static str {
+        const SAME_DIR: &str = "((?3 = 0 AND instr(relative_path, '/') = 0) OR (?3 > 0 AND relative_path LIKE ?2 ESCAPE '\\' AND instr(substr(relative_path, ?3 + 1), '/') = 0))";
+        const SAME_EXT: &str = "(?4 != '' AND relative_path LIKE ?4 ESCAPE '\\')";
+        match self {
+            Self::SameDirectoryAndExtension => {
+                "(((?3 = 0 AND instr(relative_path, '/') = 0) OR (?3 > 0 AND relative_path LIKE ?2 ESCAPE '\\' AND instr(substr(relative_path, ?3 + 1), '/') = 0)) AND (?4 != '' AND relative_path LIKE ?4 ESCAPE '\\'))"
+            }
+            Self::SameDirectory => SAME_DIR,
+            Self::DescendantAndExtension => {
+                "(?3 > 0 AND relative_path LIKE ?2 ESCAPE '\\' AND instr(substr(relative_path, ?3 + 1), '/') > 0 AND ?4 != '' AND relative_path LIKE ?4 ESCAPE '\\')"
+            }
+            Self::SameExtension => SAME_EXT,
+            Self::AnyMetadata => "1 = 1",
+        }
+    }
+}
+
 fn default_state_dir() -> PathBuf {
     if let Some(value) = std::env::var_os("XDG_STATE_HOME") {
         PathBuf::from(value).join("nvim-remote-mirror")
@@ -2160,16 +2387,26 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
-    fn test_meta(path: &str, hash: &str, size: u64) -> FileMeta {
+    fn test_meta_kind(
+        path: &str,
+        hash: &str,
+        size: u64,
+        is_dir: bool,
+        is_symlink: bool,
+    ) -> FileMeta {
         FileMeta {
             path: path.to_string(),
             size,
             mtime_ms: 10,
             mode: 0,
-            is_dir: false,
-            is_symlink: false,
+            is_dir,
+            is_symlink,
             hash: Some(hash.to_string()),
         }
+    }
+
+    fn test_meta(path: &str, hash: &str, size: u64) -> FileMeta {
+        test_meta_kind(path, hash, size, false, false)
     }
 
     fn test_sidecar(mirror: Mirror) -> Sidecar {
@@ -2388,6 +2625,78 @@ mod tests {
         let entry = sidecar.mirror.get("a.txt").unwrap().unwrap();
         assert!(entry.dirty);
         assert_eq!(entry.validation_state, "dirty");
+    }
+
+    #[test]
+    fn related_prefetch_prioritizes_nearby_uncached_files() {
+        let dir = tempdir().unwrap();
+        let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
+        mirror
+            .record_hydrated(&test_meta("src/main.rs", "main", 4), "main", "main")
+            .unwrap();
+        for path in [
+            "src/lib.rs",
+            "src/readme.md",
+            "src/nested/mod.rs",
+            "tests/main.rs",
+        ] {
+            mirror
+                .upsert_metadata(&test_meta(path, "meta", 4), "metadata")
+                .unwrap();
+        }
+        mirror
+            .upsert_metadata(&test_meta_kind("src", "dir", 0, true, false), "metadata")
+            .unwrap();
+        mirror
+            .upsert_metadata(
+                &test_meta_kind("src/link.rs", "link", 0, false, true),
+                "metadata",
+            )
+            .unwrap();
+        mirror
+            .record_hydrated(&test_meta("src/cached.rs", "cached", 6), "cached", "cached")
+            .unwrap();
+        mirror
+            .record_hydrated(&test_meta("src/stale.rs", "stale", 5), "stale", "stale")
+            .unwrap();
+        mirror
+            .record_validation("src/stale.rs", "stale", None, Some("remote changed"))
+            .unwrap();
+        mirror
+            .record_hydrated(&test_meta("src/dirty.rs", "base", 4), "base", "base")
+            .unwrap();
+        let dirty_hash = hash_bytes(b"dirty");
+        mirror
+            .enqueue_save("src/dirty.rs", &dirty_hash, Some("base"), b"dirty")
+            .unwrap();
+        mirror
+            .upsert_metadata(&test_meta("src/deleted.rs", "deleted", 7), "metadata")
+            .unwrap();
+        mirror
+            .record_validation("src/deleted.rs", "deleted", None, Some("remote deleted"))
+            .unwrap();
+        mirror
+            .upsert_metadata(&test_meta("src/legacy.rs", "legacy", 6), "metadata")
+            .unwrap();
+        mirror
+            .db
+            .execute(
+                "UPDATE files SET metadata_kind_known=0 WHERE relative_path='src/legacy.rs'",
+                [],
+            )
+            .unwrap();
+
+        let paths = mirror.related_prefetch_paths("src/main.rs", 10).unwrap();
+
+        assert_eq!(
+            paths,
+            vec![
+                "src/lib.rs".to_string(),
+                "src/readme.md".to_string(),
+                "src/nested/mod.rs".to_string(),
+                "tests/main.rs".to_string(),
+            ]
+        );
     }
 
     #[test]

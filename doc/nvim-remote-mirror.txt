@@ -23,7 +23,8 @@ COMMANDS                                      *nvim-remote-mirror-commands*
 :RemoteOpen {path}
     Open a workspace-relative file from the local mirror when cached, including
     dirty, stale, or deleted mirror entries. Hydrate it from the remote when no
-    cached file is available.
+    cached file is available. When configured, after opening it can prefetch a
+    small batch of related files from existing mirror metadata.
 
 :RemoteOpen! {path}
     Force remote rehydration for clean cached files. Dirty cached files are not
@@ -71,6 +72,8 @@ CONFIGURATION                                  *nvim-remote-mirror-config*
     ssh_connect_timeout_seconds = 10,
     prefetch_max_file_bytes = 4 * 1024 * 1024,
     prefetch_max_total_bytes = 16 * 1024 * 1024,
+    open_prefetch_related = false,
+    open_prefetch_related_limit = 16,
   })
 <
 
