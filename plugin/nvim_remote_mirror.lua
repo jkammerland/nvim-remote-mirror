@@ -16,6 +16,10 @@ vim.api.nvim_create_user_command("RemoteDisconnect", function()
   nrm.disconnect()
 end, {})
 
+vim.api.nvim_create_user_command("RemoteReconnect", function()
+  nrm.reconnect()
+end, {})
+
 vim.api.nvim_create_user_command("RemoteOpen", function(opts)
   nrm.open(opts.args, { force = opts.bang })
 end, {

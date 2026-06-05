@@ -65,6 +65,11 @@ Or connect through SSH:
 :RemoteConnect ssh://myhost/home/me/project
 ```
 
+If the sidecar exits unexpectedly, the plugin fails pending callbacks and can
+reconnect to the last target with capped retries. Use `:RemoteReconnect` to
+resume the last target manually; reconnect startup reuses the durable mirror and
+retries queued saves.
+
 By default the plugin expects these binaries:
 
 ```text
@@ -84,6 +89,10 @@ require("nvim_remote_mirror").setup({
   prefetch_max_total_bytes = 16 * 1024 * 1024,
   open_prefetch_related = false,
   open_prefetch_related_limit = 16,
+  auto_reconnect = true,
+  reconnect_delay_ms = 1000,
+  reconnect_max_attempts = 3,
+  reconnect_stable_ms = 10000,
 })
 ```
 
@@ -120,8 +129,9 @@ chunks, verifies the uploaded content hash, rechecks the remote base hash, then
 renames the temp file into place.
 
 Use `:RemoteValidate [path]` to compare cached mirror metadata with the remote
-hash. Stale cached files are marked in the mirror and rehydrated on the next
-open instead of being treated as silently valid.
+hash. Stale cached files are marked in the mirror and opened from cache by
+default; use `:RemoteOpen!` to force a remote rehydrate when you intentionally
+want to replace a clean cached copy.
 
 Use `:RemoteRefresh [path...]` to validate many cached files in one remote
 request. Without arguments it refreshes a batch of clean cached files from the
@@ -167,5 +177,5 @@ Current transport state:
   opens/status while remote worker requests are in flight. Disconnect interrupts
   the current agent/SSH process group on Unix so shutdown is not pinned to the
   normal request timeout.
-- pending: per-request cancellation, true multiplexing, streaming results,
-  reconnect resume, and broader backpressure.
+- pending: per-request cancellation, true multiplexing, streaming results, and
+  broader backpressure.

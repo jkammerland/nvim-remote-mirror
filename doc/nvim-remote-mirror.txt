@@ -20,6 +20,10 @@ COMMANDS                                      *nvim-remote-mirror-commands*
 :RemoteConnect [target]
     Connect to a local path or ssh://host/absolute/path target.
 
+:RemoteReconnect
+    Reconnect to the last remote target, reusing the durable mirror and
+    retrying queued saves after the sidecar starts.
+
 :RemoteOpen {path}
     Open a workspace-relative file from the local mirror when cached, including
     dirty, stale, or deleted mirror entries. Hydrate it from the remote when no
@@ -74,6 +78,10 @@ CONFIGURATION                                  *nvim-remote-mirror-config*
     prefetch_max_total_bytes = 16 * 1024 * 1024,
     open_prefetch_related = false,
     open_prefetch_related_limit = 16,
+    auto_reconnect = true,
+    reconnect_delay_ms = 1000,
+    reconnect_max_attempts = 3,
+    reconnect_stable_ms = 10000,
   })
 <
 

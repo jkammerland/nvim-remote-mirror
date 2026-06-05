@@ -29,9 +29,16 @@ M.config = {
   prefetch_max_total_bytes = 16 * 1024 * 1024,
   open_prefetch_related = false,
   open_prefetch_related_limit = 16,
+  auto_reconnect = true,
+  reconnect_delay_ms = 1000,
+  reconnect_max_attempts = 3,
+  reconnect_stable_ms = 10000,
 }
 
 M.client = nil
+M.last_target = nil
+M.reconnect_attempts = 0
+M.reconnect_generation = 0
 
 local function notify(message, level)
   vim.schedule(function()
@@ -46,9 +53,18 @@ local function optional_string(value)
   return nil
 end
 
+local function normalize_local_root(path)
+  path = vim.fn.fnamemodify(path, ":p")
+  local stripped = path:gsub("[/\\]+$", "")
+  if stripped == "" or stripped:match("^%a:$") then
+    return path
+  end
+  return stripped
+end
+
 local function parse_target(target)
   if target == nil or target == "" then
-    return { remote_root = uv.cwd() }
+    return { remote_root = normalize_local_root(uv.cwd()) }
   end
 
   local ssh_body = target:match("^ssh://(.+)$")
@@ -60,7 +76,14 @@ local function parse_target(target)
     return { ssh = host, remote_root = path }
   end
 
-  return { remote_root = target }
+  return { remote_root = normalize_local_root(target) }
+end
+
+local function reconnect_arg(target)
+  if target.ssh then
+    return "ssh://" .. target.ssh .. target.remote_root
+  end
+  return target.remote_root
 end
 
 local function handle_response(client, line)
@@ -126,15 +149,79 @@ local function sidecar_args(target)
   return args
 end
 
+local function fail_pending(client, message)
+  for id, callback in pairs(client.pending or {}) do
+    client.pending[id] = nil
+    pcall(callback, message, nil)
+  end
+end
+
+local function schedule_reconnect(target_arg, generation)
+  generation = generation or M.reconnect_generation
+  if not M.config.auto_reconnect then
+    return
+  end
+  if generation ~= M.reconnect_generation then
+    return
+  end
+  if M.client then
+    return
+  end
+  if not target_arg then
+    return
+  end
+  if M.reconnect_attempts >= M.config.reconnect_max_attempts then
+    notify("reconnect attempts exhausted", vim.log.levels.WARN)
+    return
+  end
+  M.reconnect_attempts = M.reconnect_attempts + 1
+  local attempt = M.reconnect_attempts
+  vim.defer_fn(function()
+    if generation ~= M.reconnect_generation then
+      return
+    end
+    if M.client then
+      return
+    end
+    notify("reconnecting remote session, attempt " .. tostring(attempt), vim.log.levels.WARN)
+    local ok, err = pcall(M.connect, target_arg, { reconnect = true })
+    if not ok then
+      notify("reconnect failed: " .. tostring(err), vim.log.levels.ERROR)
+      schedule_reconnect(target_arg, generation)
+    end
+  end, M.config.reconnect_delay_ms)
+end
+
+local function schedule_reconnect_stable_reset(client, generation)
+  if M.reconnect_attempts == 0 then
+    return
+  end
+
+  local delay = tonumber(M.config.reconnect_stable_ms) or 0
+  vim.defer_fn(function()
+    if M.client == client and not client.closing and generation == M.reconnect_generation then
+      M.reconnect_attempts = 0
+    end
+  end, math.max(delay, 0))
+end
+
 function M.setup(opts)
   M.config = vim.tbl_deep_extend("force", M.config, opts or {})
 end
 
-function M.connect(target)
+function M.connect(target, opts)
+  opts = opts or {}
   target = parse_target(target)
+  local target_arg = reconnect_arg(target)
+  local is_reconnect = opts.reconnect == true
+  if not opts.reconnect then
+    M.reconnect_generation = M.reconnect_generation + 1
+    M.reconnect_attempts = 0
+  end
+  local generation = M.reconnect_generation
 
   if M.client and M.client.job_id then
-    M.disconnect()
+    M.disconnect({ preserve_last_target = true })
   end
 
   local client = {
@@ -142,6 +229,8 @@ function M.connect(target)
     pending = {},
     stdout_tail = "",
     target = target,
+    target_arg = target_arg,
+    closing = false,
   }
 
   local command = vim.list_extend({ M.config.sidecar }, sidecar_args(target))
@@ -162,8 +251,14 @@ function M.connect(target)
       if M.client == client then
         M.client = nil
       end
-      if code ~= 0 then
+      local unexpected = not client.closing
+      if unexpected then
+        local exit_generation = M.reconnect_generation
+        fail_pending(client, "sidecar exited with code " .. tostring(code))
         notify("sidecar exited with code " .. tostring(code), vim.log.levels.ERROR)
+        schedule_reconnect(client.target_arg, exit_generation)
+      else
+        fail_pending(client, "disconnected")
       end
     end,
   })
@@ -173,28 +268,55 @@ function M.connect(target)
   end
 
   M.client = client
+  M.last_target = target_arg
   M.request("hello", {}, function(err, result)
     if err then
       notify(err, vim.log.levels.ERROR)
       return
     end
     client.hello = result
+    if is_reconnect then
+      schedule_reconnect_stable_reset(client, generation)
+    end
     notify("connected: " .. result.remote_root)
   end)
 end
 
-function M.disconnect()
+function M.disconnect(opts)
+  opts = opts or {}
   if not M.client then
+    if not opts.preserve_last_target then
+      M.reconnect_generation = M.reconnect_generation + 1
+      M.reconnect_attempts = 0
+    end
     return
   end
   local client = M.client
-  M.request("disconnect", {}, function() end)
+  client.closing = true
+  pcall(M.request, "disconnect", {}, function() end)
+  fail_pending(client, "disconnected")
   vim.defer_fn(function()
     if client.job_id then
       pcall(vim.fn.jobstop, client.job_id)
     end
   end, 250)
   M.client = nil
+  if not opts.preserve_last_target then
+    M.reconnect_generation = M.reconnect_generation + 1
+    M.reconnect_attempts = 0
+  end
+end
+
+function M.reconnect()
+  if not M.last_target then
+    error("no previous remote target to reconnect")
+  end
+  if M.client then
+    M.disconnect({ preserve_last_target = true })
+  end
+  M.reconnect_attempts = 0
+  M.reconnect_generation = M.reconnect_generation + 1
+  M.connect(M.last_target, { reconnect = true })
 end
 
 function M.request(method, params, callback)
