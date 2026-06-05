@@ -178,7 +178,8 @@ Current transport state:
   the current agent/SSH process group on Unix so shutdown is not pinned to the
   normal request timeout. Deferred sidecar work uses separate interactive and
   background queues so explicit opens/saves are not rejected by, or drained
-  behind, queued prefetch, scan, or refresh work.
-- pending: per-request cancellation, true multiplexing, streaming results, and
-  broader backpressure. Priority queues do not preempt a background request
-  after it has already started on the serial SSH/agent connection.
+  behind, queued prefetch, scan, or refresh work. Active background maintenance
+  requests can be preempted by interactive work by restarting the serial
+  SSH/agent worker; save and explicit interactive requests are not preempted.
+- pending: general per-request cancellation, true multiplexing, streaming
+  results, and broader backpressure.

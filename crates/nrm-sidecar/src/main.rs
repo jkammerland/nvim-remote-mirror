@@ -16,11 +16,11 @@ use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     mpsc, Arc, Condvar, Mutex,
 };
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_CHUNK_SIZE: u64 = 1024 * 1024;
 const SAVE_UPLOAD_CHUNK_BYTES: usize = 1024 * 1024;
@@ -140,6 +140,11 @@ struct AgentInterrupt {
     shutdown_requested: Arc<AtomicBool>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct AgentPreempt {
+    epoch: Arc<AtomicU64>,
+}
+
 impl AgentInterrupt {
     fn is_shutdown_requested(&self) -> bool {
         self.shutdown_requested.load(Ordering::SeqCst)
@@ -181,6 +186,20 @@ impl AgentInterrupt {
     }
 }
 
+impl AgentPreempt {
+    fn request_preemption(&self) {
+        self.epoch.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::SeqCst)
+    }
+
+    fn changed_since(&self, epoch: u64) -> bool {
+        self.epoch() != epoch
+    }
+}
+
 struct AgentWorker {
     tx: mpsc::Sender<AgentWorkerCommand>,
     child: Arc<Mutex<Child>>,
@@ -198,9 +217,16 @@ enum AgentWorkerReply {
     Error(String),
 }
 
+#[derive(Debug)]
+enum AgentRequestOutcome {
+    Response(Response),
+    Preempted,
+}
+
 struct AgentClient {
     launch: AgentLaunch,
     interrupt: AgentInterrupt,
+    preempt: AgentPreempt,
     worker: Option<AgentWorker>,
     next_id: RequestId,
 }
@@ -223,6 +249,7 @@ impl AgentClient {
                 ssh_connect_timeout_seconds,
             },
             interrupt,
+            preempt: AgentPreempt::default(),
             worker: None,
             next_id: 1,
         }
@@ -300,13 +327,45 @@ impl AgentClient {
     }
 
     fn request(&mut self, request: Request) -> Result<Response> {
+        self.request_inner(request, false)
+    }
+
+    fn request_maybe_preemptible_since(
+        &mut self,
+        request: Request,
+        preempt_epoch: u64,
+    ) -> Result<AgentRequestOutcome> {
+        self.request_outcome_inner(request, true, preempt_epoch)
+    }
+
+    fn preempt_handle(&self) -> AgentPreempt {
+        self.preempt.clone()
+    }
+
+    fn preempt_epoch(&self) -> u64 {
+        self.preempt.epoch()
+    }
+
+    fn request_inner(&mut self, request: Request, preemptible: bool) -> Result<Response> {
+        let preempt_epoch = self.preempt.epoch();
+        match self.request_outcome_inner(request, preemptible, preempt_epoch)? {
+            AgentRequestOutcome::Response(response) => Ok(response),
+            AgentRequestOutcome::Preempted => bail!("agent request preempted by interactive work"),
+        }
+    }
+
+    fn request_outcome_inner(
+        &mut self,
+        request: Request,
+        preemptible: bool,
+        preempt_epoch: u64,
+    ) -> Result<AgentRequestOutcome> {
         if self.interrupt.is_shutdown_requested() {
             bail!("agent request cancelled by shutdown");
         }
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1).max(1);
         let (reply, reply_rx) = mpsc::channel();
-
         for attempt in 0..2 {
             let tx = self.ensure_worker()?.tx.clone();
             let command = AgentWorkerCommand {
@@ -323,26 +382,53 @@ impl AgentClient {
             }
         }
 
-        match reply_rx.recv_timeout(self.launch.request_timeout) {
-            Ok(AgentWorkerReply::Response(Response::Error { message })) => Err(anyhow!(message)),
-            Ok(AgentWorkerReply::Response(response)) => Ok(response),
-            Ok(AgentWorkerReply::Error(message)) => {
-                self.worker = None;
-                Err(anyhow!(message))
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                let timeout = self.launch.request_timeout;
+        self.wait_for_reply(id, reply_rx, preemptible, preempt_epoch)
+    }
+
+    fn wait_for_reply(
+        &mut self,
+        id: RequestId,
+        reply_rx: mpsc::Receiver<AgentWorkerReply>,
+        preemptible: bool,
+        preempt_epoch: u64,
+    ) -> Result<AgentRequestOutcome> {
+        let started = Instant::now();
+        loop {
+            if preemptible && self.preempt.changed_since(preempt_epoch) {
                 self.kill_worker();
-                Err(anyhow!(
+                return Ok(AgentRequestOutcome::Preempted);
+            }
+
+            let timeout = self.launch.request_timeout;
+            let elapsed = started.elapsed();
+            if elapsed >= timeout {
+                self.kill_worker();
+                bail!(
                     "agent request {id} timed out after {} ms",
                     timeout.as_millis()
-                ))
+                );
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
+            let remaining = timeout.saturating_sub(elapsed);
+            let wait = remaining.min(Duration::from_millis(25));
+
+            match reply_rx.recv_timeout(wait) {
+                Ok(reply) => return self.handle_worker_reply(reply),
+                Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    self.worker = None;
+                    bail!("agent worker exited while request {id} was pending");
+                }
+            }
+        }
+    }
+
+    fn handle_worker_reply(&mut self, reply: AgentWorkerReply) -> Result<AgentRequestOutcome> {
+        match reply {
+            AgentWorkerReply::Response(Response::Error { message }) => Err(anyhow!(message)),
+            AgentWorkerReply::Response(response) => Ok(AgentRequestOutcome::Response(response)),
+            AgentWorkerReply::Error(message) => {
                 self.worker = None;
-                Err(anyhow!(
-                    "agent worker exited while request {id} was pending"
-                ))
+                Err(anyhow!(message))
             }
         }
     }
@@ -1224,6 +1310,11 @@ struct RemoteWork {
     priority: RemotePriority,
 }
 
+struct StartedRemoteWork {
+    work: RemoteWork,
+    preempt_epoch: u64,
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum RemotePriority {
     Interactive,
@@ -1275,7 +1366,11 @@ impl RemoteQueue {
         }
     }
 
-    fn try_push(&self, work: RemoteWork) -> Result<(), RemoteWork> {
+    fn try_push(
+        &self,
+        work: RemoteWork,
+        preempt: Option<&AgentPreempt>,
+    ) -> Result<Vec<RemoteWork>, RemoteWork> {
         let priority = work.priority;
         let mut state = self.state.lock().expect("remote queue mutex poisoned");
         if state.closed {
@@ -1289,8 +1384,13 @@ impl RemoteQueue {
                 } else {
                     state.interactive_len += 1;
                     state.queue.push_back(work);
+                    let interactive_index = state.queue.len() - 1;
+                    let canceled = state.drain_background_blocking(interactive_index);
+                    if let Some(preempt) = preempt {
+                        preempt.request_preemption();
+                    }
                     self.ready.notify_one();
-                    Ok(())
+                    Ok(canceled)
                 }
             }
             RemotePriority::Background => {
@@ -1300,17 +1400,30 @@ impl RemoteQueue {
                     state.background_len += 1;
                     state.queue.push_back(work);
                     self.ready.notify_one();
-                    Ok(())
+                    Ok(Vec::new())
                 }
             }
         }
     }
 
     fn pop(&self) -> Option<RemoteWork> {
+        self.pop_started_with_epoch(None)
+            .map(|started| started.work)
+    }
+
+    fn pop_started(&self, preempt: &AgentPreempt) -> Option<StartedRemoteWork> {
+        self.pop_started_with_epoch(Some(preempt))
+    }
+
+    fn pop_started_with_epoch(&self, preempt: Option<&AgentPreempt>) -> Option<StartedRemoteWork> {
         let mut state = self.state.lock().expect("remote queue mutex poisoned");
         loop {
             if let Some(index) = state.next_ready_index() {
-                return Some(state.remove(index));
+                let preempt_epoch = preempt.map(AgentPreempt::epoch).unwrap_or(0);
+                return Some(StartedRemoteWork {
+                    work: state.remove(index),
+                    preempt_epoch,
+                });
             }
             if state.closed {
                 return None;
@@ -1394,6 +1507,24 @@ impl RemoteQueueState {
                 self.background_len = self.background_len.saturating_sub(1)
             }
         }
+    }
+
+    fn drain_background_blocking(&mut self, interactive_index: usize) -> Vec<RemoteWork> {
+        let interest = RequestInterest::for_request(&self.queue[interactive_index].request);
+        let mut drained = Vec::new();
+        let mut index = 0;
+        let mut limit = interactive_index;
+        while index < limit {
+            if self.queue[index].priority == RemotePriority::Background
+                && self.queue[index].hazard.conflicts_with_interest(&interest)
+            {
+                drained.push(self.remove(index));
+                limit -= 1;
+            } else {
+                index += 1;
+            }
+        }
+        drained
     }
 }
 
@@ -1665,7 +1796,7 @@ impl Sidecar {
         Ok(sidecar)
     }
 
-    fn handle(&mut self, method: &str, params: Value) -> Result<Value> {
+    fn handle(&mut self, method: &str, params: Value, preempt_epoch: u64) -> Result<Value> {
         match method {
             "hello" => Ok(json!({
                 "sidecar_version": env!("CARGO_PKG_VERSION"),
@@ -1676,15 +1807,15 @@ impl Sidecar {
                 "files_root": self.mirror.files_root().to_string_lossy()
             })),
             "status" => self.mirror.status(),
-            "scan" => self.scan(params),
+            "scan" => self.scan(params, preempt_epoch),
             "open" => self.open(params),
-            "prefetch" => self.prefetch(params),
-            "prefetch_related" => self.prefetch_related(params),
+            "prefetch" => self.prefetch(params, preempt_epoch),
+            "prefetch_related" => self.prefetch_related(params, preempt_epoch),
             "grep" => self.grep(params),
             "flush" => self.flush(params),
             "flush_queue" => self.flush_queue(),
             "validate" => self.validate(params),
-            "refresh" => self.refresh(params),
+            "refresh" => self.refresh(params, preempt_epoch),
             "shutdown" | "disconnect" => {
                 self.agent.shutdown();
                 Ok(json!({"shutdown": true}))
@@ -1693,12 +1824,20 @@ impl Sidecar {
         }
     }
 
-    fn scan(&mut self, params: Value) -> Result<Value> {
+    fn scan(&mut self, params: Value, preempt_epoch: u64) -> Result<Value> {
         let limit = params
             .get("limit")
             .and_then(Value::as_u64)
             .unwrap_or(10_000) as usize;
-        let response = self.agent.request(Request::Scan { limit })?;
+        let response = match self
+            .agent
+            .request_maybe_preemptible_since(Request::Scan { limit }, preempt_epoch)?
+        {
+            AgentRequestOutcome::Response(response) => response,
+            AgentRequestOutcome::Preempted => {
+                return Ok(json!({"entries": [], "truncated": true, "preempted": true}));
+            }
+        };
         match response {
             Response::Scan { entries, truncated } => {
                 for entry in &entries {
@@ -1828,7 +1967,7 @@ impl Sidecar {
         Ok(())
     }
 
-    fn prefetch(&mut self, params: Value) -> Result<Value> {
+    fn prefetch(&mut self, params: Value, preempt_epoch: u64) -> Result<Value> {
         let paths = params
             .get("paths")
             .and_then(Value::as_array)
@@ -1853,19 +1992,24 @@ impl Sidecar {
                 Err(error) => errors.push(json!({"path": path, "error": error.to_string()})),
             }
         }
-        let (hydrated, batch_errors, truncated) =
-            self.batch_hydrate(requested_paths, max_file_bytes, max_total_bytes)?;
+        let (hydrated, batch_errors, truncated, preempted) = self.batch_hydrate(
+            requested_paths,
+            max_file_bytes,
+            max_total_bytes,
+            Some(preempt_epoch),
+        )?;
         errors.extend(batch_errors);
         Ok(json!({
             "hydrated": hydrated,
             "errors": errors,
             "truncated": truncated,
+            "preempted": preempted,
             "max_file_bytes": max_file_bytes,
             "max_total_bytes": max_total_bytes
         }))
     }
 
-    fn prefetch_related(&mut self, params: Value) -> Result<Value> {
+    fn prefetch_related(&mut self, params: Value, preempt_epoch: u64) -> Result<Value> {
         let anchor = required_string(&params, "anchor")?;
         let limit = params.get("limit").and_then(Value::as_u64).unwrap_or(16) as usize;
         let max_file_bytes = params
@@ -1878,8 +2022,12 @@ impl Sidecar {
             .unwrap_or(DEFAULT_BATCH_MAX_TOTAL_BYTES);
         let paths = self.mirror.related_prefetch_paths(anchor, limit)?;
         let requested = paths.len();
-        let (hydrated, errors, truncated) =
-            self.batch_hydrate(paths.clone(), max_file_bytes, max_total_bytes)?;
+        let (hydrated, errors, truncated, preempted) = self.batch_hydrate(
+            paths.clone(),
+            max_file_bytes,
+            max_total_bytes,
+            Some(preempt_epoch),
+        )?;
         Ok(json!({
             "anchor": anchor,
             "requested": requested,
@@ -1887,6 +2035,7 @@ impl Sidecar {
             "hydrated": hydrated,
             "errors": errors,
             "truncated": truncated,
+            "preempted": preempted,
             "max_file_bytes": max_file_bytes,
             "max_total_bytes": max_total_bytes
         }))
@@ -1909,15 +2058,27 @@ impl Sidecar {
         paths: Vec<String>,
         max_file_bytes: u64,
         max_total_bytes: u64,
-    ) -> Result<(usize, Vec<Value>, bool)> {
+        preempt_epoch: Option<u64>,
+    ) -> Result<(usize, Vec<Value>, bool, bool)> {
         if paths.is_empty() {
-            return Ok((0, Vec::new(), false));
+            return Ok((0, Vec::new(), false, false));
         }
-        let response = self.agent.request(Request::ReadFiles {
+        let request = Request::ReadFiles {
             paths,
             max_file_bytes,
             max_total_bytes,
-        })?;
+        };
+        let response = if let Some(preempt_epoch) = preempt_epoch {
+            match self
+                .agent
+                .request_maybe_preemptible_since(request, preempt_epoch)?
+            {
+                AgentRequestOutcome::Response(response) => response,
+                AgentRequestOutcome::Preempted => return Ok((0, Vec::new(), true, true)),
+            }
+        } else {
+            self.agent.request(request)?
+        };
         match response {
             Response::ReadFiles {
                 files,
@@ -1941,7 +2102,7 @@ impl Sidecar {
                         .into_iter()
                         .map(|error| json!({"path": error.path, "error": error.message})),
                 );
-                Ok((hydrated, reported_errors, truncated))
+                Ok((hydrated, reported_errors, truncated, false))
             }
             other => bail!("unexpected batch read response: {other:?}"),
         }
@@ -1999,7 +2160,8 @@ impl Sidecar {
                 let mut hydrate_truncated = false;
                 if hydrate {
                     let paths = self.grep_hydration_paths(&hits)?;
-                    let result = self.batch_hydrate(paths, max_file_bytes, max_total_bytes)?;
+                    let result =
+                        self.batch_hydrate(paths, max_file_bytes, max_total_bytes, None)?;
                     hydrated = result.0;
                     hydrate_errors = result.1;
                     hydrate_truncated = result.2;
@@ -2403,7 +2565,7 @@ impl Sidecar {
         }
     }
 
-    fn refresh(&mut self, params: Value) -> Result<Value> {
+    fn refresh(&mut self, params: Value, preempt_epoch: u64) -> Result<Value> {
         let limit = params.get("limit").and_then(Value::as_u64).unwrap_or(500) as usize;
         let paths = if let Some(values) = params.get("paths").and_then(Value::as_array) {
             let mut paths = Vec::new();
@@ -2420,10 +2582,10 @@ impl Sidecar {
         } else {
             self.mirror.cached_clean_paths(limit)?
         };
-        self.refresh_paths(paths)
+        self.refresh_paths(paths, preempt_epoch)
     }
 
-    fn refresh_paths(&mut self, paths: Vec<String>) -> Result<Value> {
+    fn refresh_paths(&mut self, paths: Vec<String>, preempt_epoch: u64) -> Result<Value> {
         if paths.is_empty() {
             return Ok(json!({
                 "checked": 0,
@@ -2434,10 +2596,26 @@ impl Sidecar {
                 "errors": []
             }));
         }
-        let response = self.agent.request(Request::ValidateFiles {
-            paths,
-            include_hash: true,
-        })?;
+        let response = match self.agent.request_maybe_preemptible_since(
+            Request::ValidateFiles {
+                paths,
+                include_hash: true,
+            },
+            preempt_epoch,
+        )? {
+            AgentRequestOutcome::Response(response) => response,
+            AgentRequestOutcome::Preempted => {
+                return Ok(json!({
+                    "checked": 0,
+                    "valid": 0,
+                    "stale": 0,
+                    "deleted": 0,
+                    "skipped": 0,
+                    "errors": [],
+                    "preempted": true
+                }));
+            }
+        };
         match response {
             Response::ValidateFiles { files, errors } => {
                 let mut valid = 0;
@@ -2627,6 +2805,7 @@ fn run_server(
     )?;
     let pending_remote = Arc::new(Mutex::new(PendingRemote::default()));
     let fast_state = FastState::from_sidecar(&sidecar, Arc::clone(&pending_remote));
+    let agent_preempt = sidecar.agent.preempt_handle();
     let (response_tx, response_rx) = mpsc::sync_channel::<ClientResponse>(1024);
     let writer = thread::spawn(move || -> Result<()> {
         let stdout = io::stdout();
@@ -2646,12 +2825,14 @@ fn run_server(
     let remote_pending = Arc::clone(&pending_remote);
     let remote_interrupt = agent_interrupt.clone();
     let remote_worker_queue = Arc::clone(&remote_queue);
+    let remote_worker_preempt = agent_preempt.clone();
     let remote_worker = thread::spawn(move || {
         let mut sidecar = sidecar;
-        while let Some(work) = remote_worker_queue.pop() {
+        while let Some(started) = remote_worker_queue.pop_started(&remote_worker_preempt) {
+            let preempt_epoch = started.preempt_epoch;
             let RemoteWork {
                 request, hazard, ..
-            } = work;
+            } = started.work;
             if remote_interrupt.is_shutdown_requested() {
                 if let Ok(mut pending) = remote_pending.lock() {
                     pending.clear(&hazard);
@@ -2660,7 +2841,7 @@ fn run_server(
                 break;
             }
             let should_shutdown = matches!(request.method.as_str(), "shutdown" | "disconnect");
-            let response = handle_client_request(&mut sidecar, request);
+            let response = handle_client_request(&mut sidecar, request, preempt_epoch);
             if let Ok(mut pending) = remote_pending.lock() {
                 pending.clear(&hazard);
             }
@@ -2726,22 +2907,29 @@ fn run_server(
                     hazard,
                     priority,
                 };
-                if let Err(work) = remote_queue.try_push(work) {
-                    if let Ok(mut pending) = pending_remote.lock() {
-                        pending.clear(&work.hazard);
+                let preempt = (priority == RemotePriority::Interactive).then_some(&agent_preempt);
+                match remote_queue.try_push(work, preempt) {
+                    Ok(canceled) => {
+                        clear_pending_hazard_refs(&pending_remote, &canceled);
+                        send_preempted_responses(&response_tx, canceled);
                     }
-                    try_send_client_response(
-                        &response_tx,
-                        ClientResponse {
-                            id: work.request.id,
-                            ok: false,
-                            result: None,
-                            error: Some(format!(
-                                "remote {} queue is full or not available",
-                                work.priority.label()
-                            )),
-                        },
-                    );
+                    Err(work) => {
+                        if let Ok(mut pending) = pending_remote.lock() {
+                            pending.clear(&work.hazard);
+                        }
+                        try_send_client_response(
+                            &response_tx,
+                            ClientResponse {
+                                id: work.request.id,
+                                ok: false,
+                                result: None,
+                                error: Some(format!(
+                                    "remote {} queue is full or not available",
+                                    work.priority.label()
+                                )),
+                            },
+                        );
+                    }
                 }
             }
         }
@@ -2760,9 +2948,13 @@ fn run_server(
     Ok(())
 }
 
-fn handle_client_request(sidecar: &mut Sidecar, request: ClientRequest) -> ClientResponse {
+fn handle_client_request(
+    sidecar: &mut Sidecar,
+    request: ClientRequest,
+    preempt_epoch: u64,
+) -> ClientResponse {
     let id = request.id;
-    let result = sidecar.handle(&request.method, request.params);
+    let result = sidecar.handle(&request.method, request.params, preempt_epoch);
     result_to_client_response(id, result)
 }
 
@@ -2791,6 +2983,78 @@ fn clear_pending_hazards(pending_remote: &Arc<Mutex<PendingRemote>>, works: Vec<
         for work in works {
             pending.clear(&work.hazard);
         }
+    }
+}
+
+fn clear_pending_hazard_refs(pending_remote: &Arc<Mutex<PendingRemote>>, works: &[RemoteWork]) {
+    if works.is_empty() {
+        return;
+    }
+    if let Ok(mut pending) = pending_remote.lock() {
+        for work in works {
+            pending.clear(&work.hazard);
+        }
+    }
+}
+
+fn send_preempted_responses(tx: &mpsc::SyncSender<ClientResponse>, works: Vec<RemoteWork>) {
+    for work in works {
+        try_send_client_response(tx, preempted_client_response(work));
+    }
+}
+
+fn preempted_client_response(work: RemoteWork) -> ClientResponse {
+    result_to_client_response(work.request.id, Ok(preempted_result(&work.request)))
+}
+
+fn preempted_result(request: &ClientRequest) -> Value {
+    match request.method.as_str() {
+        "scan" => json!({"entries": [], "truncated": true, "preempted": true}),
+        "prefetch" => json!({
+            "hydrated": 0,
+            "errors": [],
+            "truncated": true,
+            "preempted": true,
+            "max_file_bytes": request
+                .params
+                .get("max_file_bytes")
+                .and_then(Value::as_u64)
+                .unwrap_or(DEFAULT_BATCH_MAX_FILE_BYTES),
+            "max_total_bytes": request
+                .params
+                .get("max_total_bytes")
+                .and_then(Value::as_u64)
+                .unwrap_or(DEFAULT_BATCH_MAX_TOTAL_BYTES)
+        }),
+        "prefetch_related" => json!({
+            "anchor": request.params.get("anchor").and_then(Value::as_str).unwrap_or(""),
+            "requested": 0,
+            "paths": [],
+            "hydrated": 0,
+            "errors": [],
+            "truncated": true,
+            "preempted": true,
+            "max_file_bytes": request
+                .params
+                .get("max_file_bytes")
+                .and_then(Value::as_u64)
+                .unwrap_or(DEFAULT_BATCH_MAX_FILE_BYTES),
+            "max_total_bytes": request
+                .params
+                .get("max_total_bytes")
+                .and_then(Value::as_u64)
+                .unwrap_or(DEFAULT_BATCH_MAX_TOTAL_BYTES)
+        }),
+        "refresh" => json!({
+            "checked": 0,
+            "valid": 0,
+            "stale": 0,
+            "deleted": 0,
+            "skipped": 0,
+            "errors": [],
+            "preempted": true
+        }),
+        _ => json!({"preempted": true}),
     }
 }
 
@@ -3520,11 +3784,13 @@ mod tests {
     #[test]
     fn remote_queue_prioritizes_interactive_and_preserves_fifo() {
         let queue = RemoteQueue::new(8, 8);
-        queue.try_push(test_remote_work(1, "prefetch")).unwrap();
-        queue.try_push(test_remote_work(2, "open")).unwrap();
-        queue.try_push(test_remote_work(3, "flush")).unwrap();
         queue
-            .try_push(test_remote_work(4, "prefetch_related"))
+            .try_push(test_remote_work(1, "prefetch"), None)
+            .unwrap();
+        queue.try_push(test_remote_work(2, "open"), None).unwrap();
+        queue.try_push(test_remote_work(3, "flush"), None).unwrap();
+        queue
+            .try_push(test_remote_work(4, "prefetch_related"), None)
             .unwrap();
 
         assert_eq!(queue.pop().unwrap().request.id, 2);
@@ -3537,21 +3803,27 @@ mod tests {
     }
 
     #[test]
-    fn remote_queue_preserves_fifo_for_conflicting_background_work() {
+    fn remote_queue_preserves_background_fifo_without_interactive_work() {
         let queue = RemoteQueue::new(8, 8);
         queue
-            .try_push(test_remote_work_from_request(test_client_request(
-                1,
-                "prefetch",
-                json!({"paths": ["src/main.rs"]}),
-            )))
+            .try_push(
+                test_remote_work_from_request(test_client_request(
+                    1,
+                    "prefetch",
+                    json!({"paths": ["src/main.rs"]}),
+                )),
+                None,
+            )
             .unwrap();
         queue
-            .try_push(test_remote_work_from_request(test_client_request(
-                2,
-                "open",
-                json!({"path": "src/main.rs"}),
-            )))
+            .try_push(
+                test_remote_work_from_request(test_client_request(
+                    2,
+                    "prefetch",
+                    json!({"paths": ["src/lib.rs"]}),
+                )),
+                None,
+            )
             .unwrap();
 
         assert_eq!(queue.pop().unwrap().request.id, 1);
@@ -3563,18 +3835,24 @@ mod tests {
     fn remote_queue_flush_bypasses_conflicting_background_hydration() {
         let queue = RemoteQueue::new(8, 8);
         queue
-            .try_push(test_remote_work_from_request(test_client_request(
-                1,
-                "prefetch",
-                json!({"paths": ["src/main.rs"]}),
-            )))
+            .try_push(
+                test_remote_work_from_request(test_client_request(
+                    1,
+                    "prefetch",
+                    json!({"paths": ["src/main.rs"]}),
+                )),
+                None,
+            )
             .unwrap();
         queue
-            .try_push(test_remote_work_from_request(test_client_request(
-                2,
-                "flush",
-                json!({"path": "src/main.rs"}),
-            )))
+            .try_push(
+                test_remote_work_from_request(test_client_request(
+                    2,
+                    "flush",
+                    json!({"path": "src/main.rs"}),
+                )),
+                None,
+            )
             .unwrap();
 
         assert_eq!(queue.pop().unwrap().request.id, 2);
@@ -3585,18 +3863,86 @@ mod tests {
     #[test]
     fn remote_queue_background_capacity_does_not_block_interactive() {
         let queue = RemoteQueue::new(1, 1);
-        queue.try_push(test_remote_work(1, "prefetch")).unwrap();
+        queue
+            .try_push(test_remote_work(1, "prefetch"), None)
+            .unwrap();
         let rejected_background = queue
-            .try_push(test_remote_work(2, "prefetch_related"))
+            .try_push(test_remote_work(2, "prefetch_related"), None)
             .unwrap_err();
         assert_eq!(rejected_background.priority, RemotePriority::Background);
 
-        queue.try_push(test_remote_work(3, "open")).unwrap();
-        let rejected_interactive = queue.try_push(test_remote_work(4, "flush")).unwrap_err();
+        queue.try_push(test_remote_work(3, "open"), None).unwrap();
+        let rejected_interactive = queue
+            .try_push(test_remote_work(4, "flush"), None)
+            .unwrap_err();
         assert_eq!(rejected_interactive.priority, RemotePriority::Interactive);
 
         assert_eq!(queue.pop().unwrap().request.id, 3);
         assert_eq!(queue.pop().unwrap().request.id, 1);
+        queue.shutdown_and_drain();
+    }
+
+    #[test]
+    fn remote_queue_bumps_preemption_before_accepting_interactive_work() {
+        let queue = RemoteQueue::new(8, 8);
+        let preempt = AgentPreempt::default();
+
+        queue
+            .try_push(test_remote_work(1, "prefetch"), Some(&preempt))
+            .unwrap();
+        assert_eq!(preempt.epoch(), 0);
+
+        queue
+            .try_push(test_remote_work(2, "open"), Some(&preempt))
+            .unwrap();
+        assert_eq!(preempt.epoch(), 1);
+        queue.shutdown_and_drain();
+    }
+
+    #[test]
+    fn remote_queue_pop_started_captures_preemption_epoch_under_lock() {
+        let queue = RemoteQueue::new(8, 8);
+        let preempt = AgentPreempt::default();
+        preempt.request_preemption();
+        queue
+            .try_push(test_remote_work(1, "prefetch"), None)
+            .unwrap();
+
+        let started = queue.pop_started(&preempt).unwrap();
+
+        assert_eq!(started.work.request.id, 1);
+        assert_eq!(started.preempt_epoch, 1);
+        queue.shutdown_and_drain();
+    }
+
+    #[test]
+    fn remote_queue_cancels_queued_background_that_blocks_interactive_work() {
+        let queue = RemoteQueue::new(8, 8);
+        queue
+            .try_push(
+                test_remote_work_from_request(test_client_request(
+                    1,
+                    "prefetch",
+                    json!({"paths": ["src/main.rs"]}),
+                )),
+                None,
+            )
+            .unwrap();
+
+        let canceled = queue
+            .try_push(
+                test_remote_work_from_request(test_client_request(
+                    2,
+                    "open",
+                    json!({"path": "src/main.rs"}),
+                )),
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(canceled.len(), 1);
+        assert_eq!(canceled[0].request.id, 1);
+        assert_eq!(queue.pop().unwrap().request.id, 2);
         queue.shutdown_and_drain();
     }
 
@@ -3608,11 +3954,14 @@ mod tests {
         let hazard = PendingHazard::for_request(&request);
         pending.lock().unwrap().register(&hazard);
         queue
-            .try_push(RemoteWork {
-                request,
-                hazard,
-                priority: RemotePriority::Interactive,
-            })
+            .try_push(
+                RemoteWork {
+                    request,
+                    hazard,
+                    priority: RemotePriority::Interactive,
+                },
+                None,
+            )
             .unwrap();
 
         assert!(pending.lock().unwrap().blocks_path("src/main.rs"));
@@ -3625,13 +3974,18 @@ mod tests {
     #[test]
     fn remote_queue_close_keeps_interactive_work_and_drains_background() {
         let queue = RemoteQueue::new(8, 8);
-        queue.try_push(test_remote_work(1, "prefetch")).unwrap();
         queue
-            .try_push(test_remote_work_from_request(test_client_request(
-                2,
-                "flush",
-                json!({"path": "src/main.rs"}),
-            )))
+            .try_push(test_remote_work(1, "prefetch"), None)
+            .unwrap();
+        queue
+            .try_push(
+                test_remote_work_from_request(test_client_request(
+                    2,
+                    "flush",
+                    json!({"path": "src/main.rs"}),
+                )),
+                None,
+            )
             .unwrap();
 
         let drained = queue.close_and_drain_background();
@@ -3781,6 +4135,97 @@ mod tests {
 
         let error = handle.join().unwrap().unwrap_err().to_string();
         assert!(!error.is_empty());
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_preemption_kills_stalled_background_request_before_timeout() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let fake_agent = dir.path().join("fake-agent");
+        fs::write(&fake_agent, "#!/bin/sh\nsleep 60\n").unwrap();
+        let mut permissions = fs::metadata(&fake_agent).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&fake_agent, permissions).unwrap();
+
+        let interrupt = AgentInterrupt::default();
+        let mut client = AgentClient::new(
+            fake_agent.to_string_lossy().to_string(),
+            None,
+            dir.path().to_path_buf(),
+            Duration::from_secs(30),
+            1,
+            interrupt.clone(),
+        );
+        let preempt = client.preempt_handle();
+        let started = Instant::now();
+        let preempt_epoch = client.preempt_epoch();
+        let handle = thread::spawn(move || {
+            client.request_maybe_preemptible_since(
+                Request::Hello {
+                    client_version: "test".to_string(),
+                    protocol_version: PROTOCOL_VERSION,
+                },
+                preempt_epoch,
+            )
+        });
+
+        for _ in 0..100 {
+            if interrupt.child.lock().unwrap().is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(interrupt.child.lock().unwrap().is_some());
+
+        preempt.request_preemption();
+
+        assert!(matches!(
+            handle.join().unwrap().unwrap(),
+            AgentRequestOutcome::Preempted
+        ));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_preemption_uses_epoch_captured_before_local_background_prep() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let fake_agent = dir.path().join("fake-agent");
+        fs::write(&fake_agent, "#!/bin/sh\nsleep 60\n").unwrap();
+        let mut permissions = fs::metadata(&fake_agent).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&fake_agent, permissions).unwrap();
+
+        let interrupt = AgentInterrupt::default();
+        let mut client = AgentClient::new(
+            fake_agent.to_string_lossy().to_string(),
+            None,
+            dir.path().to_path_buf(),
+            Duration::from_secs(30),
+            1,
+            interrupt,
+        );
+        let preempt = client.preempt_handle();
+        let preempt_epoch = client.preempt_epoch();
+        preempt.request_preemption();
+        let started = Instant::now();
+
+        let outcome = client
+            .request_maybe_preemptible_since(
+                Request::Hello {
+                    client_version: "test".to_string(),
+                    protocol_version: PROTOCOL_VERSION,
+                },
+                preempt_epoch,
+            )
+            .unwrap();
+
+        assert!(matches!(outcome, AgentRequestOutcome::Preempted));
         assert!(started.elapsed() < Duration::from_secs(5));
     }
 }

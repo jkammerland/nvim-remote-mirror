@@ -374,6 +374,9 @@ local function prefetch_related(anchor)
       notify("related prefetch failed: " .. err, vim.log.levels.WARN)
       return
     end
+    if result.preempted then
+      return
+    end
     local errors = #(result.errors or {})
     if errors > 0 or result.truncated then
       notify(
@@ -445,6 +448,9 @@ function M.scan(limit)
   M.request("scan", { limit = limit or 10000 }, function(err, result)
     if err then
       notify(err, vim.log.levels.ERROR)
+      return
+    end
+    if result.preempted then
       return
     end
     notify("indexed " .. tostring(#result.entries) .. " paths")
@@ -546,6 +552,9 @@ function M.refresh(paths)
       notify(err, vim.log.levels.ERROR)
       return
     end
+    if result.preempted then
+      return
+    end
     notify(
       string.format(
         "refresh checked=%d valid=%d stale=%d deleted=%d skipped=%d errors=%d",
@@ -568,6 +577,9 @@ function M.prefetch(paths)
   }, function(err, result)
     if err then
       notify(err, vim.log.levels.ERROR)
+      return
+    end
+    if result.preempted then
       return
     end
     local suffix = ""
