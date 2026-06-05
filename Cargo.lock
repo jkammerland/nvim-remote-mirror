@@ -461,6 +461,7 @@ dependencies = [
  "anyhow",
  "blake3",
  "clap",
+ "libc",
  "nrm-protocol",
  "rusqlite",
  "serde",

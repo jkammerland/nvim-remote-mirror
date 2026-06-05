@@ -164,6 +164,8 @@ Current transport state:
 - active: request IDs, typed remote errors, request timeout, SSH connect timeout,
   batched small-file read for prefetch, batched mirror validation, chunked
   compare-and-swap writes, and sidecar fast-path responses for cached mirror
-  opens/status while remote worker requests are in flight.
-- pending: true multiplexing, cancellation, streaming results, reconnect resume,
-  and backpressure.
+  opens/status while remote worker requests are in flight. Disconnect interrupts
+  the current agent/SSH process group on Unix so shutdown is not pinned to the
+  normal request timeout.
+- pending: per-request cancellation, true multiplexing, streaming results,
+  reconnect resume, and broader backpressure.

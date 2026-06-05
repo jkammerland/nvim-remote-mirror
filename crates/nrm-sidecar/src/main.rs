@@ -11,9 +11,14 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read, Write};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    mpsc, Arc, Mutex,
+};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -127,6 +132,53 @@ struct AgentLaunch {
     ssh_connect_timeout_seconds: u64,
 }
 
+#[derive(Debug, Clone, Default)]
+struct AgentInterrupt {
+    child: Arc<Mutex<Option<Arc<Mutex<Child>>>>>,
+    shutdown_requested: Arc<AtomicBool>,
+}
+
+impl AgentInterrupt {
+    fn is_shutdown_requested(&self) -> bool {
+        self.shutdown_requested.load(Ordering::SeqCst)
+    }
+
+    fn request_shutdown(&self) {
+        self.shutdown_requested.store(true, Ordering::SeqCst);
+        self.kill_current();
+    }
+
+    fn set_child(&self, child: Arc<Mutex<Child>>) {
+        if let Ok(mut current) = self.child.lock() {
+            *current = Some(child);
+        }
+    }
+
+    fn clear_child(&self, child: &Arc<Mutex<Child>>) {
+        if let Ok(mut current) = self.child.lock() {
+            if current
+                .as_ref()
+                .is_some_and(|current_child| Arc::ptr_eq(current_child, child))
+            {
+                *current = None;
+            }
+        }
+    }
+
+    fn kill_current(&self) {
+        let child = self
+            .child
+            .lock()
+            .ok()
+            .and_then(|current| current.as_ref().map(Arc::clone));
+        if let Some(child) = child {
+            if let Ok(mut child) = child.lock() {
+                kill_child_tree(&mut child);
+            }
+        }
+    }
+}
+
 struct AgentWorker {
     tx: mpsc::Sender<AgentWorkerCommand>,
     child: Arc<Mutex<Child>>,
@@ -146,6 +198,7 @@ enum AgentWorkerReply {
 
 struct AgentClient {
     launch: AgentLaunch,
+    interrupt: AgentInterrupt,
     worker: Option<AgentWorker>,
     next_id: RequestId,
 }
@@ -157,6 +210,7 @@ impl AgentClient {
         remote_root: PathBuf,
         request_timeout: Duration,
         ssh_connect_timeout_seconds: u64,
+        interrupt: AgentInterrupt,
     ) -> Self {
         Self {
             launch: AgentLaunch {
@@ -166,12 +220,13 @@ impl AgentClient {
                 request_timeout,
                 ssh_connect_timeout_seconds,
             },
+            interrupt,
             worker: None,
             next_id: 1,
         }
     }
 
-    fn spawn_worker(launch: &AgentLaunch) -> Result<AgentWorker> {
+    fn spawn_worker(launch: &AgentLaunch, interrupt: AgentInterrupt) -> Result<AgentWorker> {
         let mut command = if let Some(target) = launch.ssh.as_deref() {
             let mut command = Command::new("ssh");
             command
@@ -198,6 +253,8 @@ impl AgentClient {
             command
         };
 
+        configure_agent_process(&mut command);
+
         let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -218,6 +275,7 @@ impl AgentClient {
         let stdin = child.stdin.take().context("agent stdin was not piped")?;
         let stdout = child.stdout.take().context("agent stdout was not piped")?;
         let child = Arc::new(Mutex::new(child));
+        interrupt.set_child(Arc::clone(&child));
         let (tx, rx) = mpsc::channel::<AgentWorkerCommand>();
         let worker_child = Arc::clone(&child);
         thread::spawn(move || {
@@ -230,15 +288,19 @@ impl AgentClient {
                 let _ = command.reply.send(response);
             }
             let _ = worker_child.lock().map(|mut child| {
-                let _ = child.kill();
+                kill_child_tree(&mut child);
                 let _ = child.wait();
             });
+            interrupt.clear_child(&worker_child);
         });
 
         Ok(AgentWorker { tx, child })
     }
 
     fn request(&mut self, request: Request) -> Result<Response> {
+        if self.interrupt.is_shutdown_requested() {
+            bail!("agent request cancelled by shutdown");
+        }
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1).max(1);
         let (reply, reply_rx) = mpsc::channel();
@@ -284,8 +346,11 @@ impl AgentClient {
     }
 
     fn ensure_worker(&mut self) -> Result<&AgentWorker> {
+        if self.interrupt.is_shutdown_requested() {
+            bail!("agent worker is shut down");
+        }
         if self.worker.is_none() {
-            self.worker = Some(Self::spawn_worker(&self.launch)?);
+            self.worker = Some(Self::spawn_worker(&self.launch, self.interrupt.clone())?);
         }
         Ok(self.worker.as_ref().expect("worker was just initialized"))
     }
@@ -299,7 +364,7 @@ impl AgentClient {
         if let Some(worker) = self.worker.take() {
             drop(worker.tx);
             if let Ok(mut child) = worker.child.lock() {
-                let _ = child.kill();
+                kill_child_tree(&mut child);
                 let _ = child.wait();
             }
         }
@@ -310,6 +375,33 @@ impl Drop for AgentClient {
     fn drop(&mut self) {
         self.kill_worker();
     }
+}
+
+#[cfg(unix)]
+fn configure_agent_process(command: &mut Command) {
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) == 0 {
+                Ok(())
+            } else {
+                Err(io::Error::last_os_error())
+            }
+        });
+    }
+}
+
+#[cfg(not(unix))]
+fn configure_agent_process(_command: &mut Command) {}
+
+fn kill_child_tree(child: &mut Child) {
+    #[cfg(unix)]
+    {
+        let pid = child.id() as libc::pid_t;
+        if pid > 0 {
+            let _ = unsafe { libc::kill(-pid, libc::SIGKILL) };
+        }
+    }
+    let _ = child.kill();
 }
 
 fn send_agent_frame<W: Write, R: Read>(
@@ -1291,6 +1383,7 @@ impl Sidecar {
         state_dir: Option<PathBuf>,
         request_timeout_ms: u64,
         ssh_connect_timeout_seconds: u64,
+        agent_interrupt: AgentInterrupt,
     ) -> Result<Self> {
         let workspace_key = workspace_key(ssh.as_deref(), &remote_root);
         let mirror = Mirror::open(state_dir, &workspace_key)?;
@@ -1300,6 +1393,7 @@ impl Sidecar {
             remote_root.clone(),
             Duration::from_millis(request_timeout_ms),
             ssh_connect_timeout_seconds,
+            agent_interrupt,
         );
         let hello = agent.request(Request::Hello {
             client_version: env!("CARGO_PKG_VERSION").to_string(),
@@ -2268,6 +2362,7 @@ fn run_server(
     ssh_connect_timeout_seconds: u64,
 ) -> Result<()> {
     let stdin = io::stdin();
+    let agent_interrupt = AgentInterrupt::default();
     let sidecar = Sidecar::new(
         remote_root,
         ssh,
@@ -2275,6 +2370,7 @@ fn run_server(
         state_dir,
         request_timeout_ms,
         ssh_connect_timeout_seconds,
+        agent_interrupt.clone(),
     )?;
     let pending_remote = Arc::new(Mutex::new(PendingRemote::default()));
     let fast_state = FastState::from_sidecar(&sidecar, Arc::clone(&pending_remote));
@@ -2292,17 +2388,24 @@ fn run_server(
     let (remote_tx, remote_rx) = mpsc::sync_channel::<RemoteWork>(128);
     let remote_response_tx = response_tx.clone();
     let remote_pending = Arc::clone(&pending_remote);
+    let remote_interrupt = agent_interrupt.clone();
     let remote_worker = thread::spawn(move || {
         let mut sidecar = sidecar;
         for work in remote_rx {
             let RemoteWork { request, hazard } = work;
+            if remote_interrupt.is_shutdown_requested() {
+                if let Ok(mut pending) = remote_pending.lock() {
+                    pending.clear(&hazard);
+                }
+                break;
+            }
             let should_shutdown = matches!(request.method.as_str(), "shutdown" | "disconnect");
             let response = handle_client_request(&mut sidecar, request);
             if let Ok(mut pending) = remote_pending.lock() {
                 pending.clear(&hazard);
             }
-            let _ = remote_response_tx.send(response);
-            if should_shutdown {
+            try_send_client_response(&remote_response_tx, response);
+            if should_shutdown || remote_interrupt.is_shutdown_requested() {
                 break;
             }
         }
@@ -2316,20 +2419,39 @@ fn run_server(
         let request: ClientRequest = match serde_json::from_str(&line) {
             Ok(request) => request,
             Err(error) => {
-                let _ = response_tx.send(ClientResponse {
-                    id: 0,
-                    ok: false,
-                    result: None,
-                    error: Some(format!("invalid request JSON: {error}")),
-                });
+                try_send_client_response(
+                    &response_tx,
+                    ClientResponse {
+                        id: 0,
+                        ok: false,
+                        result: None,
+                        error: Some(format!("invalid request JSON: {error}")),
+                    },
+                );
                 continue;
             }
         };
 
         let should_shutdown = matches!(request.method.as_str(), "shutdown" | "disconnect");
+        if should_shutdown {
+            agent_interrupt.request_shutdown();
+            try_send_client_response(
+                &response_tx,
+                ClientResponse {
+                    id: request.id,
+                    ok: true,
+                    result: Some(json!({"shutdown": true})),
+                    error: None,
+                },
+            );
+            break;
+        }
         match fast_state.try_handle(&request) {
             FastHandle::Handled(result) => {
-                let _ = response_tx.send(result_to_client_response(request.id, result));
+                try_send_client_response(
+                    &response_tx,
+                    result_to_client_response(request.id, result),
+                );
             }
             FastHandle::Defer => {
                 let hazard = PendingHazard::for_request(&request);
@@ -2337,17 +2459,24 @@ fn run_server(
                     pending.register(&hazard);
                 }
                 let work = RemoteWork { request, hazard };
-                if let Err(error) = remote_tx.send(work) {
-                    let work = error.0;
+                if let Err(error) = remote_tx.try_send(work) {
+                    let work = match error {
+                        mpsc::TrySendError::Full(work) | mpsc::TrySendError::Disconnected(work) => {
+                            work
+                        }
+                    };
                     if let Ok(mut pending) = pending_remote.lock() {
                         pending.clear(&work.hazard);
                     }
-                    let _ = response_tx.send(ClientResponse {
-                        id: work.request.id,
-                        ok: false,
-                        result: None,
-                        error: Some("remote worker is not available".to_string()),
-                    });
+                    try_send_client_response(
+                        &response_tx,
+                        ClientResponse {
+                            id: work.request.id,
+                            ok: false,
+                            result: None,
+                            error: Some("remote worker is busy or not available".to_string()),
+                        },
+                    );
                 }
             }
         }
@@ -2387,6 +2516,13 @@ fn result_to_client_response(id: u64, result: Result<Value>) -> ClientResponse {
             error: Some(error.to_string()),
         },
     }
+}
+
+fn try_send_client_response(
+    tx: &mpsc::SyncSender<ClientResponse>,
+    response: ClientResponse,
+) -> bool {
+    tx.try_send(response).is_ok()
 }
 
 fn run_lsp_proxy(
@@ -2680,6 +2816,7 @@ mod tests {
                 PathBuf::from("/unused"),
                 Duration::from_millis(1),
                 1,
+                AgentInterrupt::default(),
             ),
             mirror,
             remote_root: PathBuf::from("/unused"),
@@ -3102,6 +3239,25 @@ mod tests {
         assert!(error.contains("response id mismatch"));
     }
 
+    #[test]
+    fn agent_request_after_shutdown_does_not_spawn_worker() {
+        let interrupt = AgentInterrupt::default();
+        interrupt.request_shutdown();
+        let mut client = AgentClient::new(
+            "unused-agent".to_string(),
+            None,
+            PathBuf::from("/unused"),
+            Duration::from_secs(30),
+            1,
+            interrupt.clone(),
+        );
+
+        let error = client.request(Request::Shutdown).unwrap_err().to_string();
+
+        assert!(error.contains("shutdown"));
+        assert!(interrupt.child.lock().unwrap().is_none());
+    }
+
     #[cfg(unix)]
     #[test]
     fn agent_request_times_out_when_agent_stalls() {
@@ -3109,7 +3265,7 @@ mod tests {
 
         let dir = tempdir().unwrap();
         let fake_agent = dir.path().join("fake-agent");
-        fs::write(&fake_agent, "#!/bin/sh\nsleep 60\n").unwrap();
+        fs::write(&fake_agent, "#!/bin/sh\nexec sleep 60\n").unwrap();
         let mut permissions = fs::metadata(&fake_agent).unwrap().permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(&fake_agent, permissions).unwrap();
@@ -3120,6 +3276,7 @@ mod tests {
             dir.path().to_path_buf(),
             Duration::from_millis(50),
             1,
+            AgentInterrupt::default(),
         );
         let error = client
             .request(Request::Hello {
@@ -3129,5 +3286,49 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("timed out"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_interrupt_kills_stalled_request_before_timeout() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let fake_agent = dir.path().join("fake-agent");
+        fs::write(&fake_agent, "#!/bin/sh\nsleep 60\n").unwrap();
+        let mut permissions = fs::metadata(&fake_agent).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&fake_agent, permissions).unwrap();
+
+        let interrupt = AgentInterrupt::default();
+        let client_interrupt = interrupt.clone();
+        let mut client = AgentClient::new(
+            fake_agent.to_string_lossy().to_string(),
+            None,
+            dir.path().to_path_buf(),
+            Duration::from_secs(30),
+            1,
+            client_interrupt,
+        );
+        let started = std::time::Instant::now();
+        let handle = thread::spawn(move || {
+            client.request(Request::Hello {
+                client_version: "test".to_string(),
+                protocol_version: PROTOCOL_VERSION,
+            })
+        });
+
+        for _ in 0..100 {
+            if interrupt.child.lock().unwrap().is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(interrupt.child.lock().unwrap().is_some());
+        interrupt.kill_current();
+
+        let error = handle.join().unwrap().unwrap_err().to_string();
+        assert!(!error.is_empty());
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 }
