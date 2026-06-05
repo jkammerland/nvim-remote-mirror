@@ -73,7 +73,9 @@ COMMANDS                                      *nvim-remote-mirror-commands*
 :RemoteFlush
     Flush the current remote buffer to the remote workspace using checksum
     compare-and-swap. Large saves are uploaded in chunks. If no sidecar is
-    connected, the path is marked for replay after reconnect.
+    connected, the path is marked for replay after reconnect. Buffers are
+    tagged with the workspace that opened them; if another target is active,
+    the save is deferred until the original workspace is reconnected.
 
 :RemoteFlushQueue
     Retry queued or previously failed remote saves and report applied, still

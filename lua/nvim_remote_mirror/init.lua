@@ -365,16 +365,117 @@ local function status_remote_summary(result)
   return table.concat(parts, " ")
 end
 
-local function mark_deferred_flush(bufnr, path, reason)
+local function client_identity(client)
+  if not client then
+    return nil
+  end
+  local hello = client.hello or {}
+  return {
+    workspace_key = optional_string(hello.workspace_key),
+    target_arg = optional_string(client.target_arg),
+    files_root = optional_string(hello.files_root),
+  }
+end
+
+local function buffer_identity(bufnr)
+  if not bufnr or not vim.api.nvim_buf_is_valid(bufnr) then
+    return nil
+  end
+  return {
+    workspace_key = optional_string(vim.b[bufnr].nrm_workspace_key),
+    target_arg = optional_string(vim.b[bufnr].nrm_target_arg),
+    files_root = optional_string(vim.b[bufnr].nrm_files_root),
+  }
+end
+
+local function identity_key(identity)
+  identity = identity or {}
+  return table.concat({
+    identity.workspace_key or "",
+    identity.target_arg or "",
+    identity.files_root or "",
+  }, "\30")
+end
+
+local function deferred_flush_key(path, identity)
+  return identity_key(identity) .. "\31" .. path
+end
+
+local function identity_matches_client(identity, client)
+  if not identity then
+    return true
+  end
+  local current = client_identity(client)
+  if not current then
+    return false
+  end
+  if identity.workspace_key and current.workspace_key then
+    return identity.workspace_key == current.workspace_key
+  end
+  if identity.target_arg and current.target_arg then
+    return identity.target_arg == current.target_arg
+  end
+  if identity.files_root and current.files_root then
+    return normalize_local_path(identity.files_root):gsub("/+$", "")
+      == normalize_local_path(current.files_root):gsub("/+$", "")
+  end
+  return true
+end
+
+local function buffer_matches_identity(bufnr, path, identity)
+  if not vim.api.nvim_buf_is_valid(bufnr) or vim.b[bufnr].nrm_remote_path ~= path then
+    return false
+  end
+  return identity_key(buffer_identity(bufnr)) == identity_key(identity)
+end
+
+local function has_deferred_flush(path, identity)
+  return M.deferred_flushes[deferred_flush_key(path, identity)] ~= nil
+end
+
+local function flush_target_buffers(bufnr, identity)
+  local targets = {}
+  if bufnr then
+    table.insert(targets, bufnr)
+    return targets
+  end
+  for pending_bufnr in pairs((identity and identity.bufnrs) or {}) do
+    table.insert(targets, pending_bufnr)
+  end
+  return targets
+end
+
+local function set_remote_buffer_identity(bufnr, client, result)
+  if not result or not result.path or not vim.api.nvim_buf_is_valid(bufnr) then
+    return
+  end
+  local identity = client_identity(client)
+  vim.b[bufnr].nrm_remote_path = result.path
+  vim.b[bufnr].nrm_remote_hash = result.hash
+  vim.b[bufnr].nrm_workspace_key = identity and identity.workspace_key or nil
+  vim.b[bufnr].nrm_target_arg = identity and identity.target_arg or nil
+  vim.b[bufnr].nrm_files_root = identity and identity.files_root or nil
+  vim.b[bufnr].nrm_flush_pending = has_deferred_flush(result.path, identity)
+end
+
+local function mark_deferred_flush(bufnr, path, reason, identity)
   if not path or path == "" then
     return false
   end
+  identity = identity or buffer_identity(bufnr) or client_identity(M.client)
 
-  local item = M.deferred_flushes[path]
+  local key = deferred_flush_key(path, identity)
+  local item = M.deferred_flushes[key]
   local is_new = item == nil
   if not item then
-    item = { path = path, bufnrs = {} }
-    M.deferred_flushes[path] = item
+    item = {
+      path = path,
+      workspace_key = identity and identity.workspace_key or nil,
+      target_arg = identity and identity.target_arg or nil,
+      files_root = identity and identity.files_root or nil,
+      bufnrs = {},
+    }
+    M.deferred_flushes[key] = item
   end
   item.reason = reason
   item.updated_at = os.time()
@@ -385,29 +486,40 @@ local function mark_deferred_flush(bufnr, path, reason)
   return is_new
 end
 
-local function clear_deferred_flush(path)
-  if not path or not M.deferred_flushes[path] then
+local function clear_deferred_flush(path, identity)
+  if not path then
     return
   end
-  M.deferred_flushes[path] = nil
+  local key = deferred_flush_key(path, identity)
+  if not M.deferred_flushes[key] then
+    return
+  end
+  M.deferred_flushes[key] = nil
   for _, bufnr in ipairs(vim.api.nvim_list_bufs()) do
-    if vim.api.nvim_buf_is_valid(bufnr) and vim.b[bufnr].nrm_remote_path == path then
+    if buffer_matches_identity(bufnr, path, identity) then
       vim.b[bufnr].nrm_flush_pending = false
     end
   end
 end
 
-local function deferred_flush_paths()
-  local paths = {}
-  for path in pairs(M.deferred_flushes) do
-    table.insert(paths, path)
+local function deferred_flush_items(client)
+  local items = {}
+  for _, item in pairs(M.deferred_flushes) do
+    if not client or identity_matches_client(item, client) then
+      table.insert(items, item)
+    end
   end
-  table.sort(paths)
-  return paths
+  table.sort(items, function(a, b)
+    if a.path == b.path then
+      return identity_key(a) < identity_key(b)
+    end
+    return a.path < b.path
+  end)
+  return items
 end
 
 local function schedule_deferred_flushes_on_connect(client, generation)
-  if next(M.deferred_flushes) == nil then
+  if #deferred_flush_items(client) == 0 then
     return
   end
   vim.defer_fn(function()
@@ -843,7 +955,7 @@ end
 
 local prefetch_related
 
-local function apply_mirror_file_to_buffer(bufnr, local_path, result)
+local function apply_mirror_file_to_buffer(bufnr, local_path, result, client)
   local ok, lines = pcall(vim.fn.readfile, local_path, "b")
   if not ok then
     notify("failed to read local mirror file " .. local_path .. ": " .. tostring(lines), vim.log.levels.ERROR)
@@ -855,9 +967,7 @@ local function apply_mirror_file_to_buffer(bufnr, local_path, result)
   vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, lines)
   vim.api.nvim_set_option_value("modified", false, { buf = bufnr })
   if result then
-    vim.b[bufnr].nrm_remote_path = result.path
-    vim.b[bufnr].nrm_remote_hash = result.hash
-    vim.b[bufnr].nrm_flush_pending = M.deferred_flushes[result.path] ~= nil
+    set_remote_buffer_identity(bufnr, client or M.client, result)
   end
   return true
 end
@@ -891,13 +1001,18 @@ function setup_mirror_autohydrate(client)
       if not relative_path then
         return
       end
+      set_remote_buffer_identity(bufnr, client, {
+        path = relative_path,
+        local_path = local_path,
+        cached = true,
+      })
 
       if uv.fs_stat(local_path) then
         apply_mirror_file_to_buffer(bufnr, local_path, {
           path = relative_path,
           local_path = local_path,
           cached = true,
-        })
+        }, client)
         return
       end
 
@@ -927,7 +1042,7 @@ function setup_mirror_autohydrate(client)
               notify("skipped hydrate for modified mirror buffer " .. relative_path, vim.log.levels.WARN)
               return
             end
-            if apply_mirror_file_to_buffer(bufnr, result.local_path, result) then
+            if apply_mirror_file_to_buffer(bufnr, result.local_path, result, client) then
               warn_cached_open(result)
               vim.defer_fn(function()
                 prefetch_related(result.path)
@@ -976,6 +1091,7 @@ end
 
 function M.open(path, opts)
   opts = opts or {}
+  local client = M.client
   M.request("open", {
     path = path,
     force = opts.force == true,
@@ -989,10 +1105,11 @@ function M.open(path, opts)
       return
     end
     vim.schedule(function()
+      if M.client ~= client then
+        return
+      end
       vim.cmd.edit(vim.fn.fnameescape(result.local_path))
-      vim.b.nrm_remote_path = result.path
-      vim.b.nrm_remote_hash = result.hash
-      vim.b.nrm_flush_pending = M.deferred_flushes[result.path] ~= nil
+      set_remote_buffer_identity(0, client, result)
       warn_cached_open(result)
       vim.defer_fn(function()
         prefetch_related(result.path)
@@ -1007,22 +1124,26 @@ local function flush_remote_path(path, opts)
   if not path or path == "" then
     return
   end
-  if not M.client then
-    local is_new = mark_deferred_flush(bufnr, path, "disconnected")
+  local identity = opts.identity or buffer_identity(bufnr) or client_identity(M.client)
+  if not M.client or not identity_matches_client(identity, M.client) then
+    local reason = M.client and "workspace mismatch" or "disconnected"
+    local is_new = mark_deferred_flush(bufnr, path, reason, identity)
     if is_new then
-      notify("deferred remote save for " .. path .. " until reconnect", vim.log.levels.WARN)
+      local suffix = reason == "workspace mismatch" and " until its workspace is reconnected"
+        or " until reconnect"
+      notify("deferred remote save for " .. path .. suffix, vim.log.levels.WARN)
     end
     return
   end
 
   M.request("flush", { path = path }, function(err, result)
     if err then
-      mark_deferred_flush(bufnr, path, err)
+      mark_deferred_flush(bufnr, path, err, identity)
       notify("remote save deferred for " .. path .. ": " .. err, vim.log.levels.WARN)
       return
     end
     if result.status == "conflict" then
-      clear_deferred_flush(result.path or path)
+      clear_deferred_flush(result.path or path, identity)
       local suffix = ""
       if result.remote_content_truncated then
         suffix = " (remote copy truncated; full remote size " .. tostring(result.remote_size or "unknown") .. " bytes)"
@@ -1034,17 +1155,19 @@ local function flush_remote_path(path, opts)
       return
     end
     if result.status == "queued" then
-      clear_deferred_flush(result.path or path)
+      clear_deferred_flush(result.path or path, identity)
       notify(
         "remote save queued for " .. result.path .. ": " .. result.reason,
         vim.log.levels.WARN
       )
       return
     end
-    clear_deferred_flush(result.path or path)
+    clear_deferred_flush(result.path or path, identity)
     vim.schedule(function()
-      if bufnr and vim.api.nvim_buf_is_valid(bufnr) then
-        vim.b[bufnr].nrm_remote_hash = result.hash
+      for _, target_bufnr in ipairs(flush_target_buffers(bufnr, identity)) do
+        if buffer_matches_identity(target_bufnr, result.path or path, identity) then
+          vim.b[target_bufnr].nrm_remote_hash = result.hash
+        end
       end
     end)
   end)
@@ -1053,15 +1176,15 @@ end
 function M.flush_buffer(bufnr)
   bufnr = bufnr or vim.api.nvim_get_current_buf()
   local path = vim.b[bufnr].nrm_remote_path
-  flush_remote_path(path, { bufnr = bufnr })
+  flush_remote_path(path, { bufnr = bufnr, identity = buffer_identity(bufnr) })
 end
 
 function M.flush_deferred()
-  local paths = deferred_flush_paths()
-  for _, path in ipairs(paths) do
-    flush_remote_path(path, { deferred = true })
+  local items = deferred_flush_items(M.client)
+  for _, item in ipairs(items) do
+    flush_remote_path(item.path, { deferred = true, identity = item })
   end
-  return #paths
+  return #items
 end
 
 function M.scan(limit)

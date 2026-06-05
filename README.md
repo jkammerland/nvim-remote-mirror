@@ -207,6 +207,10 @@ bytes are snapshotted into the durable save queue before queued saves are
 flushed. Tune this with `recover_local_edits_on_connect` and
 `recover_local_edits_limit`, or call `recover_local_edits()` manually before
 `flush_queue()`.
+Remote buffers are tagged with the workspace that opened them. If you connect
+to another target and save an older remote buffer, the plugin defers that save
+instead of flushing the same relative path into the wrong workspace; it replays
+when the original workspace is active again.
 
 Small saves use one RPC request. Large saves stream through a chunked
 compare-and-swap upload: the agent checks the remote base hash before accepting
