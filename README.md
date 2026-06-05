@@ -301,9 +301,13 @@ Current transport state:
   the current agent/SSH process group on Unix so shutdown is not pinned to the
   normal request timeout. Deferred sidecar work uses separate interactive and
   background queues so explicit opens/saves are not rejected by, or drained
-  behind, queued prefetch, scan, or refresh work. Active background maintenance
-  requests and read-only remote work can be preempted by newer interactive work
-  or explicit cancellation by restarting the serial SSH/agent worker;
+  behind, queued prefetch, scan, or refresh work. Remote execution is split into
+  read and write lanes with separate agent sessions, so unrelated opens, grep,
+  validation, and probes can continue while save/flush work is in flight; reads
+  that could conflict with pending writes are routed through the write lane to
+  preserve ordering. Active background maintenance requests and read-only remote
+  work can be preempted by newer interactive work or explicit cancellation by
+  restarting that lane's serial SSH/agent worker;
   `preempted` responses are normal no-op client results, and save/flush
   requests are not preempted once started.
   Agent and LSP launches share a transport command planner, keeping SSH stdio as
@@ -312,5 +316,5 @@ Current transport state:
   remote work, clearing pending path hazards before that work reaches SSH, and
   can preempt matching active read-only/background work. Active save/flush work
   still runs to completion once started.
-- pending: active in-flight cancellation for save/flush requests, true
-  multiplexing, streaming results, and transport-level flow control.
+- pending: true multiplexing within a single transport session, streaming
+  results, and transport-level flow control.

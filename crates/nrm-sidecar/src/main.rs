@@ -502,6 +502,19 @@ impl AgentClient {
         }
     }
 
+    fn from_launch(launch: AgentLaunch, interrupt: AgentInterrupt) -> Self {
+        Self {
+            launch,
+            interrupt,
+            preempt: AgentPreempt::default(),
+            worker: None,
+            handshake_complete: false,
+            unavailable_until: None,
+            last_remote_error: None,
+            next_id: 1,
+        }
+    }
+
     fn spawn_worker(launch: &AgentLaunch, interrupt: AgentInterrupt) -> Result<AgentWorker> {
         let plan = launch
             .transport
@@ -2469,6 +2482,8 @@ struct RemoteWork {
     request: ClientRequest,
     hazard: PendingHazard,
     priority: RemotePriority,
+    lane: RemoteLane,
+    write_hazard_registered: bool,
 }
 
 struct StartedRemoteWork {
@@ -2480,17 +2495,67 @@ struct StartedRemoteWork {
 struct ActiveRemoteWork {
     id: u64,
     method: String,
+    lane: RemoteLane,
 }
 
 #[derive(Debug, Clone, Default)]
 struct ActiveRemote {
-    current: Arc<Mutex<Option<ActiveRemoteWork>>>,
+    current: Arc<Mutex<HashMap<RemoteLane, ActiveRemoteWork>>>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
+enum RemoteLane {
+    Read,
+    Write,
+}
+
+#[derive(Debug, Clone)]
+struct RemotePreempts {
+    read: AgentPreempt,
+    write: AgentPreempt,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum RemotePriority {
     Interactive,
     Background,
+}
+
+impl RemoteLane {
+    fn for_request(request: &ClientRequest, pending_writes: &PendingRemote) -> Self {
+        if request_is_write_lane(request) {
+            return Self::Write;
+        }
+        let interest = RequestInterest::for_request(request);
+        if pending_writes.conflicts_with_interest(&interest) {
+            Self::Write
+        } else {
+            Self::Read
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+        }
+    }
+}
+
+impl RemotePreempts {
+    fn for_lane(&self, lane: RemoteLane) -> &AgentPreempt {
+        match lane {
+            RemoteLane::Read => &self.read,
+            RemoteLane::Write => &self.write,
+        }
+    }
+}
+
+fn request_is_write_lane(request: &ClientRequest) -> bool {
+    matches!(
+        request.method.as_str(),
+        "flush" | "flush_queued" | "flush_queue"
+    )
 }
 
 struct RemoteQueue {
@@ -2528,30 +2593,34 @@ impl RemotePriority {
 impl ActiveRemote {
     fn set(&self, work: &RemoteWork) {
         if let Ok(mut current) = self.current.lock() {
-            *current = Some(ActiveRemoteWork {
-                id: work.request.id,
-                method: work.request.method.clone(),
-            });
+            current.insert(
+                work.lane,
+                ActiveRemoteWork {
+                    id: work.request.id,
+                    method: work.request.method.clone(),
+                    lane: work.lane,
+                },
+            );
         }
     }
 
     fn clear(&self, request_id: u64) {
         if let Ok(mut current) = self.current.lock() {
-            if current.as_ref().is_some_and(|work| work.id == request_id) {
-                *current = None;
+            let lane = current
+                .iter()
+                .find_map(|(lane, work)| (work.id == request_id).then_some(*lane));
+            if let Some(lane) = lane {
+                current.remove(&lane);
             }
         }
     }
 
-    fn cancel_if_active(&self, request_id: u64, preempt: &AgentPreempt) -> Option<ActiveCancel> {
+    fn cancel_if_active(&self, request_id: u64, preempts: &RemotePreempts) -> Option<ActiveCancel> {
         self.current.lock().ok().and_then(|current| {
-            let active = current
-                .as_ref()
-                .filter(|work| work.id == request_id)?
-                .clone();
+            let active = current.values().find(|work| work.id == request_id)?.clone();
             let canceled = active_request_is_preemptible(&active);
             if canceled {
-                preempt.request_preemption();
+                preempts.for_lane(active.lane).request_preemption();
             }
             Some(ActiveCancel { active, canceled })
         })
@@ -2559,12 +2628,10 @@ impl ActiveRemote {
 
     #[cfg(test)]
     fn get(&self, request_id: u64) -> Option<ActiveRemoteWork> {
-        self.current.lock().ok().and_then(|current| {
-            current
-                .as_ref()
-                .filter(|work| work.id == request_id)
-                .cloned()
-        })
+        self.current
+            .lock()
+            .ok()
+            .and_then(|current| current.values().find(|work| work.id == request_id).cloned())
     }
 }
 
@@ -2791,6 +2858,20 @@ impl PendingRemote {
 
     fn blocks_path(&self, path: &str) -> bool {
         self.unknown_content_mutations > 0 || self.exact_paths.contains_key(path)
+    }
+
+    fn conflicts_with_interest(&self, interest: &RequestInterest) -> bool {
+        if !interest.has_content_interest() {
+            return false;
+        }
+        if interest.unknown_content {
+            return self.unknown_content_mutations > 0 || !self.exact_paths.is_empty();
+        }
+        self.unknown_content_mutations > 0
+            || interest
+                .exact_paths
+                .iter()
+                .any(|path| self.exact_paths.contains_key(path))
     }
 }
 
@@ -3089,6 +3170,16 @@ impl Sidecar {
             remote_health: Arc::new(Mutex::new(RemoteHealth::default())),
         };
         Ok(sidecar)
+    }
+
+    fn clone_for_lane(&self, agent_interrupt: AgentInterrupt) -> Result<Self> {
+        Ok(Self {
+            agent: AgentClient::from_launch(self.agent.launch.clone(), agent_interrupt),
+            mirror: Mirror::open_root(self.mirror.root().to_path_buf())?,
+            remote_root: self.remote_root.clone(),
+            workspace_key: self.workspace_key.clone(),
+            remote_health: Arc::clone(&self.remote_health),
+        })
     }
 
     fn handle(&mut self, method: &str, params: Value, preempt_epoch: u64) -> Result<Value> {
@@ -4374,9 +4465,17 @@ fn run_server(
         ssh_connect_timeout_seconds,
         agent_interrupt.clone(),
     )?;
+    let write_interrupt = AgentInterrupt::default();
+    let write_sidecar = sidecar.clone_for_lane(write_interrupt.clone())?;
     let pending_remote = Arc::new(Mutex::new(PendingRemote::default()));
+    let pending_writes = Arc::new(Mutex::new(PendingRemote::default()));
     let fast_state = FastState::from_sidecar(&sidecar, Arc::clone(&pending_remote));
-    let agent_preempt = sidecar.agent.preempt_handle();
+    let read_preempt = sidecar.agent.preempt_handle();
+    let write_preempt = write_sidecar.agent.preempt_handle();
+    let remote_preempts = RemotePreempts {
+        read: read_preempt.clone(),
+        write: write_preempt.clone(),
+    };
     let (response_tx, response_rx) = mpsc::sync_channel::<ClientResponse>(1024);
     let writer = thread::spawn(move || -> Result<()> {
         let stdout = io::stdout();
@@ -4388,57 +4487,35 @@ fn run_server(
         Ok(())
     });
 
-    let remote_queue = Arc::new(RemoteQueue::new(
+    let read_queue = Arc::new(RemoteQueue::new(
+        REMOTE_INTERACTIVE_QUEUE_CAPACITY,
+        REMOTE_BACKGROUND_QUEUE_CAPACITY,
+    ));
+    let write_queue = Arc::new(RemoteQueue::new(
         REMOTE_INTERACTIVE_QUEUE_CAPACITY,
         REMOTE_BACKGROUND_QUEUE_CAPACITY,
     ));
     let active_remote = ActiveRemote::default();
-    let remote_response_tx = response_tx.clone();
-    let remote_pending = Arc::clone(&pending_remote);
-    let remote_interrupt = agent_interrupt.clone();
-    let remote_worker_queue = Arc::clone(&remote_queue);
-    let remote_worker_preempt = agent_preempt.clone();
-    let remote_worker_active = active_remote.clone();
-    let remote_worker = thread::spawn(move || {
-        let mut sidecar = sidecar;
-        while let Some(started) = remote_worker_queue.pop_started(&remote_worker_preempt) {
-            let preempt_epoch = started.preempt_epoch;
-            let RemoteWork {
-                request,
-                hazard,
-                priority,
-            } = started.work;
-            let request_id = request.id;
-            let work = RemoteWork {
-                request,
-                hazard,
-                priority,
-            };
-            remote_worker_active.set(&work);
-            let RemoteWork {
-                request, hazard, ..
-            } = work;
-            if remote_interrupt.is_shutdown_requested() {
-                if let Ok(mut pending) = remote_pending.lock() {
-                    pending.clear(&hazard);
-                }
-                remote_worker_active.clear(request_id);
-                clear_pending_hazards(&remote_pending, remote_worker_queue.shutdown_and_drain());
-                break;
-            }
-            let should_shutdown = matches!(request.method.as_str(), "shutdown" | "disconnect");
-            let response = handle_client_request(&mut sidecar, request, preempt_epoch);
-            if let Ok(mut pending) = remote_pending.lock() {
-                pending.clear(&hazard);
-            }
-            remote_worker_active.clear(request_id);
-            send_client_response(&remote_response_tx, response);
-            if should_shutdown || remote_interrupt.is_shutdown_requested() {
-                clear_pending_hazards(&remote_pending, remote_worker_queue.shutdown_and_drain());
-                break;
-            }
-        }
-    });
+    let read_worker = spawn_remote_worker(
+        sidecar,
+        Arc::clone(&read_queue),
+        read_preempt,
+        active_remote.clone(),
+        Arc::clone(&pending_remote),
+        Arc::clone(&pending_writes),
+        agent_interrupt.clone(),
+        response_tx.clone(),
+    );
+    let write_worker = spawn_remote_worker(
+        write_sidecar,
+        Arc::clone(&write_queue),
+        write_preempt,
+        active_remote.clone(),
+        Arc::clone(&pending_remote),
+        Arc::clone(&pending_writes),
+        write_interrupt.clone(),
+        response_tx.clone(),
+    );
 
     for line in stdin.lock().lines() {
         let line = line?;
@@ -4464,7 +4541,17 @@ fn run_server(
         let should_shutdown = matches!(request.method.as_str(), "shutdown" | "disconnect");
         if should_shutdown {
             agent_interrupt.request_shutdown();
-            clear_pending_hazards(&pending_remote, remote_queue.shutdown_and_drain());
+            write_interrupt.request_shutdown();
+            clear_pending_works(
+                &pending_remote,
+                &pending_writes,
+                read_queue.shutdown_and_drain(),
+            );
+            clear_pending_works(
+                &pending_remote,
+                &pending_writes,
+                write_queue.shutdown_and_drain(),
+            );
             send_client_response(
                 &response_tx,
                 ClientResponse {
@@ -4479,9 +4566,20 @@ fn run_server(
         if request.method == "cancel" {
             let response = match cancel_request_id(&request.params) {
                 Ok(target_id) => {
-                    if let Some(work) =
-                        cancel_queued_request(&remote_queue, &pending_remote, target_id)
-                    {
+                    if let Some(work) = cancel_queued_request(
+                        &read_queue,
+                        &pending_remote,
+                        &pending_writes,
+                        target_id,
+                    )
+                    .or_else(|| {
+                        cancel_queued_request(
+                            &write_queue,
+                            &pending_remote,
+                            &pending_writes,
+                            target_id,
+                        )
+                    }) {
                         send_client_response(&response_tx, canceled_client_response(work));
                         result_to_client_response(
                             request.id,
@@ -4492,7 +4590,7 @@ fn run_server(
                             })),
                         )
                     } else if let Some(result) =
-                        cancel_active_request(&active_remote, &agent_preempt, target_id)
+                        cancel_active_request(&active_remote, &remote_preempts, target_id)
                     {
                         result_to_client_response(request.id, Ok(result))
                     } else {
@@ -4530,25 +4628,40 @@ fn run_server(
             }
             FastHandle::Defer => {
                 let hazard = PendingHazard::for_request(&request);
+                let lane = pending_writes
+                    .lock()
+                    .map(|pending| RemoteLane::for_request(&request, &pending))
+                    .unwrap_or(RemoteLane::Write);
+                let write_hazard_registered = request_is_write_lane(&request);
                 if let Ok(mut pending) = pending_remote.lock() {
                     pending.register(&hazard);
+                }
+                if write_hazard_registered {
+                    if let Ok(mut pending) = pending_writes.lock() {
+                        pending.register(&hazard);
+                    }
                 }
                 let priority = RemotePriority::for_request(&request);
                 let work = RemoteWork {
                     request,
                     hazard,
                     priority,
+                    lane,
+                    write_hazard_registered,
                 };
-                let preempt = (priority == RemotePriority::Interactive).then_some(&agent_preempt);
-                match remote_queue.try_push(work, preempt) {
+                let queue = match lane {
+                    RemoteLane::Read => &read_queue,
+                    RemoteLane::Write => &write_queue,
+                };
+                let preempt = (priority == RemotePriority::Interactive)
+                    .then_some(remote_preempts.for_lane(lane));
+                match queue.try_push(work, preempt) {
                     Ok(canceled) => {
-                        clear_pending_hazard_refs(&pending_remote, &canceled);
+                        clear_pending_work_refs(&pending_remote, &pending_writes, &canceled);
                         send_preempted_responses(&response_tx, canceled);
                     }
                     Err(work) => {
-                        if let Ok(mut pending) = pending_remote.lock() {
-                            pending.clear(&work.hazard);
-                        }
+                        clear_pending_work(&pending_remote, &pending_writes, &work);
                         let response = if work.request.method == "flush_queued" {
                             result_to_client_response(
                                 work.request.id,
@@ -4556,7 +4669,8 @@ fn run_server(
                                     "status": "queued",
                                     "path": work.request.params.get("path").and_then(Value::as_str).unwrap_or(""),
                                     "reason": format!(
-                                        "remote {} queue is full or not available; saved locally",
+                                        "remote {} {} queue is full or not available; saved locally",
+                                        work.lane.label(),
                                         work.priority.label()
                                     )
                                 })),
@@ -4567,7 +4681,8 @@ fn run_server(
                                 ok: false,
                                 result: None,
                                 error: Some(format!(
-                                    "remote {} queue is full or not available",
+                                    "remote {} {} queue is full or not available",
+                                    work.lane.label(),
                                     work.priority.label()
                                 )),
                             }
@@ -4582,14 +4697,71 @@ fn run_server(
         }
     }
 
-    clear_pending_hazards(&pending_remote, remote_queue.close_and_drain_background());
-    let _ = remote_worker.join();
+    clear_pending_works(
+        &pending_remote,
+        &pending_writes,
+        read_queue.close_and_drain_background(),
+    );
+    clear_pending_works(
+        &pending_remote,
+        &pending_writes,
+        write_queue.close_and_drain_background(),
+    );
+    let _ = read_worker.join();
+    let _ = write_worker.join();
     drop(response_tx);
     match writer.join() {
         Ok(result) => result?,
         Err(_) => bail!("server writer thread panicked"),
     }
     Ok(())
+}
+
+fn spawn_remote_worker(
+    mut sidecar: Sidecar,
+    queue: Arc<RemoteQueue>,
+    preempt: AgentPreempt,
+    active: ActiveRemote,
+    pending_remote: Arc<Mutex<PendingRemote>>,
+    pending_writes: Arc<Mutex<PendingRemote>>,
+    interrupt: AgentInterrupt,
+    response_tx: mpsc::SyncSender<ClientResponse>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        while let Some(started) = queue.pop_started(&preempt) {
+            let preempt_epoch = started.preempt_epoch;
+            let work = started.work;
+            let request_id = work.request.id;
+            active.set(&work);
+            if interrupt.is_shutdown_requested() {
+                clear_pending_work(&pending_remote, &pending_writes, &work);
+                active.clear(request_id);
+                clear_pending_works(&pending_remote, &pending_writes, queue.shutdown_and_drain());
+                break;
+            }
+
+            let should_shutdown = matches!(work.request.method.as_str(), "shutdown" | "disconnect");
+            let RemoteWork {
+                request,
+                hazard,
+                write_hazard_registered,
+                ..
+            } = work;
+            let response = handle_client_request(&mut sidecar, request, preempt_epoch);
+            clear_pending_hazard(
+                &pending_remote,
+                &pending_writes,
+                &hazard,
+                write_hazard_registered,
+            );
+            active.clear(request_id);
+            send_client_response(&response_tx, response);
+            if should_shutdown || interrupt.is_shutdown_requested() {
+                clear_pending_works(&pending_remote, &pending_writes, queue.shutdown_and_drain());
+                break;
+            }
+        }
+    })
 }
 
 fn handle_client_request(
@@ -4619,6 +4791,7 @@ fn result_to_client_response(id: u64, result: Result<Value>) -> ClientResponse {
     }
 }
 
+#[cfg(test)]
 fn clear_pending_hazards(pending_remote: &Arc<Mutex<PendingRemote>>, works: Vec<RemoteWork>) {
     if works.is_empty() {
         return;
@@ -4630,13 +4803,64 @@ fn clear_pending_hazards(pending_remote: &Arc<Mutex<PendingRemote>>, works: Vec<
     }
 }
 
-fn clear_pending_hazard_refs(pending_remote: &Arc<Mutex<PendingRemote>>, works: &[RemoteWork]) {
+fn clear_pending_works(
+    pending_remote: &Arc<Mutex<PendingRemote>>,
+    pending_writes: &Arc<Mutex<PendingRemote>>,
+    works: Vec<RemoteWork>,
+) {
+    if works.is_empty() {
+        return;
+    }
+    clear_pending_work_refs(pending_remote, pending_writes, &works);
+}
+
+fn clear_pending_work(
+    pending_remote: &Arc<Mutex<PendingRemote>>,
+    pending_writes: &Arc<Mutex<PendingRemote>>,
+    work: &RemoteWork,
+) {
+    clear_pending_hazard(
+        pending_remote,
+        pending_writes,
+        &work.hazard,
+        work.write_hazard_registered,
+    );
+}
+
+fn clear_pending_work_refs(
+    pending_remote: &Arc<Mutex<PendingRemote>>,
+    pending_writes: &Arc<Mutex<PendingRemote>>,
+    works: &[RemoteWork],
+) {
     if works.is_empty() {
         return;
     }
     if let Ok(mut pending) = pending_remote.lock() {
         for work in works {
             pending.clear(&work.hazard);
+        }
+    }
+    if let Ok(mut pending) = pending_writes.lock() {
+        for work in works {
+            if work.write_hazard_registered {
+                pending.clear(&work.hazard);
+            }
+        }
+    }
+}
+
+fn clear_pending_hazard(
+    pending_remote: &Arc<Mutex<PendingRemote>>,
+    pending_writes: &Arc<Mutex<PendingRemote>>,
+    hazard: &PendingHazard,
+    write_hazard_registered: bool,
+) {
+    if let Ok(mut pending) = pending_remote.lock() {
+        pending.clear(hazard);
+    }
+    if write_hazard_registered {
+        if let Ok(mut pending) = pending_writes.lock() {
+            pending.clear(hazard);
         }
     }
 }
@@ -4658,21 +4882,20 @@ fn cancel_request_id(params: &Value) -> Result<u64> {
 fn cancel_queued_request(
     remote_queue: &RemoteQueue,
     pending_remote: &Arc<Mutex<PendingRemote>>,
+    pending_writes: &Arc<Mutex<PendingRemote>>,
     request_id: u64,
 ) -> Option<RemoteWork> {
     let canceled = remote_queue.cancel(request_id)?;
-    if let Ok(mut pending) = pending_remote.lock() {
-        pending.clear(&canceled.hazard);
-    }
+    clear_pending_work(pending_remote, pending_writes, &canceled);
     Some(canceled)
 }
 
 fn cancel_active_request(
     active_remote: &ActiveRemote,
-    preempt: &AgentPreempt,
+    preempts: &RemotePreempts,
     request_id: u64,
 ) -> Option<Value> {
-    let active_cancel = active_remote.cancel_if_active(request_id, preempt)?;
+    let active_cancel = active_remote.cancel_if_active(request_id, preempts)?;
     let active = active_cancel.active;
     if active_cancel.canceled {
         return Some(json!({
@@ -6339,10 +6562,22 @@ mod tests {
     fn test_remote_work_from_request(request: ClientRequest) -> RemoteWork {
         let hazard = PendingHazard::for_request(&request);
         let priority = RemotePriority::for_request(&request);
+        let pending_writes = PendingRemote::default();
+        let lane = RemoteLane::for_request(&request, &pending_writes);
+        let write_hazard_registered = request_is_write_lane(&request);
         RemoteWork {
             request,
             hazard,
             priority,
+            lane,
+            write_hazard_registered,
+        }
+    }
+
+    fn test_preempts() -> RemotePreempts {
+        RemotePreempts {
+            read: AgentPreempt::default(),
+            write: AgentPreempt::default(),
         }
     }
 
@@ -6492,13 +6727,14 @@ mod tests {
     fn cancel_queued_request_clears_pending_hazard_and_reports_original_request() {
         let queue = RemoteQueue::new(8, 8);
         let pending = Arc::new(Mutex::new(PendingRemote::default()));
+        let pending_writes = Arc::new(Mutex::new(PendingRemote::default()));
         let request = test_client_request(7, "open", json!({"path": "src/main.rs", "force": true}));
         let work = test_remote_work_from_request(request);
         pending.lock().unwrap().register(&work.hazard);
         queue.try_push(work, None).unwrap();
         assert!(pending.lock().unwrap().blocks_path("src/main.rs"));
 
-        let canceled = cancel_queued_request(&queue, &pending, 7).unwrap();
+        let canceled = cancel_queued_request(&queue, &pending, &pending_writes, 7).unwrap();
         let response = canceled_client_response(canceled);
 
         assert!(!pending.lock().unwrap().blocks_path("src/main.rs"));
@@ -6514,17 +6750,18 @@ mod tests {
     #[test]
     fn cancel_active_background_request_requests_preemption() {
         let active = ActiveRemote::default();
-        let preempt = AgentPreempt::default();
+        let preempts = test_preempts();
         let work = test_remote_work(9, "prefetch");
         active.set(&work);
 
-        let result = cancel_active_request(&active, &preempt, 9).unwrap();
+        let result = cancel_active_request(&active, &preempts, 9).unwrap();
 
         assert_eq!(result["request_id"], 9);
         assert_eq!(result["canceled"], true);
         assert_eq!(result["scope"], "active");
         assert_eq!(result["method"], "prefetch");
-        assert_eq!(preempt.epoch(), 1);
+        assert_eq!(preempts.read.epoch(), 1);
+        assert_eq!(preempts.write.epoch(), 0);
         assert_eq!(active.get(9).unwrap().id, 9);
         active.clear(9);
         assert!(active.get(9).is_none());
@@ -6533,27 +6770,28 @@ mod tests {
     #[test]
     fn cancel_active_open_request_requests_preemption() {
         let active = ActiveRemote::default();
-        let preempt = AgentPreempt::default();
+        let preempts = test_preempts();
         let work = test_remote_work(10, "open");
         active.set(&work);
 
-        let result = cancel_active_request(&active, &preempt, 10).unwrap();
+        let result = cancel_active_request(&active, &preempts, 10).unwrap();
 
         assert_eq!(result["request_id"], 10);
         assert_eq!(result["canceled"], true);
         assert_eq!(result["scope"], "active");
         assert_eq!(result["method"], "open");
-        assert_eq!(preempt.epoch(), 1);
+        assert_eq!(preempts.read.epoch(), 1);
+        assert_eq!(preempts.write.epoch(), 0);
     }
 
     #[test]
     fn cancel_active_save_request_reports_not_interrupted() {
         let active = ActiveRemote::default();
-        let preempt = AgentPreempt::default();
+        let preempts = test_preempts();
         let work = test_remote_work(11, "flush");
         active.set(&work);
 
-        let result = cancel_active_request(&active, &preempt, 11).unwrap();
+        let result = cancel_active_request(&active, &preempts, 11).unwrap();
 
         assert_eq!(result["request_id"], 11);
         assert_eq!(result["canceled"], false);
@@ -6563,22 +6801,59 @@ mod tests {
             result["reason"],
             "active request is not cancellation-preemptible"
         );
-        assert_eq!(preempt.epoch(), 0);
+        assert_eq!(preempts.read.epoch(), 0);
+        assert_eq!(preempts.write.epoch(), 0);
     }
 
     #[test]
     fn cancel_stale_active_request_does_not_preempt_current_work() {
         let active = ActiveRemote::default();
-        let preempt = AgentPreempt::default();
+        let preempts = test_preempts();
         active.set(&test_remote_work(12, "open"));
         active.clear(12);
         active.set(&test_remote_work(13, "grep"));
 
-        let result = cancel_active_request(&active, &preempt, 12);
+        let result = cancel_active_request(&active, &preempts, 12);
 
         assert!(result.is_none());
-        assert_eq!(preempt.epoch(), 0);
+        assert_eq!(preempts.read.epoch(), 0);
+        assert_eq!(preempts.write.epoch(), 0);
         assert_eq!(active.get(13).unwrap().id, 13);
+    }
+
+    #[test]
+    fn lane_routing_allows_unrelated_reads_while_write_pending() {
+        let mut pending_writes = PendingRemote::default();
+        let write = test_client_request(1, "flush_queued", json!({"path": "src/a.rs"}));
+        pending_writes.register(&PendingHazard::for_request(&write));
+
+        let unrelated_open =
+            test_client_request(2, "open", json!({"path": "src/b.rs", "force": true}));
+
+        assert_eq!(
+            RemoteLane::for_request(&unrelated_open, &pending_writes),
+            RemoteLane::Read
+        );
+    }
+
+    #[test]
+    fn lane_routing_serializes_conflicting_reads_with_pending_writes() {
+        let mut pending_writes = PendingRemote::default();
+        let write = test_client_request(1, "flush_queued", json!({"path": "src/a.rs"}));
+        pending_writes.register(&PendingHazard::for_request(&write));
+
+        let same_path_open =
+            test_client_request(2, "open", json!({"path": "src/a.rs", "force": true}));
+        let hydrating_grep = test_client_request(3, "grep", json!({"query": "needle"}));
+
+        assert_eq!(
+            RemoteLane::for_request(&same_path_open, &pending_writes),
+            RemoteLane::Write
+        );
+        assert_eq!(
+            RemoteLane::for_request(&hydrating_grep, &pending_writes),
+            RemoteLane::Write
+        );
     }
 
     #[test]
@@ -6658,6 +6933,8 @@ mod tests {
                     request,
                     hazard,
                     priority: RemotePriority::Interactive,
+                    lane: RemoteLane::Read,
+                    write_hazard_registered: false,
                 },
                 None,
             )
