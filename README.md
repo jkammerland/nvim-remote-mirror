@@ -6,9 +6,33 @@ searches, hashes, and writes files near the source tree.
 
 Goal statement:
 
-> Make Neovim feel local over slow or unstable SSH links by gradually building a
-> checksum-verified local mirror, lazily hydrating content by user intent, and
-> using conflict-safe asynchronous saves against the remote workspace.
+> Build `nvim-remote-mirror` into a local-first Neovim remote workspace system
+> that keeps cached navigation, opening, status, and provisional search
+> responsive even over slow, unstable, or offline SSH links by operating from a
+> durable checksum-verified local mirror; lazily hydrates missing or
+> intent-adjacent content in bounded prioritized batches; runs source-adjacent
+> workflows such as LSP near the remote tree with correct local/remote path
+> translation; preserves every local save through recoverable snapshots,
+> checksum compare-and-swap uploads, retry queues, and explicit conflict
+> reporting; and keeps the sidecar-agent protocol transport-neutral so SSH
+> remains the default today while QUIC/UDP over WireGuard can be added later
+> without changing Neovim-facing behavior.
+
+Completion criteria:
+
+- cached open, status, and provisional grep do not wait on SSH availability.
+- remote-dependent work is bounded by configured timeouts, backoff, and
+  interactive/background prioritization.
+- mirror entries are validated by checksums and classified as valid, stale,
+  deleted, dirty, queued, or conflicted.
+- missing and related files hydrate lazily in size-capped batches, with durable
+  progress that can resume after disconnects.
+- saves are snapshotted before remote upload and can be replayed or reported as
+  conflicts without losing local edits.
+- LSP and later source-adjacent tools run near the remote source while exposing
+  local mirror paths to Neovim.
+- the transport boundary is narrow enough that SSH stdio can be replaced by a
+  future QUIC/UDP-over-WireGuard transport without changing plugin APIs.
 
 ## Current Shape
 
@@ -110,20 +134,22 @@ require("nvim_remote_mirror").setup({
 
 ## LSP Proxy
 
-After connecting, build a Neovim LSP config from a remote language-server
-command:
+After connecting, start a remote language server through the probe-gated helper:
 
 ```lua
 local nrm = require("nvim_remote_mirror")
 nrm.connect("ssh://myhost/home/me/project")
 
 -- Run rust-analyzer on the remote host, while Neovim sees local mirror paths.
-vim.defer_fn(function()
-  vim.lsp.start(nrm.lsp_client_config({ "rust-analyzer" }, {
-    name = "remote-rust-analyzer",
-  }))
-end, 500)
+nrm.start_lsp({ "rust-analyzer" }, {
+  name = "remote-rust-analyzer",
+})
 ```
+
+`start_lsp()` probes the remote first, refreshes the cached remote status, and
+skips `vim.lsp.start()` when SSH is still in backoff or unavailable. If you need
+manual control, `lsp_client_config()` remains available as the low-level config
+builder once the remote is reachable.
 
 The proxy rewrites JSON LSP `file://` URI and absolute path prefixes between
 the local mirror and the remote workspace. Local targets launch the language

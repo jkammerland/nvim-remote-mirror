@@ -256,6 +256,17 @@ local function notify_flush_queue_result(result, opts)
   notify(message, level)
 end
 
+local function update_remote_state(client, result)
+  if not client or not client.hello or not result then
+    return
+  end
+  client.hello.remote_status = result.remote_status
+  client.hello.remote_checked = result.remote_checked
+  client.hello.remote_available = result.remote_available
+  client.hello.remote_error = result.remote_error
+  client.hello.retry_after_ms = result.retry_after_ms
+end
+
 local function schedule_flush_queue_on_connect(client, generation)
   if not M.config.flush_queue_on_connect then
     return
@@ -305,10 +316,7 @@ local function schedule_flush_queue_on_connect(client, generation)
       if err or not result or not still_current() then
         return
       end
-      client.hello.remote_status = result.remote_status
-      client.hello.remote_checked = result.remote_checked
-      client.hello.remote_available = result.remote_available
-      client.hello.remote_error = result.remote_error
+      update_remote_state(client, result)
       if result.remote_available then
         replay_once()
       end
@@ -450,6 +458,22 @@ function M.request(method, params, callback)
     params = params or {},
   }) .. "\n"
   vim.fn.chansend(client.job_id, payload)
+end
+
+function M.remote_probe(callback)
+  local client = M.client
+  if not client or not client.job_id then
+    error("not connected; run :RemoteConnect first")
+  end
+
+  M.request("remote_probe", {}, function(err, result)
+    if not err and M.client == client then
+      update_remote_state(client, result)
+    end
+    if callback then
+      callback(err, result)
+    end
+  end)
 end
 
 local function warn_cached_open(result)
@@ -834,13 +858,29 @@ function M.prefetch(paths)
   end)
 end
 
+local function validate_lsp_command(command)
+  if type(command) ~= "table" or #command == 0 then
+    error("command must be a non-empty list")
+  end
+end
+
+local function remote_unavailable_message(prefix, result)
+  local message = prefix
+  if result and optional_string(result.remote_error) then
+    message = message .. ": " .. result.remote_error
+  end
+  local retry_after_ms = result and tonumber(result.retry_after_ms)
+  if retry_after_ms and retry_after_ms > 0 then
+    message = message .. " (retry after " .. tostring(math.floor(retry_after_ms)) .. " ms)"
+  end
+  return message
+end
+
 function M.lsp_client_config(command, opts)
   if not M.client or not M.client.hello then
     error("not connected; run :RemoteConnect first")
   end
-  if type(command) ~= "table" or #command == 0 then
-    error("command must be a non-empty list")
-  end
+  validate_lsp_command(command)
 
   local cmd = {
     M.config.sidecar,
@@ -865,6 +905,40 @@ function M.lsp_client_config(command, opts)
     cmd = cmd,
     root_dir = M.client.hello.files_root,
   }, opts or {})
+end
+
+function M.start_lsp(command, opts)
+  if not M.client or not M.client.hello then
+    error("not connected; run :RemoteConnect first")
+  end
+  validate_lsp_command(command)
+
+  local client = M.client
+  M.remote_probe(function(err, result)
+    if M.client ~= client then
+      return
+    end
+    if err then
+      notify("remote probe failed before LSP start: " .. tostring(err), vim.log.levels.ERROR)
+      return
+    end
+    if not result or result.remote_available ~= true then
+      notify(
+        remote_unavailable_message("remote unavailable; LSP not started", result),
+        vim.log.levels.WARN
+      )
+      return
+    end
+
+    local ok, config_or_error = pcall(M.lsp_client_config, command, opts)
+    if not ok then
+      notify(tostring(config_or_error), vim.log.levels.ERROR)
+      return
+    end
+    vim.schedule(function()
+      vim.lsp.start(config_or_error)
+    end)
+  end)
 end
 
 vim.api.nvim_create_augroup("NvimRemoteMirror", { clear = true })

@@ -11,8 +11,12 @@ CONTENTS                                      *nvim-remote-mirror-contents*
 ==============================================================================
 GOAL                                            *nvim-remote-mirror-goal*
 
-Keep Neovim editing local over slow or unstable SSH links while a sidecar and
-remote agent lazily hydrate a checksum-verified local mirror.
+Keep cached navigation, opening, status, provisional search, and editing
+responsive over slow, unstable, or offline SSH links by operating from a
+durable checksum-verified local mirror. Hydrate missing and related content in
+bounded batches, run source-adjacent tools such as LSP near the remote tree,
+preserve saves through snapshots and checksum compare-and-swap retries, and
+keep SSH behind a transport-neutral sidecar/agent boundary.
 
 ==============================================================================
 COMMANDS                                      *nvim-remote-mirror-commands*
@@ -100,16 +104,19 @@ CONFIGURATION                                  *nvim-remote-mirror-config*
 ==============================================================================
 LSP                                                *nvim-remote-mirror-lsp*
 
-After :RemoteConnect completes, use lsp_client_config() to run a language
-server on the remote side while Neovim receives local mirror paths.
+After :RemoteConnect completes, use start_lsp() to run a language server on
+the remote side while Neovim receives local mirror paths.
 The proxy starts the server in the remote workspace directory. SSH targets use
 the configured connect timeout and cd to the remote root before server launch.
+start_lsp() probes the remote first and skips vim.lsp.start() while the remote
+is unavailable or in backoff. lsp_client_config() remains available as a
+low-level config builder when you need manual control.
 
 >
   local nrm = require("nvim_remote_mirror")
-  vim.lsp.start(nrm.lsp_client_config({ "rust-analyzer" }, {
+  nrm.start_lsp({ "rust-analyzer" }, {
     name = "remote-rust-analyzer",
-  }))
+  })
 <
 
 vim:tw=78:ts=8:ft=help:norl:
