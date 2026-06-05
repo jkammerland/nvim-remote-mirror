@@ -93,6 +93,26 @@ local function reconnect_arg(target)
   return target.remote_root
 end
 
+local function close_timer(timer)
+  if timer and not timer:is_closing() then
+    timer:stop()
+    timer:close()
+  end
+end
+
+local function clear_pending(client, id)
+  local pending = client.pending[id]
+  if not pending then
+    return nil
+  end
+  client.pending[id] = nil
+  if type(pending) == "table" then
+    close_timer(pending.timer)
+    return pending.callback
+  end
+  return pending
+end
+
 local function handle_response(client, line)
   local ok, decoded = pcall(vim.json.decode, line)
   if not ok then
@@ -100,16 +120,15 @@ local function handle_response(client, line)
     return
   end
 
-  local pending = client.pending[decoded.id]
-  if not pending then
+  local callback = clear_pending(client, decoded.id)
+  if not callback then
     return
   end
-  client.pending[decoded.id] = nil
 
   if decoded.ok then
-    pending(nil, decoded.result)
+    callback(nil, decoded.result)
   else
-    pending(decoded.error or "unknown sidecar error", nil)
+    callback(decoded.error or "unknown sidecar error", nil)
   end
 end
 
@@ -157,9 +176,11 @@ local function sidecar_args(target)
 end
 
 local function fail_pending(client, message)
-  for id, callback in pairs(client.pending or {}) do
-    client.pending[id] = nil
-    pcall(callback, message, nil)
+  for id in pairs(client.pending or {}) do
+    local callback = clear_pending(client, id)
+    if callback then
+      pcall(callback, message, nil)
+    end
   end
 end
 
@@ -450,7 +471,29 @@ function M.request(method, params, callback)
 
   local id = client.next_id
   client.next_id = client.next_id + 1
-  client.pending[id] = callback or function() end
+  callback = callback or function() end
+  local pending = {
+    callback = callback,
+    timer = nil,
+  }
+  local timeout_ms = math.max(tonumber(M.config.request_timeout_ms) or 0, 0)
+  if timeout_ms > 0 then
+    local timer = uv.new_timer()
+    pending.timer = timer
+    timer:start(timeout_ms, 0, function()
+      vim.schedule(function()
+        local timed_out = clear_pending(client, id)
+        if timed_out then
+          pcall(
+            timed_out,
+            "request `" .. method .. "` timed out after " .. tostring(timeout_ms) .. " ms",
+            nil
+          )
+        end
+      end)
+    end)
+  end
+  client.pending[id] = pending
 
   local payload = vim.json.encode({
     id = id,

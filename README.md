@@ -100,6 +100,8 @@ retries queued saves in small background batches after a remote probe succeeds.
 SSH agent handshake. Cached opens, cached grep, and status remain available if
 the remote is unreachable; the first operation that needs the remote agent
 performs the protocol handshake and reports connection failures normally.
+Pending Neovim requests are also bounded by `request_timeout_ms`, so lost or
+stalled sidecar replies clear their callback state instead of hanging forever.
 
 By default the plugin expects these binaries:
 
@@ -226,9 +228,11 @@ Current transport state:
 - active: request IDs, typed remote errors, request timeout, SSH connect timeout,
   batched small-file read for prefetch, batched mirror validation, chunked
   compare-and-swap writes, and sidecar fast-path responses for cached mirror
-  opens/status while remote worker requests are in flight. Sidecar startup is
-  local-mirror-only; the remote agent handshake is lazy so cached work survives
-  disconnected SSH. Failed remote attempts enter a short unavailable backoff so
+  opens/status while remote worker requests are in flight. Neovim-side JSON RPC
+  requests also use the configured request timeout to clean up pending callbacks
+  when a sidecar reply is lost. Sidecar startup is local-mirror-only; the remote
+  agent handshake is lazy so cached work survives disconnected SSH. Failed
+  remote attempts enter a short unavailable backoff so
   repeated remote-dependent commands fail quickly while cached operations stay
   local. Disconnect interrupts
   the current agent/SSH process group on Unix so shutdown is not pinned to the

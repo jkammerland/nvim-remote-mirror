@@ -101,6 +101,9 @@ CONFIGURATION                                  *nvim-remote-mirror-config*
   })
 <
 
+request_timeout_ms bounds both sidecar/agent work and pending Neovim-side
+callbacks waiting for sidecar JSON replies.
+
 ==============================================================================
 LSP                                                *nvim-remote-mirror-lsp*
 
