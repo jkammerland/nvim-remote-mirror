@@ -32,6 +32,7 @@ M.config = {
   prefetch_max_total_bytes = 16 * 1024 * 1024,
   open_prefetch_related = false,
   open_prefetch_related_limit = 16,
+  auto_hydrate_mirror_buffers = true,
   auto_reconnect = true,
   reconnect_delay_ms = 1000,
   reconnect_max_attempts = 3,
@@ -57,6 +58,9 @@ M.deferred_flushes = {}
 M.background_mirror_running = false
 M.background_mirror_generation = 0
 M.background_scan_after = nil
+M.mirror_autocmd_group = nil
+
+local setup_mirror_autohydrate
 
 local function notify(message, level)
   vim.schedule(function()
@@ -78,6 +82,10 @@ local function normalize_local_root(path)
     return path
   end
   return stripped
+end
+
+local function normalize_local_path(path)
+  return vim.fn.fnamemodify(path, ":p"):gsub("\\", "/")
 end
 
 local function parse_target(target)
@@ -104,10 +112,32 @@ local function reconnect_arg(target)
   return target.remote_root
 end
 
+local function mirror_relative_path(client, local_path)
+  local hello = client and client.hello
+  local files_root = hello and hello.files_root
+  if not files_root or files_root == "" then
+    return nil
+  end
+  local root = normalize_local_path(files_root):gsub("/+$", "")
+  local path = normalize_local_path(local_path)
+  local prefix = root .. "/"
+  if path:sub(1, #prefix) ~= prefix then
+    return nil
+  end
+  return path:sub(#prefix + 1)
+end
+
 local function close_timer(timer)
   if timer and not timer:is_closing() then
     timer:stop()
     timer:close()
+  end
+end
+
+local function clear_mirror_autohydrate()
+  if M.mirror_autocmd_group then
+    pcall(vim.api.nvim_del_augroup_by_id, M.mirror_autocmd_group)
+    M.mirror_autocmd_group = nil
   end
 end
 
@@ -572,6 +602,7 @@ function M.connect(target, opts)
     on_exit = function(_, code)
       if M.client == client then
         M.client = nil
+        clear_mirror_autohydrate()
       end
       local unexpected = not client.closing
       if unexpected then
@@ -597,6 +628,7 @@ function M.connect(target, opts)
       return
     end
     client.hello = result
+    setup_mirror_autohydrate(client)
     if is_reconnect then
       schedule_reconnect_stable_reset(client, generation)
     end
@@ -613,6 +645,7 @@ end
 function M.disconnect(opts)
   opts = opts or {}
   if not M.client then
+    clear_mirror_autohydrate()
     if not opts.preserve_last_target then
       M.reconnect_generation = M.reconnect_generation + 1
       M.reconnect_attempts = 0
@@ -628,6 +661,7 @@ function M.disconnect(opts)
       pcall(vim.fn.jobstop, client.job_id)
     end
   end, 250)
+  clear_mirror_autohydrate()
   M.client = nil
   if not opts.preserve_last_target then
     M.stop_background_mirror()
@@ -724,7 +758,95 @@ local function warn_cached_open(result)
   end
 end
 
-local function prefetch_related(anchor)
+local prefetch_related
+
+local function apply_mirror_file_to_buffer(bufnr, local_path, result)
+  local ok, lines = pcall(vim.fn.readfile, local_path, "b")
+  if not ok then
+    notify("failed to read local mirror file " .. local_path .. ": " .. tostring(lines), vim.log.levels.ERROR)
+    return false
+  end
+  if not vim.api.nvim_buf_is_valid(bufnr) then
+    return false
+  end
+  vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, lines)
+  vim.api.nvim_set_option_value("modified", false, { buf = bufnr })
+  if result then
+    vim.b[bufnr].nrm_remote_path = result.path
+    vim.b[bufnr].nrm_remote_hash = result.hash
+    vim.b[bufnr].nrm_flush_pending = M.deferred_flushes[result.path] ~= nil
+  end
+  return true
+end
+
+function setup_mirror_autohydrate(client)
+  clear_mirror_autohydrate()
+  if not M.config.auto_hydrate_mirror_buffers then
+    return
+  end
+  local files_root = client.hello and client.hello.files_root
+  if not files_root or files_root == "" then
+    return
+  end
+
+  local root = normalize_local_path(files_root):gsub("/+$", "")
+  local patterns = {
+    root .. "/*",
+    root .. "/**/*",
+  }
+  M.mirror_autocmd_group = vim.api.nvim_create_augroup("NvimRemoteMirrorAutoHydrate", { clear = true })
+  vim.api.nvim_create_autocmd("BufReadCmd", {
+    group = M.mirror_autocmd_group,
+    pattern = patterns,
+    callback = function(args)
+      if M.client ~= client or client.closing then
+        return
+      end
+      local bufnr = args.buf
+      local local_path = normalize_local_path(args.file or vim.api.nvim_buf_get_name(bufnr))
+      local relative_path = mirror_relative_path(client, local_path)
+      if not relative_path then
+        return
+      end
+
+      if uv.fs_stat(local_path) then
+        apply_mirror_file_to_buffer(bufnr, local_path, {
+          path = relative_path,
+          local_path = local_path,
+          cached = true,
+        })
+        return
+      end
+
+      M.request("open", { path = relative_path, force = false }, function(err, result)
+        if err then
+          notify("failed to hydrate " .. relative_path .. ": " .. err, vim.log.levels.ERROR)
+          return
+        end
+        vim.schedule(function()
+          if M.client ~= client or client.closing or not vim.api.nvim_buf_is_valid(bufnr) then
+            return
+          end
+          if normalize_local_path(vim.api.nvim_buf_get_name(bufnr)) ~= local_path then
+            return
+          end
+          if vim.api.nvim_get_option_value("modified", { buf = bufnr }) then
+            notify("skipped hydrate for modified mirror buffer " .. relative_path, vim.log.levels.WARN)
+            return
+          end
+          if apply_mirror_file_to_buffer(bufnr, result.local_path, result) then
+            warn_cached_open(result)
+            vim.defer_fn(function()
+              prefetch_related(result.path)
+            end, 20)
+          end
+        end)
+      end)
+    end,
+  })
+end
+
+function prefetch_related(anchor)
   if not M.config.open_prefetch_related then
     return
   end

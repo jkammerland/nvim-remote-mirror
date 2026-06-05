@@ -132,6 +132,7 @@ require("nvim_remote_mirror").setup({
   prefetch_max_total_bytes = 16 * 1024 * 1024,
   open_prefetch_related = false,
   open_prefetch_related_limit = 16,
+  auto_hydrate_mirror_buffers = true,
   auto_reconnect = true,
   reconnect_delay_ms = 1000,
   reconnect_max_attempts = 3,
@@ -226,6 +227,11 @@ After opening, the plugin can issue an opt-in small related-file prefetch from
 existing mirror metadata, prioritizing same-directory and same-extension files.
 Enable that with `open_prefetch_related = true` and tune the batch with
 `open_prefetch_related_limit`.
+
+When `auto_hydrate_mirror_buffers` is enabled, Neovim edits under the local
+mirror root are mapped back to workspace-relative remote paths. This lets LSP
+definition/reference jumps into not-yet-cached mirror files hydrate through the
+sidecar instead of opening an empty local path.
 
 `:RemoteGrep` queues the authoritative remote search first, then searches a
 bounded slice of already hydrated local mirror files. Cached hits are

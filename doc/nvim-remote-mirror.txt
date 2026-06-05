@@ -101,6 +101,7 @@ CONFIGURATION                                  *nvim-remote-mirror-config*
     prefetch_max_total_bytes = 16 * 1024 * 1024,
     open_prefetch_related = false,
     open_prefetch_related_limit = 16,
+    auto_hydrate_mirror_buffers = true,
     auto_reconnect = true,
     reconnect_delay_ms = 1000,
     reconnect_max_attempts = 3,
@@ -124,6 +125,8 @@ background_mirror controls the idle mirror builder; set it false and use
 :RemoteMirrorStart manually on especially fragile links. Each background tick
 scans metadata, hydrates a tiny clean-file batch, then validates a tiny
 oldest-check cached-file batch against the remote checksum.
+auto_hydrate_mirror_buffers makes LSP jumps into missing local mirror files call
+the sidecar open path and hydrate the corresponding remote file.
 
 ==============================================================================
 LSP                                                *nvim-remote-mirror-lsp*
