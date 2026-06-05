@@ -474,9 +474,14 @@ struct AgentClient {
     preempt: AgentPreempt,
     worker: Option<AgentWorker>,
     handshake_complete: bool,
+    remote_backoff: Arc<Mutex<RemoteBackoffState>>,
+    next_id: RequestId,
+}
+
+#[derive(Debug, Default)]
+struct RemoteBackoffState {
     unavailable_until: Option<Instant>,
     last_remote_error: Option<String>,
-    next_id: RequestId,
 }
 
 impl AgentClient {
@@ -499,21 +504,19 @@ impl AgentClient {
             preempt: AgentPreempt::default(),
             worker: None,
             handshake_complete: false,
-            unavailable_until: None,
-            last_remote_error: None,
+            remote_backoff: Arc::new(Mutex::new(RemoteBackoffState::default())),
             next_id: 1,
         }
     }
 
-    fn from_launch(launch: AgentLaunch, interrupt: AgentInterrupt) -> Self {
+    fn clone_for_lane(&self, interrupt: AgentInterrupt) -> Self {
         Self {
-            launch,
+            launch: self.launch.clone(),
             interrupt,
             preempt: AgentPreempt::default(),
             worker: None,
             handshake_complete: false,
-            unavailable_until: None,
-            last_remote_error: None,
+            remote_backoff: Arc::clone(&self.remote_backoff),
             next_id: 1,
         }
     }
@@ -587,14 +590,17 @@ impl AgentClient {
         if self.handshake_complete {
             return RemoteHealth::connected();
         }
-        if let Some(error) = self.last_remote_error.clone() {
-            return RemoteHealth::unavailable(self.unavailable_until, error);
+        if let Ok(backoff) = self.remote_backoff.lock() {
+            if let Some(error) = backoff.last_remote_error.clone() {
+                return RemoteHealth::unavailable(backoff.unavailable_until, error);
+            }
         }
         RemoteHealth::default()
     }
 
     fn remote_backoff(&self) -> Option<(u64, String)> {
-        let until = self.unavailable_until?;
+        let backoff = self.remote_backoff.lock().ok()?;
+        let until = backoff.unavailable_until?;
         let now = Instant::now();
         if now >= until {
             return None;
@@ -603,7 +609,7 @@ impl AgentClient {
             .duration_since(now)
             .as_millis()
             .min(u128::from(u64::MAX)) as u64;
-        let error = self
+        let error = backoff
             .last_remote_error
             .clone()
             .unwrap_or_else(|| "last remote attempt failed".to_string());
@@ -614,22 +620,28 @@ impl AgentClient {
         if let Some((remaining_ms, error)) = self.remote_backoff() {
             bail!("remote unavailable; retry after {remaining_ms} ms: {error}");
         }
-        self.unavailable_until = None;
+        if let Ok(mut backoff) = self.remote_backoff.lock() {
+            backoff.unavailable_until = None;
+        }
         Ok(())
     }
 
     fn mark_remote_unavailable(&mut self, error: impl Into<String>) -> anyhow::Error {
         self.handshake_complete = false;
         let error = error.into();
-        self.last_remote_error = Some(error.clone());
-        self.unavailable_until =
-            Some(Instant::now() + Duration::from_millis(REMOTE_UNAVAILABLE_BACKOFF_MS));
+        if let Ok(mut backoff) = self.remote_backoff.lock() {
+            backoff.last_remote_error = Some(error.clone());
+            backoff.unavailable_until =
+                Some(Instant::now() + Duration::from_millis(REMOTE_UNAVAILABLE_BACKOFF_MS));
+        }
         anyhow!(error)
     }
 
     fn clear_remote_unavailable(&mut self) {
-        self.unavailable_until = None;
-        self.last_remote_error = None;
+        if let Ok(mut backoff) = self.remote_backoff.lock() {
+            backoff.unavailable_until = None;
+            backoff.last_remote_error = None;
+        }
     }
 
     #[cfg(test)]
@@ -3254,7 +3266,7 @@ impl Sidecar {
 
     fn clone_for_lane(&self, agent_interrupt: AgentInterrupt) -> Result<Self> {
         Ok(Self {
-            agent: AgentClient::from_launch(self.agent.launch.clone(), agent_interrupt),
+            agent: self.agent.clone_for_lane(agent_interrupt),
             mirror: Mirror::open_root(self.mirror.root().to_path_buf())?,
             remote_root: self.remote_root.clone(),
             workspace_key: self.workspace_key.clone(),
@@ -7751,6 +7763,42 @@ mod tests {
             .unwrap_err()
             .to_string();
         let second = client
+            .request(Request::Hello {
+                client_version: "test".to_string(),
+                protocol_version: PROTOCOL_VERSION,
+            })
+            .unwrap_err()
+            .to_string();
+
+        assert!(first.contains("failed to launch agent"));
+        assert!(second.contains("remote unavailable; retry after"));
+        assert!(second.contains("failed to launch agent"));
+    }
+
+    #[test]
+    fn cloned_agent_lanes_share_remote_backoff_after_launch_failure() {
+        let dir = tempdir().unwrap();
+        let mut read_client = AgentClient::new(
+            dir.path()
+                .join("missing-agent")
+                .to_string_lossy()
+                .to_string(),
+            None,
+            dir.path().to_path_buf(),
+            Duration::from_secs(30),
+            1,
+            AgentInterrupt::default(),
+        );
+        let mut write_client = read_client.clone_for_lane(AgentInterrupt::default());
+
+        let first = read_client
+            .request(Request::Hello {
+                client_version: "test".to_string(),
+                protocol_version: PROTOCOL_VERSION,
+            })
+            .unwrap_err()
+            .to_string();
+        let second = write_client
             .request(Request::Hello {
                 client_version: "test".to_string(),
                 protocol_version: PROTOCOL_VERSION,
