@@ -8,7 +8,7 @@ use nrm_protocol::{
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -363,6 +363,10 @@ impl Mirror {
     fn open(state_dir: Option<PathBuf>, workspace_key: &str) -> Result<Self> {
         let state_dir = state_dir.unwrap_or_else(default_state_dir);
         let root = state_dir.join("workspaces").join(workspace_key);
+        Self::open_root(root)
+    }
+
+    fn open_root(root: PathBuf) -> Result<Self> {
         let files_root = root.join("files");
         let conflicts_root = root.join("conflicts");
         let save_snapshots_root = root.join("save-snapshots");
@@ -370,6 +374,7 @@ impl Mirror {
         fs::create_dir_all(&conflicts_root)?;
         fs::create_dir_all(&save_snapshots_root)?;
         let db = Connection::open(root.join("mirror.sqlite"))?;
+        db.busy_timeout(Duration::from_millis(1_000))?;
         let mirror = Self {
             root,
             files_root,
@@ -1081,6 +1086,201 @@ struct Sidecar {
     mirror: Mirror,
     remote_root: PathBuf,
     workspace_key: String,
+}
+
+#[derive(Debug, Clone)]
+struct FastState {
+    mirror_root: PathBuf,
+    files_root: PathBuf,
+    remote_root: PathBuf,
+    workspace_key: String,
+    pending_remote: Arc<Mutex<PendingRemote>>,
+}
+
+enum FastHandle {
+    Handled(Result<Value>),
+    Defer,
+}
+
+#[derive(Debug, Default)]
+struct PendingRemote {
+    exact_paths: HashMap<String, usize>,
+    unknown_content_mutations: usize,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PendingHazard {
+    exact_paths: Vec<String>,
+    unknown_content_mutation: bool,
+}
+
+struct RemoteWork {
+    request: ClientRequest,
+    hazard: PendingHazard,
+}
+
+impl PendingRemote {
+    fn register(&mut self, hazard: &PendingHazard) {
+        if hazard.unknown_content_mutation {
+            self.unknown_content_mutations = self.unknown_content_mutations.saturating_add(1);
+        }
+        for path in &hazard.exact_paths {
+            *self.exact_paths.entry(path.clone()).or_insert(0) += 1;
+        }
+    }
+
+    fn clear(&mut self, hazard: &PendingHazard) {
+        if hazard.unknown_content_mutation {
+            self.unknown_content_mutations = self.unknown_content_mutations.saturating_sub(1);
+        }
+        for path in &hazard.exact_paths {
+            let should_remove = if let Some(count) = self.exact_paths.get_mut(path) {
+                *count = count.saturating_sub(1);
+                *count == 0
+            } else {
+                false
+            };
+            if should_remove {
+                self.exact_paths.remove(path);
+            }
+        }
+    }
+
+    fn blocks_path(&self, path: &str) -> bool {
+        self.unknown_content_mutations > 0 || self.exact_paths.contains_key(path)
+    }
+}
+
+impl PendingHazard {
+    fn for_request(request: &ClientRequest) -> Self {
+        match request.method.as_str() {
+            "open" => {
+                let force = request
+                    .params
+                    .get("force")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                if force {
+                    return path_hazard(request.params.get("path").and_then(Value::as_str));
+                }
+                Self::default()
+            }
+            "prefetch" => {
+                let mut paths = Vec::new();
+                if let Some(values) = request.params.get("paths").and_then(Value::as_array) {
+                    for value in values {
+                        if let Some(path) = value.as_str().and_then(normalized_path_string) {
+                            paths.push(path);
+                        }
+                    }
+                }
+                Self {
+                    exact_paths: paths,
+                    unknown_content_mutation: false,
+                }
+            }
+            "grep" => Self {
+                exact_paths: Vec::new(),
+                unknown_content_mutation: request
+                    .params
+                    .get("hydrate")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true),
+            },
+            "flush" => path_hazard(request.params.get("path").and_then(Value::as_str)),
+            _ => Self::default(),
+        }
+    }
+}
+
+fn path_hazard(path: Option<&str>) -> PendingHazard {
+    PendingHazard {
+        exact_paths: path.and_then(normalized_path_string).into_iter().collect(),
+        unknown_content_mutation: false,
+    }
+}
+
+fn normalized_path_string(path: &str) -> Option<String> {
+    normalize_relative_path(path)
+        .ok()
+        .map(|path| path.to_string_lossy().replace('\\', "/"))
+}
+
+impl FastState {
+    fn from_sidecar(sidecar: &Sidecar, pending_remote: Arc<Mutex<PendingRemote>>) -> Self {
+        Self {
+            mirror_root: sidecar.mirror.root().to_path_buf(),
+            files_root: sidecar.mirror.files_root().to_path_buf(),
+            remote_root: sidecar.remote_root.clone(),
+            workspace_key: sidecar.workspace_key.clone(),
+            pending_remote,
+        }
+    }
+
+    fn try_handle(&self, request: &ClientRequest) -> FastHandle {
+        match request.method.as_str() {
+            "hello" => FastHandle::Handled(Ok(json!({
+                "sidecar_version": env!("CARGO_PKG_VERSION"),
+                "protocol_version": PROTOCOL_VERSION,
+                "workspace_key": self.workspace_key,
+                "remote_root": self.remote_root.to_string_lossy(),
+                "mirror_root": self.mirror_root.to_string_lossy(),
+                "files_root": self.files_root.to_string_lossy()
+            }))),
+            "status" => FastHandle::Handled(
+                Mirror::open_root(self.mirror_root.clone()).and_then(|mirror| mirror.status()),
+            ),
+            "open" => self.try_open(&request.params),
+            _ => FastHandle::Defer,
+        }
+    }
+
+    fn try_open(&self, params: &Value) -> FastHandle {
+        let force = params
+            .get("force")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if force {
+            return FastHandle::Defer;
+        }
+        let result = (|| -> Result<Option<Value>> {
+            let path = required_string(params, "path")?;
+            let normalized_path = normalize_relative_path(path)?
+                .to_string_lossy()
+                .replace('\\', "/");
+            if self
+                .pending_remote
+                .lock()
+                .map(|pending| pending.blocks_path(&normalized_path))
+                .unwrap_or(true)
+            {
+                return Ok(None);
+            }
+            let mirror = Mirror::open_root(self.mirror_root.clone())?;
+            let Some(entry) = mirror.get(&normalized_path)? else {
+                return Ok(None);
+            };
+            if entry.state != "hydrated" || !entry.local_path.exists() {
+                return Ok(None);
+            }
+            let reason = if entry.dirty {
+                "dirty"
+            } else {
+                match entry.validation_state.as_str() {
+                    "stale" | "deleted" | "conflict" => entry.validation_state.as_str(),
+                    _ => "cached",
+                }
+            };
+            Ok(Some(Sidecar::cached_open_response(
+                &entry, reason, false, false,
+            )))
+        })();
+        match result {
+            Ok(Some(value)) => FastHandle::Handled(Ok(value)),
+            Ok(None) => FastHandle::Defer,
+            Err(error) => FastHandle::Handled(Err(error)),
+        }
+    }
 }
 
 impl Sidecar {
@@ -2068,8 +2268,7 @@ fn run_server(
     ssh_connect_timeout_seconds: u64,
 ) -> Result<()> {
     let stdin = io::stdin();
-    let mut stdout = io::stdout().lock();
-    let mut sidecar = Sidecar::new(
+    let sidecar = Sidecar::new(
         remote_root,
         ssh,
         agent,
@@ -2077,6 +2276,37 @@ fn run_server(
         request_timeout_ms,
         ssh_connect_timeout_seconds,
     )?;
+    let pending_remote = Arc::new(Mutex::new(PendingRemote::default()));
+    let fast_state = FastState::from_sidecar(&sidecar, Arc::clone(&pending_remote));
+    let (response_tx, response_rx) = mpsc::sync_channel::<ClientResponse>(1024);
+    let writer = thread::spawn(move || -> Result<()> {
+        let stdout = io::stdout();
+        let mut stdout = stdout.lock();
+        for response in response_rx {
+            writeln!(stdout, "{}", serde_json::to_string(&response)?)?;
+            stdout.flush()?;
+        }
+        Ok(())
+    });
+
+    let (remote_tx, remote_rx) = mpsc::sync_channel::<RemoteWork>(128);
+    let remote_response_tx = response_tx.clone();
+    let remote_pending = Arc::clone(&pending_remote);
+    let remote_worker = thread::spawn(move || {
+        let mut sidecar = sidecar;
+        for work in remote_rx {
+            let RemoteWork { request, hazard } = work;
+            let should_shutdown = matches!(request.method.as_str(), "shutdown" | "disconnect");
+            let response = handle_client_request(&mut sidecar, request);
+            if let Ok(mut pending) = remote_pending.lock() {
+                pending.clear(&hazard);
+            }
+            let _ = remote_response_tx.send(response);
+            if should_shutdown {
+                break;
+            }
+        }
+    });
 
     for line in stdin.lock().lines() {
         let line = line?;
@@ -2086,44 +2316,77 @@ fn run_server(
         let request: ClientRequest = match serde_json::from_str(&line) {
             Ok(request) => request,
             Err(error) => {
-                writeln!(
-                    stdout,
-                    "{}",
-                    serde_json::to_string(&ClientResponse {
-                        id: 0,
-                        ok: false,
-                        result: None,
-                        error: Some(format!("invalid request JSON: {error}")),
-                    })?
-                )?;
-                stdout.flush()?;
+                let _ = response_tx.send(ClientResponse {
+                    id: 0,
+                    ok: false,
+                    result: None,
+                    error: Some(format!("invalid request JSON: {error}")),
+                });
                 continue;
             }
         };
 
         let should_shutdown = matches!(request.method.as_str(), "shutdown" | "disconnect");
-        let response = match sidecar.handle(&request.method, request.params) {
-            Ok(result) => ClientResponse {
-                id: request.id,
-                ok: true,
-                result: Some(result),
-                error: None,
-            },
-            Err(error) => ClientResponse {
-                id: request.id,
-                ok: false,
-                result: None,
-                error: Some(error.to_string()),
-            },
-        };
-        writeln!(stdout, "{}", serde_json::to_string(&response)?)?;
-        stdout.flush()?;
+        match fast_state.try_handle(&request) {
+            FastHandle::Handled(result) => {
+                let _ = response_tx.send(result_to_client_response(request.id, result));
+            }
+            FastHandle::Defer => {
+                let hazard = PendingHazard::for_request(&request);
+                if let Ok(mut pending) = pending_remote.lock() {
+                    pending.register(&hazard);
+                }
+                let work = RemoteWork { request, hazard };
+                if let Err(error) = remote_tx.send(work) {
+                    let work = error.0;
+                    if let Ok(mut pending) = pending_remote.lock() {
+                        pending.clear(&work.hazard);
+                    }
+                    let _ = response_tx.send(ClientResponse {
+                        id: work.request.id,
+                        ok: false,
+                        result: None,
+                        error: Some("remote worker is not available".to_string()),
+                    });
+                }
+            }
+        }
         if should_shutdown {
             break;
         }
     }
 
+    drop(remote_tx);
+    let _ = remote_worker.join();
+    drop(response_tx);
+    match writer.join() {
+        Ok(result) => result?,
+        Err(_) => bail!("server writer thread panicked"),
+    }
     Ok(())
+}
+
+fn handle_client_request(sidecar: &mut Sidecar, request: ClientRequest) -> ClientResponse {
+    let id = request.id;
+    let result = sidecar.handle(&request.method, request.params);
+    result_to_client_response(id, result)
+}
+
+fn result_to_client_response(id: u64, result: Result<Value>) -> ClientResponse {
+    match result {
+        Ok(result) => ClientResponse {
+            id,
+            ok: true,
+            result: Some(result),
+            error: None,
+        },
+        Err(error) => ClientResponse {
+            id,
+            ok: false,
+            result: None,
+            error: Some(error.to_string()),
+        },
+    }
 }
 
 fn run_lsp_proxy(
@@ -2697,6 +2960,108 @@ mod tests {
                 "tests/main.rs".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn fast_state_serves_cached_open_and_status_from_reopened_mirror() {
+        let dir = tempdir().unwrap();
+        let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
+        mirror
+            .record_hydrated(&test_meta("src/main.rs", "hash", 4), "hash", "hash")
+            .unwrap();
+        let local_path = mirror.local_path("src/main.rs").unwrap();
+        fs::create_dir_all(local_path.parent().unwrap()).unwrap();
+        fs::write(&local_path, b"main").unwrap();
+        let sidecar = test_sidecar(mirror);
+        let fast =
+            FastState::from_sidecar(&sidecar, Arc::new(Mutex::new(PendingRemote::default())));
+
+        let request = ClientRequest {
+            id: 1,
+            method: "open".to_string(),
+            params: json!({"path": "src/main.rs"}),
+        };
+        let FastHandle::Handled(result) = fast.try_handle(&request) else {
+            panic!("cached open should be handled by fast state");
+        };
+        let result = result.unwrap();
+        assert_eq!(result["cached"], true);
+        assert_eq!(result["cache_reason"], "cached");
+        assert_eq!(
+            result["local_path"].as_str().unwrap(),
+            local_path.to_string_lossy()
+        );
+
+        let request = ClientRequest {
+            id: 2,
+            method: "status".to_string(),
+            params: json!({}),
+        };
+        let FastHandle::Handled(result) = fast.try_handle(&request) else {
+            panic!("status should be handled by fast state");
+        };
+        assert_eq!(result.unwrap()["cached_files"], 1);
+    }
+
+    #[test]
+    fn fast_state_defers_force_or_uncached_open() {
+        let dir = tempdir().unwrap();
+        let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
+        mirror
+            .record_hydrated(&test_meta("src/main.rs", "hash", 4), "hash", "hash")
+            .unwrap();
+        let local_path = mirror.local_path("src/main.rs").unwrap();
+        fs::create_dir_all(local_path.parent().unwrap()).unwrap();
+        fs::write(&local_path, b"main").unwrap();
+        let sidecar = test_sidecar(mirror);
+        let fast =
+            FastState::from_sidecar(&sidecar, Arc::new(Mutex::new(PendingRemote::default())));
+
+        let force = ClientRequest {
+            id: 1,
+            method: "open".to_string(),
+            params: json!({"path": "src/main.rs", "force": true}),
+        };
+        assert!(matches!(fast.try_handle(&force), FastHandle::Defer));
+
+        let uncached = ClientRequest {
+            id: 2,
+            method: "open".to_string(),
+            params: json!({"path": "missing.rs"}),
+        };
+        assert!(matches!(fast.try_handle(&uncached), FastHandle::Defer));
+    }
+
+    #[test]
+    fn fast_state_defers_open_blocked_by_pending_remote_hazard() {
+        let dir = tempdir().unwrap();
+        let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
+        mirror
+            .record_hydrated(&test_meta("src/main.rs", "hash", 4), "hash", "hash")
+            .unwrap();
+        let local_path = mirror.local_path("src/main.rs").unwrap();
+        fs::create_dir_all(local_path.parent().unwrap()).unwrap();
+        fs::write(&local_path, b"main").unwrap();
+        let sidecar = test_sidecar(mirror);
+        let pending = Arc::new(Mutex::new(PendingRemote::default()));
+        let fast = FastState::from_sidecar(&sidecar, Arc::clone(&pending));
+        let force = ClientRequest {
+            id: 1,
+            method: "open".to_string(),
+            params: json!({"path": "src/main.rs", "force": true}),
+        };
+        let hazard = PendingHazard::for_request(&force);
+        pending.lock().unwrap().register(&hazard);
+
+        let cached = ClientRequest {
+            id: 2,
+            method: "open".to_string(),
+            params: json!({"path": "src/main.rs"}),
+        };
+        assert!(matches!(fast.try_handle(&cached), FastHandle::Defer));
+
+        pending.lock().unwrap().clear(&hazard);
+        assert!(matches!(fast.try_handle(&cached), FastHandle::Handled(_)));
     }
 
     #[test]

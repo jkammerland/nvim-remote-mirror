@@ -163,6 +163,7 @@ Current transport state:
 
 - active: request IDs, typed remote errors, request timeout, SSH connect timeout,
   batched small-file read for prefetch, batched mirror validation, chunked
-  compare-and-swap writes.
+  compare-and-swap writes, and sidecar fast-path responses for cached mirror
+  opens/status while remote worker requests are in flight.
 - pending: true multiplexing, cancellation, streaming results, reconnect resume,
   and backpressure.
