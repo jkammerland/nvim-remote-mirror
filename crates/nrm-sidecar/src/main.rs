@@ -1,8 +1,8 @@
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 use nrm_protocol::{
-    read_frame, write_frame, FileMeta, Request, Response, SaveOutcome, MAX_FRAME_LEN,
-    PROTOCOL_VERSION,
+    read_frame, write_frame, FileMeta, Request, RequestId, Response, RpcError, RpcMessage,
+    SaveOutcome, MAX_FRAME_LEN, PROTOCOL_VERSION,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -10,9 +10,10 @@ use serde_json::{json, Value};
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Component, Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_CHUNK_SIZE: u64 = 1024 * 1024;
 const MAX_SAVE_PAYLOAD_BYTES: usize = MAX_FRAME_LEN - (1024 * 1024);
@@ -35,6 +36,10 @@ enum CommandKind {
         agent: String,
         #[arg(long)]
         state_dir: Option<PathBuf>,
+        #[arg(long, default_value_t = 30_000)]
+        request_timeout_ms: u64,
+        #[arg(long, default_value_t = 10)]
+        ssh_connect_timeout_seconds: u64,
     },
     LspProxy {
         #[arg(long)]
@@ -108,26 +113,83 @@ enum SaveAttempt {
     },
 }
 
+#[derive(Debug, Clone)]
+struct AgentLaunch {
+    agent: String,
+    ssh: Option<String>,
+    remote_root: PathBuf,
+    request_timeout: Duration,
+    ssh_connect_timeout_seconds: u64,
+}
+
+struct AgentWorker {
+    tx: mpsc::Sender<AgentWorkerCommand>,
+    child: Arc<Mutex<Child>>,
+}
+
+struct AgentWorkerCommand {
+    id: RequestId,
+    request: Request,
+    reply: mpsc::Sender<AgentWorkerReply>,
+}
+
+#[derive(Debug)]
+enum AgentWorkerReply {
+    Response(Response),
+    Error(String),
+}
+
 struct AgentClient {
-    child: Child,
-    stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    launch: AgentLaunch,
+    worker: Option<AgentWorker>,
+    next_id: RequestId,
 }
 
 impl AgentClient {
-    fn spawn(agent: &str, ssh: Option<&str>, remote_root: &Path) -> Result<Self> {
-        let mut command = if let Some(target) = ssh {
+    fn new(
+        agent: String,
+        ssh: Option<String>,
+        remote_root: PathBuf,
+        request_timeout: Duration,
+        ssh_connect_timeout_seconds: u64,
+    ) -> Self {
+        Self {
+            launch: AgentLaunch {
+                agent,
+                ssh,
+                remote_root,
+                request_timeout,
+                ssh_connect_timeout_seconds,
+            },
+            worker: None,
+            next_id: 1,
+        }
+    }
+
+    fn spawn_worker(launch: &AgentLaunch) -> Result<AgentWorker> {
+        let mut command = if let Some(target) = launch.ssh.as_deref() {
             let mut command = Command::new("ssh");
             command
+                .arg("-o")
+                .arg("BatchMode=yes")
+                .arg("-o")
+                .arg(format!(
+                    "ConnectTimeout={}",
+                    launch.ssh_connect_timeout_seconds
+                ))
+                .arg("-o")
+                .arg("ServerAliveInterval=15")
+                .arg("-o")
+                .arg("ServerAliveCountMax=2")
                 .arg(target)
-                .arg(agent)
+                .arg(&launch.agent)
                 .arg("serve")
                 .arg("--root")
-                .arg(remote_root);
+                .arg(&launch.remote_root);
             command
         } else {
-            let mut command = Command::new(agent);
-            command.arg("serve").arg("--root").arg(remote_root);
+            let mut command = Command::new(&launch.agent);
+            command.arg("serve").arg("--root").arg(&launch.remote_root);
             command
         };
 
@@ -138,42 +200,150 @@ impl AgentClient {
             .spawn()
             .with_context(|| {
                 format!(
-                    "failed to launch agent `{agent}`{}",
-                    ssh.map(|target| format!(" through ssh target `{target}`"))
+                    "failed to launch agent `{}`{}",
+                    launch.agent,
+                    launch
+                        .ssh
+                        .as_deref()
+                        .map(|target| format!(" through ssh target `{target}`"))
                         .unwrap_or_default()
                 )
             })?;
 
         let stdin = child.stdin.take().context("agent stdin was not piped")?;
         let stdout = child.stdout.take().context("agent stdout was not piped")?;
-        Ok(Self {
-            child,
-            stdin,
-            stdout: BufReader::new(stdout),
-        })
+        let child = Arc::new(Mutex::new(child));
+        let (tx, rx) = mpsc::channel::<AgentWorkerCommand>();
+        let worker_child = Arc::clone(&child);
+        thread::spawn(move || {
+            let mut stdin = stdin;
+            let mut stdout = BufReader::new(stdout);
+            while let Ok(command) = rx.recv() {
+                let response =
+                    send_agent_frame(&mut stdin, &mut stdout, command.id, command.request)
+                        .unwrap_or_else(|error| AgentWorkerReply::Error(error.to_string()));
+                let _ = command.reply.send(response);
+            }
+            let _ = worker_child.lock().map(|mut child| {
+                let _ = child.kill();
+                let _ = child.wait();
+            });
+        });
+
+        Ok(AgentWorker { tx, child })
     }
 
     fn request(&mut self, request: Request) -> Result<Response> {
-        write_frame(&mut self.stdin, &request).context("failed to write agent request")?;
-        let response: Response =
-            read_frame(&mut self.stdout).context("failed to read agent response")?;
-        match response {
-            Response::Error { message } => Err(anyhow!(message)),
-            other => Ok(other),
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1).max(1);
+        let (reply, reply_rx) = mpsc::channel();
+
+        for attempt in 0..2 {
+            let tx = self.ensure_worker()?.tx.clone();
+            let command = AgentWorkerCommand {
+                id,
+                request: request.clone(),
+                reply: reply.clone(),
+            };
+            if tx.send(command).is_ok() {
+                break;
+            }
+            self.worker = None;
+            if attempt == 1 {
+                bail!("agent worker exited before request {id} could be sent");
+            }
         }
+
+        match reply_rx.recv_timeout(self.launch.request_timeout) {
+            Ok(AgentWorkerReply::Response(Response::Error { message })) => Err(anyhow!(message)),
+            Ok(AgentWorkerReply::Response(response)) => Ok(response),
+            Ok(AgentWorkerReply::Error(message)) => {
+                self.worker = None;
+                Err(anyhow!(message))
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let timeout = self.launch.request_timeout;
+                self.kill_worker();
+                Err(anyhow!(
+                    "agent request {id} timed out after {} ms",
+                    timeout.as_millis()
+                ))
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                self.worker = None;
+                Err(anyhow!(
+                    "agent worker exited while request {id} was pending"
+                ))
+            }
+        }
+    }
+
+    fn ensure_worker(&mut self) -> Result<&AgentWorker> {
+        if self.worker.is_none() {
+            self.worker = Some(Self::spawn_worker(&self.launch)?);
+        }
+        Ok(self.worker.as_ref().expect("worker was just initialized"))
     }
 
     fn shutdown(&mut self) {
         let _ = self.request(Request::Shutdown);
-        let _ = self.child.wait();
+        self.kill_worker();
+    }
+
+    fn kill_worker(&mut self) {
+        if let Some(worker) = self.worker.take() {
+            drop(worker.tx);
+            if let Ok(mut child) = worker.child.lock() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
     }
 }
 
 impl Drop for AgentClient {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        self.kill_worker();
     }
+}
+
+fn send_agent_frame<W: Write, R: Read>(
+    stdin: &mut W,
+    stdout: &mut BufReader<R>,
+    id: RequestId,
+    request: Request,
+) -> Result<AgentWorkerReply> {
+    write_frame(stdin, &RpcMessage::Request { id, request })
+        .context("failed to write agent request")?;
+    let message: RpcMessage = read_frame(stdout).context("failed to read agent response")?;
+    match message {
+        RpcMessage::Response {
+            id: response_id,
+            response,
+        } if response_id == id => Ok(AgentWorkerReply::Response(response)),
+        RpcMessage::Error {
+            id: response_id,
+            error,
+        } if response_id == id => Ok(AgentWorkerReply::Error(format_rpc_error(error))),
+        RpcMessage::Response {
+            id: response_id, ..
+        }
+        | RpcMessage::Error {
+            id: response_id, ..
+        } => {
+            bail!("agent response id mismatch: expected {id}, got {response_id}")
+        }
+        other => bail!("unexpected agent frame for request {id}: {other:?}"),
+    }
+}
+
+fn format_rpc_error(error: RpcError) -> String {
+    format!(
+        "{:?}: {}{}",
+        error.code,
+        error.message,
+        if error.retryable { " (retryable)" } else { "" }
+    )
 }
 
 struct Mirror {
@@ -709,10 +879,18 @@ impl Sidecar {
         ssh: Option<String>,
         agent: String,
         state_dir: Option<PathBuf>,
+        request_timeout_ms: u64,
+        ssh_connect_timeout_seconds: u64,
     ) -> Result<Self> {
         let workspace_key = workspace_key(ssh.as_deref(), &remote_root);
         let mirror = Mirror::open(state_dir, &workspace_key)?;
-        let mut agent = AgentClient::spawn(&agent, ssh.as_deref(), &remote_root)?;
+        let mut agent = AgentClient::new(
+            agent,
+            ssh,
+            remote_root.clone(),
+            Duration::from_millis(request_timeout_ms),
+            ssh_connect_timeout_seconds,
+        );
         let hello = agent.request(Request::Hello {
             client_version: env!("CARGO_PKG_VERSION").to_string(),
             protocol_version: PROTOCOL_VERSION,
@@ -1108,7 +1286,16 @@ fn main() -> Result<()> {
             ssh,
             agent,
             state_dir,
-        } => run_server(remote_root, ssh, agent, state_dir),
+            request_timeout_ms,
+            ssh_connect_timeout_seconds,
+        } => run_server(
+            remote_root,
+            ssh,
+            agent,
+            state_dir,
+            request_timeout_ms,
+            ssh_connect_timeout_seconds,
+        ),
         CommandKind::LspProxy {
             remote_root,
             local_root,
@@ -1123,10 +1310,19 @@ fn run_server(
     ssh: Option<String>,
     agent: String,
     state_dir: Option<PathBuf>,
+    request_timeout_ms: u64,
+    ssh_connect_timeout_seconds: u64,
 ) -> Result<()> {
     let stdin = io::stdin();
     let mut stdout = io::stdout().lock();
-    let mut sidecar = Sidecar::new(remote_root, ssh, agent, state_dir)?;
+    let mut sidecar = Sidecar::new(
+        remote_root,
+        ssh,
+        agent,
+        state_dir,
+        request_timeout_ms,
+        ssh_connect_timeout_seconds,
+    )?;
 
     for line in stdin.lock().lines() {
         let line = line?;
@@ -1501,5 +1697,51 @@ mod tests {
             "file:///remote/repo/src/main.rs"
         );
         assert_eq!(value["params"]["rootPath"], "/remote/repo");
+    }
+
+    #[test]
+    fn agent_frame_requires_matching_response_id() {
+        let response = RpcMessage::Response {
+            id: 999,
+            response: Response::Ack,
+        };
+        let mut encoded = Vec::new();
+        write_frame(&mut encoded, &response).unwrap();
+        let mut stdout = BufReader::new(std::io::Cursor::new(encoded));
+        let mut stdin = Vec::new();
+
+        let error = send_agent_frame(&mut stdin, &mut stdout, 7, Request::Shutdown)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("response id mismatch"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_request_times_out_when_agent_stalls() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let fake_agent = dir.path().join("fake-agent");
+        fs::write(&fake_agent, "#!/bin/sh\nsleep 60\n").unwrap();
+        let mut permissions = fs::metadata(&fake_agent).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&fake_agent, permissions).unwrap();
+
+        let mut client = AgentClient::new(
+            fake_agent.to_string_lossy().to_string(),
+            None,
+            dir.path().to_path_buf(),
+            Duration::from_millis(50),
+            1,
+        );
+        let error = client
+            .request(Request::Hello {
+                client_version: "test".to_string(),
+                protocol_version: PROTOCOL_VERSION,
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("timed out"));
     }
 }

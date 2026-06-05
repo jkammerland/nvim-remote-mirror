@@ -23,6 +23,8 @@ M.config = {
   agent = executable_or_default("nrm-agent"),
   state_dir = nil,
   grep_limit = 200,
+  request_timeout_ms = 30000,
+  ssh_connect_timeout_seconds = 10,
 }
 
 M.client = nil
@@ -106,6 +108,10 @@ local function sidecar_args(target)
     table.insert(args, "--state-dir")
     table.insert(args, M.config.state_dir)
   end
+  table.insert(args, "--request-timeout-ms")
+  table.insert(args, tostring(M.config.request_timeout_ms))
+  table.insert(args, "--ssh-connect-timeout-seconds")
+  table.insert(args, tostring(M.config.ssh_connect_timeout_seconds))
   return args
 end
 

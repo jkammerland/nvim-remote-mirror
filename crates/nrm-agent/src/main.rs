@@ -2,8 +2,8 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use ignore::WalkBuilder;
 use nrm_protocol::{
-    read_frame, write_frame, CapabilitySet, FileMeta, Request, Response, SaveApplied, SaveConflict,
-    SaveOutcome, SearchHit, PROTOCOL_VERSION,
+    read_frame, write_frame, CapabilitySet, FileMeta, Request, Response, RpcError, RpcMessage,
+    SaveApplied, SaveConflict, SaveOutcome, SearchHit, PROTOCOL_VERSION,
 };
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -42,19 +42,42 @@ fn serve(root: PathBuf) -> Result<()> {
     let mut writer = stdout.lock();
 
     loop {
-        let request = match read_frame::<_, Request>(&mut reader) {
-            Ok(request) => request,
+        let message = match read_frame::<_, RpcMessage>(&mut reader) {
+            Ok(message) => message,
             Err(error) => {
                 eprintln!("nrm-agent: failed to read frame: {error}");
                 break;
             }
         };
 
+        let (id, request) = match message {
+            RpcMessage::Request { id, request } => (id, request),
+            RpcMessage::Cancel { id } => {
+                write_frame(
+                    &mut writer,
+                    &RpcMessage::Error {
+                        id,
+                        error: RpcError {
+                            code: nrm_protocol::RpcErrorCode::Cancelled,
+                            message: "request cancellation is not active yet".to_string(),
+                            retryable: true,
+                        },
+                    },
+                )?;
+                continue;
+            }
+            other => {
+                eprintln!("nrm-agent: unexpected client frame: {other:?}");
+                break;
+            }
+        };
+
         let shutdown = matches!(request, Request::Shutdown);
         let response = match handle_request(&root, request) {
-            Ok(response) => response,
-            Err(error) => Response::Error {
-                message: error.to_string(),
+            Ok(response) => RpcMessage::Response { id, response },
+            Err(error) => RpcMessage::Error {
+                id,
+                error: RpcError::agent(error.to_string()),
             },
         };
         write_frame(&mut writer, &response)?;

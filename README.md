@@ -21,6 +21,8 @@ This first implementation covers:
 
 - SSH or local agent launch.
 - versioned hello/capability handshake.
+- request-id framed sidecar/agent RPC with typed remote errors.
+- configurable request and SSH connect timeouts.
 - remote scan.
 - lazy file open/hydration into a local mirror.
 - remote grep with streamed-style result payloads.
@@ -73,6 +75,8 @@ Override them from Lua:
 require("nvim_remote_mirror").setup({
   sidecar = "/path/to/nrm-sidecar",
   agent = "/path/to/nrm-agent",
+  request_timeout_ms = 30000,
+  ssh_connect_timeout_seconds = 10,
 })
 ```
 
@@ -116,6 +120,13 @@ Neovim talks to the sidecar through newline-delimited JSON:
 ```
 
 The sidecar talks to the agent using a 4-byte big-endian length prefix followed
-by a bincode-encoded protocol message. That boundary is transport-agnostic, so a
+by a bincode-encoded `RpcMessage`. Every request has a request ID and every
+agent reply carries the matching ID. That boundary is transport-agnostic, so a
 future QUIC/UDP transport over WireGuard can replace SSH without changing the
 mirror model.
+
+Current transport state:
+
+- active: request IDs, typed remote errors, request timeout, SSH connect timeout.
+- pending: true multiplexing, cancellation, streaming results, reconnect resume,
+  and backpressure.

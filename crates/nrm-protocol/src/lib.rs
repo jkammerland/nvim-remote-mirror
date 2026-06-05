@@ -4,6 +4,8 @@ use std::io::{Read, Write};
 pub const PROTOCOL_VERSION: u16 = 1;
 pub const MAX_FRAME_LEN: usize = 64 * 1024 * 1024;
 
+pub type RequestId = u64;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CapabilitySet {
     pub scan: bool,
@@ -12,6 +14,10 @@ pub struct CapabilitySet {
     pub checksum: bool,
     pub grep: bool,
     pub lsp_proxy: bool,
+    pub request_ids: bool,
+    pub cancellation: bool,
+    pub streaming: bool,
+    pub multiplexing: bool,
 }
 
 impl CapabilitySet {
@@ -23,6 +29,10 @@ impl CapabilitySet {
             checksum: true,
             grep: true,
             lsp_proxy: false,
+            request_ids: true,
+            cancellation: false,
+            streaming: false,
+            multiplexing: false,
         }
     }
 }
@@ -139,6 +149,47 @@ pub enum Response {
     },
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum RpcErrorCode {
+    Agent,
+    Protocol,
+    Cancelled,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RpcError {
+    pub code: RpcErrorCode,
+    pub message: String,
+    pub retryable: bool,
+}
+
+impl RpcError {
+    pub fn agent(message: impl Into<String>) -> Self {
+        Self {
+            code: RpcErrorCode::Agent,
+            message: message.into(),
+            retryable: false,
+        }
+    }
+
+    pub fn protocol(message: impl Into<String>) -> Self {
+        Self {
+            code: RpcErrorCode::Protocol,
+            message: message.into(),
+            retryable: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum RpcMessage {
+    Request { id: RequestId, request: Request },
+    Response { id: RequestId, response: Response },
+    Error { id: RequestId, error: RpcError },
+    Cancel { id: RequestId },
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum FrameError {
     #[error("frame length {0} exceeds maximum {MAX_FRAME_LEN}")]
@@ -187,16 +238,36 @@ mod tests {
 
     #[test]
     fn round_trips_request_frame() {
-        let request = Request::ReadFile {
-            path: "src/main.rs".to_string(),
-            offset: 10,
-            len: Some(512),
+        let request = RpcMessage::Request {
+            id: 42,
+            request: Request::ReadFile {
+                path: "src/main.rs".to_string(),
+                offset: 10,
+                len: Some(512),
+            },
         };
         let mut bytes = Vec::new();
         write_frame(&mut bytes, &request).unwrap();
 
-        let decoded: Request = read_frame(&mut Cursor::new(bytes)).unwrap();
+        let decoded: RpcMessage = read_frame(&mut Cursor::new(bytes)).unwrap();
         assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn round_trips_typed_rpc_error() {
+        let message = RpcMessage::Error {
+            id: 7,
+            error: RpcError {
+                code: RpcErrorCode::Protocol,
+                message: "bad frame".to_string(),
+                retryable: false,
+            },
+        };
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &message).unwrap();
+
+        let decoded: RpcMessage = read_frame(&mut Cursor::new(bytes)).unwrap();
+        assert_eq!(decoded, message);
     }
 
     #[test]
