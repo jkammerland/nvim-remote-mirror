@@ -4,12 +4,27 @@ use ignore::WalkBuilder;
 use nrm_protocol::{
     read_frame, write_frame, BatchReadError, BatchReadFile, BatchValidateFile, CapabilitySet,
     FileMeta, Request, Response, RpcError, RpcMessage, SaveApplied, SaveConflict, SaveOutcome,
-    SearchHit, PROTOCOL_VERSION,
+    SearchHit, WriteStartOutcome, WriteStarted, PROTOCOL_VERSION,
 };
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+struct AgentState {
+    root: PathBuf,
+    uploads: HashMap<String, PendingUpload>,
+}
+
+struct PendingUpload {
+    path: String,
+    expected_hash: Option<String>,
+    content_hash: String,
+    size: u64,
+    tmp_path: PathBuf,
+    written: u64,
+}
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Remote workspace agent for nvim-remote-mirror")]
@@ -37,6 +52,10 @@ fn serve(root: PathBuf) -> Result<()> {
     let root = root
         .canonicalize()
         .with_context(|| format!("failed to canonicalize root {}", root.display()))?;
+    let mut state = AgentState {
+        root,
+        uploads: HashMap::new(),
+    };
     let stdin = io::stdin();
     let stdout = io::stdout();
     let mut reader = stdin.lock();
@@ -74,7 +93,7 @@ fn serve(root: PathBuf) -> Result<()> {
         };
 
         let shutdown = matches!(request, Request::Shutdown);
-        let response = match handle_request(&root, request) {
+        let response = match handle_request(&mut state, request) {
             Ok(response) => RpcMessage::Response { id, response },
             Err(error) => RpcMessage::Error {
                 id,
@@ -90,7 +109,7 @@ fn serve(root: PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn handle_request(root: &Path, request: Request) -> Result<Response> {
+fn handle_request(state: &mut AgentState, request: Request) -> Result<Response> {
     match request {
         Request::Hello {
             protocol_version, ..
@@ -106,19 +125,19 @@ fn handle_request(root: &Path, request: Request) -> Result<Response> {
                 capabilities: CapabilitySet::v1_agent(),
             })
         }
-        Request::Scan { limit } => scan(root, limit),
+        Request::Scan { limit } => scan(&state.root, limit),
         Request::Stat { path } => {
-            let abs = resolve_remote_path(root, &path)?;
+            let abs = resolve_remote_path(&state.root, &path)?;
             Ok(Response::Stat {
                 meta: if abs.exists() {
-                    Some(file_meta(root, &abs, false)?)
+                    Some(file_meta(&state.root, &abs, false)?)
                 } else {
                     None
                 },
             })
         }
         Request::Checksum { path } => {
-            let abs = resolve_remote_path(root, &path)?;
+            let abs = resolve_remote_path(&state.root, &path)?;
             let hash = if abs.is_file() {
                 Some(hash_file(&abs)?)
             } else {
@@ -129,19 +148,32 @@ fn handle_request(root: &Path, request: Request) -> Result<Response> {
         Request::ValidateFiles {
             paths,
             include_hash,
-        } => validate_files(root, paths, include_hash),
-        Request::ReadFile { path, offset, len } => read_file(root, path, offset, len),
+        } => validate_files(&state.root, paths, include_hash),
+        Request::ReadFile { path, offset, len } => read_file(&state.root, path, offset, len),
         Request::ReadFiles {
             paths,
             max_file_bytes,
             max_total_bytes,
-        } => read_files(root, paths, max_file_bytes, max_total_bytes),
-        Request::Grep { query, limit } => grep(root, &query, limit),
+        } => read_files(&state.root, paths, max_file_bytes, max_total_bytes),
+        Request::Grep { query, limit } => grep(&state.root, &query, limit),
         Request::WriteFileCas {
             path,
             expected_hash,
             content,
-        } => write_file_cas(root, path, expected_hash, content),
+        } => write_file_cas(&state.root, path, expected_hash, content),
+        Request::BeginWriteFileCas {
+            path,
+            expected_hash,
+            content_hash,
+            size,
+        } => begin_write_file_cas(state, path, expected_hash, content_hash, size),
+        Request::WriteFileChunk {
+            upload_id,
+            offset,
+            content,
+        } => write_file_chunk(state, upload_id, offset, content),
+        Request::FinishWriteFileCas { upload_id } => finish_write_file_cas(state, upload_id),
+        Request::AbortWriteFileCas { upload_id } => abort_write_file_cas(state, upload_id),
         Request::Shutdown => Ok(Response::Ack),
     }
 }
@@ -408,6 +440,174 @@ fn write_file_cas(
     })
 }
 
+fn begin_write_file_cas(
+    state: &mut AgentState,
+    path: String,
+    expected_hash: Option<String>,
+    content_hash: String,
+    size: u64,
+) -> Result<Response> {
+    let abs = resolve_remote_path(&state.root, &path)?;
+    let actual_hash = if abs.exists() && abs.is_file() {
+        Some(hash_file(&abs)?)
+    } else {
+        None
+    };
+
+    if actual_hash != expected_hash {
+        let remote_content = if abs.is_file() {
+            fs::read(&abs).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        return Ok(Response::BeginWriteFileCas {
+            outcome: WriteStartOutcome::Conflict(SaveConflict {
+                path,
+                expected_hash,
+                actual_hash,
+                remote_content,
+            }),
+        });
+    }
+
+    if let Some(parent) = abs.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let upload_id = format!(
+        "{}-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos(),
+        hash_bytes(path.as_bytes())
+    );
+    let tmp_path = abs.with_extension(format!("nrm-upload-{upload_id}"));
+    File::create(&tmp_path)?;
+    state.uploads.insert(
+        upload_id.clone(),
+        PendingUpload {
+            path,
+            expected_hash,
+            content_hash,
+            size,
+            tmp_path,
+            written: 0,
+        },
+    );
+
+    Ok(Response::BeginWriteFileCas {
+        outcome: WriteStartOutcome::Started(WriteStarted { upload_id }),
+    })
+}
+
+fn write_file_chunk(
+    state: &mut AgentState,
+    upload_id: String,
+    offset: u64,
+    content: Vec<u8>,
+) -> Result<Response> {
+    let upload = state
+        .uploads
+        .get_mut(&upload_id)
+        .ok_or_else(|| anyhow::anyhow!("unknown upload id {upload_id}"))?;
+    if offset != upload.written {
+        bail!(
+            "upload {upload_id} expected offset {}, got {offset}",
+            upload.written
+        );
+    }
+    let next = upload.written.saturating_add(content.len() as u64);
+    if next > upload.size {
+        bail!(
+            "upload {upload_id} exceeds declared size: next={next} size={}",
+            upload.size
+        );
+    }
+
+    let mut file = fs::OpenOptions::new().write(true).open(&upload.tmp_path)?;
+    file.seek(SeekFrom::Start(offset))?;
+    file.write_all(&content)?;
+    upload.written = next;
+
+    Ok(Response::WriteFileChunk {
+        upload_id,
+        accepted: next,
+    })
+}
+
+fn finish_write_file_cas(state: &mut AgentState, upload_id: String) -> Result<Response> {
+    let upload = state
+        .uploads
+        .remove(&upload_id)
+        .ok_or_else(|| anyhow::anyhow!("unknown upload id {upload_id}"))?;
+    if upload.written != upload.size {
+        let _ = fs::remove_file(&upload.tmp_path);
+        bail!(
+            "upload {upload_id} incomplete: written={} size={}",
+            upload.written,
+            upload.size
+        );
+    }
+
+    let tmp_hash = hash_file(&upload.tmp_path)?;
+    if tmp_hash != upload.content_hash {
+        let _ = fs::remove_file(&upload.tmp_path);
+        bail!(
+            "upload {upload_id} hash mismatch: expected={} actual={tmp_hash}",
+            upload.content_hash
+        );
+    }
+
+    let abs = resolve_remote_path(&state.root, &upload.path)?;
+    let actual_hash = if abs.exists() && abs.is_file() {
+        Some(hash_file(&abs)?)
+    } else {
+        None
+    };
+    if actual_hash != upload.expected_hash {
+        let remote_content = if abs.is_file() {
+            fs::read(&abs).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let _ = fs::remove_file(&upload.tmp_path);
+        return Ok(Response::FinishWriteFileCas {
+            outcome: SaveOutcome::Conflict(SaveConflict {
+                path: upload.path,
+                expected_hash: upload.expected_hash,
+                actual_hash,
+                remote_content,
+            }),
+        });
+    }
+
+    if let Some(parent) = abs.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    {
+        let file = File::open(&upload.tmp_path)?;
+        file.sync_all()?;
+    }
+    fs::rename(&upload.tmp_path, &abs)?;
+    let meta = file_meta(&state.root, &abs, true)?;
+
+    Ok(Response::FinishWriteFileCas {
+        outcome: SaveOutcome::Applied(SaveApplied {
+            path: upload.path,
+            new_hash: tmp_hash,
+            size: meta.size,
+            mtime_ms: meta.mtime_ms,
+        }),
+    })
+}
+
+fn abort_write_file_cas(state: &mut AgentState, upload_id: String) -> Result<Response> {
+    if let Some(upload) = state.uploads.remove(&upload_id) {
+        let _ = fs::remove_file(upload.tmp_path);
+    }
+    Ok(Response::AbortWriteFileCas { upload_id })
+}
+
 fn resolve_remote_path(root: &Path, path: &str) -> Result<PathBuf> {
     let relative = normalize_relative_path(path)?;
     Ok(root.join(relative))
@@ -615,5 +815,80 @@ mod tests {
             }
             other => panic!("unexpected response: {other:?}"),
         }
+    }
+
+    #[test]
+    fn chunked_write_cas_applies_when_hash_matches() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        fs::write(root.join("large.bin"), "old").unwrap();
+        let old_hash = hash_file(&root.join("large.bin")).unwrap();
+        let content = b"new-content-in-two-chunks".to_vec();
+        let content_hash = hash_bytes(&content);
+        let mut state = AgentState {
+            root: root.clone(),
+            uploads: HashMap::new(),
+        };
+
+        let begin = begin_write_file_cas(
+            &mut state,
+            "large.bin".to_string(),
+            Some(old_hash),
+            content_hash.clone(),
+            content.len() as u64,
+        )
+        .unwrap();
+        let upload_id = match begin {
+            Response::BeginWriteFileCas {
+                outcome: WriteStartOutcome::Started(started),
+            } => started.upload_id,
+            other => panic!("unexpected begin response: {other:?}"),
+        };
+
+        write_file_chunk(&mut state, upload_id.clone(), 0, content[..8].to_vec()).unwrap();
+        write_file_chunk(&mut state, upload_id.clone(), 8, content[8..].to_vec()).unwrap();
+        let finish = finish_write_file_cas(&mut state, upload_id).unwrap();
+
+        match finish {
+            Response::FinishWriteFileCas {
+                outcome: SaveOutcome::Applied(applied),
+            } => {
+                assert_eq!(applied.path, "large.bin");
+                assert_eq!(applied.new_hash, content_hash);
+            }
+            other => panic!("unexpected finish response: {other:?}"),
+        }
+        assert_eq!(fs::read(root.join("large.bin")).unwrap(), content);
+    }
+
+    #[test]
+    fn chunked_write_cas_conflicts_before_upload() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        fs::write(root.join("large.bin"), "remote").unwrap();
+        let mut state = AgentState {
+            root,
+            uploads: HashMap::new(),
+        };
+
+        let begin = begin_write_file_cas(
+            &mut state,
+            "large.bin".to_string(),
+            Some("stale".to_string()),
+            hash_bytes(b"new"),
+            3,
+        )
+        .unwrap();
+
+        match begin {
+            Response::BeginWriteFileCas {
+                outcome: WriteStartOutcome::Conflict(conflict),
+            } => {
+                assert_eq!(conflict.expected_hash.as_deref(), Some("stale"));
+                assert_eq!(conflict.remote_content, b"remote");
+            }
+            other => panic!("unexpected begin response: {other:?}"),
+        }
+        assert!(state.uploads.is_empty());
     }
 }

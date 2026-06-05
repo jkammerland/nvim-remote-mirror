@@ -16,6 +16,7 @@ pub struct CapabilitySet {
     pub lsp_proxy: bool,
     pub batch_read: bool,
     pub batch_validate: bool,
+    pub chunked_write: bool,
     pub request_ids: bool,
     pub cancellation: bool,
     pub streaming: bool,
@@ -33,6 +34,7 @@ impl CapabilitySet {
             lsp_proxy: false,
             batch_read: true,
             batch_validate: true,
+            chunked_write: true,
             request_ids: true,
             cancellation: false,
             streaming: false,
@@ -103,6 +105,17 @@ pub enum SaveOutcome {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WriteStarted {
+    pub upload_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum WriteStartOutcome {
+    Started(WriteStarted),
+    Conflict(SaveConflict),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Request {
     Hello {
         client_version: String,
@@ -139,6 +152,23 @@ pub enum Request {
         path: String,
         expected_hash: Option<String>,
         content: Vec<u8>,
+    },
+    BeginWriteFileCas {
+        path: String,
+        expected_hash: Option<String>,
+        content_hash: String,
+        size: u64,
+    },
+    WriteFileChunk {
+        upload_id: String,
+        offset: u64,
+        content: Vec<u8>,
+    },
+    FinishWriteFileCas {
+        upload_id: String,
+    },
+    AbortWriteFileCas {
+        upload_id: String,
     },
     Shutdown,
 }
@@ -184,6 +214,19 @@ pub enum Response {
     },
     WriteFileCas {
         outcome: SaveOutcome,
+    },
+    BeginWriteFileCas {
+        outcome: WriteStartOutcome,
+    },
+    WriteFileChunk {
+        upload_id: String,
+        accepted: u64,
+    },
+    FinishWriteFileCas {
+        outcome: SaveOutcome,
+    },
+    AbortWriteFileCas {
+        upload_id: String,
     },
     Ack,
     Error {
@@ -336,6 +379,24 @@ mod tests {
             request: Request::ValidateFiles {
                 paths: vec!["a.txt".to_string(), "deleted.txt".to_string()],
                 include_hash: true,
+            },
+        };
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &request).unwrap();
+
+        let decoded: RpcMessage = read_frame(&mut Cursor::new(bytes)).unwrap();
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn round_trips_chunked_write_request() {
+        let request = RpcMessage::Request {
+            id: 10,
+            request: Request::BeginWriteFileCas {
+                path: "large.bin".to_string(),
+                expected_hash: Some("old".to_string()),
+                content_hash: "new".to_string(),
+                size: 4096,
             },
         };
         let mut bytes = Vec::new();

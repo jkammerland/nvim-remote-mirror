@@ -2,7 +2,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 use nrm_protocol::{
     read_frame, write_frame, BatchReadFile, BatchValidateFile, FileMeta, Request, RequestId,
-    Response, RpcError, RpcMessage, SaveOutcome, MAX_FRAME_LEN, PROTOCOL_VERSION,
+    Response, RpcError, RpcMessage, SaveOutcome, WriteStartOutcome, MAX_FRAME_LEN,
+    PROTOCOL_VERSION,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -16,6 +17,7 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_CHUNK_SIZE: u64 = 1024 * 1024;
+const SAVE_UPLOAD_CHUNK_BYTES: usize = 1024 * 1024;
 const DEFAULT_BATCH_MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
 const DEFAULT_BATCH_MAX_TOTAL_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_SAVE_PAYLOAD_BYTES: usize = MAX_FRAME_LEN - (1024 * 1024);
@@ -1199,6 +1201,52 @@ impl Sidecar {
     }
 
     fn apply_save_entry(&mut self, entry: SaveQueueEntry) -> Result<SaveAttempt> {
+        let snapshot_size = match fs::metadata(&entry.snapshot_path) {
+            Ok(metadata) => metadata.len(),
+            Err(error) => {
+                let reason = format!(
+                    "failed to stat queued save snapshot {}: {error}",
+                    entry.snapshot_path.display()
+                );
+                self.mirror
+                    .mark_save_failed(entry.id, &entry.relative_path, &reason)?;
+                return Ok(SaveAttempt::Queued {
+                    path: entry.relative_path,
+                    reason,
+                });
+            }
+        };
+        let actual_local_hash = match hash_file(&entry.snapshot_path) {
+            Ok(hash) => hash,
+            Err(error) => {
+                let reason = format!(
+                    "failed to hash queued save snapshot {}: {error}",
+                    entry.snapshot_path.display()
+                );
+                self.mirror
+                    .mark_save_failed(entry.id, &entry.relative_path, &reason)?;
+                return Ok(SaveAttempt::Queued {
+                    path: entry.relative_path,
+                    reason,
+                });
+            }
+        };
+        if actual_local_hash != entry.local_hash {
+            let reason = format!(
+                "queued save snapshot hash mismatch: expected={} actual={actual_local_hash}",
+                entry.local_hash
+            );
+            self.mirror
+                .mark_save_failed(entry.id, &entry.relative_path, &reason)?;
+            return Ok(SaveAttempt::Queued {
+                path: entry.relative_path,
+                reason,
+            });
+        }
+        if snapshot_size as usize > MAX_SAVE_PAYLOAD_BYTES {
+            return self.apply_chunked_save_entry(entry, snapshot_size);
+        }
+
         let content = match fs::read(&entry.snapshot_path) {
             Ok(content) => content,
             Err(error) => {
@@ -1214,33 +1262,15 @@ impl Sidecar {
                 });
             }
         };
-        let actual_local_hash = hash_bytes(&content);
-        if actual_local_hash != entry.local_hash {
-            let reason = format!(
-                "queued save snapshot hash mismatch: expected={} actual={actual_local_hash}",
-                entry.local_hash
-            );
-            self.mirror
-                .mark_save_failed(entry.id, &entry.relative_path, &reason)?;
-            return Ok(SaveAttempt::Queued {
-                path: entry.relative_path,
-                reason,
-            });
-        }
-        if content.len() > MAX_SAVE_PAYLOAD_BYTES {
-            let reason = format!(
-                "queued save is {} bytes; current whole-file CAS payload limit is {} bytes",
-                content.len(),
-                MAX_SAVE_PAYLOAD_BYTES
-            );
-            self.mirror
-                .mark_save_failed(entry.id, &entry.relative_path, &reason)?;
-            return Ok(SaveAttempt::Queued {
-                path: entry.relative_path,
-                reason,
-            });
-        }
 
+        self.apply_small_save_entry(entry, content)
+    }
+
+    fn apply_small_save_entry(
+        &mut self,
+        entry: SaveQueueEntry,
+        content: Vec<u8>,
+    ) -> Result<SaveAttempt> {
         let response = match self.agent.request(Request::WriteFileCas {
             path: entry.relative_path.clone(),
             expected_hash: entry.expected_hash.clone(),
@@ -1259,11 +1289,117 @@ impl Sidecar {
         };
 
         match response {
-            Response::WriteFileCas {
-                outcome: SaveOutcome::Applied(applied),
+            Response::WriteFileCas { outcome } => self.record_save_outcome(entry.id, outcome),
+            other => bail!("unexpected flush response: {other:?}"),
+        }
+    }
+
+    fn apply_chunked_save_entry(
+        &mut self,
+        entry: SaveQueueEntry,
+        snapshot_size: u64,
+    ) -> Result<SaveAttempt> {
+        let begin = match self.agent.request(Request::BeginWriteFileCas {
+            path: entry.relative_path.clone(),
+            expected_hash: entry.expected_hash.clone(),
+            content_hash: entry.local_hash.clone(),
+            size: snapshot_size,
+        }) {
+            Ok(response) => response,
+            Err(error) => {
+                let reason = format!("remote chunked save start failed: {error}");
+                self.mirror
+                    .mark_save_failed(entry.id, &entry.relative_path, &reason)?;
+                return Ok(SaveAttempt::Queued {
+                    path: entry.relative_path,
+                    reason,
+                });
+            }
+        };
+
+        let upload_id = match begin {
+            Response::BeginWriteFileCas {
+                outcome: WriteStartOutcome::Started(started),
+            } => started.upload_id,
+            Response::BeginWriteFileCas {
+                outcome: WriteStartOutcome::Conflict(conflict),
             } => {
+                return self.record_save_outcome(entry.id, SaveOutcome::Conflict(conflict));
+            }
+            other => bail!("unexpected chunked save begin response: {other:?}"),
+        };
+
+        if let Err(error) = self.upload_snapshot_chunks(&entry, &upload_id) {
+            let _ = self.agent.request(Request::AbortWriteFileCas {
+                upload_id: upload_id.clone(),
+            });
+            let reason = format!("remote chunked save upload failed: {error}");
+            self.mirror
+                .mark_save_failed(entry.id, &entry.relative_path, &reason)?;
+            return Ok(SaveAttempt::Queued {
+                path: entry.relative_path,
+                reason,
+            });
+        }
+
+        let finish = match self
+            .agent
+            .request(Request::FinishWriteFileCas { upload_id })
+        {
+            Ok(response) => response,
+            Err(error) => {
+                let reason = format!("remote chunked save finish failed: {error}");
+                self.mirror
+                    .mark_save_failed(entry.id, &entry.relative_path, &reason)?;
+                return Ok(SaveAttempt::Queued {
+                    path: entry.relative_path,
+                    reason,
+                });
+            }
+        };
+
+        match finish {
+            Response::FinishWriteFileCas { outcome } => self.record_save_outcome(entry.id, outcome),
+            other => bail!("unexpected chunked save finish response: {other:?}"),
+        }
+    }
+
+    fn upload_snapshot_chunks(&mut self, entry: &SaveQueueEntry, upload_id: &str) -> Result<()> {
+        let mut file = File::open(&entry.snapshot_path)?;
+        let mut offset = 0_u64;
+        let mut buffer = vec![0_u8; SAVE_UPLOAD_CHUNK_BYTES];
+        loop {
+            let read = file.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            let response = self.agent.request(Request::WriteFileChunk {
+                upload_id: upload_id.to_string(),
+                offset,
+                content: buffer[..read].to_vec(),
+            })?;
+            match response {
+                Response::WriteFileChunk { accepted, .. } if accepted == offset + read as u64 => {
+                    offset = accepted;
+                }
+                Response::WriteFileChunk { accepted, .. } => {
+                    bail!(
+                        "agent accepted unexpected byte count for {}: expected={} accepted={accepted}",
+                        entry.relative_path,
+                        offset + read as u64
+                    );
+                }
+                other => bail!("unexpected chunk write response: {other:?}"),
+            }
+        }
+        Ok(())
+    }
+
+    fn record_save_outcome(&self, queue_id: i64, outcome: SaveOutcome) -> Result<SaveAttempt> {
+        match outcome {
+            SaveOutcome::Applied(applied) => {
                 self.mirror.mark_save_applied(
-                    entry.id,
+                    queue_id,
                     &applied.path,
                     &applied.new_hash,
                     applied.size,
@@ -1275,12 +1411,10 @@ impl Sidecar {
                     size: applied.size,
                 })
             }
-            Response::WriteFileCas {
-                outcome: SaveOutcome::Conflict(conflict),
-            } => {
+            SaveOutcome::Conflict(conflict) => {
                 let message = "remote content changed before queued save was applied";
                 let conflict_path = self.mirror.record_save_conflict(
-                    entry.id,
+                    queue_id,
                     &conflict.path,
                     &conflict.remote_content,
                     message,
@@ -1292,7 +1426,6 @@ impl Sidecar {
                     remote_path: conflict_path,
                 })
             }
-            other => bail!("unexpected flush response: {other:?}"),
         }
     }
 

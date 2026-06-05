@@ -29,6 +29,7 @@ This first implementation covers:
 - batched mirror refresh to mark cached files valid, stale, or deleted.
 - remote grep with streamed-style result payloads.
 - durable local save snapshots with checksum-aware flush/retry and conflict detection.
+- chunked compare-and-swap uploads for large remote saves.
 - basic Neovim commands.
 - basic LSP stdio proxying with local/remote path translation.
 
@@ -111,6 +112,11 @@ creates a content-addressed snapshot in the workspace state directory, then
 tries a remote compare-and-swap write. If the upload fails, `:RemoteStatus`
 shows the queued or failed save and `:RemoteFlushQueue` retries it.
 
+Small saves use one RPC request. Large saves stream through a chunked
+compare-and-swap upload: the agent checks the remote base hash before accepting
+chunks, verifies the uploaded content hash, rechecks the remote base hash, then
+renames the temp file into place.
+
 Use `:RemoteValidate [path]` to compare cached mirror metadata with the remote
 hash. Stale cached files are marked in the mirror and rehydrated on the next
 open instead of being treated as silently valid.
@@ -140,6 +146,7 @@ mirror model.
 Current transport state:
 
 - active: request IDs, typed remote errors, request timeout, SSH connect timeout,
-  batched small-file read for prefetch, batched mirror validation.
+  batched small-file read for prefetch, batched mirror validation, chunked
+  compare-and-swap writes.
 - pending: true multiplexing, cancellation, streaming results, reconnect resume,
   and backpressure.

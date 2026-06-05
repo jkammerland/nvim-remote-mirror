@@ -31,7 +31,7 @@ COMMANDS                                      *nvim-remote-mirror-commands*
 
 :RemoteFlush
     Flush the current remote buffer to the remote workspace using checksum
-    compare-and-swap.
+    compare-and-swap. Large saves are uploaded in chunks.
 
 :RemoteFlushQueue
     Retry queued or previously failed remote saves.
