@@ -1337,6 +1337,19 @@ impl Mirror {
         self.replace_search_index_from_bytes(&entry.relative_path, local_hash, &content)
     }
 
+    fn immediate_transaction(&self, action: impl FnOnce() -> Result<()>) -> Result<()> {
+        self.db.execute_batch("BEGIN IMMEDIATE")?;
+        let result = action();
+        match result {
+            Ok(()) => self.db.execute_batch("COMMIT")?,
+            Err(error) => {
+                let _ = self.db.execute_batch("ROLLBACK");
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
     fn replace_search_index_rows(
         &self,
         relative_path: &str,
@@ -1347,8 +1360,7 @@ impl Mirror {
         lines: &[(i64, String)],
         trigrams: &[(Vec<u8>, i64)],
     ) -> Result<()> {
-        self.db.execute_batch("BEGIN IMMEDIATE")?;
-        let result = (|| -> Result<()> {
+        self.immediate_transaction(|| {
             self.db.execute(
                 "DELETE FROM search_trigrams WHERE relative_path=?1",
                 params![relative_path],
@@ -1401,15 +1413,7 @@ impl Mirror {
                 ],
             )?;
             Ok(())
-        })();
-        match result {
-            Ok(()) => self.db.execute_batch("COMMIT")?,
-            Err(error) => {
-                let _ = self.db.execute_batch("ROLLBACK");
-                return Err(error);
-            }
-        }
-        Ok(())
+        })
     }
 
     fn ensure_search_index_ready(
@@ -1605,35 +1609,38 @@ impl Mirror {
             .latest_unresolved_save_hash(&relative_path)?
             .or_else(|| expected_hash.map(ToOwned::to_owned));
         let snapshot_path = self.write_save_snapshot(&relative_path, local_hash, content)?;
-        self.db.execute(
-            "
-            UPDATE files SET
-              size=?3,
-              local_hash=?2,
-              dirty=1,
-              validation_state='dirty',
-              last_error=NULL,
-              updated_at_ms=?4
-            WHERE relative_path=?1
-            ",
-            params![relative_path, local_hash, content.len() as i64, now_ms()],
-        )?;
-        self.db.execute(
-            "
-            INSERT INTO save_queue (
-              relative_path, expected_hash, local_hash, snapshot_path, state,
-              attempts, created_at_ms, updated_at_ms
-            )
-            VALUES (?1, ?2, ?3, ?4, 'pending', 0, ?5, ?5)
-            ",
-            params![
-                relative_path,
-                effective_expected_hash,
-                local_hash,
-                snapshot_path.to_string_lossy(),
-                now_ms()
-            ],
-        )?;
+        self.immediate_transaction(|| {
+            self.db.execute(
+                "
+                UPDATE files SET
+                  size=?3,
+                  local_hash=?2,
+                  dirty=1,
+                  validation_state='dirty',
+                  last_error=NULL,
+                  updated_at_ms=?4
+                WHERE relative_path=?1
+                ",
+                params![relative_path, local_hash, content.len() as i64, now_ms()],
+            )?;
+            self.db.execute(
+                "
+                INSERT INTO save_queue (
+                  relative_path, expected_hash, local_hash, snapshot_path, state,
+                  attempts, created_at_ms, updated_at_ms
+                )
+                VALUES (?1, ?2, ?3, ?4, 'pending', 0, ?5, ?5)
+                ",
+                params![
+                    relative_path,
+                    effective_expected_hash,
+                    local_hash,
+                    snapshot_path.to_string_lossy(),
+                    now_ms()
+                ],
+            )?;
+            Ok(())
+        })?;
         let queue_id = self.db.last_insert_rowid();
         self.replace_search_index_from_bytes(&relative_path, local_hash, content)?;
         Ok(SaveQueueEntry {
@@ -1982,48 +1989,51 @@ impl Mirror {
         size: u64,
         mtime_ms: i64,
     ) -> Result<()> {
-        self.db.execute(
-            "
-            UPDATE save_queue SET state='applied', last_error=NULL, updated_at_ms=?2
-            WHERE id=?1
-            ",
-            params![queue_id, now_ms()],
-        )?;
-        let unresolved = self.unresolved_save_count(relative_path)?;
-        if unresolved > 0 {
+        self.immediate_transaction(|| {
+            self.db.execute(
+                "
+                UPDATE save_queue SET state='applied', last_error=NULL, updated_at_ms=?2
+                WHERE id=?1
+                ",
+                params![queue_id, now_ms()],
+            )?;
+            let unresolved = self.unresolved_save_count(relative_path)?;
+            if unresolved > 0 {
+                self.db.execute(
+                    "
+                    UPDATE files SET
+                      size=?2,
+                      mtime_ms=?3,
+                      remote_hash=?4,
+                      validation_state='dirty',
+                      last_error=NULL,
+                      updated_at_ms=?5
+                    WHERE relative_path=?1
+                    ",
+                    params![relative_path, size as i64, mtime_ms, new_hash, now_ms()],
+                )?;
+                return Ok(());
+            }
+
             self.db.execute(
                 "
                 UPDATE files SET
                   size=?2,
                   mtime_ms=?3,
                   remote_hash=?4,
-                  validation_state='dirty',
+                  local_hash=?4,
+                  dirty=0,
+                  state='hydrated',
+                  validated_at_ms=?5,
+                  validation_state='valid',
                   last_error=NULL,
                   updated_at_ms=?5
                 WHERE relative_path=?1
                 ",
                 params![relative_path, size as i64, mtime_ms, new_hash, now_ms()],
             )?;
-            return Ok(());
-        }
-
-        self.db.execute(
-            "
-            UPDATE files SET
-              size=?2,
-              mtime_ms=?3,
-              remote_hash=?4,
-              local_hash=?4,
-              dirty=0,
-              state='hydrated',
-              validated_at_ms=?5,
-              validation_state='valid',
-              last_error=NULL,
-              updated_at_ms=?5
-            WHERE relative_path=?1
-            ",
-            params![relative_path, size as i64, mtime_ms, new_hash, now_ms()],
-        )?;
+            Ok(())
+        })?;
         if let Some(entry) = self.get(relative_path)? {
             if entry.local_path.is_file() {
                 let file_len = fs::metadata(&entry.local_path)
@@ -2036,25 +2046,27 @@ impl Mirror {
     }
 
     fn mark_save_failed(&self, queue_id: i64, relative_path: &str, error: &str) -> Result<()> {
-        self.db.execute(
-            "
-            UPDATE save_queue SET
-              state='failed',
-              attempts=attempts+1,
-              last_error=?2,
-              updated_at_ms=?3
-            WHERE id=?1
-            ",
-            params![queue_id, error, now_ms()],
-        )?;
-        self.db.execute(
-            "
-            UPDATE files SET last_error=?2, updated_at_ms=?3
-            WHERE relative_path=?1
-            ",
-            params![relative_path, error, now_ms()],
-        )?;
-        Ok(())
+        self.immediate_transaction(|| {
+            self.db.execute(
+                "
+                UPDATE save_queue SET
+                  state='failed',
+                  attempts=attempts+1,
+                  last_error=?2,
+                  updated_at_ms=?3
+                WHERE id=?1
+                ",
+                params![queue_id, error, now_ms()],
+            )?;
+            self.db.execute(
+                "
+                UPDATE files SET last_error=?2, updated_at_ms=?3
+                WHERE relative_path=?1
+                ",
+                params![relative_path, error, now_ms()],
+            )?;
+            Ok(())
+        })
     }
 
     fn record_save_conflict(
@@ -2075,28 +2087,31 @@ impl Mirror {
             .conflicts_root
             .join(format!("{safe_name}.remote.{suffix}.{}", now_ms()));
         fs::write(&path, remote_content)?;
-        self.db.execute(
-            "
-            UPDATE save_queue SET
-              state='conflict',
-              attempts=attempts+1,
-              last_error=?2,
-              remote_conflict_path=?3,
-              updated_at_ms=?4
-            WHERE id=?1
-            ",
-            params![queue_id, message, path.to_string_lossy(), now_ms()],
-        )?;
-        self.db.execute(
-            "
-            UPDATE files SET
-              validation_state='conflict',
-              last_error=?2,
-              updated_at_ms=?3
-            WHERE relative_path=?1
-            ",
-            params![relative_path, message, now_ms()],
-        )?;
+        self.immediate_transaction(|| {
+            self.db.execute(
+                "
+                UPDATE save_queue SET
+                  state='conflict',
+                  attempts=attempts+1,
+                  last_error=?2,
+                  remote_conflict_path=?3,
+                  updated_at_ms=?4
+                WHERE id=?1
+                ",
+                params![queue_id, message, path.to_string_lossy(), now_ms()],
+            )?;
+            self.db.execute(
+                "
+                UPDATE files SET
+                  validation_state='conflict',
+                  last_error=?2,
+                  updated_at_ms=?3
+                WHERE relative_path=?1
+                ",
+                params![relative_path, message, now_ms()],
+            )?;
+            Ok(())
+        })?;
         Ok(path)
     }
 
