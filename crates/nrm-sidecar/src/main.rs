@@ -3708,6 +3708,14 @@ impl Sidecar {
             .get("hydrate")
             .and_then(Value::as_bool)
             .unwrap_or(true);
+        let after = optional_string_param(&params, "after")
+            .map(|value| normalize_relative_path(value))
+            .transpose()?
+            .map(|value| value.to_string_lossy().replace('\\', "/"));
+        let max_files = params
+            .get("max_files")
+            .and_then(Value::as_u64)
+            .map(|value| value.min(usize::MAX as u64) as usize);
         let max_file_bytes = params
             .get("max_file_bytes")
             .and_then(Value::as_u64)
@@ -3720,6 +3728,8 @@ impl Sidecar {
             Request::Grep {
                 query: query.to_string(),
                 limit,
+                after: after.clone(),
+                max_files,
             },
             preempt_epoch,
         )? {
@@ -3731,12 +3741,19 @@ impl Sidecar {
                     "preempted": true,
                     "hydrated": 0,
                     "hydrate_errors": [],
-                    "hydrate_truncated": false
+                    "hydrate_truncated": false,
+                    "next_after": after,
+                    "scanned_files": 0
                 }));
             }
         };
         match response {
-            Response::Grep { hits, truncated } => {
+            Response::Grep {
+                hits,
+                truncated,
+                next_after,
+                scanned_files,
+            } => {
                 let mut hydrated = 0;
                 let mut hydrate_errors = Vec::new();
                 let mut hydrate_truncated = false;
@@ -3758,7 +3775,9 @@ impl Sidecar {
                             "preempted": true,
                             "hydrated": hydrated,
                             "hydrate_errors": hydrate_errors,
-                            "hydrate_truncated": hydrate_truncated
+                            "hydrate_truncated": hydrate_truncated,
+                            "next_after": next_after,
+                            "scanned_files": scanned_files
                         }));
                     }
                 }
@@ -3768,7 +3787,9 @@ impl Sidecar {
                     "truncated": truncated,
                     "hydrated": hydrated,
                     "hydrate_errors": hydrate_errors,
-                    "hydrate_truncated": hydrate_truncated
+                    "hydrate_truncated": hydrate_truncated,
+                    "next_after": next_after,
+                    "scanned_files": scanned_files
                 }))
             }
             other => bail!("unexpected grep response: {other:?}"),
@@ -5009,6 +5030,16 @@ fn preempted_result(request: &ClientRequest) -> Value {
             "skipped": 0,
             "errors": [],
             "preempted": true
+        }),
+        "grep" => json!({
+            "hits": [],
+            "truncated": true,
+            "preempted": true,
+            "hydrated": 0,
+            "hydrate_errors": [],
+            "hydrate_truncated": false,
+            "next_after": request.params.get("after").and_then(Value::as_str),
+            "scanned_files": 0
         }),
         "remote_probe" => json!({
             "remote_status": "unchecked",

@@ -24,6 +24,7 @@ M.config = {
   state_dir = nil,
   find_limit = 200,
   grep_limit = 200,
+  grep_remote_page_files = 512,
   grep_cache_max_files = 2000,
   grep_cache_max_file_bytes = 512 * 1024,
   grep_cache_max_total_bytes = 8 * 1024 * 1024,
@@ -1137,7 +1138,16 @@ end
 function M.grep(query)
   M.grep_generation = M.grep_generation + 1
   local generation = M.grep_generation
-  local remote_result = nil
+  local grep_limit = math.max(tonumber(M.config.grep_limit) or 0, 0)
+  local remote_result = {
+    hits = {},
+    truncated = false,
+    hydrated = 0,
+    hydrate_errors = {},
+    hydrate_truncated = false,
+    scanned_files = 0,
+  }
+  local remote_has_result = false
   local remote_applied = false
   local dirty_cache_hits = {}
 
@@ -1145,8 +1155,11 @@ function M.grep(query)
     return generation == M.grep_generation
   end
 
-  local function apply_remote_result()
-    if not is_current() or not remote_result then
+  local function apply_remote_result(force)
+    if not is_current() or not remote_has_result then
+      return
+    end
+    if not force and #(remote_result.hits or {}) == 0 and #(dirty_cache_hits or {}) == 0 then
       return
     end
     remote_applied = true
@@ -1160,37 +1173,72 @@ function M.grep(query)
     end
   end
 
-  M.request("grep", {
-    query = query,
-    limit = M.config.grep_limit,
-    hydrate = true,
-    max_file_bytes = M.config.prefetch_max_file_bytes,
-    max_total_bytes = M.config.prefetch_max_total_bytes,
-  }, function(err, result)
-    if not is_current() then
+  local function append_remote_page(result)
+    for _, hit in ipairs(result.hits or {}) do
+      table.insert(remote_result.hits, hit)
+    end
+    remote_result.truncated = result.truncated == true
+    remote_result.next_after = result.next_after
+    remote_result.scanned_files = (remote_result.scanned_files or 0) + (tonumber(result.scanned_files) or 0)
+    remote_result.hydrated = (remote_result.hydrated or 0) + (tonumber(result.hydrated) or 0)
+    remote_result.hydrate_truncated = remote_result.hydrate_truncated or result.hydrate_truncated == true
+    for _, hydrate_error in ipairs(result.hydrate_errors or {}) do
+      table.insert(remote_result.hydrate_errors, hydrate_error)
+    end
+  end
+
+  local function request_remote_page(after)
+    local remaining = math.max(grep_limit - #(remote_result.hits or {}), 0)
+    if remaining <= 0 then
+      apply_remote_result(true)
       return
     end
-    if err then
-      notify(err, vim.log.levels.ERROR)
-      return
-    end
-    if not result or result.preempted then
-      return
-    end
-    remote_result = result
-    apply_remote_result()
-    local hydrate_errors = #(result.hydrate_errors or {})
-    if hydrate_errors > 0 or result.hydrate_truncated then
-      notify(
-        "grep hydrated "
-          .. tostring(result.hydrated or 0)
-          .. " files with "
-          .. tostring(hydrate_errors)
-          .. " errors",
-        vim.log.levels.WARN
-      )
-    end
-  end)
+
+    M.request("grep", {
+      query = query,
+      limit = remaining,
+      after = after,
+      max_files = M.config.grep_remote_page_files,
+      hydrate = true,
+      max_file_bytes = M.config.prefetch_max_file_bytes,
+      max_total_bytes = M.config.prefetch_max_total_bytes,
+    }, function(err, result)
+      if not is_current() then
+        return
+      end
+      if err then
+        notify(err, vim.log.levels.ERROR)
+        return
+      end
+      if not result or result.preempted then
+        return
+      end
+
+      remote_has_result = true
+      append_remote_page(result)
+
+      local hydrate_errors = #(result.hydrate_errors or {})
+      if hydrate_errors > 0 or result.hydrate_truncated then
+        notify(
+          "grep hydrated "
+            .. tostring(result.hydrated or 0)
+            .. " files with "
+            .. tostring(hydrate_errors)
+            .. " errors",
+          vim.log.levels.WARN
+        )
+      end
+
+      local next_after = optional_string(result.next_after)
+      local has_more = result.truncated == true and next_after and #(remote_result.hits or {}) < grep_limit
+      apply_remote_result(not has_more)
+      if has_more then
+        request_remote_page(next_after)
+      end
+    end)
+  end
+
+  request_remote_page(nil)
 
   M.request("grep_cache", {
     query = query,
@@ -1214,8 +1262,8 @@ function M.grep(query)
       end
     end
 
-    if remote_result then
-      apply_remote_result()
+    if remote_has_result and (#(remote_result.hits or {}) > 0 or remote_applied) then
+      apply_remote_result(false)
       return
     end
 

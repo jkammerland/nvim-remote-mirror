@@ -136,6 +136,7 @@ require("nvim_remote_mirror").setup({
   ssh_connect_timeout_seconds = 10,
   find_limit = 200,
   grep_limit = 200,
+  grep_remote_page_files = 512,
   grep_cache_max_files = 2000,
   grep_cache_max_file_bytes = 512 * 1024,
   grep_cache_max_total_bytes = 8 * 1024 * 1024,
@@ -258,6 +259,10 @@ slow or temporarily unavailable after metadata has been scanned.
 `:RemoteGrep` queues the authoritative remote search first, then searches a
 bounded slice of already hydrated local mirror files. Cached hits are
 provisional and can populate quickfix while the remote search is still running.
+Remote grep walks the tree in deterministic cursor pages bounded by
+`grep_remote_page_files`, so sparse or no-hit searches can refresh quickfix
+progressively instead of waiting for one full remote tree pass. Each page
+hydrates safe result files before it is merged into the displayed remote result.
 The cached search uses a persisted SQLite line index, plus byte trigrams for
 literal queries of at least three bytes, and verifies matches in Rust so
 case-sensitive literal behavior and byte-based columns stay stable. Dirty saves
@@ -288,7 +293,7 @@ agent protocol frame format.
 Current transport state:
 
 - active: request IDs, typed remote errors, request timeout, SSH connect timeout,
-  cursor-based scan, batched small-file read for direct opens and prefetch, batched mirror
+  cursor-based scan and remote grep, batched small-file read for direct opens and prefetch, batched mirror
   validation, chunked compare-and-swap writes, and sidecar fast-path responses for cached mirror
   opens/status while remote worker requests are in flight. Neovim-side JSON RPC
   requests also use the configured request timeout to clean up pending callbacks

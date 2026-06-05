@@ -53,9 +53,10 @@ COMMANDS                                      *nvim-remote-mirror-commands*
 
 :RemoteGrep {query}
     Queue remote grep, search a bounded slice of already hydrated local mirror
-    files as a provisional cache result, hydrate remote matches in a batch, and
-    refresh quickfix with safe local mirror paths. Cached grep uses a persisted
-    local line/trigram index and keeps dirty cached matches as local truth.
+    files as a provisional cache result, walk the remote tree in cursor pages,
+    hydrate remote matches in a batch, and refresh quickfix with safe local
+    mirror paths. Cached grep uses a persisted local line/trigram index and
+    keeps dirty cached matches as local truth.
 
 :RemotePrefetch {path...}
     Hydrate one or more workspace-relative files in the background request.
@@ -101,6 +102,7 @@ CONFIGURATION                                  *nvim-remote-mirror-config*
     state_dir = "/path/to/state",
     find_limit = 200,
     grep_limit = 200,
+    grep_remote_page_files = 512,
     grep_cache_max_files = 2000,
     grep_cache_max_file_bytes = 512 * 1024,
     grep_cache_max_total_bytes = 8 * 1024 * 1024,
@@ -145,6 +147,8 @@ background_mirror controls the idle mirror builder; set it false and use
 :RemoteMirrorStart manually on especially fragile links. Each background tick
 scans metadata, hydrates a tiny clean-file batch, then validates a tiny
 oldest-check cached-file batch against the remote checksum.
+grep_remote_page_files bounds each remote grep cursor page by scanned files so
+sparse searches can refresh quickfix progressively on slow links.
 open_batch_max_file_bytes controls how large a direct uncached open may be
 before it falls back from one-request batch read hydration to chunked reads.
 auto_hydrate_mirror_buffers makes LSP jumps into missing local mirror files call

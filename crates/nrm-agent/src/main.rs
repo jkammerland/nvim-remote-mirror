@@ -155,7 +155,12 @@ fn handle_request(state: &mut AgentState, request: Request) -> Result<Response> 
             max_file_bytes,
             max_total_bytes,
         } => read_files(&state.root, paths, max_file_bytes, max_total_bytes),
-        Request::Grep { query, limit } => grep(&state.root, &query, limit),
+        Request::Grep {
+            query,
+            limit,
+            after,
+            max_files,
+        } => grep(&state.root, &query, limit, after.as_deref(), max_files),
         Request::WriteFileCas {
             path,
             expected_hash,
@@ -188,6 +193,7 @@ fn scan(root: &Path, limit: usize, after: Option<&str>) -> Result<Response> {
         .parents(true)
         .git_ignore(true)
         .git_exclude(true)
+        .sort_by_file_name(|a, b| a.cmp(b))
         .build()
     {
         let entry = entry?;
@@ -347,30 +353,55 @@ fn read_file_for_batch(root: &Path, path: &str, max_file_bytes: u64) -> Result<B
     })
 }
 
-fn grep(root: &Path, query: &str, limit: usize) -> Result<Response> {
-    if query.is_empty() {
+fn grep(
+    root: &Path,
+    query: &str,
+    limit: usize,
+    after: Option<&str>,
+    max_files: Option<usize>,
+) -> Result<Response> {
+    if query.is_empty() || limit == 0 {
         return Ok(Response::Grep {
             hits: Vec::new(),
             truncated: false,
+            next_after: None,
+            scanned_files: 0,
         });
     }
 
     let mut hits = Vec::new();
     let mut truncated = false;
+    let mut next_after = None;
+    let mut after_seen = after.is_none();
+    let mut scanned_files = 0_usize;
+    let max_files = max_files.unwrap_or(usize::MAX);
     for entry in WalkBuilder::new(root)
         .hidden(false)
         .parents(true)
         .git_ignore(true)
         .git_exclude(true)
+        .sort_by_file_name(|a, b| a.cmp(b))
         .build()
     {
         let entry = entry?;
-        if hits.len() >= limit {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let relative = relative_path(root, path)?;
+        if !after_seen {
+            if after == Some(relative.as_str()) {
+                after_seen = true;
+            }
+            continue;
+        }
+        if scanned_files >= max_files {
             truncated = true;
             break;
         }
-        let path = entry.path();
-        if !path.is_file() || likely_binary(path)? {
+        scanned_files += 1;
+        next_after = Some(relative.clone());
+        if likely_binary(path)? {
             continue;
         }
         let text = match fs::read_to_string(path) {
@@ -380,20 +411,32 @@ fn grep(root: &Path, query: &str, limit: usize) -> Result<Response> {
         for (line_idx, line) in text.lines().enumerate() {
             if let Some(byte_idx) = line.find(query) {
                 hits.push(SearchHit {
-                    path: relative_path(root, path)?,
+                    path: relative.clone(),
                     line: line_idx as u64 + 1,
                     column: byte_idx as u64 + 1,
                     text: line.to_string(),
                 });
                 if hits.len() >= limit {
                     truncated = true;
+                    next_after = None;
                     break;
                 }
             }
         }
+        if hits.len() >= limit {
+            break;
+        }
     }
 
-    Ok(Response::Grep { hits, truncated })
+    if !truncated {
+        next_after = None;
+    }
+    Ok(Response::Grep {
+        hits,
+        truncated,
+        next_after,
+        scanned_files,
+    })
 }
 
 fn write_file_cas(
@@ -870,6 +913,70 @@ mod tests {
         assert!(!truncated);
         assert!(!entries.iter().any(|entry| entry.path == cursor));
         assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn grep_paginates_by_scanned_files_and_cursor() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.txt"), "miss").unwrap();
+        fs::write(root.join("b.txt"), "needle b").unwrap();
+        fs::write(root.join("c.txt"), "needle c").unwrap();
+
+        let first = grep(root, "needle", 10, None, Some(2)).unwrap();
+        let Response::Grep {
+            hits,
+            truncated,
+            next_after,
+            scanned_files,
+        } = first
+        else {
+            panic!("unexpected grep response");
+        };
+        assert!(truncated);
+        assert_eq!(scanned_files, 2);
+        assert_eq!(next_after.as_deref(), Some("b.txt"));
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path, "b.txt");
+
+        let second = grep(root, "needle", 10, next_after.as_deref(), Some(2)).unwrap();
+        let Response::Grep {
+            hits,
+            truncated,
+            next_after,
+            scanned_files,
+        } = second
+        else {
+            panic!("unexpected grep response");
+        };
+        assert!(!truncated);
+        assert_eq!(scanned_files, 1);
+        assert!(next_after.is_none());
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path, "c.txt");
+    }
+
+    #[test]
+    fn grep_stops_without_cursor_when_hit_limit_is_reached() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.txt"), "needle a").unwrap();
+        fs::write(root.join("b.txt"), "needle b").unwrap();
+
+        let response = grep(root, "needle", 1, None, Some(10)).unwrap();
+        let Response::Grep {
+            hits,
+            truncated,
+            next_after,
+            scanned_files,
+        } = response
+        else {
+            panic!("unexpected grep response");
+        };
+        assert!(truncated);
+        assert!(next_after.is_none());
+        assert_eq!(scanned_files, 1);
+        assert_eq!(hits.len(), 1);
     }
 
     #[test]

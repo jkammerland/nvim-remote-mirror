@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 pub const MAX_FRAME_LEN: usize = 64 * 1024 * 1024;
 
 pub type RequestId = u64;
@@ -148,6 +148,8 @@ pub enum Request {
     Grep {
         query: String,
         limit: usize,
+        after: Option<String>,
+        max_files: Option<usize>,
     },
     WriteFileCas {
         path: String,
@@ -215,6 +217,8 @@ pub enum Response {
     Grep {
         hits: Vec<SearchHit>,
         truncated: bool,
+        next_after: Option<String>,
+        scanned_files: usize,
     },
     WriteFileCas {
         outcome: SaveOutcome,
@@ -383,6 +387,24 @@ mod tests {
             request: Request::Scan {
                 limit: 128,
                 after: Some("src/main.rs".to_string()),
+            },
+        };
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &request).unwrap();
+
+        let decoded: RpcMessage = read_frame(&mut Cursor::new(bytes)).unwrap();
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn round_trips_grep_page_request() {
+        let request = RpcMessage::Request {
+            id: 12,
+            request: Request::Grep {
+                query: "needle".to_string(),
+                limit: 50,
+                after: Some("src/lib.rs".to_string()),
+                max_files: Some(128),
             },
         };
         let mut bytes = Vec::new();
