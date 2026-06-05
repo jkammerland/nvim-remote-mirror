@@ -18,11 +18,13 @@ remote agent lazily hydrate a checksum-verified local mirror.
 COMMANDS                                      *nvim-remote-mirror-commands*
 
 :RemoteConnect [target]
-    Connect to a local path or ssh://host/absolute/path target.
+    Connect to a local path or ssh://host/absolute/path target. Startup uses
+    the durable local mirror first; the remote agent handshake is lazy, so
+    cached opens, cached grep, and status can work while SSH is unreachable.
 
 :RemoteReconnect
     Reconnect to the last remote target, reusing the durable mirror and
-    retrying queued saves after the sidecar starts.
+    retrying queued saves after a remote probe succeeds.
 
 :RemoteOpen {path}
     Open a workspace-relative file from the local mirror when cached, including

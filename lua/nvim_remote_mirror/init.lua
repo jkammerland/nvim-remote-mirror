@@ -297,7 +297,25 @@ local function schedule_flush_queue_on_connect(client, generation)
     })
   end
 
-  vim.defer_fn(replay_once, delay)
+  local function probe_then_replay()
+    if not still_current() then
+      return
+    end
+    M.request("remote_probe", {}, function(err, result)
+      if err or not result or not still_current() then
+        return
+      end
+      client.hello.remote_status = result.remote_status
+      client.hello.remote_checked = result.remote_checked
+      client.hello.remote_available = result.remote_available
+      client.hello.remote_error = result.remote_error
+      if result.remote_available then
+        replay_once()
+      end
+    end)
+  end
+
+  vim.defer_fn(probe_then_replay, delay)
 end
 
 function M.setup(opts)
@@ -373,7 +391,8 @@ function M.connect(target, opts)
     if is_reconnect then
       schedule_reconnect_stable_reset(client, generation)
     end
-    notify("connected: " .. result.remote_root)
+    local remote_suffix = result.remote_status == "unchecked" and " (remote unchecked)" or ""
+    notify("connected: " .. result.remote_root .. remote_suffix)
     schedule_flush_queue_on_connect(client, generation)
   end)
 end

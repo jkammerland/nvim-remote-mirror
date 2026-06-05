@@ -71,7 +71,7 @@ enum CommandKind {
     },
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct ClientRequest {
     id: u64,
     method: String,
@@ -249,6 +249,7 @@ struct AgentClient {
     interrupt: AgentInterrupt,
     preempt: AgentPreempt,
     worker: Option<AgentWorker>,
+    handshake_complete: bool,
     next_id: RequestId,
 }
 
@@ -272,6 +273,7 @@ impl AgentClient {
             interrupt,
             preempt: AgentPreempt::default(),
             worker: None,
+            handshake_complete: false,
             next_id: 1,
         }
     }
@@ -363,6 +365,10 @@ impl AgentClient {
         self.preempt.clone()
     }
 
+    fn handshake_complete(&self) -> bool {
+        self.handshake_complete
+    }
+
     fn preempt_epoch(&self) -> u64 {
         self.preempt.epoch()
     }
@@ -376,6 +382,65 @@ impl AgentClient {
     }
 
     fn request_outcome_inner(
+        &mut self,
+        request: Request,
+        preemptible: bool,
+        preempt_epoch: u64,
+    ) -> Result<AgentRequestOutcome> {
+        if !matches!(request, Request::Hello { .. }) && !self.handshake_complete {
+            if let Some(outcome) = self.ensure_handshake(preemptible, preempt_epoch)? {
+                return Ok(outcome);
+            }
+        }
+        let is_hello = matches!(request, Request::Hello { .. });
+        let outcome = self.send_request_outcome(request, preemptible, preempt_epoch)?;
+        if is_hello {
+            self.record_handshake_outcome(&outcome)?;
+        }
+        Ok(outcome)
+    }
+
+    fn ensure_handshake(
+        &mut self,
+        preemptible: bool,
+        preempt_epoch: u64,
+    ) -> Result<Option<AgentRequestOutcome>> {
+        let outcome = self.send_request_outcome(
+            Request::Hello {
+                client_version: env!("CARGO_PKG_VERSION").to_string(),
+                protocol_version: PROTOCOL_VERSION,
+            },
+            preemptible,
+            preempt_epoch,
+        )?;
+        match outcome {
+            AgentRequestOutcome::Response(Response::Hello { .. }) => {
+                self.handshake_complete = true;
+                Ok(None)
+            }
+            AgentRequestOutcome::Response(other) => {
+                self.kill_worker();
+                bail!("unexpected hello response from agent: {other:?}");
+            }
+            AgentRequestOutcome::Preempted => Ok(Some(AgentRequestOutcome::Preempted)),
+        }
+    }
+
+    fn record_handshake_outcome(&mut self, outcome: &AgentRequestOutcome) -> Result<()> {
+        match outcome {
+            AgentRequestOutcome::Response(Response::Hello { .. }) => {
+                self.handshake_complete = true;
+                Ok(())
+            }
+            AgentRequestOutcome::Response(other) => {
+                self.kill_worker();
+                bail!("unexpected hello response from agent: {other:?}");
+            }
+            AgentRequestOutcome::Preempted => Ok(()),
+        }
+    }
+
+    fn send_request_outcome(
         &mut self,
         request: Request,
         preemptible: bool,
@@ -398,6 +463,7 @@ impl AgentClient {
                 break;
             }
             self.worker = None;
+            self.handshake_complete = false;
             if attempt == 1 {
                 bail!("agent worker exited before request {id} could be sent");
             }
@@ -437,6 +503,7 @@ impl AgentClient {
                 Err(mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     self.worker = None;
+                    self.handshake_complete = false;
                     bail!("agent worker exited while request {id} was pending");
                 }
             }
@@ -449,6 +516,7 @@ impl AgentClient {
             AgentWorkerReply::Response(response) => Ok(AgentRequestOutcome::Response(response)),
             AgentWorkerReply::Error(message) => {
                 self.worker = None;
+                self.handshake_complete = false;
                 Err(anyhow!(message))
             }
         }
@@ -465,11 +533,14 @@ impl AgentClient {
     }
 
     fn shutdown(&mut self) {
-        let _ = self.request(Request::Shutdown);
+        if self.worker.is_some() {
+            let _ = self.request(Request::Shutdown);
+        }
         self.kill_worker();
     }
 
     fn kill_worker(&mut self) {
+        self.handshake_complete = false;
         if let Some(worker) = self.worker.take() {
             drop(worker.tx);
             if let Ok(mut child) = worker.child.lock() {
@@ -823,6 +894,25 @@ impl Mirror {
         })
     }
 
+    fn enqueue_local_save(&self, relative_path: &str) -> Result<SaveQueueEntry> {
+        let entry = self
+            .get(relative_path)?
+            .ok_or_else(|| anyhow!("{relative_path} is not known in the mirror"))?;
+        let content = fs::read(&entry.local_path).with_context(|| {
+            format!(
+                "failed to read local mirror file {}",
+                entry.local_path.display()
+            )
+        })?;
+        let local_hash = hash_bytes(&content);
+        self.enqueue_save(
+            relative_path,
+            &local_hash,
+            entry.remote_hash.as_deref(),
+            &content,
+        )
+    }
+
     fn write_save_snapshot(
         &self,
         relative_path: &str,
@@ -922,6 +1012,70 @@ impl Mirror {
             )
             .optional()
             .map_err(Into::into)
+    }
+
+    fn save_queue_entry(&self, queue_id: i64) -> Result<SaveQueueEntry> {
+        self.db
+            .query_row(
+                "
+                SELECT id, relative_path, expected_hash, local_hash, snapshot_path
+                FROM save_queue
+                WHERE id=?1 AND state IN ('pending', 'failed') AND snapshot_path IS NOT NULL
+                ",
+                params![queue_id],
+                |row| {
+                    Ok(SaveQueueEntry {
+                        id: row.get(0)?,
+                        relative_path: row.get(1)?,
+                        expected_hash: row.get(2)?,
+                        local_hash: row.get(3)?,
+                        snapshot_path: PathBuf::from(row.get::<_, String>(4)?),
+                    })
+                },
+            )
+            .optional()?
+            .ok_or_else(|| anyhow!("queued save {queue_id} is not pending or failed"))
+    }
+
+    fn restore_latest_dirty_snapshot(&self, entry: &MirrorEntry) -> Result<()> {
+        let save = self
+            .latest_unresolved_save_entry(&entry.relative_path)?
+            .ok_or_else(|| {
+                anyhow!(
+                    "{} is dirty but the local file is missing and no save snapshot exists",
+                    entry.relative_path
+                )
+            })?;
+        let snapshot_hash = hash_file(&save.snapshot_path).with_context(|| {
+            format!(
+                "failed to hash queued save snapshot {}",
+                save.snapshot_path.display()
+            )
+        })?;
+        if snapshot_hash != save.local_hash {
+            bail!(
+                "queued save snapshot hash mismatch for {}: expected={} actual={snapshot_hash}",
+                entry.relative_path,
+                save.local_hash
+            );
+        }
+        if let Some(parent) = entry.local_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let part_path = entry.local_path.with_extension("nrm-restore-part");
+        {
+            let mut source = File::open(&save.snapshot_path).with_context(|| {
+                format!(
+                    "failed to open queued save snapshot {}",
+                    save.snapshot_path.display()
+                )
+            })?;
+            let mut part = File::create(&part_path)?;
+            io::copy(&mut source, &mut part)?;
+            part.sync_all()?;
+        }
+        fs::rename(&part_path, &entry.local_path)?;
+        Ok(())
     }
 
     fn unresolved_save_count(&self, relative_path: &str) -> Result<i64> {
@@ -1511,7 +1665,9 @@ struct RemoteQueueState {
 impl RemotePriority {
     fn for_request(request: &ClientRequest) -> Self {
         match request.method.as_str() {
-            "prefetch" | "prefetch_related" | "refresh" | "scan" => Self::Background,
+            "prefetch" | "prefetch_related" | "refresh" | "scan" | "remote_probe" => {
+                Self::Background
+            }
             "flush_queue" if request_background_flag(request) => Self::Background,
             _ => Self::Interactive,
         }
@@ -1770,7 +1926,9 @@ impl PendingHazard {
                     .and_then(Value::as_bool)
                     .unwrap_or(true),
             },
-            "flush" => path_hazard(request.params.get("path").and_then(Value::as_str)),
+            "flush" | "flush_queued" => {
+                path_hazard(request.params.get("path").and_then(Value::as_str))
+            }
             "flush_queue" if request_background_flag(request) => Self::default(),
             "flush_queue" => Self {
                 exact_paths: Vec::new(),
@@ -1884,7 +2042,10 @@ impl FastState {
                 "workspace_key": self.workspace_key,
                 "remote_root": self.remote_root.to_string_lossy(),
                 "mirror_root": self.mirror_root.to_string_lossy(),
-                "files_root": self.files_root.to_string_lossy()
+                "files_root": self.files_root.to_string_lossy(),
+                "remote_status": "unchecked",
+                "remote_checked": false,
+                "remote_available": false
             }))),
             "status" => FastHandle::Handled(
                 Mirror::open_root(self.mirror_root.clone()).and_then(|mirror| mirror.status()),
@@ -1903,27 +2064,46 @@ impl FastState {
             .get("force")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        if force {
-            return FastHandle::Defer;
-        }
         let result = (|| -> Result<Option<Value>> {
             let path = required_string(params, "path")?;
             let normalized_path = normalize_relative_path(path)?
                 .to_string_lossy()
                 .replace('\\', "/");
+            let mirror = Mirror::open_root(self.mirror_root.clone())?;
+            let Some(mut entry) = mirror.get(&normalized_path)? else {
+                return Ok(None);
+            };
+            if entry.state != "hydrated" {
+                return Ok(None);
+            }
+            let mut restored_from_snapshot = false;
+            if entry.dirty && !entry.local_path.exists() {
+                mirror.restore_latest_dirty_snapshot(&entry)?;
+                restored_from_snapshot = true;
+                entry = mirror
+                    .get(&normalized_path)?
+                    .ok_or_else(|| anyhow!("restored file lost mirror metadata"))?;
+            }
+            if !entry.local_path.exists() {
+                return Ok(None);
+            }
+            if entry.dirty {
+                return Ok(Some(Sidecar::cached_open_response(
+                    &entry,
+                    "dirty",
+                    force,
+                    restored_from_snapshot,
+                )));
+            }
+            if force {
+                return Ok(None);
+            }
             if self
                 .pending_remote
                 .lock()
                 .map(|pending| pending.blocks_path(&normalized_path))
                 .unwrap_or(true)
             {
-                return Ok(None);
-            }
-            let mirror = Mirror::open_root(self.mirror_root.clone())?;
-            let Some(entry) = mirror.get(&normalized_path)? else {
-                return Ok(None);
-            };
-            if entry.state != "hydrated" || !entry.local_path.exists() {
                 return Ok(None);
             }
             let reason = if entry.dirty {
@@ -1935,7 +2115,10 @@ impl FastState {
                 }
             };
             Ok(Some(Sidecar::cached_open_response(
-                &entry, reason, false, false,
+                &entry,
+                reason,
+                false,
+                restored_from_snapshot,
             )))
         })();
         match result {
@@ -1943,6 +2126,20 @@ impl FastState {
             Ok(None) => FastHandle::Defer,
             Err(error) => FastHandle::Handled(Err(error)),
         }
+    }
+
+    fn prepare_flush(&self, request: &ClientRequest) -> Result<ClientRequest> {
+        let path = required_string(&request.params, "path")?;
+        let mirror = Mirror::open_root(self.mirror_root.clone())?;
+        let queued = mirror.enqueue_local_save(path)?;
+        Ok(ClientRequest {
+            id: request.id,
+            method: "flush_queued".to_string(),
+            params: json!({
+                "queue_id": queued.id,
+                "path": queued.relative_path
+            }),
+        })
     }
 }
 
@@ -1958,7 +2155,7 @@ impl Sidecar {
     ) -> Result<Self> {
         let workspace_key = workspace_key(ssh.as_deref(), &remote_root);
         let mirror = Mirror::open(state_dir, &workspace_key)?;
-        let mut agent = AgentClient::new(
+        let agent = AgentClient::new(
             agent,
             ssh,
             remote_root.clone(),
@@ -1966,13 +2163,6 @@ impl Sidecar {
             ssh_connect_timeout_seconds,
             agent_interrupt,
         );
-        let hello = agent.request(Request::Hello {
-            client_version: env!("CARGO_PKG_VERSION").to_string(),
-            protocol_version: PROTOCOL_VERSION,
-        })?;
-        if !matches!(hello, Response::Hello { .. }) {
-            bail!("unexpected hello response from agent: {hello:?}");
-        }
         let sidecar = Self {
             agent,
             mirror,
@@ -1990,9 +2180,13 @@ impl Sidecar {
                 "workspace_key": self.workspace_key,
                 "remote_root": self.remote_root.to_string_lossy(),
                 "mirror_root": self.mirror.root().to_string_lossy(),
-                "files_root": self.mirror.files_root().to_string_lossy()
+                "files_root": self.mirror.files_root().to_string_lossy(),
+                "remote_status": "unchecked",
+                "remote_checked": false,
+                "remote_available": false
             })),
             "status" => self.mirror.status(),
+            "remote_probe" => Ok(self.remote_probe()),
             "scan" => self.scan(params, preempt_epoch),
             "open" => self.open(params),
             "prefetch" => self.prefetch(params, preempt_epoch),
@@ -2000,6 +2194,7 @@ impl Sidecar {
             "grep" => self.grep(params),
             "grep_cache" => self.mirror.grep_cache(&params),
             "flush" => self.flush(params),
+            "flush_queued" => self.flush_queued(params),
             "flush_queue" => self.flush_queue(params),
             "validate" => self.validate(params),
             "refresh" => self.refresh(params, preempt_epoch),
@@ -2008,6 +2203,46 @@ impl Sidecar {
                 Ok(json!({"shutdown": true}))
             }
             other => bail!("unknown method `{other}`"),
+        }
+    }
+
+    fn remote_probe(&mut self) -> Value {
+        if self.agent.handshake_complete() {
+            return json!({
+                "remote_status": "connected",
+                "remote_checked": true,
+                "remote_available": true
+            });
+        }
+
+        match self.agent.request(Request::Hello {
+            client_version: env!("CARGO_PKG_VERSION").to_string(),
+            protocol_version: PROTOCOL_VERSION,
+        }) {
+            Ok(Response::Hello {
+                agent_version,
+                protocol_version,
+                capabilities,
+            }) => json!({
+                "remote_status": "connected",
+                "remote_checked": true,
+                "remote_available": true,
+                "agent_version": agent_version,
+                "protocol_version": protocol_version,
+                "capabilities": capabilities
+            }),
+            Ok(other) => json!({
+                "remote_status": "unavailable",
+                "remote_checked": true,
+                "remote_available": false,
+                "remote_error": format!("unexpected hello response from agent: {other:?}")
+            }),
+            Err(error) => json!({
+                "remote_status": "unavailable",
+                "remote_checked": true,
+                "remote_available": false,
+                "remote_error": error.to_string()
+            }),
         }
     }
 
@@ -2046,7 +2281,7 @@ impl Sidecar {
             if entry.state == "hydrated" {
                 let mut restored_from_snapshot = false;
                 if entry.dirty && !entry.local_path.exists() {
-                    self.restore_latest_dirty_snapshot(&entry)?;
+                    self.mirror.restore_latest_dirty_snapshot(&entry)?;
                     restored_from_snapshot = true;
                     entry = self
                         .mirror
@@ -2110,48 +2345,6 @@ impl Sidecar {
             "force_skipped": force_skipped,
             "restored_from_snapshot": restored_from_snapshot
         })
-    }
-
-    fn restore_latest_dirty_snapshot(&self, entry: &MirrorEntry) -> Result<()> {
-        let save = self
-            .mirror
-            .latest_unresolved_save_entry(&entry.relative_path)?
-            .ok_or_else(|| {
-                anyhow!(
-                    "{} is dirty but the local file is missing and no save snapshot exists",
-                    entry.relative_path
-                )
-            })?;
-        let snapshot_hash = hash_file(&save.snapshot_path).with_context(|| {
-            format!(
-                "failed to hash queued save snapshot {}",
-                save.snapshot_path.display()
-            )
-        })?;
-        if snapshot_hash != save.local_hash {
-            bail!(
-                "queued save snapshot hash mismatch for {}: expected={} actual={snapshot_hash}",
-                entry.relative_path,
-                save.local_hash
-            );
-        }
-        if let Some(parent) = entry.local_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let part_path = entry.local_path.with_extension("nrm-restore-part");
-        {
-            let mut source = File::open(&save.snapshot_path).with_context(|| {
-                format!(
-                    "failed to open queued save snapshot {}",
-                    save.snapshot_path.display()
-                )
-            })?;
-            let mut part = File::create(&part_path)?;
-            io::copy(&mut source, &mut part)?;
-            part.sync_all()?;
-        }
-        fs::rename(&part_path, &entry.local_path)?;
-        Ok(())
     }
 
     fn prefetch(&mut self, params: Value, preempt_epoch: u64) -> Result<Value> {
@@ -2412,20 +2605,16 @@ impl Sidecar {
 
     fn flush(&mut self, params: Value) -> Result<Value> {
         let path = required_string(&params, "path")?;
-        let entry = self
-            .mirror
-            .get(path)?
-            .ok_or_else(|| anyhow!("{path} is not known in the mirror"))?;
-        let content = fs::read(&entry.local_path).with_context(|| {
-            format!(
-                "failed to read local mirror file {}",
-                entry.local_path.display()
-            )
-        })?;
-        let local_hash = hash_bytes(&content);
-        let queued =
-            self.mirror
-                .enqueue_save(path, &local_hash, entry.remote_hash.as_deref(), &content)?;
+        let queued = self.mirror.enqueue_local_save(path)?;
+        Self::save_attempt_to_json(self.apply_save_entry(queued)?)
+    }
+
+    fn flush_queued(&mut self, params: Value) -> Result<Value> {
+        let queue_id = params
+            .get("queue_id")
+            .and_then(Value::as_i64)
+            .ok_or_else(|| anyhow!("flush_queued requires params.queue_id"))?;
+        let queued = self.mirror.save_queue_entry(queue_id)?;
         Self::save_attempt_to_json(self.apply_save_entry(queued)?)
     }
 
@@ -3062,7 +3251,7 @@ fn run_server(
         if line.trim().is_empty() {
             continue;
         }
-        let request: ClientRequest = match serde_json::from_str(&line) {
+        let mut request: ClientRequest = match serde_json::from_str(&line) {
             Ok(request) => request,
             Err(error) => {
                 try_send_client_response(
@@ -3093,6 +3282,18 @@ fn run_server(
             );
             break;
         }
+        if request.method == "flush" {
+            request = match fast_state.prepare_flush(&request) {
+                Ok(request) => request,
+                Err(error) => {
+                    try_send_client_response(
+                        &response_tx,
+                        result_to_client_response(request.id, Err(error)),
+                    );
+                    continue;
+                }
+            };
+        }
         match fast_state.try_handle(&request) {
             FastHandle::Handled(result) => {
                 try_send_client_response(
@@ -3121,8 +3322,19 @@ fn run_server(
                         if let Ok(mut pending) = pending_remote.lock() {
                             pending.clear(&work.hazard);
                         }
-                        try_send_client_response(
-                            &response_tx,
+                        let response = if work.request.method == "flush_queued" {
+                            result_to_client_response(
+                                work.request.id,
+                                Ok(json!({
+                                    "status": "queued",
+                                    "path": work.request.params.get("path").and_then(Value::as_str).unwrap_or(""),
+                                    "reason": format!(
+                                        "remote {} queue is full or not available; saved locally",
+                                        work.priority.label()
+                                    )
+                                })),
+                            )
+                        } else {
                             ClientResponse {
                                 id: work.request.id,
                                 ok: false,
@@ -3131,8 +3343,9 @@ fn run_server(
                                     "remote {} queue is full or not available",
                                     work.priority.label()
                                 )),
-                            },
-                        );
+                            }
+                        };
+                        try_send_client_response(&response_tx, response);
                     }
                 }
             }
@@ -3669,6 +3882,62 @@ mod tests {
     }
 
     #[test]
+    fn sidecar_starts_and_serves_cache_without_agent_handshake() {
+        let state_dir = tempdir().unwrap();
+        let remote_dir = tempdir().unwrap();
+        let remote_root = remote_dir.path().join("repo");
+        let key = workspace_key(None, &remote_root);
+        let mirror = Mirror::open(Some(state_dir.path().to_path_buf()), &key).unwrap();
+        mirror
+            .record_hydrated(&test_meta("src/main.rs", "hash", 4), "hash", "hash")
+            .unwrap();
+        let local_path = mirror.local_path("src/main.rs").unwrap();
+        fs::create_dir_all(local_path.parent().unwrap()).unwrap();
+        fs::write(&local_path, b"main").unwrap();
+        drop(mirror);
+
+        let mut sidecar = Sidecar::new(
+            remote_root,
+            None,
+            state_dir
+                .path()
+                .join("missing-agent")
+                .to_string_lossy()
+                .to_string(),
+            Some(state_dir.path().to_path_buf()),
+            1,
+            1,
+            AgentInterrupt::default(),
+        )
+        .unwrap();
+
+        let hello = sidecar.handle("hello", json!({}), 0).unwrap();
+        assert_eq!(hello["remote_status"], "unchecked");
+        assert_eq!(hello["remote_checked"], false);
+        assert_eq!(hello["remote_available"], false);
+
+        let opened = sidecar
+            .open(json!({"path": "src/main.rs", "force": false}))
+            .unwrap();
+        assert_eq!(opened["cached"], true);
+        assert_eq!(
+            opened["local_path"].as_str().unwrap(),
+            local_path.to_string_lossy()
+        );
+
+        let probe = sidecar.remote_probe();
+        assert_eq!(probe["remote_status"], "unavailable");
+        assert_eq!(probe["remote_checked"], true);
+        assert_eq!(probe["remote_available"], false);
+
+        let error = sidecar
+            .scan(json!({"limit": 1}), 0)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("failed to launch agent"));
+    }
+
+    #[test]
     fn metadata_scan_does_not_move_hydrated_base_hash() {
         let dir = tempdir().unwrap();
         let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
@@ -4195,6 +4464,38 @@ mod tests {
     }
 
     #[test]
+    fn fast_state_prepares_flush_by_enqueueing_local_snapshot() {
+        let dir = tempdir().unwrap();
+        let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
+        mirror
+            .record_hydrated(&test_meta("src/main.rs", "base", 4), "base", "base")
+            .unwrap();
+        let local_path = mirror.local_path("src/main.rs").unwrap();
+        fs::create_dir_all(local_path.parent().unwrap()).unwrap();
+        fs::write(&local_path, b"dirty").unwrap();
+        let mirror_root = mirror.root().to_path_buf();
+        let sidecar = test_sidecar(mirror);
+        let fast =
+            FastState::from_sidecar(&sidecar, Arc::new(Mutex::new(PendingRemote::default())));
+
+        let request = ClientRequest {
+            id: 7,
+            method: "flush".to_string(),
+            params: json!({"path": "src/main.rs"}),
+        };
+        let prepared = fast.prepare_flush(&request).unwrap();
+        let reopened = Mirror::open_root(mirror_root).unwrap();
+        let entries = reopened.pending_save_entries(Some(10)).unwrap();
+
+        assert_eq!(prepared.id, 7);
+        assert_eq!(prepared.method, "flush_queued");
+        assert_eq!(prepared.params["path"], "src/main.rs");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].relative_path, "src/main.rs");
+        assert_eq!(fs::read(&entries[0].snapshot_path).unwrap(), b"dirty");
+    }
+
+    #[test]
     fn fast_state_defers_force_or_uncached_open() {
         let dir = tempdir().unwrap();
         let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
@@ -4221,6 +4522,43 @@ mod tests {
             params: json!({"path": "missing.rs"}),
         };
         assert!(matches!(fast.try_handle(&uncached), FastHandle::Defer));
+    }
+
+    #[test]
+    fn fast_state_serves_dirty_force_open_without_remote() {
+        let dir = tempdir().unwrap();
+        let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
+        mirror
+            .record_hydrated(&test_meta("src/main.rs", "base", 4), "base", "base")
+            .unwrap();
+        let local_path = mirror.local_path("src/main.rs").unwrap();
+        fs::create_dir_all(local_path.parent().unwrap()).unwrap();
+        fs::write(&local_path, b"dirty").unwrap();
+        let dirty_hash = hash_bytes(b"dirty");
+        mirror
+            .enqueue_save("src/main.rs", &dirty_hash, Some("base"), b"dirty")
+            .unwrap();
+        let sidecar = test_sidecar(mirror);
+        let fast =
+            FastState::from_sidecar(&sidecar, Arc::new(Mutex::new(PendingRemote::default())));
+
+        let force = ClientRequest {
+            id: 1,
+            method: "open".to_string(),
+            params: json!({"path": "src/main.rs", "force": true}),
+        };
+        let FastHandle::Handled(result) = fast.try_handle(&force) else {
+            panic!("dirty force open should be handled by fast state");
+        };
+        let result = result.unwrap();
+
+        assert_eq!(result["cached"], true);
+        assert_eq!(result["dirty"], true);
+        assert_eq!(result["force_skipped"], true);
+        assert_eq!(
+            result["local_path"].as_str().unwrap(),
+            local_path.to_string_lossy().as_ref()
+        );
     }
 
     #[test]

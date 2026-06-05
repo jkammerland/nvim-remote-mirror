@@ -20,7 +20,7 @@ Goal statement:
 This first implementation covers:
 
 - SSH or local agent launch.
-- versioned hello/capability handshake.
+- lazy versioned hello/capability handshake on first remote agent request.
 - request-id framed sidecar/agent RPC with typed remote errors.
 - configurable request and SSH connect timeouts.
 - remote scan.
@@ -68,8 +68,12 @@ Or connect through SSH:
 If the sidecar exits unexpectedly, the plugin fails pending callbacks and can
 reconnect to the last target with capped retries. Use `:RemoteReconnect` to
 resume the last target manually; reconnect startup reuses the durable mirror and
-retries queued saves in small background batches after the connection handshake
-has completed.
+retries queued saves in small background batches after a remote probe succeeds.
+
+`:RemoteConnect` starts from the durable local mirror and does not block on an
+SSH agent handshake. Cached opens, cached grep, and status remain available if
+the remote is unreachable; the first operation that needs the remote agent
+performs the protocol handshake and reports connection failures normally.
 
 By default the plugin expects these binaries:
 
@@ -187,7 +191,9 @@ Current transport state:
 - active: request IDs, typed remote errors, request timeout, SSH connect timeout,
   batched small-file read for prefetch, batched mirror validation, chunked
   compare-and-swap writes, and sidecar fast-path responses for cached mirror
-  opens/status while remote worker requests are in flight. Disconnect interrupts
+  opens/status while remote worker requests are in flight. Sidecar startup is
+  local-mirror-only; the remote agent handshake is lazy so cached work survives
+  disconnected SSH. Disconnect interrupts
   the current agent/SSH process group on Unix so shutdown is not pinned to the
   normal request timeout. Deferred sidecar work uses separate interactive and
   background queues so explicit opens/saves are not rejected by, or drained
