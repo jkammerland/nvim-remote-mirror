@@ -131,8 +131,9 @@ CONFIGURATION                                  *nvim-remote-mirror-config*
 request_timeout_ms bounds both sidecar/agent work and pending Neovim-side
 callbacks waiting for sidecar JSON replies.
 When a callback times out, the plugin sends a best-effort sidecar cancel for
-queued remote work. Requests already running in the serial SSH/agent worker are
-not interrupted by that cancel.
+queued remote work. Matching active background work is preempted by restarting
+the serial SSH/agent worker. Active explicit opens and saves are not
+interrupted by that cancel.
 background_mirror controls the idle mirror builder; set it false and use
 :RemoteMirrorStart manually on especially fragile links. Each background tick
 scans metadata, hydrates a tiny clean-file batch, then validates a tiny

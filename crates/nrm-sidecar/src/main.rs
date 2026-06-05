@@ -2454,6 +2454,18 @@ struct StartedRemoteWork {
     preempt_epoch: u64,
 }
 
+#[derive(Debug, Clone)]
+struct ActiveRemoteWork {
+    id: u64,
+    method: String,
+    priority: RemotePriority,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ActiveRemote {
+    current: Arc<Mutex<Option<ActiveRemoteWork>>>,
+}
+
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum RemotePriority {
     Interactive,
@@ -2489,6 +2501,35 @@ impl RemotePriority {
             Self::Interactive => "interactive",
             Self::Background => "background",
         }
+    }
+}
+
+impl ActiveRemote {
+    fn set(&self, work: &RemoteWork) {
+        if let Ok(mut current) = self.current.lock() {
+            *current = Some(ActiveRemoteWork {
+                id: work.request.id,
+                method: work.request.method.clone(),
+                priority: work.priority,
+            });
+        }
+    }
+
+    fn clear(&self, request_id: u64) {
+        if let Ok(mut current) = self.current.lock() {
+            if current.as_ref().is_some_and(|work| work.id == request_id) {
+                *current = None;
+            }
+        }
+    }
+
+    fn get(&self, request_id: u64) -> Option<ActiveRemoteWork> {
+        self.current.lock().ok().and_then(|current| {
+            current
+                .as_ref()
+                .filter(|work| work.id == request_id)
+                .cloned()
+        })
     }
 }
 
@@ -4162,22 +4203,37 @@ fn run_server(
         REMOTE_INTERACTIVE_QUEUE_CAPACITY,
         REMOTE_BACKGROUND_QUEUE_CAPACITY,
     ));
+    let active_remote = ActiveRemote::default();
     let remote_response_tx = response_tx.clone();
     let remote_pending = Arc::clone(&pending_remote);
     let remote_interrupt = agent_interrupt.clone();
     let remote_worker_queue = Arc::clone(&remote_queue);
     let remote_worker_preempt = agent_preempt.clone();
+    let remote_worker_active = active_remote.clone();
     let remote_worker = thread::spawn(move || {
         let mut sidecar = sidecar;
         while let Some(started) = remote_worker_queue.pop_started(&remote_worker_preempt) {
             let preempt_epoch = started.preempt_epoch;
             let RemoteWork {
-                request, hazard, ..
+                request,
+                hazard,
+                priority,
             } = started.work;
+            let request_id = request.id;
+            let work = RemoteWork {
+                request,
+                hazard,
+                priority,
+            };
+            remote_worker_active.set(&work);
+            let RemoteWork {
+                request, hazard, ..
+            } = work;
             if remote_interrupt.is_shutdown_requested() {
                 if let Ok(mut pending) = remote_pending.lock() {
                     pending.clear(&hazard);
                 }
+                remote_worker_active.clear(request_id);
                 clear_pending_hazards(&remote_pending, remote_worker_queue.shutdown_and_drain());
                 break;
             }
@@ -4186,6 +4242,7 @@ fn run_server(
             if let Ok(mut pending) = remote_pending.lock() {
                 pending.clear(&hazard);
             }
+            remote_worker_active.clear(request_id);
             send_client_response(&remote_response_tx, response);
             if should_shutdown || remote_interrupt.is_shutdown_requested() {
                 clear_pending_hazards(&remote_pending, remote_worker_queue.shutdown_and_drain());
@@ -4233,8 +4290,9 @@ fn run_server(
         if request.method == "cancel" {
             let response = match cancel_request_id(&request.params) {
                 Ok(target_id) => {
-                    let canceled = cancel_queued_request(&remote_queue, &pending_remote, target_id);
-                    if let Some(work) = canceled {
+                    if let Some(work) =
+                        cancel_queued_request(&remote_queue, &pending_remote, target_id)
+                    {
                         send_client_response(&response_tx, canceled_client_response(work));
                         result_to_client_response(
                             request.id,
@@ -4244,14 +4302,18 @@ fn run_server(
                                 "scope": "queued"
                             })),
                         )
+                    } else if let Some(result) =
+                        cancel_active_request(&active_remote, &agent_preempt, target_id)
+                    {
+                        result_to_client_response(request.id, Ok(result))
                     } else {
                         result_to_client_response(
                             request.id,
                             Ok(json!({
                                 "request_id": target_id,
                                 "canceled": false,
-                                "scope": "queued",
-                                "reason": "request is not queued"
+                                "scope": "unknown",
+                                "reason": "request is neither queued nor active"
                             })),
                         )
                     }
@@ -4414,6 +4476,30 @@ fn cancel_queued_request(
         pending.clear(&canceled.hazard);
     }
     Some(canceled)
+}
+
+fn cancel_active_request(
+    active_remote: &ActiveRemote,
+    preempt: &AgentPreempt,
+    request_id: u64,
+) -> Option<Value> {
+    let active = active_remote.get(request_id)?;
+    if active.priority == RemotePriority::Background {
+        preempt.request_preemption();
+        return Some(json!({
+            "request_id": request_id,
+            "canceled": true,
+            "scope": "active",
+            "method": active.method
+        }));
+    }
+    Some(json!({
+        "request_id": request_id,
+        "canceled": false,
+        "scope": "active",
+        "method": active.method,
+        "reason": "active interactive work is not interrupted"
+    }))
 }
 
 fn canceled_client_response(work: RemoteWork) -> ClientResponse {
@@ -6151,6 +6237,45 @@ mod tests {
             .unwrap()
             .contains("canceled before remote execution"));
         assert!(queue.shutdown_and_drain().is_empty());
+    }
+
+    #[test]
+    fn cancel_active_background_request_requests_preemption() {
+        let active = ActiveRemote::default();
+        let preempt = AgentPreempt::default();
+        let work = test_remote_work(9, "prefetch");
+        active.set(&work);
+
+        let result = cancel_active_request(&active, &preempt, 9).unwrap();
+
+        assert_eq!(result["request_id"], 9);
+        assert_eq!(result["canceled"], true);
+        assert_eq!(result["scope"], "active");
+        assert_eq!(result["method"], "prefetch");
+        assert_eq!(preempt.epoch(), 1);
+        assert_eq!(active.get(9).unwrap().id, 9);
+        active.clear(9);
+        assert!(active.get(9).is_none());
+    }
+
+    #[test]
+    fn cancel_active_interactive_request_reports_not_interrupted() {
+        let active = ActiveRemote::default();
+        let preempt = AgentPreempt::default();
+        let work = test_remote_work(10, "open");
+        active.set(&work);
+
+        let result = cancel_active_request(&active, &preempt, 10).unwrap();
+
+        assert_eq!(result["request_id"], 10);
+        assert_eq!(result["canceled"], false);
+        assert_eq!(result["scope"], "active");
+        assert_eq!(result["method"], "open");
+        assert_eq!(
+            result["reason"],
+            "active interactive work is not interrupted"
+        );
+        assert_eq!(preempt.epoch(), 0);
     }
 
     #[test]

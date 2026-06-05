@@ -112,7 +112,9 @@ Pending Neovim requests are also bounded by `request_timeout_ms`, so lost or
 stalled sidecar replies clear their callback state instead of hanging forever.
 When a Neovim-side timeout fires, the plugin sends a best-effort sidecar
 cancel request so remote work that has not started yet is dropped from the
-queue and no longer blocks cached reads for the same path.
+queue and no longer blocks cached reads for the same path. If the matching
+request is active background work, the sidecar preempts the serial SSH/agent
+worker; active explicit opens and saves are not interrupted.
 
 By default the plugin expects these binaries:
 
@@ -298,6 +300,8 @@ Current transport state:
   Agent and LSP launches share a transport command planner, keeping SSH stdio as
   a replaceable implementation detail behind the sidecar-agent frame boundary.
   Timed-out Neovim requests send a best-effort sidecar cancellation for queued
-  remote work, clearing pending path hazards before that work reaches SSH.
-- pending: active in-flight agent cancellation, true multiplexing, streaming
-  results, and transport-level flow control.
+  remote work, clearing pending path hazards before that work reaches SSH, and
+  can preempt matching active background work. Active explicit opens/saves still
+  run to completion once started.
+- pending: active in-flight cancellation for interactive/save requests, true
+  multiplexing, streaming results, and transport-level flow control.
