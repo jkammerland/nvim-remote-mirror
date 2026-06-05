@@ -4157,7 +4157,7 @@ impl Sidecar {
         };
 
         match response {
-            Response::WriteFileCas { outcome } => self.record_save_outcome(entry.id, outcome),
+            Response::WriteFileCas { outcome } => self.record_save_outcome(&entry, outcome),
             other => bail!("unexpected flush response: {other:?}"),
         }
     }
@@ -4192,7 +4192,7 @@ impl Sidecar {
             Response::BeginWriteFileCas {
                 outcome: WriteStartOutcome::Conflict(conflict),
             } => {
-                return self.record_save_outcome(entry.id, SaveOutcome::Conflict(conflict));
+                return self.record_save_outcome(&entry, SaveOutcome::Conflict(conflict));
             }
             other => bail!("unexpected chunked save begin response: {other:?}"),
         };
@@ -4227,7 +4227,7 @@ impl Sidecar {
         };
 
         match finish {
-            Response::FinishWriteFileCas { outcome } => self.record_save_outcome(entry.id, outcome),
+            Response::FinishWriteFileCas { outcome } => self.record_save_outcome(&entry, outcome),
             other => bail!("unexpected chunked save finish response: {other:?}"),
         }
     }
@@ -4263,11 +4263,15 @@ impl Sidecar {
         Ok(())
     }
 
-    fn record_save_outcome(&self, queue_id: i64, outcome: SaveOutcome) -> Result<SaveAttempt> {
+    fn record_save_outcome(
+        &self,
+        entry: &SaveQueueEntry,
+        outcome: SaveOutcome,
+    ) -> Result<SaveAttempt> {
         match outcome {
             SaveOutcome::Applied(applied) => {
                 self.mirror.mark_save_applied(
-                    queue_id,
+                    entry.id,
                     &applied.path,
                     &applied.new_hash,
                     applied.size,
@@ -4280,6 +4284,25 @@ impl Sidecar {
                 })
             }
             SaveOutcome::Conflict(conflict) => {
+                if conflict.actual_hash.as_deref() == Some(entry.local_hash.as_str()) {
+                    let size = conflict.remote_size.unwrap_or_else(|| {
+                        fs::metadata(&entry.snapshot_path)
+                            .map(|metadata| metadata.len())
+                            .unwrap_or(0)
+                    });
+                    self.mirror.mark_save_applied(
+                        entry.id,
+                        &conflict.path,
+                        &entry.local_hash,
+                        size,
+                        now_ms(),
+                    )?;
+                    return Ok(SaveAttempt::Applied {
+                        path: conflict.path,
+                        hash: entry.local_hash.clone(),
+                        size,
+                    });
+                }
                 let remote_content_bytes = conflict.remote_content.len();
                 let message = if conflict.remote_content_truncated {
                     format!(
@@ -4294,7 +4317,7 @@ impl Sidecar {
                     "remote content changed before queued save was applied".to_string()
                 };
                 let conflict_path = self.mirror.record_save_conflict(
-                    queue_id,
+                    entry.id,
                     &conflict.path,
                     &conflict.remote_content,
                     conflict.remote_content_truncated,
@@ -6325,7 +6348,7 @@ mod tests {
 
         let attempt = sidecar
             .record_save_outcome(
-                queued.id,
+                &queued,
                 SaveOutcome::Conflict(nrm_protocol::SaveConflict {
                     path: "a.txt".to_string(),
                     expected_hash: Some("base".to_string()),
@@ -6352,6 +6375,54 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("saved first 13 of 10000 remote bytes"));
+    }
+
+    #[test]
+    fn save_conflict_matching_queued_hash_marks_save_applied() {
+        let dir = tempdir().unwrap();
+        let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
+        let local_path = record_hydrated_content(&mirror, "a.txt", b"base");
+        let dirty_content = b"dirty";
+        fs::write(&local_path, dirty_content).unwrap();
+        let dirty_hash = hash_bytes(dirty_content);
+        let queued = mirror
+            .enqueue_save("a.txt", &dirty_hash, Some("base"), dirty_content)
+            .unwrap();
+        let sidecar = test_sidecar(mirror);
+
+        let attempt = sidecar
+            .record_save_outcome(
+                &queued,
+                SaveOutcome::Conflict(nrm_protocol::SaveConflict {
+                    path: "a.txt".to_string(),
+                    expected_hash: Some("base".to_string()),
+                    actual_hash: Some(dirty_hash.clone()),
+                    remote_content: dirty_content.to_vec(),
+                    remote_content_truncated: false,
+                    remote_size: Some(dirty_content.len() as u64),
+                }),
+            )
+            .unwrap();
+        let value = Sidecar::save_attempt_to_json(attempt).unwrap();
+
+        assert_eq!(value["status"], "applied");
+        assert_eq!(value["hash"], dirty_hash);
+        assert_eq!(sidecar.mirror.pending_save_count().unwrap(), 0);
+        let save_state: String = sidecar
+            .mirror
+            .db
+            .query_row(
+                "SELECT state FROM save_queue WHERE id=?1",
+                params![queued.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(save_state, "applied");
+        let entry = sidecar.mirror.get("a.txt").unwrap().unwrap();
+        assert!(!entry.dirty);
+        assert_eq!(entry.remote_hash.as_deref(), Some(dirty_hash.as_str()));
+        assert_eq!(entry.local_hash.as_deref(), Some(dirty_hash.as_str()));
+        assert_eq!(entry.validation_state, "valid");
     }
 
     #[test]
