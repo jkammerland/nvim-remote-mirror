@@ -201,6 +201,9 @@ pub enum Response {
         offset: u64,
         eof: bool,
         content: Vec<u8>,
+        /// Full-file content hash. This is populated on the EOF chunk and left
+        /// empty on non-EOF chunks so large reads do not rehash the same remote
+        /// file once per chunk.
         hash: String,
         meta: FileMeta,
     },

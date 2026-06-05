@@ -214,7 +214,9 @@ local mirror, oldest validation first.
 
 `:RemotePrefetch` uses a batched remote read request by default. Files larger
 than `prefetch_max_file_bytes` are skipped from the batch so explicit
-`:RemoteOpen` can hydrate them through the chunked path.
+`:RemoteOpen` can hydrate them through the chunked path. Chunked opens stream
+fixed-size reads into a temporary mirror file and verify the full remote hash
+only on the final chunk, avoiding repeated full-file hashing on the remote.
 
 When `background_mirror` is enabled, the plugin starts a conservative idle
 mirror builder after connect. Each tick probes the remote, scans the next

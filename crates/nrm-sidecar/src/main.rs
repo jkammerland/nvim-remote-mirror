@@ -4048,6 +4048,9 @@ impl Sidecar {
                         part.write_all(&content)?;
                         offset += content.len() as u64;
                         if eof {
+                            if hash.is_empty() {
+                                bail!("remote read for {path} completed without a content hash");
+                            }
                             break (meta, hash);
                         }
                     }

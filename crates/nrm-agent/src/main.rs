@@ -229,8 +229,14 @@ fn read_file(root: &Path, path: String, offset: u64, len: Option<u64>) -> Result
     let mut content = vec![0_u8; read_len as usize];
     file.read_exact(&mut content)?;
     let eof = offset + read_len >= file_len;
-    let hash = hash_file(&abs)?;
-    let meta = file_meta(root, &abs, true)?;
+    let mut meta = file_meta(root, &abs, false)?;
+    let hash = if eof {
+        let hash = hash_file(&abs)?;
+        meta.hash = Some(hash.clone());
+        hash
+    } else {
+        String::new()
+    };
 
     Ok(Response::ReadFile {
         path,
@@ -794,6 +800,48 @@ mod tests {
                 assert_eq!(errors.len(), 2);
                 assert_eq!(errors[0].path, "missing.txt");
                 assert_eq!(errors[1].path, "large.txt");
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_file_only_hashes_final_chunk() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("large.txt"), "abcdef").unwrap();
+        let expected_hash = hash_file(&root.join("large.txt")).unwrap();
+
+        let first = read_file(root, "large.txt".to_string(), 0, Some(3)).unwrap();
+        match first {
+            Response::ReadFile {
+                eof,
+                content,
+                hash,
+                meta,
+                ..
+            } => {
+                assert!(!eof);
+                assert_eq!(content, b"abc");
+                assert_eq!(hash, "");
+                assert_eq!(meta.hash, None);
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+
+        let second = read_file(root, "large.txt".to_string(), 3, Some(3)).unwrap();
+        match second {
+            Response::ReadFile {
+                eof,
+                content,
+                hash,
+                meta,
+                ..
+            } => {
+                assert!(eof);
+                assert_eq!(content, b"def");
+                assert_eq!(hash, expected_hash);
+                assert_eq!(meta.hash.as_deref(), Some(hash.as_str()));
             }
             other => panic!("unexpected response: {other:?}"),
         }
