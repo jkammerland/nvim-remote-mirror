@@ -21,7 +21,14 @@ COMMANDS                                      *nvim-remote-mirror-commands*
     Connect to a local path or ssh://host/absolute/path target.
 
 :RemoteOpen {path}
-    Hydrate a workspace-relative file into the local mirror and edit it.
+    Open a workspace-relative file from the local mirror when cached, including
+    dirty, stale, or deleted mirror entries. Hydrate it from the remote when no
+    cached file is available.
+
+:RemoteOpen! {path}
+    Force remote rehydration for clean cached files. Dirty cached files are not
+    overwritten; if the local file is missing, the latest queued save snapshot
+    is restored instead.
 
 :RemoteGrep {query}
     Run grep on the remote agent, hydrate matching files in a batch, and

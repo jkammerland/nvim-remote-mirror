@@ -24,7 +24,7 @@ This first implementation covers:
 - request-id framed sidecar/agent RPC with typed remote errors.
 - configurable request and SSH connect timeouts.
 - remote scan.
-- lazy file open/hydration into a local mirror.
+- lazy file open/hydration into a local mirror with dirty/stale cached opens.
 - batched prefetch hydration with per-file and total byte caps.
 - batched mirror refresh to mark cached files valid, stale, or deleted.
 - remote grep that batch-hydrates result files for local quickfix jumps.
@@ -128,6 +128,12 @@ local mirror, oldest validation first.
 `:RemotePrefetch` uses a batched remote read request by default. Files larger
 than `prefetch_max_file_bytes` are skipped from the batch so explicit
 `:RemoteOpen` can hydrate them through the chunked path.
+
+`:RemoteOpen` prefers an existing clean or dirty local mirror file, including
+entries previously marked stale or deleted, so navigation does not block on a
+slow or unreachable remote. `:RemoteOpen!` forces a remote rehydrate for clean
+cached files. Dirty cached files are never overwritten by force; if their local
+file is missing, the sidecar restores the latest queued save snapshot instead.
 
 `:RemoteGrep` runs search on the remote agent, batch-hydrates matching files
 within the prefetch byte caps, and populates quickfix with local mirror paths

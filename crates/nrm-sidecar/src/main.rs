@@ -671,6 +671,30 @@ impl Mirror {
         Ok(entries)
     }
 
+    fn latest_unresolved_save_entry(&self, relative_path: &str) -> Result<Option<SaveQueueEntry>> {
+        self.db
+            .query_row(
+                "
+                SELECT id, relative_path, expected_hash, local_hash, snapshot_path
+                FROM save_queue
+                WHERE relative_path=?1 AND state IN ('pending', 'failed') AND snapshot_path IS NOT NULL
+                ORDER BY id DESC LIMIT 1
+                ",
+                params![relative_path],
+                |row| {
+                    Ok(SaveQueueEntry {
+                        id: row.get(0)?,
+                        relative_path: row.get(1)?,
+                        expected_hash: row.get(2)?,
+                        local_hash: row.get(3)?,
+                        snapshot_path: PathBuf::from(row.get::<_, String>(4)?),
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     fn unresolved_save_count(&self, relative_path: &str) -> Result<i64> {
         self.db
             .query_row(
@@ -1001,24 +1025,38 @@ impl Sidecar {
             .get("force")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        if !force {
-            if let Some(entry) = self.mirror.get(path)? {
-                if entry.state == "hydrated"
-                    && entry.local_path.exists()
-                    && !entry.dirty
-                    && entry.validation_state != "stale"
-                {
-                    return Ok(json!({
-                        "path": entry.relative_path,
-                        "local_path": entry.local_path.to_string_lossy(),
-                        "hash": entry.remote_hash,
-                        "local_hash": entry.local_hash,
-                        "size": entry.size,
-                        "validation_state": entry.validation_state,
-                        "validated_at_ms": entry.validated_at_ms,
-                        "last_error": entry.last_error,
-                        "cached": true
-                    }));
+        if let Some(mut entry) = self.mirror.get(path)? {
+            if entry.state == "hydrated" {
+                let mut restored_from_snapshot = false;
+                if entry.dirty && !entry.local_path.exists() {
+                    self.restore_latest_dirty_snapshot(&entry)?;
+                    restored_from_snapshot = true;
+                    entry = self
+                        .mirror
+                        .get(&entry.relative_path)?
+                        .ok_or_else(|| anyhow!("restored file lost mirror metadata"))?;
+                }
+                if entry.local_path.exists() {
+                    if entry.dirty {
+                        return Ok(Self::cached_open_response(
+                            &entry,
+                            "dirty",
+                            force,
+                            restored_from_snapshot,
+                        ));
+                    }
+                    if !force {
+                        let reason = match entry.validation_state.as_str() {
+                            "stale" | "deleted" | "conflict" => entry.validation_state.as_str(),
+                            _ => "cached",
+                        };
+                        return Ok(Self::cached_open_response(
+                            &entry,
+                            reason,
+                            false,
+                            restored_from_snapshot,
+                        ));
+                    }
                 }
             }
         }
@@ -1032,6 +1070,71 @@ impl Sidecar {
             "validated_at_ms": hydrated.validated_at_ms,
             "cached": false
         }))
+    }
+
+    fn cached_open_response(
+        entry: &MirrorEntry,
+        cache_reason: &str,
+        force_skipped: bool,
+        restored_from_snapshot: bool,
+    ) -> Value {
+        json!({
+            "path": entry.relative_path,
+            "local_path": entry.local_path.to_string_lossy(),
+            "hash": entry.remote_hash,
+            "local_hash": entry.local_hash,
+            "size": entry.size,
+            "validation_state": entry.validation_state,
+            "validated_at_ms": entry.validated_at_ms,
+            "last_error": entry.last_error,
+            "dirty": entry.dirty,
+            "cached": true,
+            "cache_reason": cache_reason,
+            "force_skipped": force_skipped,
+            "restored_from_snapshot": restored_from_snapshot
+        })
+    }
+
+    fn restore_latest_dirty_snapshot(&self, entry: &MirrorEntry) -> Result<()> {
+        let save = self
+            .mirror
+            .latest_unresolved_save_entry(&entry.relative_path)?
+            .ok_or_else(|| {
+                anyhow!(
+                    "{} is dirty but the local file is missing and no save snapshot exists",
+                    entry.relative_path
+                )
+            })?;
+        let snapshot_hash = hash_file(&save.snapshot_path).with_context(|| {
+            format!(
+                "failed to hash queued save snapshot {}",
+                save.snapshot_path.display()
+            )
+        })?;
+        if snapshot_hash != save.local_hash {
+            bail!(
+                "queued save snapshot hash mismatch for {}: expected={} actual={snapshot_hash}",
+                entry.relative_path,
+                save.local_hash
+            );
+        }
+        if let Some(parent) = entry.local_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let part_path = entry.local_path.with_extension("nrm-restore-part");
+        {
+            let mut source = File::open(&save.snapshot_path).with_context(|| {
+                format!(
+                    "failed to open queued save snapshot {}",
+                    save.snapshot_path.display()
+                )
+            })?;
+            let mut part = File::create(&part_path)?;
+            io::copy(&mut source, &mut part)?;
+            part.sync_all()?;
+        }
+        fs::rename(&part_path, &entry.local_path)?;
+        Ok(())
     }
 
     fn prefetch(&mut self, params: Value) -> Result<Value> {
@@ -1534,6 +1637,17 @@ impl Sidecar {
             .mirror
             .get(path)?
             .ok_or_else(|| anyhow!("{path} is not known in the mirror"))?;
+        if entry.dirty {
+            self.mirror
+                .record_validation(&entry.relative_path, "dirty", None, None)?;
+            return Ok(json!({
+                "path": entry.relative_path,
+                "status": "dirty",
+                "remote_hash": entry.remote_hash,
+                "local_hash": entry.local_hash,
+                "skipped": true
+            }));
+        }
         let response = self.agent.request(Request::Checksum {
             path: entry.relative_path.clone(),
         })?;
@@ -1693,42 +1807,52 @@ impl Sidecar {
             fs::create_dir_all(parent)?;
         }
         let part_path = local_path.with_extension("nrm-part");
-        let mut part = File::create(&part_path)?;
-        let mut offset = 0_u64;
+        let hydrated = (|| -> Result<(FileMeta, String, String)> {
+            let mut part = File::create(&part_path)?;
+            let mut offset = 0_u64;
 
-        let (meta, remote_hash) = loop {
-            let response = self.agent.request(Request::ReadFile {
-                path: path.to_string(),
-                offset,
-                len: Some(DEFAULT_CHUNK_SIZE),
-            })?;
-            match response {
-                Response::ReadFile {
-                    eof,
-                    content,
-                    hash,
-                    meta,
-                    ..
-                } => {
-                    part.write_all(&content)?;
-                    offset += content.len() as u64;
-                    if eof {
-                        break (meta, hash);
+            let (meta, remote_hash) = loop {
+                let response = self.agent.request(Request::ReadFile {
+                    path: path.to_string(),
+                    offset,
+                    len: Some(DEFAULT_CHUNK_SIZE),
+                })?;
+                match response {
+                    Response::ReadFile {
+                        eof,
+                        content,
+                        hash,
+                        meta,
+                        ..
+                    } => {
+                        part.write_all(&content)?;
+                        offset += content.len() as u64;
+                        if eof {
+                            break (meta, hash);
+                        }
                     }
+                    other => bail!("unexpected read response: {other:?}"),
                 }
-                other => bail!("unexpected read response: {other:?}"),
+            };
+            part.sync_all()?;
+            drop(part);
+
+            let local_hash = hash_file(&part_path)?;
+            if local_hash != remote_hash {
+                bail!(
+                    "local hydration hash mismatch for {path}: local={local_hash} remote={remote_hash}"
+                );
+            }
+            Ok((meta, remote_hash, local_hash))
+        })();
+        let (meta, remote_hash, local_hash) = match hydrated {
+            Ok(hydrated) => hydrated,
+            Err(error) => {
+                let _ = fs::remove_file(&part_path);
+                return Err(error);
             }
         };
-        part.sync_all()?;
-        drop(part);
         fs::rename(&part_path, &local_path)?;
-
-        let local_hash = hash_file(&local_path)?;
-        if local_hash != remote_hash {
-            bail!(
-                "local hydration hash mismatch for {path}: local={local_hash} remote={remote_hash}"
-            );
-        }
         self.mirror
             .record_hydrated(&meta, &remote_hash, &local_hash)?;
         self.mirror
@@ -2036,6 +2160,33 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    fn test_meta(path: &str, hash: &str, size: u64) -> FileMeta {
+        FileMeta {
+            path: path.to_string(),
+            size,
+            mtime_ms: 10,
+            mode: 0,
+            is_dir: false,
+            is_symlink: false,
+            hash: Some(hash.to_string()),
+        }
+    }
+
+    fn test_sidecar(mirror: Mirror) -> Sidecar {
+        Sidecar {
+            agent: AgentClient::new(
+                "unused-agent".to_string(),
+                None,
+                PathBuf::from("/unused"),
+                Duration::from_millis(1),
+                1,
+            ),
+            mirror,
+            remote_root: PathBuf::from("/unused"),
+            workspace_key: "test".to_string(),
+        }
+    }
+
     #[test]
     fn local_paths_reject_traversal() {
         let dir = tempdir().unwrap();
@@ -2048,15 +2199,7 @@ mod tests {
     fn mirror_records_hydrated_files() {
         let dir = tempdir().unwrap();
         let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
-        let meta = FileMeta {
-            path: "src/main.rs".to_string(),
-            size: 5,
-            mtime_ms: 10,
-            mode: 0,
-            is_dir: false,
-            is_symlink: false,
-            hash: Some("abc".to_string()),
-        };
+        let meta = test_meta("src/main.rs", "abc", 5);
         mirror.record_hydrated(&meta, "abc", "abc").unwrap();
         let entry = mirror.get("src/main.rs").unwrap().unwrap();
         assert_eq!(entry.relative_path, "src/main.rs");
@@ -2069,15 +2212,7 @@ mod tests {
     fn queued_saves_keep_exact_snapshots_and_chain_expected_hashes() {
         let dir = tempdir().unwrap();
         let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
-        let meta = FileMeta {
-            path: "src/main.rs".to_string(),
-            size: 3,
-            mtime_ms: 10,
-            mode: 0,
-            is_dir: false,
-            is_symlink: false,
-            hash: Some("base".to_string()),
-        };
+        let meta = test_meta("src/main.rs", "base", 3);
         mirror.record_hydrated(&meta, "base", "base").unwrap();
 
         let first_content = b"one";
@@ -2117,15 +2252,7 @@ mod tests {
     fn validation_can_mark_cached_file_stale() {
         let dir = tempdir().unwrap();
         let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
-        let meta = FileMeta {
-            path: "a.txt".to_string(),
-            size: 3,
-            mtime_ms: 10,
-            mode: 0,
-            is_dir: false,
-            is_symlink: false,
-            hash: Some("local".to_string()),
-        };
+        let meta = test_meta("a.txt", "local", 3);
         mirror.record_hydrated(&meta, "local", "local").unwrap();
         mirror
             .record_validation("a.txt", "stale", None, Some("remote hash differs"))
@@ -2135,6 +2262,132 @@ mod tests {
         assert_eq!(entry.validation_state, "stale");
         assert_eq!(entry.remote_hash.as_deref(), Some("local"));
         assert_eq!(entry.last_error.as_deref(), Some("remote hash differs"));
+    }
+
+    #[test]
+    fn open_returns_dirty_cache_even_when_force_requested() {
+        let dir = tempdir().unwrap();
+        let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
+        let meta = test_meta("a.txt", "base", 4);
+        mirror.record_hydrated(&meta, "base", "base").unwrap();
+        let local_path = mirror.local_path("a.txt").unwrap();
+        fs::write(&local_path, b"dirty").unwrap();
+        let dirty_hash = hash_bytes(b"dirty");
+        mirror
+            .enqueue_save("a.txt", &dirty_hash, Some("base"), b"dirty")
+            .unwrap();
+
+        let mut sidecar = test_sidecar(mirror);
+        let result = sidecar
+            .open(json!({"path": "a.txt", "force": true}))
+            .unwrap();
+
+        assert_eq!(result["cached"], true);
+        assert_eq!(result["dirty"], true);
+        assert_eq!(result["force_skipped"], true);
+        assert_eq!(result["cache_reason"], "dirty");
+        assert_eq!(fs::read(local_path).unwrap(), b"dirty");
+        assert_eq!(sidecar.mirror.unresolved_save_count("a.txt").unwrap(), 1);
+        assert!(sidecar.mirror.get("a.txt").unwrap().unwrap().dirty);
+    }
+
+    #[test]
+    fn open_restores_missing_dirty_file_from_latest_snapshot() {
+        let dir = tempdir().unwrap();
+        let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
+        let meta = test_meta("a.txt", "base", 4);
+        mirror.record_hydrated(&meta, "base", "base").unwrap();
+        let local_path = mirror.local_path("a.txt").unwrap();
+        fs::write(&local_path, b"dirty").unwrap();
+        let dirty_hash = hash_bytes(b"dirty");
+        mirror
+            .enqueue_save("a.txt", &dirty_hash, Some("base"), b"dirty")
+            .unwrap();
+        fs::remove_file(&local_path).unwrap();
+
+        let mut sidecar = test_sidecar(mirror);
+        let result = sidecar
+            .open(json!({"path": "a.txt", "force": true}))
+            .unwrap();
+
+        assert_eq!(result["cached"], true);
+        assert_eq!(result["dirty"], true);
+        assert_eq!(result["force_skipped"], true);
+        assert_eq!(result["restored_from_snapshot"], true);
+        assert_eq!(fs::read(local_path).unwrap(), b"dirty");
+        assert_eq!(sidecar.mirror.unresolved_save_count("a.txt").unwrap(), 1);
+        assert!(sidecar.mirror.get("a.txt").unwrap().unwrap().dirty);
+    }
+
+    #[test]
+    fn open_returns_stale_cache_without_force() {
+        let dir = tempdir().unwrap();
+        let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
+        let meta = test_meta("a.txt", "local", 5);
+        mirror.record_hydrated(&meta, "local", "local").unwrap();
+        let local_path = mirror.local_path("a.txt").unwrap();
+        fs::write(&local_path, b"local").unwrap();
+        mirror
+            .record_validation("a.txt", "stale", None, Some("remote hash differs"))
+            .unwrap();
+
+        let mut sidecar = test_sidecar(mirror);
+        let result = sidecar.open(json!({"path": "a.txt"})).unwrap();
+
+        assert_eq!(result["cached"], true);
+        assert_eq!(result["dirty"], false);
+        assert_eq!(result["force_skipped"], false);
+        assert_eq!(result["cache_reason"], "stale");
+        assert_eq!(result["validation_state"], "stale");
+    }
+
+    #[test]
+    fn open_returns_deleted_cache_without_force() {
+        let dir = tempdir().unwrap();
+        let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
+        let meta = test_meta("a.txt", "local", 5);
+        mirror.record_hydrated(&meta, "local", "local").unwrap();
+        let local_path = mirror.local_path("a.txt").unwrap();
+        fs::write(&local_path, b"local").unwrap();
+        mirror
+            .record_validation(
+                "a.txt",
+                "deleted",
+                None,
+                Some("remote file no longer exists"),
+            )
+            .unwrap();
+
+        let mut sidecar = test_sidecar(mirror);
+        let result = sidecar.open(json!({"path": "a.txt"})).unwrap();
+
+        assert_eq!(result["cached"], true);
+        assert_eq!(result["dirty"], false);
+        assert_eq!(result["cache_reason"], "deleted");
+        assert_eq!(result["validation_state"], "deleted");
+    }
+
+    #[test]
+    fn validate_skips_dirty_cache_without_remote_request() {
+        let dir = tempdir().unwrap();
+        let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
+        let meta = test_meta("a.txt", "base", 4);
+        mirror.record_hydrated(&meta, "base", "base").unwrap();
+        let local_path = mirror.local_path("a.txt").unwrap();
+        fs::write(&local_path, b"dirty").unwrap();
+        let dirty_hash = hash_bytes(b"dirty");
+        mirror
+            .enqueue_save("a.txt", &dirty_hash, Some("base"), b"dirty")
+            .unwrap();
+
+        let mut sidecar = test_sidecar(mirror);
+        let result = sidecar.validate(json!({"path": "a.txt"})).unwrap();
+
+        assert_eq!(result["status"], "dirty");
+        assert_eq!(result["skipped"], true);
+        let entry = sidecar.mirror.get("a.txt").unwrap().unwrap();
+        assert!(entry.dirty);
+        assert_eq!(entry.validation_state, "dirty");
     }
 
     #[test]

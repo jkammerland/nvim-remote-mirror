@@ -17,10 +17,11 @@ vim.api.nvim_create_user_command("RemoteDisconnect", function()
 end, {})
 
 vim.api.nvim_create_user_command("RemoteOpen", function(opts)
-  nrm.open(opts.args)
+  nrm.open(opts.args, { force = opts.bang })
 end, {
   nargs = 1,
   complete = "file",
+  bang = true,
 })
 
 vim.api.nvim_create_user_command("RemoteScan", function(opts)

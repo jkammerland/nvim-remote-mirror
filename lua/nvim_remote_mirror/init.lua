@@ -213,8 +213,29 @@ function M.request(method, params, callback)
   vim.fn.chansend(client.job_id, payload)
 end
 
-function M.open(path)
-  M.request("open", { path = path }, function(err, result)
+local function warn_cached_open(result)
+  if result.force_skipped then
+    notify(
+      "kept dirty local mirror for " .. result.path .. "; force rehydrate skipped",
+      vim.log.levels.WARN
+    )
+    return
+  end
+  if result.restored_from_snapshot then
+    notify("restored dirty local mirror snapshot for " .. result.path, vim.log.levels.WARN)
+    return
+  end
+  if result.cached and result.cache_reason and result.cache_reason ~= "cached" then
+    notify(
+      "opened cached " .. result.cache_reason .. " mirror for " .. result.path,
+      vim.log.levels.WARN
+    )
+  end
+end
+
+function M.open(path, opts)
+  opts = opts or {}
+  M.request("open", { path = path, force = opts.force == true }, function(err, result)
     if err then
       notify(err, vim.log.levels.ERROR)
       return
@@ -223,6 +244,7 @@ function M.open(path)
       vim.cmd.edit(vim.fn.fnameescape(result.local_path))
       vim.b.nrm_remote_path = result.path
       vim.b.nrm_remote_hash = result.hash
+      warn_cached_open(result)
     end)
   end)
 end
