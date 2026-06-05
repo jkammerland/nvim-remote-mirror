@@ -5322,37 +5322,120 @@ fn write_lsp_message<W: Write>(writer: &mut W, body: &[u8]) -> Result<()> {
 
 fn rewrite_lsp_body(body: &[u8], from_prefix: &str, to_prefix: &str) -> Result<Vec<u8>> {
     let mut value: Value = serde_json::from_slice(body)?;
-    rewrite_json_strings(&mut value, from_prefix, to_prefix);
+    rewrite_lsp_json(&mut value, None, from_prefix, to_prefix);
     Ok(serde_json::to_vec(&value)?)
 }
 
-fn rewrite_json_strings(value: &mut Value, from_prefix: &str, to_prefix: &str) {
+fn rewrite_lsp_json(value: &mut Value, key: Option<&str>, from_prefix: &str, to_prefix: &str) {
     match value {
         Value::String(text) => {
-            let from_uri = path_to_file_uri_prefix(from_prefix);
-            let to_uri = path_to_file_uri_prefix(to_prefix);
-            if text.starts_with(&from_uri) {
-                *text = text.replacen(&from_uri, &to_uri, 1);
-            } else if text.starts_with(from_prefix) {
-                *text = text.replacen(from_prefix, to_prefix, 1);
+            if let Some(rewritten) = rewrite_lsp_uri(text, from_prefix, to_prefix) {
+                *text = rewritten;
+            } else if key.map(is_lsp_path_key).unwrap_or(false) {
+                if let Some(rewritten) = rewrite_lsp_path(text, from_prefix, to_prefix) {
+                    *text = rewritten;
+                }
             }
         }
         Value::Array(values) => {
             for value in values {
-                rewrite_json_strings(value, from_prefix, to_prefix);
+                rewrite_lsp_json(value, key, from_prefix, to_prefix);
             }
         }
         Value::Object(map) => {
-            for value in map.values_mut() {
-                rewrite_json_strings(value, from_prefix, to_prefix);
+            let entries = std::mem::take(map);
+            for (entry_key, mut entry_value) in entries {
+                rewrite_lsp_json(&mut entry_value, Some(&entry_key), from_prefix, to_prefix);
+                map.insert(
+                    rewrite_lsp_object_key(&entry_key, from_prefix, to_prefix),
+                    entry_value,
+                );
             }
         }
         _ => {}
     }
 }
 
-fn path_to_file_uri_prefix(path: &str) -> String {
-    format!("file://{}", path)
+fn rewrite_lsp_object_key(key: &str, from_prefix: &str, to_prefix: &str) -> String {
+    rewrite_lsp_uri(key, from_prefix, to_prefix)
+        .or_else(|| rewrite_lsp_path(key, from_prefix, to_prefix))
+        .unwrap_or_else(|| key.to_string())
+}
+
+fn rewrite_lsp_uri(text: &str, from_prefix: &str, to_prefix: &str) -> Option<String> {
+    for (from_uri, to_uri) in path_to_file_uri_prefix_pairs(from_prefix, to_prefix) {
+        if let Some(suffix) = strip_prefix_with_boundary(text, &from_uri, &['/', '?', '#']) {
+            return Some(format!("{to_uri}{suffix}"));
+        }
+    }
+    None
+}
+
+fn rewrite_lsp_path(text: &str, from_prefix: &str, to_prefix: &str) -> Option<String> {
+    strip_prefix_with_boundary(text, from_prefix, &['/', '\\'])
+        .map(|suffix| format!("{to_prefix}{suffix}"))
+}
+
+fn strip_prefix_with_boundary<'a>(
+    text: &'a str,
+    prefix: &str,
+    boundaries: &[char],
+) -> Option<&'a str> {
+    let suffix = text.strip_prefix(prefix)?;
+    if suffix
+        .chars()
+        .next()
+        .map(|ch| boundaries.contains(&ch))
+        .unwrap_or(true)
+    {
+        Some(suffix)
+    } else {
+        None
+    }
+}
+
+fn is_lsp_path_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    key == "path"
+        || key == "file"
+        || key == "filename"
+        || key == "directory"
+        || key == "dir"
+        || key == "cwd"
+        || key.ends_with("path")
+        || key.ends_with("filepath")
+        || key.ends_with("file_path")
+        || key.ends_with("filename")
+        || key.ends_with("file_name")
+        || key.ends_with("directory")
+}
+
+fn path_to_file_uri_prefix_pairs(from_prefix: &str, to_prefix: &str) -> Vec<(String, String)> {
+    let mut pairs = vec![(
+        format!("file://{}", from_prefix),
+        format!("file://{}", to_prefix),
+    )];
+    let encoded = (
+        format!("file://{}", percent_encode_uri_path(from_prefix)),
+        format!("file://{}", percent_encode_uri_path(to_prefix)),
+    );
+    if encoded != pairs[0] {
+        pairs.insert(0, encoded);
+    }
+    pairs
+}
+
+fn percent_encode_uri_path(path: &str) -> String {
+    let mut encoded = String::new();
+    for byte in path.as_bytes() {
+        match *byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b':' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(*byte as char)
+            }
+            other => encoded.push_str(&format!("%{other:02X}")),
+        }
+    }
+    encoded
 }
 
 fn required_string<'a>(params: &'a Value, key: &str) -> Result<&'a str> {
@@ -7283,7 +7366,7 @@ mod tests {
 
     #[test]
     fn rewrites_lsp_uri_prefixes() {
-        let body = br#"{"params":{"textDocument":{"uri":"file:///local/mirror/src/main.rs"},"rootPath":"/local/mirror"}}"#;
+        let body = br#"{"params":{"textDocument":{"uri":"file:///local/mirror/src/main.rs"},"rootPath":"/local/mirror","message":"/local/mirror should stay in prose","profile":"/local/mirror should stay profile text"}}"#;
         let rewritten = rewrite_lsp_body(body, "/local/mirror", "/remote/repo").unwrap();
         let value: Value = serde_json::from_slice(&rewritten).unwrap();
         assert_eq!(
@@ -7291,6 +7374,58 @@ mod tests {
             "file:///remote/repo/src/main.rs"
         );
         assert_eq!(value["params"]["rootPath"], "/remote/repo");
+        assert_eq!(
+            value["params"]["message"],
+            "/local/mirror should stay in prose"
+        );
+        assert_eq!(
+            value["params"]["profile"],
+            "/local/mirror should stay profile text"
+        );
+    }
+
+    #[test]
+    fn rewrites_lsp_workspace_edit_uri_keys() {
+        let body = br#"{"result":{"changes":{"file:///remote/repo/src/lib.rs":[{"newText":"x"}]},"documentChanges":[{"textDocument":{"uri":"file:///remote/repo/src/main.rs"}}]}}"#;
+        let rewritten = rewrite_lsp_body(body, "/remote/repo", "/local/mirror").unwrap();
+        let value: Value = serde_json::from_slice(&rewritten).unwrap();
+
+        assert!(value["result"]["changes"]
+            .as_object()
+            .unwrap()
+            .contains_key("file:///local/mirror/src/lib.rs"));
+        assert_eq!(
+            value["result"]["documentChanges"][0]["textDocument"]["uri"],
+            "file:///local/mirror/src/main.rs"
+        );
+    }
+
+    #[test]
+    fn rewrites_lsp_encoded_file_uri_prefixes() {
+        let body =
+            br#"{"params":{"textDocument":{"uri":"file:///local/mirror%20space/src/main.rs"}}}"#;
+        let rewritten =
+            rewrite_lsp_body(body, "/local/mirror space", "/remote/repo space").unwrap();
+        let value: Value = serde_json::from_slice(&rewritten).unwrap();
+
+        assert_eq!(
+            value["params"]["textDocument"]["uri"],
+            "file:///remote/repo%20space/src/main.rs"
+        );
+    }
+
+    #[test]
+    fn lsp_rewrite_respects_path_boundaries() {
+        let body = br#"{"params":{"textDocument":{"uri":"file:///local/mirror-other/src/main.rs"},"rootPath":"/local/mirror-other","path":"/local/mirror/src/main.rs"}}"#;
+        let rewritten = rewrite_lsp_body(body, "/local/mirror", "/remote/repo").unwrap();
+        let value: Value = serde_json::from_slice(&rewritten).unwrap();
+
+        assert_eq!(
+            value["params"]["textDocument"]["uri"],
+            "file:///local/mirror-other/src/main.rs"
+        );
+        assert_eq!(value["params"]["rootPath"], "/local/mirror-other");
+        assert_eq!(value["params"]["path"], "/remote/repo/src/main.rs");
     }
 
     #[test]

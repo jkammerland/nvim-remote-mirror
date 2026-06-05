@@ -179,6 +179,9 @@ the configured connect timeout and cd to the remote root before server launch.
 start_lsp() probes the remote first and skips vim.lsp.start() while the remote
 is unavailable or in backoff. lsp_client_config() remains available as a
 low-level config builder when you need manual control.
+The proxy rewrites file:// URI values, workspace-edit URI object keys, and known
+path fields between local mirror and remote workspace prefixes. Unrelated prose
+strings are left untouched, and path boundaries are checked before rewriting.
 
 >
   local nrm = require("nvim_remote_mirror")

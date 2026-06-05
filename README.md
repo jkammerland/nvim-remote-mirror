@@ -184,11 +184,13 @@ skips `vim.lsp.start()` when SSH is still in backoff or unavailable. If you need
 manual control, `lsp_client_config()` remains available as the low-level config
 builder once the remote is reachable.
 
-The proxy rewrites JSON LSP `file://` URI and absolute path prefixes between
-the local mirror and the remote workspace. Local targets launch the language
-server with `remote_root` as the process working directory; SSH targets launch
-through SSH with the configured connect timeout and `cd` to `remote_root` before
-starting the language server.
+The proxy rewrites JSON LSP `file://` URI values, URI object keys such as
+workspace-edit `changes`, and known path fields between the local mirror and the
+remote workspace. It leaves unrelated prose strings alone and checks path
+boundaries so similarly named sibling directories are not rewritten. Local
+targets launch the language server with `remote_root` as the process working
+directory; SSH targets launch through SSH with the configured connect timeout
+and `cd` to `remote_root` before starting the language server.
 
 ## Save Recovery
 
