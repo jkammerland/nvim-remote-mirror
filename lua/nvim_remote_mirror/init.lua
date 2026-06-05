@@ -981,9 +981,10 @@ function M.status()
     end
     notify(
       string.format(
-        "known=%d cached=%d dirty=%d pending=%d failed=%d conflicts=%d stale=%d deleted=%d",
+        "known=%d cached=%d indexed=%d dirty=%d pending=%d failed=%d conflicts=%d stale=%d deleted=%d",
         result.known_files,
         result.cached_files,
+        result.indexed_files or 0,
         result.dirty_files,
         result.pending_saves,
         result.failed_saves,

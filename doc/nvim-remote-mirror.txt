@@ -47,8 +47,8 @@ COMMANDS                                      *nvim-remote-mirror-commands*
 :RemoteGrep {query}
     Queue remote grep, search a bounded slice of already hydrated local mirror
     files as a provisional cache result, hydrate remote matches in a batch, and
-    refresh quickfix with safe local mirror paths. Dirty cached matches are kept
-    as local truth.
+    refresh quickfix with safe local mirror paths. Cached grep uses a persisted
+    local line/trigram index and keeps dirty cached matches as local truth.
 
 :RemotePrefetch {path...}
     Hydrate one or more workspace-relative files in the background request.
@@ -78,7 +78,7 @@ COMMANDS                                      *nvim-remote-mirror-commands*
     valid, stale, or deleted.
 
 :RemoteStatus
-    Show known, cached, dirty, and pending mirror counts.
+    Show known, cached, indexed, dirty, and pending mirror counts.
 
 :RemoteDisconnect
     Stop the sidecar and agent.

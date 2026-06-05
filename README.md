@@ -54,6 +54,7 @@ This first implementation covers:
   preemptible batches.
 - batched mirror refresh to mark cached files valid, stale, or deleted.
 - remote grep that batch-hydrates result files for local quickfix jumps.
+- persisted local line/trigram index for faster provisional cached grep.
 - local mirror rehash before cached reads or batch overwrites, with
   out-of-band local edits snapshotted and queued as dirty saves.
 - durable local save snapshots with checksum-aware flush/retry and conflict detection.
@@ -226,6 +227,10 @@ Enable that with `open_prefetch_related = true` and tune the batch with
 `:RemoteGrep` queues the authoritative remote search first, then searches a
 bounded slice of already hydrated local mirror files. Cached hits are
 provisional and can populate quickfix while the remote search is still running.
+The cached search uses a persisted SQLite line index, plus byte trigrams for
+literal queries of at least three bytes, and verifies matches in Rust so
+case-sensitive literal behavior and byte-based columns stay stable. Dirty saves
+and out-of-band local edits update the index from the exact local bytes.
 The final quickfix refresh uses only safe local mirror paths from the remote
 result, preserving dirty cached matches as local truth.
 

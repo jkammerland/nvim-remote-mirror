@@ -30,6 +30,8 @@ const DEFAULT_BATCH_MAX_TOTAL_BYTES: u64 = 16 * 1024 * 1024;
 const DEFAULT_GREP_CACHE_MAX_FILES: usize = 2_000;
 const DEFAULT_GREP_CACHE_MAX_FILE_BYTES: u64 = 512 * 1024;
 const DEFAULT_GREP_CACHE_MAX_TOTAL_BYTES: u64 = 8 * 1024 * 1024;
+const SEARCH_INDEX_MAX_FILE_BYTES: u64 = DEFAULT_BATCH_MAX_FILE_BYTES;
+const SEARCH_TRIGRAM_BYTES: usize = 3;
 const REMOTE_UNAVAILABLE_BACKOFF_MS: u64 = 2_000;
 const MAX_SAVE_PAYLOAD_BYTES: usize = MAX_FRAME_LEN - (1024 * 1024);
 const REMOTE_INTERACTIVE_QUEUE_CAPACITY: usize = 128;
@@ -126,6 +128,18 @@ struct SaveQueueEntry {
     expected_hash: Option<String>,
     local_hash: String,
     snapshot_path: PathBuf,
+}
+
+#[derive(Debug)]
+struct SearchIndexMeta {
+    local_hash: String,
+    state: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchIndexReadiness {
+    Ready,
+    Legacy,
 }
 
 #[derive(Debug)]
@@ -681,6 +695,46 @@ fn format_rpc_error(error: RpcError) -> String {
     )
 }
 
+fn indexed_text_lines(text: &str) -> Vec<(i64, String)> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    text.split_inclusive('\n')
+        .enumerate()
+        .map(|(idx, line)| {
+            (
+                idx as i64 + 1,
+                line.trim_end_matches(&['\r', '\n'][..]).to_string(),
+            )
+        })
+        .collect()
+}
+
+fn indexed_line_trigrams(lines: &[(i64, String)]) -> Vec<(Vec<u8>, i64)> {
+    let mut trigrams = Vec::new();
+    for (line_number, line) in lines {
+        for gram in unique_trigrams(line.as_bytes()) {
+            trigrams.push((gram, *line_number));
+        }
+    }
+    trigrams
+}
+
+fn unique_trigrams(bytes: &[u8]) -> Vec<Vec<u8>> {
+    if bytes.len() < SEARCH_TRIGRAM_BYTES {
+        return Vec::new();
+    }
+    let mut seen = HashSet::new();
+    let mut trigrams = Vec::new();
+    for window in bytes.windows(SEARCH_TRIGRAM_BYTES) {
+        let gram = window.to_vec();
+        if seen.insert(gram.clone()) {
+            trigrams.push(gram);
+        }
+    }
+    trigrams
+}
+
 struct Mirror {
     root: PathBuf,
     files_root: PathBuf,
@@ -750,6 +804,29 @@ impl Mirror {
               created_at_ms INTEGER NOT NULL,
               updated_at_ms INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS search_files (
+              relative_path TEXT PRIMARY KEY,
+              local_hash TEXT NOT NULL,
+              indexed_bytes INTEGER NOT NULL,
+              line_count INTEGER NOT NULL,
+              index_state TEXT NOT NULL,
+              last_error TEXT,
+              updated_at_ms INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS search_lines (
+              relative_path TEXT NOT NULL,
+              line_number INTEGER NOT NULL,
+              text TEXT NOT NULL,
+              PRIMARY KEY(relative_path, line_number)
+            );
+            CREATE TABLE IF NOT EXISTS search_trigrams (
+              gram BLOB NOT NULL,
+              relative_path TEXT NOT NULL,
+              line_number INTEGER NOT NULL,
+              PRIMARY KEY(gram, relative_path, line_number)
+            );
+            CREATE INDEX IF NOT EXISTS search_trigrams_path_idx
+              ON search_trigrams(relative_path, line_number);
             ",
         )?;
         self.add_missing_column("files", "validated_at_ms", "INTEGER NOT NULL DEFAULT 0")?;
@@ -900,6 +977,357 @@ impl Mirror {
             .map_err(Into::into)
     }
 
+    fn search_index_meta(&self, relative_path: &str) -> Result<Option<SearchIndexMeta>> {
+        self.db
+            .query_row(
+                "
+                SELECT local_hash, index_state
+                FROM search_files
+                WHERE relative_path=?1
+                ",
+                params![relative_path],
+                |row| {
+                    Ok(SearchIndexMeta {
+                        local_hash: row.get(0)?,
+                        state: row.get(1)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    fn replace_search_index_from_bytes(
+        &self,
+        relative_path: &str,
+        local_hash: &str,
+        content: &[u8],
+    ) -> Result<SearchIndexReadiness> {
+        let relative_path = normalize_relative_path(relative_path)?
+            .to_string_lossy()
+            .replace('\\', "/");
+        let indexed_bytes = content.len() as u64;
+        if indexed_bytes > SEARCH_INDEX_MAX_FILE_BYTES {
+            self.replace_search_index_rows(
+                &relative_path,
+                local_hash,
+                indexed_bytes,
+                "too_large",
+                Some("file exceeds local search index byte cap"),
+                &[],
+                &[],
+            )?;
+            return Ok(SearchIndexReadiness::Legacy);
+        }
+        let text = match std::str::from_utf8(content) {
+            Ok(text) => text,
+            Err(error) => {
+                self.replace_search_index_rows(
+                    &relative_path,
+                    local_hash,
+                    indexed_bytes,
+                    "binary",
+                    Some(&error.to_string()),
+                    &[],
+                    &[],
+                )?;
+                return Ok(SearchIndexReadiness::Legacy);
+            }
+        };
+        let lines = indexed_text_lines(text);
+        let trigrams = indexed_line_trigrams(&lines);
+        self.replace_search_index_rows(
+            &relative_path,
+            local_hash,
+            indexed_bytes,
+            "ready",
+            None,
+            &lines,
+            &trigrams,
+        )?;
+        Ok(SearchIndexReadiness::Ready)
+    }
+
+    fn rebuild_search_index_from_local_file(
+        &self,
+        entry: &MirrorEntry,
+        local_hash: &str,
+        file_len: u64,
+    ) -> Result<SearchIndexReadiness> {
+        if file_len > SEARCH_INDEX_MAX_FILE_BYTES {
+            self.replace_search_index_rows(
+                &entry.relative_path,
+                local_hash,
+                file_len,
+                "too_large",
+                Some("file exceeds local search index byte cap"),
+                &[],
+                &[],
+            )?;
+            return Ok(SearchIndexReadiness::Legacy);
+        }
+        let content = fs::read(&entry.local_path).with_context(|| {
+            format!(
+                "failed to read local mirror file {} for search index",
+                entry.local_path.display()
+            )
+        })?;
+        self.replace_search_index_from_bytes(&entry.relative_path, local_hash, &content)
+    }
+
+    fn replace_search_index_rows(
+        &self,
+        relative_path: &str,
+        local_hash: &str,
+        indexed_bytes: u64,
+        index_state: &str,
+        last_error: Option<&str>,
+        lines: &[(i64, String)],
+        trigrams: &[(Vec<u8>, i64)],
+    ) -> Result<()> {
+        self.db.execute_batch("BEGIN IMMEDIATE")?;
+        let result = (|| -> Result<()> {
+            self.db.execute(
+                "DELETE FROM search_trigrams WHERE relative_path=?1",
+                params![relative_path],
+            )?;
+            self.db.execute(
+                "DELETE FROM search_lines WHERE relative_path=?1",
+                params![relative_path],
+            )?;
+            for (line_number, text) in lines {
+                self.db.execute(
+                    "
+                    INSERT INTO search_lines (relative_path, line_number, text)
+                    VALUES (?1, ?2, ?3)
+                    ",
+                    params![relative_path, line_number, text],
+                )?;
+            }
+            for (gram, line_number) in trigrams {
+                self.db.execute(
+                    "
+                    INSERT OR IGNORE INTO search_trigrams (gram, relative_path, line_number)
+                    VALUES (?1, ?2, ?3)
+                    ",
+                    params![gram, relative_path, line_number],
+                )?;
+            }
+            self.db.execute(
+                "
+                INSERT INTO search_files (
+                  relative_path, local_hash, indexed_bytes, line_count,
+                  index_state, last_error, updated_at_ms
+                )
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                ON CONFLICT(relative_path) DO UPDATE SET
+                  local_hash=excluded.local_hash,
+                  indexed_bytes=excluded.indexed_bytes,
+                  line_count=excluded.line_count,
+                  index_state=excluded.index_state,
+                  last_error=excluded.last_error,
+                  updated_at_ms=excluded.updated_at_ms
+                ",
+                params![
+                    relative_path,
+                    local_hash,
+                    indexed_bytes as i64,
+                    lines.len() as i64,
+                    index_state,
+                    last_error,
+                    now_ms()
+                ],
+            )?;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => self.db.execute_batch("COMMIT")?,
+            Err(error) => {
+                let _ = self.db.execute_batch("ROLLBACK");
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    fn ensure_search_index_ready(
+        &self,
+        entry: &MirrorEntry,
+        file_len: u64,
+    ) -> Result<SearchIndexReadiness> {
+        let Some(local_hash) = entry.local_hash.as_deref().or(entry.remote_hash.as_deref()) else {
+            return Ok(SearchIndexReadiness::Legacy);
+        };
+        if let Some(meta) = self.search_index_meta(&entry.relative_path)? {
+            if meta.local_hash == local_hash {
+                return Ok(match meta.state.as_str() {
+                    "ready" => SearchIndexReadiness::Ready,
+                    "binary" => SearchIndexReadiness::Legacy,
+                    "too_large" => SearchIndexReadiness::Legacy,
+                    _ => SearchIndexReadiness::Legacy,
+                });
+            }
+        }
+        self.rebuild_search_index_from_local_file(entry, local_hash, file_len)
+    }
+
+    fn indexed_grep_hits(
+        &self,
+        entry: &MirrorEntry,
+        query: &str,
+        remaining: usize,
+    ) -> Result<(Vec<Value>, bool)> {
+        if query.as_bytes().len() >= SEARCH_TRIGRAM_BYTES {
+            if let Some(gram) = self.rarest_query_trigram(&entry.relative_path, query)? {
+                return self.indexed_grep_hits_for_gram(entry, query, remaining, &gram);
+            }
+            return Ok((Vec::new(), false));
+        }
+
+        let mut statement = self.db.prepare(
+            "
+            SELECT line_number, text
+            FROM search_lines
+            WHERE relative_path=?1
+            ORDER BY line_number ASC
+            ",
+        )?;
+        let rows = statement.query_map(params![&entry.relative_path], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        self.grep_indexed_rows(entry, query, remaining, rows)
+    }
+
+    fn indexed_grep_hits_for_gram(
+        &self,
+        entry: &MirrorEntry,
+        query: &str,
+        remaining: usize,
+        gram: &[u8],
+    ) -> Result<(Vec<Value>, bool)> {
+        let mut statement = self.db.prepare(
+            "
+            SELECT l.line_number, l.text
+            FROM search_trigrams g
+            JOIN search_lines l
+              ON l.relative_path = g.relative_path
+             AND l.line_number = g.line_number
+            WHERE g.relative_path=?1
+              AND g.gram=?2
+            ORDER BY l.line_number ASC
+            ",
+        )?;
+        let rows = statement.query_map(params![&entry.relative_path, gram], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        self.grep_indexed_rows(entry, query, remaining, rows)
+    }
+
+    fn grep_indexed_rows<I>(
+        &self,
+        entry: &MirrorEntry,
+        query: &str,
+        remaining: usize,
+        rows: I,
+    ) -> Result<(Vec<Value>, bool)>
+    where
+        I: IntoIterator<Item = rusqlite::Result<(i64, String)>>,
+    {
+        let mut hits = Vec::new();
+        for row in rows {
+            let (line_number, text) = row?;
+            if let Some(byte_idx) = text.find(query) {
+                hits.push(json!({
+                    "path": entry.relative_path,
+                    "local_path": entry.local_path.to_string_lossy(),
+                    "line": line_number as u64,
+                    "column": byte_idx as u64 + 1,
+                    "text": text,
+                    "cached": true,
+                    "dirty": entry.dirty,
+                    "validation_state": entry.validation_state
+                }));
+                if hits.len() >= remaining {
+                    return Ok((hits, true));
+                }
+            }
+        }
+        Ok((hits, false))
+    }
+
+    fn rarest_query_trigram(&self, relative_path: &str, query: &str) -> Result<Option<Vec<u8>>> {
+        let trigrams = unique_trigrams(query.as_bytes());
+        let mut best: Option<(Vec<u8>, i64)> = None;
+        for gram in trigrams {
+            let count: i64 = self.db.query_row(
+                "
+                SELECT COUNT(*)
+                FROM search_trigrams
+                WHERE relative_path=?1 AND gram=?2
+                ",
+                params![relative_path, &gram],
+                |row| row.get(0),
+            )?;
+            if count == 0 {
+                return Ok(Some(gram));
+            }
+            if best
+                .as_ref()
+                .map(|(_, best_count)| count < *best_count)
+                .unwrap_or(true)
+            {
+                best = Some((gram, count));
+            }
+        }
+        Ok(best.map(|(gram, _)| gram))
+    }
+
+    fn legacy_grep_file(
+        &self,
+        entry: &MirrorEntry,
+        query: &str,
+        remaining: usize,
+    ) -> Result<(Vec<Value>, bool, bool)> {
+        let file = File::open(&entry.local_path)?;
+        let mut reader = BufReader::new(file);
+        let mut hits = Vec::new();
+        let mut line = String::new();
+        let mut line_number = 0_u64;
+        let mut invalid_text = false;
+        loop {
+            line.clear();
+            let bytes_read = match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(bytes_read) => bytes_read,
+                Err(_) => {
+                    invalid_text = true;
+                    break;
+                }
+            };
+            if bytes_read == 0 {
+                break;
+            }
+            line_number += 1;
+            let line_text = line.trim_end_matches(&['\r', '\n'][..]);
+            if let Some(byte_idx) = line_text.find(query) {
+                hits.push(json!({
+                    "path": entry.relative_path,
+                    "local_path": entry.local_path.to_string_lossy(),
+                    "line": line_number,
+                    "column": byte_idx as u64 + 1,
+                    "text": line_text,
+                    "cached": true,
+                    "dirty": entry.dirty,
+                    "validation_state": entry.validation_state
+                }));
+                if hits.len() >= remaining {
+                    return Ok((hits, invalid_text, true));
+                }
+            }
+        }
+        Ok((hits, invalid_text, false))
+    }
+
     fn enqueue_save(
         &self,
         relative_path: &str,
@@ -944,8 +1372,10 @@ impl Mirror {
                 now_ms()
             ],
         )?;
+        let queue_id = self.db.last_insert_rowid();
+        self.replace_search_index_from_bytes(&relative_path, local_hash, content)?;
         Ok(SaveQueueEntry {
-            id: self.db.last_insert_rowid(),
+            id: queue_id,
             relative_path: relative_path.to_string(),
             expected_hash: effective_expected_hash,
             local_hash: local_hash.to_string(),
@@ -1036,6 +1466,7 @@ impl Mirror {
             ",
             params![entry.relative_path, size, local_hash, now_ms()],
         )?;
+        self.rebuild_search_index_from_local_file(entry, local_hash, size as u64)?;
         Ok(())
     }
 
@@ -1267,6 +1698,14 @@ impl Mirror {
             ",
             params![relative_path, size as i64, mtime_ms, new_hash, now_ms()],
         )?;
+        if let Some(entry) = self.get(relative_path)? {
+            if entry.local_path.is_file() {
+                let file_len = fs::metadata(&entry.local_path)
+                    .map(|metadata| metadata.len())
+                    .unwrap_or(size);
+                self.rebuild_search_index_from_local_file(&entry, new_hash, file_len)?;
+            }
+        }
         Ok(())
     }
 
@@ -1335,6 +1774,11 @@ impl Mirror {
             [],
             |row| row.get(0),
         )?;
+        let indexed: i64 = self.db.query_row(
+            "SELECT COUNT(*) FROM search_files WHERE index_state='ready'",
+            [],
+            |row| row.get(0),
+        )?;
         let known: i64 = self
             .db
             .query_row("SELECT COUNT(*) FROM files", [], |row| row.get(0))?;
@@ -1372,6 +1816,7 @@ impl Mirror {
             "mirror_root": self.root.to_string_lossy(),
             "known_files": known,
             "cached_files": cached,
+            "indexed_files": indexed,
             "dirty_files": dirty,
             "pending_saves": pending,
             "failed_saves": failed,
@@ -1483,6 +1928,8 @@ impl Mirror {
         let mut searched_files = 0_usize;
         let mut searched_bytes = 0_u64;
         let mut skipped_files = 0_usize;
+        let mut indexed_files = 0_usize;
+        let mut legacy_files = 0_usize;
         let mut truncated = false;
 
         if query.is_empty() || limit == 0 {
@@ -1528,54 +1975,43 @@ impl Mirror {
                 truncated = true;
                 break;
             }
-            let file = match File::open(&entry.local_path) {
-                Ok(file) => file,
-                Err(_) => {
-                    skipped_files += 1;
-                    continue;
-                }
-            };
             searched_bytes = searched_bytes.saturating_add(file_len);
-            let mut reader = BufReader::new(file);
-            let mut line = String::new();
-            let mut line_number = 0_u64;
-            let mut invalid_text = false;
-            loop {
-                line.clear();
-                let bytes_read = match reader.read_line(&mut line) {
-                    Ok(0) => break,
-                    Ok(bytes_read) => bytes_read,
-                    Err(_) => {
-                        invalid_text = true;
-                        break;
-                    }
-                };
-                if bytes_read == 0 {
-                    break;
-                }
-                line_number += 1;
-                let line = line.trim_end_matches(&['\r', '\n'][..]);
-                if let Some(byte_idx) = line.find(query) {
-                    hits.push(json!({
-                        "path": entry.relative_path,
-                        "local_path": entry.local_path.to_string_lossy(),
-                        "line": line_number,
-                        "column": byte_idx as u64 + 1,
-                        "text": line,
-                        "cached": true,
-                        "dirty": entry.dirty,
-                        "validation_state": entry.validation_state
-                    }));
-                    if hits.len() >= limit {
+
+            match self.ensure_search_index_ready(&entry, file_len)? {
+                SearchIndexReadiness::Ready => {
+                    let remaining = limit.saturating_sub(hits.len());
+                    let (mut file_hits, hit_limit) =
+                        self.indexed_grep_hits(&entry, query, remaining)?;
+                    searched_files += 1;
+                    indexed_files += 1;
+                    hits.append(&mut file_hits);
+                    if hit_limit {
                         truncated = true;
                         break;
                     }
                 }
-            }
-            if invalid_text {
-                skipped_files += 1;
-            } else {
-                searched_files += 1;
+                SearchIndexReadiness::Legacy => {
+                    let remaining = limit.saturating_sub(hits.len());
+                    let (mut file_hits, invalid_text, hit_limit) =
+                        match self.legacy_grep_file(&entry, query, remaining) {
+                            Ok(result) => result,
+                            Err(_) => {
+                                skipped_files += 1;
+                                continue;
+                            }
+                        };
+                    legacy_files += 1;
+                    hits.append(&mut file_hits);
+                    if invalid_text {
+                        skipped_files += 1;
+                    } else {
+                        searched_files += 1;
+                    }
+                    if hit_limit {
+                        truncated = true;
+                        break;
+                    }
+                }
             }
         }
 
@@ -1585,6 +2021,8 @@ impl Mirror {
             "searched_files": searched_files,
             "searched_bytes": searched_bytes,
             "skipped_files": skipped_files,
+            "indexed_files": indexed_files,
+            "legacy_files": legacy_files,
             "max_files": max_files,
             "max_file_bytes": max_file_bytes,
             "max_total_bytes": max_total_bytes,
@@ -2732,6 +3170,8 @@ impl Sidecar {
         fs::rename(&part_path, &local_path)?;
         self.mirror
             .record_hydrated(&file.meta, &file.hash, &local_hash)?;
+        self.mirror
+            .replace_search_index_from_bytes(&file.path, &local_hash, &file.content)?;
         Ok(())
     }
 
@@ -3372,9 +3812,16 @@ impl Sidecar {
         fs::rename(&part_path, &local_path)?;
         self.mirror
             .record_hydrated(&meta, &remote_hash, &local_hash)?;
-        self.mirror
+        let hydrated = self
+            .mirror
             .get(path)?
-            .ok_or_else(|| anyhow!("hydrated file was not recorded in mirror metadata"))
+            .ok_or_else(|| anyhow!("hydrated file was not recorded in mirror metadata"))?;
+        let file_len = fs::metadata(&hydrated.local_path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(meta.size);
+        self.mirror
+            .rebuild_search_index_from_local_file(&hydrated, &local_hash, file_len)?;
+        Ok(hydrated)
     }
 }
 
@@ -4323,6 +4770,135 @@ mod tests {
         assert_eq!(result["searched_files"], 1);
         assert_eq!(result["max_files"], 1);
         assert_eq!(result["truncated"], true);
+    }
+
+    #[test]
+    fn grep_cache_rebuilds_missing_search_index_after_reopen() {
+        let dir = tempdir().unwrap();
+        {
+            let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
+            record_hydrated_content(&mirror, "src/main.rs", b"fn reopened_hit() {}\n");
+        }
+        let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
+
+        let result = mirror
+            .grep_cache(&json!({"query": "reopened_hit", "limit": 10}))
+            .unwrap();
+
+        let hits = result["hits"].as_array().unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["path"], "src/main.rs");
+        assert_eq!(result["indexed_files"], 1);
+        let indexed: i64 = mirror
+            .db
+            .query_row(
+                "SELECT COUNT(*) FROM search_files WHERE index_state='ready'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexed, 1);
+    }
+
+    #[test]
+    fn grep_cache_refreshes_index_for_dirty_save_bytes() {
+        let dir = tempdir().unwrap();
+        let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
+        let local_path = record_hydrated_content(&mirror, "src/main.rs", b"fn old() {}\n");
+        let dirty_content = b"fn dirty_index_hit() {}\n";
+        fs::write(&local_path, dirty_content).unwrap();
+        let dirty_hash = hash_bytes(dirty_content);
+
+        mirror
+            .enqueue_save("src/main.rs", &dirty_hash, Some("base"), dirty_content)
+            .unwrap();
+        let result = mirror
+            .grep_cache(&json!({"query": "dirty_index_hit", "limit": 10}))
+            .unwrap();
+
+        let hits = result["hits"].as_array().unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["path"], "src/main.rs");
+        assert_eq!(hits[0]["dirty"], true);
+        assert_eq!(result["indexed_files"], 1);
+    }
+
+    #[test]
+    fn grep_cache_reindexes_out_of_band_edit_before_searching() {
+        let dir = tempdir().unwrap();
+        let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
+        let local_path = record_hydrated_content(&mirror, "src/main.rs", b"fn base() {}\n");
+        let _ = mirror
+            .grep_cache(&json!({"query": "base", "limit": 10}))
+            .unwrap();
+        fs::write(&local_path, b"fn out_of_band_hit() {}\n").unwrap();
+
+        let result = mirror
+            .grep_cache(&json!({"query": "out_of_band_hit", "limit": 10}))
+            .unwrap();
+
+        let hits = result["hits"].as_array().unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["path"], "src/main.rs");
+        assert_eq!(hits[0]["dirty"], true);
+        assert_eq!(mirror.pending_save_count().unwrap(), 1);
+        assert_eq!(result["indexed_files"], 1);
+    }
+
+    #[test]
+    fn grep_cache_preserves_literal_byte_columns_from_index() {
+        let dir = tempdir().unwrap();
+        let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
+        record_hydrated_content(&mirror, "unicode.rs", "å%_Hit\n".as_bytes());
+
+        let result = mirror
+            .grep_cache(&json!({"query": "%_Hit", "limit": 10}))
+            .unwrap();
+
+        let hits = result["hits"].as_array().unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["column"], 3);
+        assert_eq!(hits[0]["text"], "å%_Hit");
+        let miss = mirror
+            .grep_cache(&json!({"query": "%_hit", "limit": 10}))
+            .unwrap();
+        assert!(miss["hits"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn grep_cache_skips_indexed_hit_when_file_cap_excludes_it() {
+        let dir = tempdir().unwrap();
+        let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
+        record_hydrated_content(&mirror, "large.rs", b"hit beyond tiny cap\n");
+        let _ = mirror
+            .grep_cache(&json!({"query": "hit", "limit": 10}))
+            .unwrap();
+
+        let result = mirror
+            .grep_cache(&json!({"query": "hit", "limit": 10, "max_file_bytes": 1}))
+            .unwrap();
+
+        assert!(result["hits"].as_array().unwrap().is_empty());
+        assert_eq!(result["skipped_files"], 1);
+        assert_eq!(result["truncated"], true);
+    }
+
+    #[test]
+    fn grep_cache_falls_back_for_mixed_invalid_utf8_files() {
+        let dir = tempdir().unwrap();
+        let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
+        record_hydrated_content(&mirror, "mixed.bin", b"hit before invalid\n\xff");
+
+        let result = mirror
+            .grep_cache(&json!({"query": "hit", "limit": 10}))
+            .unwrap();
+
+        let hits = result["hits"].as_array().unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["path"], "mixed.bin");
+        assert_eq!(hits[0]["text"], "hit before invalid");
+        assert_eq!(result["legacy_files"], 1);
+        assert_eq!(result["skipped_files"], 1);
     }
 
     #[test]
