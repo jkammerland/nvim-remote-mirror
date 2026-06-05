@@ -112,6 +112,7 @@ CONFIGURATION                                  *nvim-remote-mirror-config*
     background_mirror_interval_ms = 5000,
     background_mirror_scan_limit = 256,
     background_mirror_prefetch_limit = 4,
+    background_mirror_refresh_limit = 32,
     background_mirror_max_file_bytes = 128 * 1024,
     background_mirror_max_total_bytes = 512 * 1024,
   })
@@ -120,7 +121,9 @@ CONFIGURATION                                  *nvim-remote-mirror-config*
 request_timeout_ms bounds both sidecar/agent work and pending Neovim-side
 callbacks waiting for sidecar JSON replies.
 background_mirror controls the idle mirror builder; set it false and use
-:RemoteMirrorStart manually on especially fragile links.
+:RemoteMirrorStart manually on especially fragile links. Each background tick
+scans metadata, hydrates a tiny clean-file batch, then validates a tiny
+oldest-check cached-file batch against the remote checksum.
 
 ==============================================================================
 LSP                                                *nvim-remote-mirror-lsp*

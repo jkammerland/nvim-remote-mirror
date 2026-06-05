@@ -43,6 +43,7 @@ M.config = {
   background_mirror_interval_ms = 5000,
   background_mirror_scan_limit = 256,
   background_mirror_prefetch_limit = 4,
+  background_mirror_refresh_limit = 32,
   background_mirror_max_file_bytes = 128 * 1024,
   background_mirror_max_total_bytes = 512 * 1024,
 }
@@ -464,9 +465,35 @@ local function schedule_background_mirror(delay, generation)
           M.background_scan_after = nil
         end
 
+        local function still_current_background()
+          return M.background_mirror_running
+            and generation == M.background_mirror_generation
+            and M.client == client
+        end
+
+        local function finish_background_tick()
+          if not still_current_background() then
+            return
+          end
+          local refresh_limit = math.max(tonumber(M.config.background_mirror_refresh_limit) or 0, 0)
+          if refresh_limit == 0 then
+            schedule_background_mirror(background_interval(), generation)
+            return
+          end
+          M.request("refresh", {
+            background = true,
+            limit = refresh_limit,
+          }, function()
+            if not still_current_background() then
+              return
+            end
+            schedule_background_mirror(background_interval(), generation)
+          end)
+        end
+
         local prefetch_limit = math.max(tonumber(M.config.background_mirror_prefetch_limit) or 0, 0)
         if prefetch_limit == 0 then
-          schedule_background_mirror(background_interval(), generation)
+          finish_background_tick()
           return
         end
 
@@ -482,7 +509,7 @@ local function schedule_background_mirror(delay, generation)
           then
             return
           end
-          schedule_background_mirror(background_interval(), generation)
+          finish_background_tick()
         end)
       end)
     end)
