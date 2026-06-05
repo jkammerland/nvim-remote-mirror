@@ -187,6 +187,11 @@ enum HydrateOutcome {
     Preempted,
 }
 
+enum HydrationInstall {
+    ReplaceWithPart,
+    AdoptExisting { local_hash: String },
+}
+
 #[derive(Debug, Clone)]
 struct ProcessLaunchPlan {
     program: String,
@@ -3859,8 +3864,17 @@ impl Sidecar {
                     file.hash
                 );
             }
-            self.ensure_hydration_target_clean(&file.path, &local_path)?;
-            fs::rename(&part_path, &local_path)?;
+            let install = self.prepare_hydration_target(&file.path, &local_path, &file.hash)?;
+            let local_hash = match install {
+                HydrationInstall::ReplaceWithPart => {
+                    fs::rename(&part_path, &local_path)?;
+                    local_hash
+                }
+                HydrationInstall::AdoptExisting { local_hash } => {
+                    let _ = fs::remove_file(&part_path);
+                    local_hash
+                }
+            };
             self.mirror
                 .record_hydrated(&file.meta, &file.hash, &local_hash)?;
             self.mirror
@@ -3874,19 +3888,50 @@ impl Sidecar {
         Ok(())
     }
 
-    fn ensure_hydration_target_clean(&self, path: &str, local_path: &Path) -> Result<()> {
+    fn prepare_hydration_target(
+        &self,
+        path: &str,
+        local_path: &Path,
+        remote_hash: &str,
+    ) -> Result<HydrationInstall> {
         if let Some(entry) = self.mirror.get(path)? {
             if entry.local_path.exists() && entry.state != "hydrated" {
+                if entry.dirty {
+                    bail!("skipped dirty local mirror file");
+                }
+                let existing_hash = hash_file(&entry.local_path).with_context(|| {
+                    format!(
+                        "failed to hash existing local mirror file {}",
+                        entry.local_path.display()
+                    )
+                })?;
+                if existing_hash == remote_hash {
+                    return Ok(HydrationInstall::AdoptExisting {
+                        local_hash: existing_hash,
+                    });
+                }
                 bail!("skipped existing local mirror file without hydrated metadata");
             }
             let (entry, _) = self.mirror.sync_cached_file_integrity(&entry)?;
             if entry.dirty {
                 bail!("skipped dirty local mirror file");
             }
+            return Ok(HydrationInstall::ReplaceWithPart);
         } else if local_path.exists() {
+            let existing_hash = hash_file(local_path).with_context(|| {
+                format!(
+                    "failed to hash existing unmanaged local mirror file {}",
+                    local_path.display()
+                )
+            })?;
+            if existing_hash == remote_hash {
+                return Ok(HydrationInstall::AdoptExisting {
+                    local_hash: existing_hash,
+                });
+            }
             bail!("skipped existing unmanaged local mirror file");
         }
-        Ok(())
+        Ok(HydrationInstall::ReplaceWithPart)
     }
 
     fn grep(&mut self, params: Value, preempt_epoch: u64) -> Result<Value> {
@@ -4646,7 +4691,17 @@ impl Sidecar {
                     "local hydration hash mismatch for {path}: local={local_hash} remote={remote_hash}"
                 );
             }
-            self.ensure_hydration_target_clean(path, &local_path)?;
+            let install = self.prepare_hydration_target(path, &local_path, &remote_hash)?;
+            let local_hash = match install {
+                HydrationInstall::ReplaceWithPart => {
+                    fs::rename(&part_path, &local_path)?;
+                    local_hash
+                }
+                HydrationInstall::AdoptExisting { local_hash } => {
+                    let _ = fs::remove_file(&part_path);
+                    local_hash
+                }
+            };
             Ok(Some((meta, remote_hash, local_hash)))
         })();
         let Some((meta, remote_hash, local_hash)) = (match hydrated {
@@ -4659,7 +4714,6 @@ impl Sidecar {
             let _ = fs::remove_file(&part_path);
             return Ok(HydrateOutcome::Preempted);
         };
-        fs::rename(&part_path, &local_path)?;
         self.mirror
             .record_hydrated(&meta, &remote_hash, &local_hash)?;
         let hydrated = self
@@ -6675,6 +6729,66 @@ mod tests {
             .exists());
         assert_eq!(sidecar.mirror.pending_save_count().unwrap(), 1);
         assert!(sidecar.mirror.get("a.txt").unwrap().unwrap().dirty);
+    }
+
+    #[test]
+    fn batch_hydrate_adopts_unmanaged_existing_matching_remote_file() {
+        let dir = tempdir().unwrap();
+        let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
+        let local_path = mirror.local_path("a.txt").unwrap();
+        fs::create_dir_all(local_path.parent().unwrap()).unwrap();
+        fs::write(&local_path, b"remote new").unwrap();
+        let sidecar = test_sidecar(mirror);
+        let remote_hash = hash_bytes(b"remote new");
+
+        sidecar
+            .record_batch_file(BatchReadFile {
+                path: "a.txt".to_string(),
+                content: b"remote new".to_vec(),
+                hash: remote_hash.clone(),
+                meta: test_meta("a.txt", &remote_hash, b"remote new".len() as u64),
+            })
+            .unwrap();
+
+        let entry = sidecar.mirror.get("a.txt").unwrap().unwrap();
+        assert_eq!(fs::read(&local_path).unwrap(), b"remote new");
+        assert_eq!(entry.state, "hydrated");
+        assert_eq!(entry.remote_hash.as_deref(), Some(remote_hash.as_str()));
+        assert_eq!(entry.local_hash.as_deref(), Some(remote_hash.as_str()));
+        assert_eq!(entry.validation_state, "valid");
+        assert!(!local_path.with_extension("nrm-batch-part").exists());
+    }
+
+    #[test]
+    fn batch_hydrate_adopts_metadata_existing_matching_remote_file() {
+        let dir = tempdir().unwrap();
+        let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
+        let remote_hash = hash_bytes(b"remote new");
+        mirror
+            .upsert_metadata(
+                &test_meta("a.txt", &remote_hash, b"remote new".len() as u64),
+                "metadata",
+            )
+            .unwrap();
+        let local_path = mirror.local_path("a.txt").unwrap();
+        fs::create_dir_all(local_path.parent().unwrap()).unwrap();
+        fs::write(&local_path, b"remote new").unwrap();
+        let sidecar = test_sidecar(mirror);
+
+        sidecar
+            .record_batch_file(BatchReadFile {
+                path: "a.txt".to_string(),
+                content: b"remote new".to_vec(),
+                hash: remote_hash.clone(),
+                meta: test_meta("a.txt", &remote_hash, b"remote new".len() as u64),
+            })
+            .unwrap();
+
+        let entry = sidecar.mirror.get("a.txt").unwrap().unwrap();
+        assert_eq!(entry.state, "hydrated");
+        assert_eq!(entry.remote_hash.as_deref(), Some(remote_hash.as_str()));
+        assert_eq!(entry.local_hash.as_deref(), Some(remote_hash.as_str()));
+        assert_eq!(entry.validation_state, "valid");
     }
 
     #[test]
