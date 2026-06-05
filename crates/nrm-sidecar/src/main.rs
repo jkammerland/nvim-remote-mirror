@@ -36,6 +36,7 @@ const REMOTE_UNAVAILABLE_BACKOFF_MS: u64 = 2_000;
 const MAX_SAVE_PAYLOAD_BYTES: usize = MAX_FRAME_LEN - (1024 * 1024);
 const REMOTE_INTERACTIVE_QUEUE_CAPACITY: usize = 128;
 const REMOTE_BACKGROUND_QUEUE_CAPACITY: usize = 128;
+const BACKGROUND_SCAN_CURSOR_KEY: &str = "background_scan_cursor";
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Local sidecar for nvim-remote-mirror")]
@@ -1045,6 +1046,11 @@ impl Mirror {
             );
             CREATE INDEX IF NOT EXISTS search_trigrams_path_idx
               ON search_trigrams(relative_path, line_number);
+            CREATE TABLE IF NOT EXISTS workspace_state (
+              key TEXT PRIMARY KEY,
+              value TEXT NOT NULL,
+              updated_at_ms INTEGER NOT NULL
+            );
             ",
         )?;
         self.add_missing_column("files", "validated_at_ms", "INTEGER NOT NULL DEFAULT 0")?;
@@ -1085,6 +1091,44 @@ impl Mirror {
 
     fn files_root(&self) -> &Path {
         &self.files_root
+    }
+
+    fn workspace_state_value(&self, key: &str) -> Result<Option<String>> {
+        self.db
+            .query_row(
+                "SELECT value FROM workspace_state WHERE key=?1",
+                params![key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    fn set_workspace_state_value(&self, key: &str, value: Option<&str>) -> Result<()> {
+        if let Some(value) = value {
+            self.db.execute(
+                "
+                INSERT INTO workspace_state (key, value, updated_at_ms)
+                VALUES (?1, ?2, ?3)
+                ON CONFLICT(key) DO UPDATE SET
+                  value=excluded.value,
+                  updated_at_ms=excluded.updated_at_ms
+                ",
+                params![key, value, now_ms()],
+            )?;
+        } else {
+            self.db
+                .execute("DELETE FROM workspace_state WHERE key=?1", params![key])?;
+        }
+        Ok(())
+    }
+
+    fn background_scan_cursor(&self) -> Result<Option<String>> {
+        self.workspace_state_value(BACKGROUND_SCAN_CURSOR_KEY)
+    }
+
+    fn set_background_scan_cursor(&self, cursor: Option<&str>) -> Result<()> {
+        self.set_workspace_state_value(BACKGROUND_SCAN_CURSOR_KEY, cursor)
     }
 
     fn local_path(&self, relative_path: &str) -> Result<PathBuf> {
@@ -3391,10 +3435,11 @@ impl Sidecar {
             .get("limit")
             .and_then(Value::as_u64)
             .unwrap_or(10_000) as usize;
-        let after = optional_string_param(&params, "after")
-            .map(|value| normalize_relative_path(value))
-            .transpose()?
-            .map(|value| value.to_string_lossy().replace('\\', "/"));
+        let resume = params
+            .get("resume")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let after = self.scan_after_param(&params, resume)?;
         let response = match self.agent.request_maybe_preemptible_since(
             Request::Scan {
                 limit,
@@ -3418,14 +3463,49 @@ impl Sidecar {
                 for entry in &entries {
                     self.mirror.upsert_metadata(entry, "metadata")?;
                 }
+                self.record_scan_progress(resume, truncated, next_after.as_deref())?;
                 Ok(json!({
                     "entries": entries,
                     "truncated": truncated,
-                    "next_after": next_after
+                    "next_after": next_after,
+                    "resumed_after": after
                 }))
             }
             other => bail!("unexpected scan response: {other:?}"),
         }
+    }
+
+    fn scan_after_param(&self, params: &Value, resume: bool) -> Result<Option<String>> {
+        if let Some(after) = optional_string_param(params, "after") {
+            return Ok(Some(
+                normalize_relative_path(after)?
+                    .to_string_lossy()
+                    .replace('\\', "/"),
+            ));
+        }
+        if resume {
+            return self.mirror.background_scan_cursor();
+        }
+        Ok(None)
+    }
+
+    fn record_scan_progress(
+        &self,
+        resume: bool,
+        truncated: bool,
+        next_after: Option<&str>,
+    ) -> Result<()> {
+        if !resume {
+            return Ok(());
+        }
+        if truncated {
+            if let Some(next_after) = next_after {
+                self.mirror.set_background_scan_cursor(Some(next_after))?;
+            }
+        } else {
+            self.mirror.set_background_scan_cursor(None)?;
+        }
+        Ok(())
     }
 
     fn open(&mut self, params: Value, preempt_epoch: u64) -> Result<Value> {
@@ -5798,6 +5878,78 @@ mod tests {
         let entry = mirror.get("src/main.rs").unwrap().unwrap();
         assert_eq!(entry.remote_hash.as_deref(), Some("opened"));
         assert_eq!(entry.state, "hydrated");
+    }
+
+    #[test]
+    fn background_scan_cursor_persists_across_mirror_reopen() {
+        let dir = tempdir().unwrap();
+        let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
+        let mirror_root = mirror.root().to_path_buf();
+
+        assert_eq!(mirror.background_scan_cursor().unwrap(), None);
+        mirror
+            .set_background_scan_cursor(Some("src/lib.rs"))
+            .unwrap();
+        drop(mirror);
+
+        let reopened = Mirror::open_root(mirror_root.clone()).unwrap();
+        assert_eq!(
+            reopened.background_scan_cursor().unwrap().as_deref(),
+            Some("src/lib.rs")
+        );
+        reopened.set_background_scan_cursor(None).unwrap();
+        drop(reopened);
+
+        let reopened = Mirror::open_root(mirror_root).unwrap();
+        assert_eq!(reopened.background_scan_cursor().unwrap(), None);
+    }
+
+    #[test]
+    fn resumable_scan_uses_persisted_cursor_and_tracks_progress() {
+        let dir = tempdir().unwrap();
+        let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
+        mirror
+            .set_background_scan_cursor(Some("src/lib.rs"))
+            .unwrap();
+        let sidecar = test_sidecar(mirror);
+
+        assert_eq!(
+            sidecar
+                .scan_after_param(&json!({"resume": true}), true)
+                .unwrap()
+                .as_deref(),
+            Some("src/lib.rs")
+        );
+        assert_eq!(sidecar.scan_after_param(&json!({}), false).unwrap(), None);
+        assert_eq!(
+            sidecar
+                .scan_after_param(&json!({"resume": true, "after": "./README.md"}), true)
+                .unwrap()
+                .as_deref(),
+            Some("README.md")
+        );
+
+        sidecar
+            .record_scan_progress(true, true, Some("src/main.rs"))
+            .unwrap();
+        assert_eq!(
+            sidecar.mirror.background_scan_cursor().unwrap().as_deref(),
+            Some("src/main.rs")
+        );
+        sidecar.record_scan_progress(true, true, None).unwrap();
+        assert_eq!(
+            sidecar.mirror.background_scan_cursor().unwrap().as_deref(),
+            Some("src/main.rs")
+        );
+        sidecar
+            .record_scan_progress(false, true, Some("ignored.rs"))
+            .unwrap();
+        assert_eq!(
+            sidecar.mirror.background_scan_cursor().unwrap().as_deref(),
+            Some("src/main.rs")
+        );
+        sidecar.record_scan_progress(true, false, None).unwrap();
+        assert_eq!(sidecar.mirror.background_scan_cursor().unwrap(), None);
     }
 
     #[test]

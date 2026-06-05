@@ -248,8 +248,11 @@ mirror builder after connect. Each tick probes the remote, scans the next
 metadata cursor batch, and hydrates a small set of clean uncached metadata paths
 through `prefetch_known`. It then validates a small batch of clean cached files
 oldest-check first, so the mirror gradually checksums itself against the remote
-without blocking navigation. Use `:RemoteMirrorStart` and `:RemoteMirrorStop`
-to control the scheduler manually on very slow links.
+without blocking navigation. The sidecar persists the background scan cursor in
+the mirror database, so reconnects continue building metadata from the last
+completed batch instead of restarting every scan from the root. Use
+`:RemoteMirrorStart` and `:RemoteMirrorStop` to control the scheduler manually
+on very slow links.
 
 `:RemoteOpen` prefers an existing clean or dirty local mirror file, including
 entries previously marked stale or deleted, so navigation does not block on a

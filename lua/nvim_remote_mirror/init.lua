@@ -553,6 +553,7 @@ local function schedule_background_mirror(delay, generation)
 
       local scan_params = {
         limit = M.config.background_mirror_scan_limit,
+        resume = true,
       }
       if M.background_scan_after then
         scan_params.after = M.background_scan_after

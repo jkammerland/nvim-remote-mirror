@@ -64,6 +64,8 @@ COMMANDS                                      *nvim-remote-mirror-commands*
 :RemoteMirrorStart
     Start the background mirror builder. It probes the remote, scans metadata
     with a cursor, then hydrates a small batch of clean uncached known files.
+    The scan cursor is persisted in the mirror database, so reconnects resume
+    metadata discovery from the last completed background batch.
 
 :RemoteMirrorStop
     Stop the background mirror builder.
@@ -148,7 +150,8 @@ on the write lane.
 background_mirror controls the idle mirror builder; set it false and use
 :RemoteMirrorStart manually on especially fragile links. Each background tick
 scans metadata, hydrates a tiny clean-file batch, then validates a tiny
-oldest-check cached-file batch against the remote checksum.
+oldest-check cached-file batch against the remote checksum. The metadata scan
+cursor is persisted across reconnects.
 grep_remote_page_files bounds each remote grep page by scanned files. Consecutive
 remote pages use a live agent continuation session when possible, and keep a
 path cursor as a restart fallback.
