@@ -37,6 +37,13 @@ local function notify(message, level)
   end)
 end
 
+local function optional_string(value)
+  if type(value) == "string" and value ~= "" then
+    return value
+  end
+  return nil
+end
+
 local function parse_target(target)
   if target == nil or target == "" then
     return { remote_root = uv.cwd() }
@@ -265,7 +272,13 @@ function M.scan(limit)
 end
 
 function M.grep(query)
-  M.request("grep", { query = query, limit = M.config.grep_limit }, function(err, result)
+  M.request("grep", {
+    query = query,
+    limit = M.config.grep_limit,
+    hydrate = true,
+    max_file_bytes = M.config.prefetch_max_file_bytes,
+    max_total_bytes = M.config.prefetch_max_total_bytes,
+  }, function(err, result)
     if err then
       notify(err, vim.log.levels.ERROR)
       return
@@ -273,7 +286,7 @@ function M.grep(query)
     local items = {}
     for _, hit in ipairs(result.hits or {}) do
       table.insert(items, {
-        filename = hit.path,
+        filename = optional_string(hit.local_path) or hit.path,
         lnum = hit.line,
         col = hit.column,
         text = hit.text,
@@ -283,6 +296,17 @@ function M.grep(query)
       vim.fn.setqflist({}, " ", { title = "RemoteGrep " .. query, items = items })
       vim.cmd.copen()
     end)
+    local hydrate_errors = #(result.hydrate_errors or {})
+    if hydrate_errors > 0 or result.hydrate_truncated then
+      notify(
+        "grep hydrated "
+          .. tostring(result.hydrated or 0)
+          .. " files with "
+          .. tostring(hydrate_errors)
+          .. " errors",
+        vim.log.levels.WARN
+      )
+    end
   end)
 end
 

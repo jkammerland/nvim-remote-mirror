@@ -24,7 +24,8 @@ COMMANDS                                      *nvim-remote-mirror-commands*
     Hydrate a workspace-relative file into the local mirror and edit it.
 
 :RemoteGrep {query}
-    Run grep on the remote agent and populate the quickfix list.
+    Run grep on the remote agent, hydrate matching files in a batch, and
+    populate the quickfix list with local mirror paths when available.
 
 :RemotePrefetch {path...}
     Hydrate one or more workspace-relative files in the background request.

@@ -8,6 +8,7 @@ use nrm_protocol::{
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -1154,17 +1155,87 @@ impl Sidecar {
     fn grep(&mut self, params: Value) -> Result<Value> {
         let query = required_string(&params, "query")?;
         let limit = params.get("limit").and_then(Value::as_u64).unwrap_or(200) as usize;
+        let hydrate = params
+            .get("hydrate")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        let max_file_bytes = params
+            .get("max_file_bytes")
+            .and_then(Value::as_u64)
+            .unwrap_or(DEFAULT_BATCH_MAX_FILE_BYTES);
+        let max_total_bytes = params
+            .get("max_total_bytes")
+            .and_then(Value::as_u64)
+            .unwrap_or(DEFAULT_BATCH_MAX_TOTAL_BYTES);
         let response = self.agent.request(Request::Grep {
             query: query.to_string(),
             limit,
         })?;
         match response {
-            Response::Grep { hits, truncated } => Ok(json!({
-                "hits": hits,
-                "truncated": truncated
-            })),
+            Response::Grep { hits, truncated } => {
+                let mut hydrated = 0;
+                let mut hydrate_errors = Vec::new();
+                let mut hydrate_truncated = false;
+                if hydrate {
+                    let paths = self.grep_hydration_paths(&hits)?;
+                    let result = self.batch_hydrate(paths, max_file_bytes, max_total_bytes)?;
+                    hydrated = result.0;
+                    hydrate_errors = result.1;
+                    hydrate_truncated = result.2;
+                }
+                let hits = self.grep_hits_with_local_paths(hits)?;
+                Ok(json!({
+                    "hits": hits,
+                    "truncated": truncated,
+                    "hydrated": hydrated,
+                    "hydrate_errors": hydrate_errors,
+                    "hydrate_truncated": hydrate_truncated
+                }))
+            }
             other => bail!("unexpected grep response: {other:?}"),
         }
+    }
+
+    fn grep_hydration_paths(&self, hits: &[nrm_protocol::SearchHit]) -> Result<Vec<String>> {
+        let mut seen = HashSet::new();
+        let mut paths = Vec::new();
+        for hit in hits {
+            if !seen.insert(hit.path.clone()) {
+                continue;
+            }
+            let path = normalize_relative_path(&hit.path)?
+                .to_string_lossy()
+                .replace('\\', "/");
+            if let Some(entry) = self.mirror.get(&path)? {
+                if entry.dirty {
+                    continue;
+                }
+            }
+            paths.push(path);
+        }
+        Ok(paths)
+    }
+
+    fn grep_hits_with_local_paths(&self, hits: Vec<nrm_protocol::SearchHit>) -> Result<Vec<Value>> {
+        let mut values = Vec::with_capacity(hits.len());
+        for hit in hits {
+            let entry = self.mirror.get(&hit.path)?;
+            let local_path = entry
+                .as_ref()
+                .filter(|entry| entry.local_path.exists())
+                .map(|entry| entry.local_path.to_string_lossy().to_string());
+            let mut value = json!({
+                "path": hit.path,
+                "line": hit.line,
+                "column": hit.column,
+                "text": hit.text
+            });
+            if let Some(local_path) = local_path {
+                value["local_path"] = json!(local_path);
+            }
+            values.push(value);
+        }
+        Ok(values)
     }
 
     fn flush(&mut self, params: Value) -> Result<Value> {

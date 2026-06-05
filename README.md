@@ -27,7 +27,7 @@ This first implementation covers:
 - lazy file open/hydration into a local mirror.
 - batched prefetch hydration with per-file and total byte caps.
 - batched mirror refresh to mark cached files valid, stale, or deleted.
-- remote grep with streamed-style result payloads.
+- remote grep that batch-hydrates result files for local quickfix jumps.
 - durable local save snapshots with checksum-aware flush/retry and conflict detection.
 - chunked compare-and-swap uploads for large remote saves.
 - basic Neovim commands.
@@ -128,6 +128,10 @@ local mirror, oldest validation first.
 `:RemotePrefetch` uses a batched remote read request by default. Files larger
 than `prefetch_max_file_bytes` are skipped from the batch so explicit
 `:RemoteOpen` can hydrate them through the chunked path.
+
+`:RemoteGrep` runs search on the remote agent, batch-hydrates matching files
+within the prefetch byte caps, and populates quickfix with local mirror paths
+when hydration succeeds.
 
 ## Protocol Notes
 
