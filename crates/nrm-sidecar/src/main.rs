@@ -1820,13 +1820,7 @@ impl Mirror {
             now_ms(),
             local_hash
         ));
-        let tmp = path.with_extension("snapshot.tmp");
-        {
-            let mut file = File::create(&tmp)?;
-            file.write_all(content)?;
-            file.sync_all()?;
-        }
-        fs::rename(&tmp, &path)?;
+        write_durable_file(&path, content)?;
         Ok(path)
     }
 
@@ -2091,7 +2085,7 @@ impl Mirror {
         let path = self
             .conflicts_root
             .join(format!("{safe_name}.remote.{suffix}.{}", now_ms()));
-        fs::write(&path, remote_content)?;
+        write_durable_file(&path, remote_content)?;
         self.immediate_transaction(|| {
             self.db.execute(
                 "
@@ -5746,6 +5740,55 @@ fn workspace_key(ssh: Option<&str>, remote_root: &Path) -> String {
     hasher.finalize().to_hex()[..24].to_string()
 }
 
+fn write_durable_file(path: &Path, content: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("durable file path must have a parent: {}", path.display()))?;
+    fs::create_dir_all(parent)?;
+
+    let tmp = path.with_extension(format!(
+        "tmp-{}",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let install = (|| -> Result<()> {
+        {
+            let mut file = File::options().write(true).create_new(true).open(&tmp)?;
+            file.write_all(content)?;
+            file.sync_all()?;
+        }
+        fs::rename(&tmp, path)?;
+        sync_parent_dir(path)?;
+        Ok(())
+    })();
+
+    if install.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    install
+}
+
+fn sync_parent_dir(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        sync_dir(parent)
+            .with_context(|| format!("failed to sync directory {}", parent.display()))?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_dir(path: &Path) -> Result<()> {
+    File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_dir(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
 fn hash_bytes(bytes: &[u8]) -> String {
     blake3::hash(bytes).to_hex().to_string()
 }
@@ -5885,6 +5928,24 @@ mod tests {
             optional_positive_usize_param(&json!({"max_files": "bad"}), "max_files"),
             None
         );
+    }
+
+    #[test]
+    fn durable_file_helper_installs_content_and_cleans_temp() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("nested").join("artifact.bin");
+
+        write_durable_file(&path, b"one").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"one");
+
+        write_durable_file(&path, b"two").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"two");
+
+        let entries = fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(entries, vec!["artifact.bin".to_string()]);
     }
 
     #[test]

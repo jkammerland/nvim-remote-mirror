@@ -6,11 +6,18 @@ use nrm_protocol::{
     FileMeta, Request, Response, RpcError, RpcMessage, SaveApplied, SaveConflict, SaveOutcome,
     SearchHit, WriteStartOutcome, WriteStarted, MAX_CONFLICT_CONTENT_BYTES, PROTOCOL_VERSION,
 };
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+#[cfg(test)]
+thread_local! {
+    static FILE_META_CALLS: Cell<usize> = const { Cell::new(0) };
+}
 
 struct AgentState {
     root: PathBuf,
@@ -220,9 +227,9 @@ fn scan(root: &Path, limit: usize, after: Option<&str>) -> Result<Response> {
         if path == root {
             continue;
         }
-        let meta = file_meta(root, path, false)?;
+        let relative = relative_path(root, path)?;
         if !after_seen {
-            if after == Some(meta.path.as_str()) {
+            if after == Some(relative.as_str()) {
                 after_seen = true;
             }
             continue;
@@ -231,6 +238,7 @@ fn scan(root: &Path, limit: usize, after: Option<&str>) -> Result<Response> {
             truncated = true;
             break;
         }
+        let meta = file_meta(root, path, false)?;
         entries.push(meta);
     }
 
@@ -547,6 +555,7 @@ fn write_file_cas(
         file.sync_all()?;
     }
     fs::rename(&tmp, &abs)?;
+    sync_parent_dir(&abs)?;
     let new_hash = hash_file(&abs)?;
     let meta = file_meta(root, &abs, true)?;
 
@@ -699,6 +708,7 @@ fn finish_write_file_cas(state: &mut AgentState, upload_id: String) -> Result<Re
         file.sync_all()?;
     }
     fs::rename(&upload.tmp_path, &abs)?;
+    sync_parent_dir(&abs)?;
     let meta = file_meta(&state.root, &abs, true)?;
 
     Ok(Response::FinishWriteFileCas {
@@ -758,6 +768,25 @@ fn resolve_remote_path(root: &Path, path: &str) -> Result<PathBuf> {
     Ok(root.join(relative))
 }
 
+fn sync_parent_dir(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        sync_dir(parent)
+            .with_context(|| format!("failed to sync directory {}", parent.display()))?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn sync_dir(path: &Path) -> Result<()> {
+    File::open(path)?.sync_all()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_dir(_path: &Path) -> Result<()> {
+    Ok(())
+}
+
 fn normalize_relative_path(path: &str) -> Result<PathBuf> {
     let path = Path::new(path);
     if path.is_absolute() {
@@ -779,6 +808,9 @@ fn normalize_relative_path(path: &str) -> Result<PathBuf> {
 }
 
 fn file_meta(root: &Path, path: &Path, include_hash: bool) -> Result<FileMeta> {
+    #[cfg(test)]
+    FILE_META_CALLS.with(|calls| calls.set(calls.get() + 1));
+
     let metadata = fs::symlink_metadata(path)?;
     let hash = if include_hash && metadata.is_file() {
         Some(hash_file(path)?)
@@ -1043,6 +1075,26 @@ mod tests {
         assert!(!truncated);
         assert!(!entries.iter().any(|entry| entry.path == cursor));
         assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn scan_resume_skips_metadata_for_already_scanned_prefix() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.txt"), "a").unwrap();
+        fs::write(root.join("b.txt"), "b").unwrap();
+        fs::write(root.join("c.txt"), "c").unwrap();
+
+        FILE_META_CALLS.with(|calls| calls.set(0));
+        let response = scan(root, 10, Some("b.txt")).unwrap();
+        let Response::Scan { entries, truncated } = response else {
+            panic!("unexpected scan response");
+        };
+
+        assert!(!truncated);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path, "c.txt");
+        assert_eq!(FILE_META_CALLS.with(Cell::get), 1);
     }
 
     #[test]
