@@ -162,12 +162,111 @@ enum SaveAttempt {
 }
 
 #[derive(Debug, Clone)]
+struct ProcessLaunchPlan {
+    program: String,
+    args: Vec<String>,
+    current_dir: Option<PathBuf>,
+}
+
+impl ProcessLaunchPlan {
+    fn command(&self) -> Command {
+        let mut command = Command::new(&self.program);
+        command.args(&self.args);
+        if let Some(current_dir) = &self.current_dir {
+            command.current_dir(current_dir);
+        }
+        command
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SshTransport {
+    target: String,
+    connect_timeout_seconds: u64,
+}
+
+impl SshTransport {
+    fn command_args(&self, remote_command: String) -> Vec<String> {
+        vec![
+            "-o".to_string(),
+            "BatchMode=yes".to_string(),
+            "-o".to_string(),
+            format!("ConnectTimeout={}", self.connect_timeout_seconds),
+            "-o".to_string(),
+            "ServerAliveInterval=15".to_string(),
+            "-o".to_string(),
+            "ServerAliveCountMax=2".to_string(),
+            self.target.clone(),
+            remote_command,
+        ]
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RemoteTransport {
+    Local,
+    Ssh(SshTransport),
+}
+
+impl RemoteTransport {
+    fn from_ssh(ssh: Option<String>, connect_timeout_seconds: u64) -> Self {
+        match ssh {
+            Some(target) => Self::Ssh(SshTransport {
+                target,
+                connect_timeout_seconds,
+            }),
+            None => Self::Local,
+        }
+    }
+
+    fn agent_plan(&self, agent: &str, remote_root: &Path) -> ProcessLaunchPlan {
+        match self {
+            Self::Local => ProcessLaunchPlan {
+                program: agent.to_string(),
+                args: vec![
+                    "serve".to_string(),
+                    "--root".to_string(),
+                    remote_root.to_string_lossy().to_string(),
+                ],
+                current_dir: None,
+            },
+            Self::Ssh(ssh) => ProcessLaunchPlan {
+                program: "ssh".to_string(),
+                args: ssh.command_args(agent_remote_command(agent, remote_root)),
+                current_dir: None,
+            },
+        }
+    }
+
+    fn lsp_plan(&self, remote_root: PathBuf, command: Vec<String>) -> ProcessLaunchPlan {
+        match self {
+            Self::Local => ProcessLaunchPlan {
+                program: command[0].clone(),
+                args: command[1..].to_vec(),
+                current_dir: Some(remote_root),
+            },
+            Self::Ssh(ssh) => ProcessLaunchPlan {
+                program: "ssh".to_string(),
+                args: ssh.command_args(lsp_remote_command(remote_root, command)),
+                current_dir: None,
+            },
+        }
+    }
+
+    fn launch_context_suffix(&self) -> String {
+        match self {
+            Self::Local => String::new(),
+            Self::Ssh(ssh) => format!(" through ssh target `{}`", ssh.target),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 struct AgentLaunch {
     agent: String,
-    ssh: Option<String>,
     remote_root: PathBuf,
     request_timeout: Duration,
-    ssh_connect_timeout_seconds: u64,
+    transport: RemoteTransport,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -282,10 +381,9 @@ impl AgentClient {
         Self {
             launch: AgentLaunch {
                 agent,
-                ssh,
                 remote_root,
                 request_timeout,
-                ssh_connect_timeout_seconds,
+                transport: RemoteTransport::from_ssh(ssh, ssh_connect_timeout_seconds),
             },
             interrupt,
             preempt: AgentPreempt::default(),
@@ -298,32 +396,10 @@ impl AgentClient {
     }
 
     fn spawn_worker(launch: &AgentLaunch, interrupt: AgentInterrupt) -> Result<AgentWorker> {
-        let mut command = if let Some(target) = launch.ssh.as_deref() {
-            let mut command = Command::new("ssh");
-            command
-                .arg("-o")
-                .arg("BatchMode=yes")
-                .arg("-o")
-                .arg(format!(
-                    "ConnectTimeout={}",
-                    launch.ssh_connect_timeout_seconds
-                ))
-                .arg("-o")
-                .arg("ServerAliveInterval=15")
-                .arg("-o")
-                .arg("ServerAliveCountMax=2")
-                .arg(target)
-                .arg(&launch.agent)
-                .arg("serve")
-                .arg("--root")
-                .arg(&launch.remote_root);
-            command
-        } else {
-            let mut command = Command::new(&launch.agent);
-            command.arg("serve").arg("--root").arg(&launch.remote_root);
-            command
-        };
-
+        let plan = launch
+            .transport
+            .agent_plan(&launch.agent, &launch.remote_root);
+        let mut command = plan.command();
         configure_agent_process(&mut command);
 
         let mut child = command
@@ -335,11 +411,7 @@ impl AgentClient {
                 format!(
                     "failed to launch agent `{}`{}",
                     launch.agent,
-                    launch
-                        .ssh
-                        .as_deref()
-                        .map(|target| format!(" through ssh target `{target}`"))
-                        .unwrap_or_default()
+                    launch.transport.launch_context_suffix()
                 )
             })?;
 
@@ -4292,9 +4364,7 @@ fn run_lsp_proxy(
 }
 
 struct LspLaunch {
-    program: String,
-    args: Vec<String>,
-    current_dir: Option<PathBuf>,
+    plan: ProcessLaunchPlan,
 }
 
 impl LspLaunch {
@@ -4304,41 +4374,25 @@ impl LspLaunch {
         ssh_connect_timeout_seconds: u64,
         command: Vec<String>,
     ) -> Self {
-        if let Some(target) = ssh {
-            let mut args = vec![
-                "-o".to_string(),
-                "BatchMode=yes".to_string(),
-                "-o".to_string(),
-                format!("ConnectTimeout={ssh_connect_timeout_seconds}"),
-                "-o".to_string(),
-                "ServerAliveInterval=15".to_string(),
-                "-o".to_string(),
-                "ServerAliveCountMax=2".to_string(),
-                target,
-            ];
-            args.push(lsp_remote_command(remote_root, command));
-            Self {
-                program: "ssh".to_string(),
-                args,
-                current_dir: None,
-            }
-        } else {
-            Self {
-                program: command[0].clone(),
-                args: command[1..].to_vec(),
-                current_dir: Some(remote_root),
-            }
+        Self {
+            plan: RemoteTransport::from_ssh(ssh, ssh_connect_timeout_seconds)
+                .lsp_plan(remote_root, command),
         }
     }
 
     fn command(&self) -> Command {
-        let mut command = Command::new(&self.program);
-        command.args(&self.args);
-        if let Some(current_dir) = &self.current_dir {
-            command.current_dir(current_dir);
-        }
-        command
+        self.plan.command()
     }
+}
+
+fn agent_remote_command(agent: &str, remote_root: &Path) -> String {
+    [
+        shell_quote(agent),
+        shell_quote("serve"),
+        shell_quote("--root"),
+        shell_quote(remote_root.to_string_lossy()),
+    ]
+    .join(" ")
 }
 
 fn lsp_remote_command(remote_root: PathBuf, command: Vec<String>) -> String {
@@ -5961,6 +6015,40 @@ mod tests {
     }
 
     #[test]
+    fn agent_local_transport_launches_agent_directly() {
+        let plan = RemoteTransport::from_ssh(None, 10)
+            .agent_plan("nrm-agent", Path::new("/tmp/repo with spaces"));
+
+        assert_eq!(plan.program, "nrm-agent");
+        assert_eq!(plan.args, vec!["serve", "--root", "/tmp/repo with spaces"]);
+        assert_eq!(plan.current_dir, None);
+    }
+
+    #[test]
+    fn agent_ssh_transport_uses_quoted_remote_command_and_connection_options() {
+        let plan = RemoteTransport::from_ssh(Some("host".to_string()), 7)
+            .agent_plan("nrm-agent", Path::new("/tmp/repo with 'quote' ; x"));
+
+        assert_eq!(plan.program, "ssh");
+        assert_eq!(plan.current_dir, None);
+        assert_eq!(
+            plan.args,
+            vec![
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=7",
+                "-o",
+                "ServerAliveInterval=15",
+                "-o",
+                "ServerAliveCountMax=2",
+                "host",
+                "'nrm-agent' 'serve' '--root' '/tmp/repo with '\\''quote'\\'' ; x'"
+            ]
+        );
+    }
+
+    #[test]
     fn lsp_local_launch_runs_in_remote_root() {
         let launch = LspLaunch::new(
             PathBuf::from("/repo"),
@@ -5969,9 +6057,9 @@ mod tests {
             vec!["rust-analyzer".to_string(), "--stdio".to_string()],
         );
 
-        assert_eq!(launch.program, "rust-analyzer");
-        assert_eq!(launch.args, vec!["--stdio"]);
-        assert_eq!(launch.current_dir.as_deref(), Some(Path::new("/repo")));
+        assert_eq!(launch.plan.program, "rust-analyzer");
+        assert_eq!(launch.plan.args, vec!["--stdio"]);
+        assert_eq!(launch.plan.current_dir.as_deref(), Some(Path::new("/repo")));
     }
 
     #[test]
@@ -5987,10 +6075,10 @@ mod tests {
             ],
         );
 
-        assert_eq!(launch.program, "ssh");
-        assert_eq!(launch.current_dir, None);
+        assert_eq!(launch.plan.program, "ssh");
+        assert_eq!(launch.plan.current_dir, None);
         assert_eq!(
-            launch.args,
+            launch.plan.args,
             vec![
                 "-o",
                 "BatchMode=yes",
@@ -6046,6 +6134,43 @@ mod tests {
         let stdout = String::from_utf8(output.stdout).unwrap();
         assert!(stdout.contains(&format!("PWD=<{}>", remote_root.display())));
         assert!(stdout.contains("ARG=<arg with spaces; $(echo nope)>"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_ssh_remote_command_preserves_agent_and_root_through_shell_parse() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let remote_root = dir.path().join("repo with 'quote' ; x");
+        fs::create_dir_all(&remote_root).unwrap();
+        let fake_agent = dir.path().join("fake agent 'quote'; x");
+        fs::write(
+            &fake_agent,
+            "#!/bin/sh\nprintf 'ARG1=<%s>\\nARG2=<%s>\\nARG3=<%s>\\n' \"$1\" \"$2\" \"$3\"\n",
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&fake_agent).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&fake_agent, permissions).unwrap();
+
+        let fake_agent = fake_agent.to_string_lossy().to_string();
+        let remote_command = agent_remote_command(&fake_agent, &remote_root);
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(remote_command)
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(stdout.contains("ARG1=<serve>"));
+        assert!(stdout.contains("ARG2=<--root>"));
+        assert!(stdout.contains(&format!("ARG3=<{}>", remote_root.display())));
     }
 
     #[test]

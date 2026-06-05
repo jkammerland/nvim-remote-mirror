@@ -264,6 +264,12 @@ agent reply carries the matching ID. That boundary is transport-agnostic, so a
 future QUIC/UDP transport over WireGuard can replace SSH without changing the
 mirror model.
 
+Agent and LSP process creation goes through the same transport command planner:
+local targets spawn the requested binary directly, while SSH targets use the
+configured connection options and a single shell-quoted remote command. This
+keeps SSH-specific launch details outside the Neovim-facing JSON API and the
+agent protocol frame format.
+
 Current transport state:
 
 - active: request IDs, typed remote errors, request timeout, SSH connect timeout,
@@ -283,5 +289,7 @@ Current transport state:
   behind, queued prefetch, scan, or refresh work. Active background maintenance
   requests can be preempted by interactive work by restarting the serial
   SSH/agent worker; save and explicit interactive requests are not preempted.
+  Agent and LSP launches share a transport command planner, keeping SSH stdio as
+  a replaceable implementation detail behind the sidecar-agent frame boundary.
 - pending: general per-request cancellation, true multiplexing, streaming
   results, and transport-level flow control.

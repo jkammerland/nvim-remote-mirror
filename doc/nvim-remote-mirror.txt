@@ -134,6 +134,11 @@ oldest-check cached-file batch against the remote checksum.
 auto_hydrate_mirror_buffers makes LSP jumps into missing local mirror files call
 the sidecar open path and hydrate the corresponding remote file.
 
+Agent and LSP launch commands share a sidecar transport planner. Local targets
+spawn binaries directly; SSH targets use configured connection options and a
+single shell-quoted remote command. Neovim still talks only to the sidecar JSON
+API, so SSH stdio can be replaced later without changing editor-facing behavior.
+
 ==============================================================================
 LSP                                                *nvim-remote-mirror-lsp*
 
