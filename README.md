@@ -95,6 +95,9 @@ If the sidecar exits unexpectedly, the plugin fails pending callbacks and can
 reconnect to the last target with capped retries. Use `:RemoteReconnect` to
 resume the last target manually; reconnect startup reuses the durable mirror and
 retries queued saves in small background batches after a remote probe succeeds.
+If a remote buffer is saved while the sidecar is unavailable, the plugin marks
+that path for replay and asks the next sidecar session to flush the saved local
+mirror file into the durable queue.
 
 `:RemoteConnect` starts from the durable local mirror and does not block on an
 SSH agent handshake. Cached opens, cached grep, and status remain available if
@@ -167,6 +170,9 @@ Writes are preserved locally before any remote upload attempt. `:RemoteFlush`
 creates a content-addressed snapshot in the workspace state directory, then
 tries a remote compare-and-swap write. If the upload fails, `:RemoteStatus`
 shows the queued or failed save and `:RemoteFlushQueue` retries it.
+If `:RemoteFlush` or automatic `BufWritePost` runs while disconnected, the path
+is kept in memory and replayed after reconnect so the sidecar can snapshot the
+already-written local mirror file.
 
 Small saves use one RPC request. Large saves stream through a chunked
 compare-and-swap upload: the agent checks the remote base hash before accepting
