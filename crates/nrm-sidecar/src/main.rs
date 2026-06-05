@@ -358,6 +358,91 @@ enum AgentRequestOutcome {
     Preempted,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteHealthState {
+    Unchecked,
+    Connected,
+    Unavailable,
+}
+
+#[derive(Debug, Clone)]
+struct RemoteHealth {
+    state: RemoteHealthState,
+    unavailable_until: Option<Instant>,
+    error: Option<String>,
+}
+
+impl Default for RemoteHealth {
+    fn default() -> Self {
+        Self {
+            state: RemoteHealthState::Unchecked,
+            unavailable_until: None,
+            error: None,
+        }
+    }
+}
+
+impl RemoteHealth {
+    fn connected() -> Self {
+        Self {
+            state: RemoteHealthState::Connected,
+            unavailable_until: None,
+            error: None,
+        }
+    }
+
+    fn unavailable(unavailable_until: Option<Instant>, error: String) -> Self {
+        Self {
+            state: RemoteHealthState::Unavailable,
+            unavailable_until,
+            error: Some(error),
+        }
+    }
+
+    fn retry_after_ms(&self) -> Option<u64> {
+        let until = self.unavailable_until?;
+        let now = Instant::now();
+        if now >= until {
+            return Some(0);
+        }
+        Some(
+            until
+                .duration_since(now)
+                .as_millis()
+                .min(u128::from(u64::MAX)) as u64,
+        )
+    }
+
+    fn insert_into(&self, value: &mut Value) {
+        let Some(object) = value.as_object_mut() else {
+            return;
+        };
+        match self.state {
+            RemoteHealthState::Unchecked => {
+                object.insert("remote_status".to_string(), json!("unchecked"));
+                object.insert("remote_checked".to_string(), json!(false));
+                object.insert("remote_available".to_string(), json!(false));
+            }
+            RemoteHealthState::Connected => {
+                object.insert("remote_status".to_string(), json!("connected"));
+                object.insert("remote_checked".to_string(), json!(true));
+                object.insert("remote_available".to_string(), json!(true));
+            }
+            RemoteHealthState::Unavailable => {
+                object.insert("remote_status".to_string(), json!("unavailable"));
+                object.insert("remote_checked".to_string(), json!(true));
+                object.insert("remote_available".to_string(), json!(false));
+                if let Some(retry_after_ms) = self.retry_after_ms() {
+                    object.insert("retry_after_ms".to_string(), json!(retry_after_ms));
+                }
+                if let Some(error) = &self.error {
+                    object.insert("remote_error".to_string(), json!(error));
+                }
+            }
+        }
+    }
+}
+
 struct AgentClient {
     launch: AgentLaunch,
     interrupt: AgentInterrupt,
@@ -458,6 +543,16 @@ impl AgentClient {
 
     fn handshake_complete(&self) -> bool {
         self.handshake_complete
+    }
+
+    fn remote_health(&self) -> RemoteHealth {
+        if self.handshake_complete {
+            return RemoteHealth::connected();
+        }
+        if let Some(error) = self.last_remote_error.clone() {
+            return RemoteHealth::unavailable(self.unavailable_until, error);
+        }
+        RemoteHealth::default()
     }
 
     fn remote_backoff(&self) -> Option<(u64, String)> {
@@ -2298,11 +2393,20 @@ impl Mirror {
     }
 }
 
+fn status_with_remote_health(mut status: Value, remote_health: RemoteHealth) -> Result<Value> {
+    if !status.is_object() {
+        bail!("mirror status was not a JSON object");
+    }
+    remote_health.insert_into(&mut status);
+    Ok(status)
+}
+
 struct Sidecar {
     agent: AgentClient,
     mirror: Mirror,
     remote_root: PathBuf,
     workspace_key: String,
+    remote_health: Arc<Mutex<RemoteHealth>>,
 }
 
 #[derive(Debug, Clone)]
@@ -2312,6 +2416,7 @@ struct FastState {
     remote_root: PathBuf,
     workspace_key: String,
     pending_remote: Arc<Mutex<PendingRemote>>,
+    remote_health: Arc<Mutex<RemoteHealth>>,
 }
 
 enum FastHandle {
@@ -2738,6 +2843,7 @@ impl FastState {
             remote_root: sidecar.remote_root.clone(),
             workspace_key: sidecar.workspace_key.clone(),
             pending_remote,
+            remote_health: Arc::clone(&sidecar.remote_health),
         }
     }
 
@@ -2754,9 +2860,9 @@ impl FastState {
                 "remote_checked": false,
                 "remote_available": false
             }))),
-            "status" => FastHandle::Handled(
-                Mirror::open_root(self.mirror_root.clone()).and_then(|mirror| mirror.status()),
-            ),
+            "status" => FastHandle::Handled(Mirror::open_root(self.mirror_root.clone()).and_then(
+                |mirror| status_with_remote_health(mirror.status()?, self.remote_health_snapshot()),
+            )),
             "find_paths" => FastHandle::Handled(
                 Mirror::open_root(self.mirror_root.clone())
                     .and_then(|mirror| mirror.find_paths(&request.params)),
@@ -2854,6 +2960,13 @@ impl FastState {
             }),
         })
     }
+
+    fn remote_health_snapshot(&self) -> RemoteHealth {
+        self.remote_health
+            .lock()
+            .map(|health| health.clone())
+            .unwrap_or_default()
+    }
 }
 
 impl Sidecar {
@@ -2881,11 +2994,18 @@ impl Sidecar {
             mirror,
             remote_root,
             workspace_key,
+            remote_health: Arc::new(Mutex::new(RemoteHealth::default())),
         };
         Ok(sidecar)
     }
 
     fn handle(&mut self, method: &str, params: Value, preempt_epoch: u64) -> Result<Value> {
+        let result = self.handle_inner(method, params, preempt_epoch);
+        self.record_remote_health();
+        result
+    }
+
+    fn handle_inner(&mut self, method: &str, params: Value, preempt_epoch: u64) -> Result<Value> {
         match method {
             "hello" => Ok(json!({
                 "sidecar_version": env!("CARGO_PKG_VERSION"),
@@ -2898,7 +3018,7 @@ impl Sidecar {
                 "remote_checked": false,
                 "remote_available": false
             })),
-            "status" => self.mirror.status(),
+            "status" => self.status(),
             "find_paths" => self.mirror.find_paths(&params),
             "remote_probe" => Ok(self.remote_probe()),
             "scan" => self.scan(params, preempt_epoch),
@@ -2918,6 +3038,16 @@ impl Sidecar {
                 Ok(json!({"shutdown": true}))
             }
             other => bail!("unknown method `{other}`"),
+        }
+    }
+
+    fn status(&self) -> Result<Value> {
+        status_with_remote_health(self.mirror.status()?, self.agent.remote_health())
+    }
+
+    fn record_remote_health(&self) {
+        if let Ok(mut health) = self.remote_health.lock() {
+            *health = self.agent.remote_health();
         }
     }
 
@@ -4662,6 +4792,7 @@ mod tests {
             mirror,
             remote_root: PathBuf::from("/unused"),
             workspace_key: "test".to_string(),
+            remote_health: Arc::new(Mutex::new(RemoteHealth::default())),
         }
     }
 
@@ -5533,7 +5664,54 @@ mod tests {
         let FastHandle::Handled(result) = fast.try_handle(&request) else {
             panic!("status should be handled by fast state");
         };
-        assert_eq!(result.unwrap()["cached_files"], 1);
+        let result = result.unwrap();
+        assert_eq!(result["cached_files"], 1);
+        assert_eq!(result["remote_status"], "unchecked");
+        assert_eq!(result["remote_checked"], false);
+        assert_eq!(result["remote_available"], false);
+    }
+
+    #[test]
+    fn fast_state_status_reports_remote_backoff_after_failed_probe() {
+        let dir = tempdir().unwrap();
+        let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
+        record_hydrated_content(&mirror, "src/main.rs", b"main");
+        let mut sidecar = test_sidecar(mirror);
+        sidecar.agent.launch.agent = dir
+            .path()
+            .join("missing-agent")
+            .to_string_lossy()
+            .to_string();
+        let fast =
+            FastState::from_sidecar(&sidecar, Arc::new(Mutex::new(PendingRemote::default())));
+
+        let probe = sidecar.handle("remote_probe", json!({}), 0).unwrap();
+        assert_eq!(probe["remote_status"], "unavailable");
+        assert_eq!(probe["remote_available"], false);
+        assert!(probe["remote_error"]
+            .as_str()
+            .unwrap()
+            .contains("failed to launch agent"));
+
+        let request = ClientRequest {
+            id: 2,
+            method: "status".to_string(),
+            params: json!({}),
+        };
+        let FastHandle::Handled(result) = fast.try_handle(&request) else {
+            panic!("status should stay on fast path after a failed probe");
+        };
+        let result = result.unwrap();
+
+        assert_eq!(result["cached_files"], 1);
+        assert_eq!(result["remote_status"], "unavailable");
+        assert_eq!(result["remote_checked"], true);
+        assert_eq!(result["remote_available"], false);
+        assert!(result["retry_after_ms"].as_u64().unwrap() <= REMOTE_UNAVAILABLE_BACKOFF_MS);
+        assert!(result["remote_error"]
+            .as_str()
+            .unwrap()
+            .contains("failed to launch agent"));
     }
 
     #[test]

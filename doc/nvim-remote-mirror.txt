@@ -83,7 +83,8 @@ COMMANDS                                      *nvim-remote-mirror-commands*
     valid, stale, or deleted.
 
 :RemoteStatus
-    Show known, cached, indexed, dirty, and pending mirror counts.
+    Show known, cached, indexed, dirty, and pending mirror counts plus the
+    last known remote health. This is a local fast path and does not probe SSH.
 
 :RemoteDisconnect
     Stop the sidecar and agent.

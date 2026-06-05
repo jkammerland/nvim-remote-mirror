@@ -330,6 +330,21 @@ local function update_remote_state(client, result)
   client.hello.retry_after_ms = result.retry_after_ms
 end
 
+local function status_remote_summary(result)
+  local status = optional_string(result.remote_status) or "unchecked"
+  local parts = { "remote=" .. status }
+  local retry_after_ms = tonumber(result.retry_after_ms)
+  if retry_after_ms and retry_after_ms > 0 then
+    table.insert(parts, "retry_after_ms=" .. tostring(math.floor(retry_after_ms)))
+  end
+  local remote_error = optional_string(result.remote_error)
+  if remote_error and result.remote_available == false then
+    remote_error = remote_error:gsub("%s+", " ")
+    table.insert(parts, "error=" .. remote_error:sub(1, 160))
+  end
+  return table.concat(parts, " ")
+end
+
 local function mark_deferred_flush(bufnr, path, reason)
   if not path or path == "" then
     return false
@@ -1179,9 +1194,10 @@ function M.status()
       notify(err, vim.log.levels.ERROR)
       return
     end
+    update_remote_state(M.client, result)
     notify(
       string.format(
-        "known=%d cached=%d indexed=%d dirty=%d pending=%d failed=%d conflicts=%d stale=%d deleted=%d",
+        "known=%d cached=%d indexed=%d dirty=%d pending=%d failed=%d conflicts=%d stale=%d deleted=%d %s",
         result.known_files,
         result.cached_files,
         result.indexed_files or 0,
@@ -1190,7 +1206,8 @@ function M.status()
         result.failed_saves,
         result.conflicted_saves,
         result.stale_files,
-        result.deleted_files
+        result.deleted_files,
+        status_remote_summary(result)
       )
     )
   end)
