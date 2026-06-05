@@ -25,6 +25,8 @@ M.config = {
   grep_limit = 200,
   request_timeout_ms = 30000,
   ssh_connect_timeout_seconds = 10,
+  prefetch_max_file_bytes = 4 * 1024 * 1024,
+  prefetch_max_total_bytes = 16 * 1024 * 1024,
 }
 
 M.client = nil
@@ -330,12 +332,24 @@ function M.validate(path)
 end
 
 function M.prefetch(paths)
-  M.request("prefetch", { paths = paths }, function(err, result)
+  M.request("prefetch", {
+    paths = paths,
+    max_file_bytes = M.config.prefetch_max_file_bytes,
+    max_total_bytes = M.config.prefetch_max_total_bytes,
+  }, function(err, result)
     if err then
       notify(err, vim.log.levels.ERROR)
       return
     end
-    notify("prefetched " .. tostring(result.hydrated) .. " files")
+    local suffix = ""
+    if result.truncated then
+      suffix = " (truncated)"
+    end
+    local errors = #(result.errors or {})
+    if errors > 0 then
+      suffix = suffix .. " with " .. tostring(errors) .. " errors"
+    end
+    notify("prefetched " .. tostring(result.hydrated) .. " files" .. suffix)
   end)
 end
 

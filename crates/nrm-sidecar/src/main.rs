@@ -1,8 +1,8 @@
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 use nrm_protocol::{
-    read_frame, write_frame, FileMeta, Request, RequestId, Response, RpcError, RpcMessage,
-    SaveOutcome, MAX_FRAME_LEN, PROTOCOL_VERSION,
+    read_frame, write_frame, BatchReadFile, FileMeta, Request, RequestId, Response, RpcError,
+    RpcMessage, SaveOutcome, MAX_FRAME_LEN, PROTOCOL_VERSION,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -16,6 +16,8 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_CHUNK_SIZE: u64 = 1024 * 1024;
+const DEFAULT_BATCH_MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
+const DEFAULT_BATCH_MAX_TOTAL_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_SAVE_PAYLOAD_BYTES: usize = MAX_FRAME_LEN - (1024 * 1024);
 
 #[derive(Debug, Parser)]
@@ -995,19 +997,117 @@ impl Sidecar {
             .get("paths")
             .and_then(Value::as_array)
             .ok_or_else(|| anyhow!("prefetch requires params.paths array"))?;
-        let mut hydrated = 0;
+        let max_file_bytes = params
+            .get("max_file_bytes")
+            .and_then(Value::as_u64)
+            .unwrap_or(DEFAULT_BATCH_MAX_FILE_BYTES);
+        let max_total_bytes = params
+            .get("max_total_bytes")
+            .and_then(Value::as_u64)
+            .unwrap_or(DEFAULT_BATCH_MAX_TOTAL_BYTES);
+        let mut requested_paths = Vec::new();
         let mut errors = Vec::new();
         for value in paths {
             let Some(path) = value.as_str() else {
                 errors.push(json!({"path": null, "error": "path must be a string"}));
                 continue;
             };
-            match self.hydrate(path) {
-                Ok(_) => hydrated += 1,
+            match self.normalize_prefetch_path(path) {
+                Ok(path) => requested_paths.push(path),
                 Err(error) => errors.push(json!({"path": path, "error": error.to_string()})),
             }
         }
-        Ok(json!({ "hydrated": hydrated, "errors": errors }))
+        let (hydrated, batch_errors, truncated) =
+            self.batch_hydrate(requested_paths, max_file_bytes, max_total_bytes)?;
+        errors.extend(batch_errors);
+        Ok(json!({
+            "hydrated": hydrated,
+            "errors": errors,
+            "truncated": truncated,
+            "max_file_bytes": max_file_bytes,
+            "max_total_bytes": max_total_bytes
+        }))
+    }
+
+    fn normalize_prefetch_path(&self, path: &str) -> Result<String> {
+        let path = normalize_relative_path(path)?
+            .to_string_lossy()
+            .replace('\\', "/");
+        if let Some(entry) = self.mirror.get(&path)? {
+            if entry.dirty {
+                bail!("skipped dirty local mirror file");
+            }
+        }
+        Ok(path)
+    }
+
+    fn batch_hydrate(
+        &mut self,
+        paths: Vec<String>,
+        max_file_bytes: u64,
+        max_total_bytes: u64,
+    ) -> Result<(usize, Vec<Value>, bool)> {
+        if paths.is_empty() {
+            return Ok((0, Vec::new(), false));
+        }
+        let response = self.agent.request(Request::ReadFiles {
+            paths,
+            max_file_bytes,
+            max_total_bytes,
+        })?;
+        match response {
+            Response::ReadFiles {
+                files,
+                errors,
+                truncated,
+            } => {
+                let mut hydrated = 0;
+                let mut reported_errors = Vec::new();
+                for file in files {
+                    let path = file.path.clone();
+                    match self.record_batch_file(file) {
+                        Ok(()) => hydrated += 1,
+                        Err(error) => reported_errors.push(json!({
+                            "path": path,
+                            "error": error.to_string()
+                        })),
+                    }
+                }
+                reported_errors.extend(
+                    errors
+                        .into_iter()
+                        .map(|error| json!({"path": error.path, "error": error.message})),
+                );
+                Ok((hydrated, reported_errors, truncated))
+            }
+            other => bail!("unexpected batch read response: {other:?}"),
+        }
+    }
+
+    fn record_batch_file(&self, file: BatchReadFile) -> Result<()> {
+        let local_path = self.mirror.local_path(&file.path)?;
+        if let Some(parent) = local_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let part_path = local_path.with_extension("nrm-batch-part");
+        {
+            let mut part = File::create(&part_path)?;
+            part.write_all(&file.content)?;
+            part.sync_all()?;
+        }
+        let local_hash = hash_file(&part_path)?;
+        if local_hash != file.hash {
+            let _ = fs::remove_file(&part_path);
+            bail!(
+                "batch hydration hash mismatch for {}: local={local_hash} remote={}",
+                file.path,
+                file.hash
+            );
+        }
+        fs::rename(&part_path, &local_path)?;
+        self.mirror
+            .record_hydrated(&file.meta, &file.hash, &local_hash)?;
+        Ok(())
     }
 
     fn grep(&mut self, params: Value) -> Result<Value> {

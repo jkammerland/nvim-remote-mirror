@@ -57,6 +57,8 @@ CONFIGURATION                                  *nvim-remote-mirror-config*
     grep_limit = 200,
     request_timeout_ms = 30000,
     ssh_connect_timeout_seconds = 10,
+    prefetch_max_file_bytes = 4 * 1024 * 1024,
+    prefetch_max_total_bytes = 16 * 1024 * 1024,
   })
 <
 

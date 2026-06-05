@@ -14,6 +14,7 @@ pub struct CapabilitySet {
     pub checksum: bool,
     pub grep: bool,
     pub lsp_proxy: bool,
+    pub batch_read: bool,
     pub request_ids: bool,
     pub cancellation: bool,
     pub streaming: bool,
@@ -29,6 +30,7 @@ impl CapabilitySet {
             checksum: true,
             grep: true,
             lsp_proxy: false,
+            batch_read: true,
             request_ids: true,
             cancellation: false,
             streaming: false,
@@ -54,6 +56,20 @@ pub struct SearchHit {
     pub line: u64,
     pub column: u64,
     pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BatchReadFile {
+    pub path: String,
+    pub content: Vec<u8>,
+    pub hash: String,
+    pub meta: FileMeta,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BatchReadError {
+    pub path: String,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -98,6 +114,11 @@ pub enum Request {
         offset: u64,
         len: Option<u64>,
     },
+    ReadFiles {
+        paths: Vec<String>,
+        max_file_bytes: u64,
+        max_total_bytes: u64,
+    },
     Grep {
         query: String,
         limit: usize,
@@ -135,6 +156,11 @@ pub enum Response {
         content: Vec<u8>,
         hash: String,
         meta: FileMeta,
+    },
+    ReadFiles {
+        files: Vec<BatchReadFile>,
+        errors: Vec<BatchReadError>,
+        truncated: bool,
     },
     Grep {
         hits: Vec<SearchHit>,
@@ -268,6 +294,23 @@ mod tests {
 
         let decoded: RpcMessage = read_frame(&mut Cursor::new(bytes)).unwrap();
         assert_eq!(decoded, message);
+    }
+
+    #[test]
+    fn round_trips_batch_read_request() {
+        let request = RpcMessage::Request {
+            id: 8,
+            request: Request::ReadFiles {
+                paths: vec!["a.txt".to_string(), "src/lib.rs".to_string()],
+                max_file_bytes: 1024,
+                max_total_bytes: 4096,
+            },
+        };
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &request).unwrap();
+
+        let decoded: RpcMessage = read_frame(&mut Cursor::new(bytes)).unwrap();
+        assert_eq!(decoded, request);
     }
 
     #[test]

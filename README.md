@@ -25,6 +25,7 @@ This first implementation covers:
 - configurable request and SSH connect timeouts.
 - remote scan.
 - lazy file open/hydration into a local mirror.
+- batched prefetch hydration with per-file and total byte caps.
 - remote grep with streamed-style result payloads.
 - durable local save snapshots with checksum-aware flush/retry and conflict detection.
 - basic Neovim commands.
@@ -77,6 +78,8 @@ require("nvim_remote_mirror").setup({
   agent = "/path/to/nrm-agent",
   request_timeout_ms = 30000,
   ssh_connect_timeout_seconds = 10,
+  prefetch_max_file_bytes = 4 * 1024 * 1024,
+  prefetch_max_total_bytes = 16 * 1024 * 1024,
 })
 ```
 
@@ -111,6 +114,10 @@ Use `:RemoteValidate [path]` to compare cached mirror metadata with the remote
 hash. Stale cached files are marked in the mirror and rehydrated on the next
 open instead of being treated as silently valid.
 
+`:RemotePrefetch` uses a batched remote read request by default. Files larger
+than `prefetch_max_file_bytes` are skipped from the batch so explicit
+`:RemoteOpen` can hydrate them through the chunked path.
+
 ## Protocol Notes
 
 Neovim talks to the sidecar through newline-delimited JSON:
@@ -127,6 +134,7 @@ mirror model.
 
 Current transport state:
 
-- active: request IDs, typed remote errors, request timeout, SSH connect timeout.
+- active: request IDs, typed remote errors, request timeout, SSH connect timeout,
+  batched small-file read for prefetch.
 - pending: true multiplexing, cancellation, streaming results, reconnect resume,
   and backpressure.

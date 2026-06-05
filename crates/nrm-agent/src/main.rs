@@ -2,8 +2,9 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use ignore::WalkBuilder;
 use nrm_protocol::{
-    read_frame, write_frame, CapabilitySet, FileMeta, Request, Response, RpcError, RpcMessage,
-    SaveApplied, SaveConflict, SaveOutcome, SearchHit, PROTOCOL_VERSION,
+    read_frame, write_frame, BatchReadError, BatchReadFile, CapabilitySet, FileMeta, Request,
+    Response, RpcError, RpcMessage, SaveApplied, SaveConflict, SaveOutcome, SearchHit,
+    PROTOCOL_VERSION,
 };
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -126,6 +127,11 @@ fn handle_request(root: &Path, request: Request) -> Result<Response> {
             Ok(Response::Checksum { path, hash })
         }
         Request::ReadFile { path, offset, len } => read_file(root, path, offset, len),
+        Request::ReadFiles {
+            paths,
+            max_file_bytes,
+            max_total_bytes,
+        } => read_files(root, paths, max_file_bytes, max_total_bytes),
         Request::Grep { query, limit } => grep(root, &query, limit),
         Request::WriteFileCas {
             path,
@@ -186,6 +192,74 @@ fn read_file(root: &Path, path: String, offset: u64, len: Option<u64>) -> Result
         path,
         offset,
         eof,
+        content,
+        hash,
+        meta,
+    })
+}
+
+fn read_files(
+    root: &Path,
+    paths: Vec<String>,
+    max_file_bytes: u64,
+    max_total_bytes: u64,
+) -> Result<Response> {
+    let mut files = Vec::new();
+    let mut errors = Vec::new();
+    let mut total_bytes = 0_u64;
+    let mut truncated = false;
+
+    for path in paths {
+        match read_file_for_batch(root, &path, max_file_bytes) {
+            Ok(file) => {
+                let next_total = total_bytes.saturating_add(file.content.len() as u64);
+                if next_total > max_total_bytes {
+                    errors.push(BatchReadError {
+                        path,
+                        message: format!(
+                            "batch total cap exceeded: next_total={next_total} max_total_bytes={max_total_bytes}"
+                        ),
+                    });
+                    truncated = true;
+                    break;
+                }
+                total_bytes = next_total;
+                files.push(file);
+            }
+            Err(error) => errors.push(BatchReadError {
+                path,
+                message: error.to_string(),
+            }),
+        }
+    }
+
+    Ok(Response::ReadFiles {
+        files,
+        errors,
+        truncated,
+    })
+}
+
+fn read_file_for_batch(root: &Path, path: &str, max_file_bytes: u64) -> Result<BatchReadFile> {
+    let abs = resolve_remote_path(root, path)?;
+    if !abs.is_file() {
+        bail!("{path} is not a regular file");
+    }
+
+    let metadata = fs::metadata(&abs)?;
+    if metadata.len() > max_file_bytes {
+        bail!(
+            "{path} is {} bytes, above batch max_file_bytes={max_file_bytes}",
+            metadata.len()
+        );
+    }
+
+    let content = fs::read(&abs)?;
+    let hash = hash_bytes(&content);
+    let mut meta = file_meta(root, &abs, false)?;
+    meta.hash = Some(hash.clone());
+    Ok(BatchReadFile {
+        path: path.to_string(),
         content,
         hash,
         meta,
@@ -366,6 +440,10 @@ fn hash_file(path: &Path) -> Result<String> {
     Ok(hasher.finalize().to_hex().to_string())
 }
 
+fn hash_bytes(bytes: &[u8]) -> String {
+    blake3::hash(bytes).to_hex().to_string()
+}
+
 fn likely_binary(path: &Path) -> Result<bool> {
     let mut file = File::open(path)?;
     let mut buffer = [0_u8; 1024];
@@ -439,5 +517,42 @@ mod tests {
             }
         ));
         assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "two");
+    }
+
+    #[test]
+    fn read_files_batches_successes_and_per_file_errors() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.txt"), "one").unwrap();
+        fs::write(root.join("large.txt"), "abcdef").unwrap();
+
+        let response = read_files(
+            root,
+            vec![
+                "a.txt".to_string(),
+                "missing.txt".to_string(),
+                "large.txt".to_string(),
+            ],
+            3,
+            1024,
+        )
+        .unwrap();
+
+        match response {
+            Response::ReadFiles {
+                files,
+                errors,
+                truncated,
+            } => {
+                assert!(!truncated);
+                assert_eq!(files.len(), 1);
+                assert_eq!(files[0].path, "a.txt");
+                assert_eq!(files[0].content, b"one");
+                assert_eq!(errors.len(), 2);
+                assert_eq!(errors[0].path, "missing.txt");
+                assert_eq!(errors[1].path, "large.txt");
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
     }
 }
