@@ -1655,6 +1655,70 @@ impl Mirror {
         Ok((updated, true))
     }
 
+    fn recover_local_edits(&self, limit: usize, after: Option<&str>) -> Result<Value> {
+        let limit = limit.max(1).min(100_000);
+        let db_limit = limit.saturating_add(1).min(i64::MAX as usize) as i64;
+        let after = after.unwrap_or("");
+        let mut entries = {
+            let mut statement = self.db.prepare(
+                "
+                SELECT relative_path, local_path, size, remote_hash, local_hash, state, dirty,
+                       validated_at_ms, validation_state, last_error
+                FROM files
+                WHERE state='hydrated'
+                  AND is_dir=0
+                  AND is_symlink=0
+                  AND relative_path > ?1
+                ORDER BY relative_path ASC
+                LIMIT ?2
+                ",
+            )?;
+            let rows = statement.query_map(params![after, db_limit], mirror_entry_from_row)?;
+            let mut entries = Vec::new();
+            for row in rows {
+                entries.push(row?);
+            }
+            entries
+        };
+
+        let truncated = entries.len() > limit;
+        if truncated {
+            entries.truncate(limit);
+        }
+        let next_after = truncated
+            .then(|| entries.last().map(|entry| entry.relative_path.clone()))
+            .flatten();
+        let scanned = entries.len();
+        let mut queued = Vec::new();
+        let mut errors = Vec::new();
+
+        for entry in entries {
+            let relative_path = entry.relative_path.clone();
+            match self.sync_cached_file_integrity(&entry) {
+                Ok((_, true)) => {
+                    let save = self.latest_unresolved_save_entry(&relative_path)?;
+                    queued.push(json!({
+                        "path": relative_path,
+                        "queue_id": save.map(|entry| entry.id)
+                    }));
+                }
+                Ok((_, false)) => {}
+                Err(error) => errors.push(json!({
+                    "path": relative_path,
+                    "error": error.to_string()
+                })),
+            }
+        }
+
+        Ok(json!({
+            "scanned": scanned,
+            "queued": queued,
+            "errors": errors,
+            "truncated": truncated,
+            "next_after": next_after
+        }))
+    }
+
     fn record_clean_local_hash(&self, entry: &MirrorEntry, local_hash: &str) -> Result<()> {
         let size = fs::metadata(&entry.local_path)
             .map(|metadata| metadata.len() as i64)
@@ -2554,7 +2618,7 @@ impl RemotePreempts {
 fn request_is_write_lane(request: &ClientRequest) -> bool {
     matches!(
         request.method.as_str(),
-        "flush" | "flush_queued" | "flush_queue"
+        "recover_local_edits" | "flush" | "flush_queued" | "flush_queue"
     )
 }
 
@@ -2577,7 +2641,9 @@ impl RemotePriority {
         match request.method.as_str() {
             "prefetch" | "prefetch_known" | "prefetch_related" | "refresh" | "scan"
             | "remote_probe" => Self::Background,
-            "flush_queue" if request_background_flag(request) => Self::Background,
+            "recover_local_edits" | "flush_queue" if request_background_flag(request) => {
+                Self::Background
+            }
             _ => Self::Interactive,
         }
     }
@@ -2914,6 +2980,11 @@ impl PendingHazard {
             "flush" | "flush_queued" => {
                 path_hazard(request.params.get("path").and_then(Value::as_str))
             }
+            "recover_local_edits" if request_background_flag(request) => Self::default(),
+            "recover_local_edits" => Self {
+                exact_paths: Vec::new(),
+                unknown_content_mutation: true,
+            },
             "flush_queue" if request_background_flag(request) => Self::default(),
             "flush_queue" => Self {
                 exact_paths: Vec::new(),
@@ -3211,6 +3282,7 @@ impl Sidecar {
             "prefetch_related" => self.prefetch_related(params, preempt_epoch),
             "grep" => self.grep(params, preempt_epoch),
             "grep_cache" => self.mirror.grep_cache(&params),
+            "recover_local_edits" => self.recover_local_edits(params),
             "flush" => self.flush(params),
             "flush_queued" => self.flush_queued(params),
             "flush_queue" => self.flush_queue(params),
@@ -3847,6 +3919,15 @@ impl Sidecar {
         let path = required_string(&params, "path")?;
         let queued = self.mirror.enqueue_local_save(path)?;
         Self::save_attempt_to_json(self.apply_save_entry(queued)?)
+    }
+
+    fn recover_local_edits(&mut self, params: Value) -> Result<Value> {
+        let limit = optional_positive_usize_param(&params, "limit").unwrap_or(256);
+        let after = optional_string_param(&params, "after")
+            .map(|value| normalize_relative_path(value))
+            .transpose()?
+            .map(|value| value.to_string_lossy().replace('\\', "/"));
+        self.mirror.recover_local_edits(limit, after.as_deref())
     }
 
     fn flush_queued(&mut self, params: Value) -> Result<Value> {
@@ -5880,6 +5961,70 @@ mod tests {
         assert!(!entry.dirty);
         assert_eq!(entry.remote_hash.as_deref(), Some(second_hash.as_str()));
         assert_eq!(entry.local_hash.as_deref(), Some(second_hash.as_str()));
+    }
+
+    #[test]
+    fn recover_local_edits_queues_changed_hydrated_files_in_pages() {
+        let dir = tempdir().unwrap();
+        let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
+        record_hydrated_content(&mirror, "a.txt", b"base a");
+        let b_path = record_hydrated_content(&mirror, "b.txt", b"base b");
+        fs::write(&b_path, b"dirty b").unwrap();
+
+        let first = mirror.recover_local_edits(1, None).unwrap();
+
+        assert_eq!(first["scanned"], 1);
+        assert_eq!(first["queued"].as_array().unwrap().len(), 0);
+        assert_eq!(first["truncated"], true);
+        assert_eq!(first["next_after"], "a.txt");
+
+        let second = mirror.recover_local_edits(10, Some("a.txt")).unwrap();
+
+        let queued = second["queued"].as_array().unwrap();
+        assert_eq!(second["scanned"], 1);
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0]["path"], "b.txt");
+        assert!(queued[0]["queue_id"].as_i64().unwrap() > 0);
+        assert_eq!(second["truncated"], false);
+        assert_eq!(mirror.pending_save_count().unwrap(), 1);
+
+        let save = mirror
+            .latest_unresolved_save_entry("b.txt")
+            .unwrap()
+            .unwrap();
+        assert_eq!(fs::read(&save.snapshot_path).unwrap(), b"dirty b");
+        let entry = mirror.get("b.txt").unwrap().unwrap();
+        assert!(entry.dirty);
+        assert_eq!(
+            entry.local_hash.as_deref(),
+            Some(hash_bytes(b"dirty b").as_str())
+        );
+    }
+
+    #[test]
+    fn recover_local_edits_chains_new_dirty_snapshot_after_existing_save() {
+        let dir = tempdir().unwrap();
+        let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
+        let local_path = record_hydrated_content(&mirror, "a.txt", b"base");
+
+        fs::write(&local_path, b"dirty one").unwrap();
+        let first_hash = hash_bytes(b"dirty one");
+        mirror
+            .enqueue_save("a.txt", &first_hash, Some("base"), b"dirty one")
+            .unwrap();
+        fs::write(&local_path, b"dirty two").unwrap();
+
+        let result = mirror.recover_local_edits(10, None).unwrap();
+
+        let queued = result["queued"].as_array().unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0]["path"], "a.txt");
+
+        let saves = mirror.pending_save_entries(Some(10)).unwrap();
+        assert_eq!(saves.len(), 2);
+        assert_eq!(saves[1].expected_hash.as_deref(), Some(first_hash.as_str()));
+        assert_eq!(fs::read(&saves[0].snapshot_path).unwrap(), b"dirty one");
+        assert_eq!(fs::read(&saves[1].snapshot_path).unwrap(), b"dirty two");
     }
 
     #[test]

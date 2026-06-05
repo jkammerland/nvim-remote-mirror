@@ -118,6 +118,8 @@ CONFIGURATION                                  *nvim-remote-mirror-config*
     reconnect_delay_ms = 1000,
     reconnect_max_attempts = 3,
     reconnect_stable_ms = 10000,
+    recover_local_edits_on_connect = true,
+    recover_local_edits_limit = 256,
     flush_queue_on_connect = true,
     flush_queue_on_connect_delay_ms = 500,
     flush_queue_on_connect_limit = 1,
@@ -149,6 +151,10 @@ scans metadata, hydrates a tiny clean-file batch, then validates a tiny
 oldest-check cached-file batch against the remote checksum.
 grep_remote_page_files bounds each remote grep cursor page by scanned files so
 sparse searches can refresh quickfix progressively on slow links.
+recover_local_edits_on_connect scans hydrated local mirror files after reconnect
+and queues snapshots for changed bytes that were saved while the sidecar was
+unavailable, including crash-surviving saves that were never replayed from Lua
+memory. recover_local_edits_limit bounds each local scan page.
 open_batch_max_file_bytes controls how large a direct uncached open may be
 before it falls back from one-request batch read hydration to chunked reads.
 auto_hydrate_mirror_buffers makes LSP jumps into missing local mirror files call

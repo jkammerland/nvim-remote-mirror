@@ -150,6 +150,8 @@ require("nvim_remote_mirror").setup({
   reconnect_delay_ms = 1000,
   reconnect_max_attempts = 3,
   reconnect_stable_ms = 10000,
+  recover_local_edits_on_connect = true,
+  recover_local_edits_limit = 256,
   flush_queue_on_connect = true,
   flush_queue_on_connect_delay_ms = 500,
   flush_queue_on_connect_limit = 1,
@@ -196,7 +198,13 @@ tries a remote compare-and-swap write. If the upload fails, `:RemoteStatus`
 shows the queued or failed save and `:RemoteFlushQueue` retries it.
 If `:RemoteFlush` or automatic `BufWritePost` runs while disconnected, the path
 is kept in memory and replayed after reconnect so the sidecar can snapshot the
-already-written local mirror file.
+already-written local mirror file. On reconnect the sidecar also runs a bounded
+local recovery scan over hydrated mirror files. If Neovim saved a mirror file
+while the sidecar was unavailable and then crashed before replay, changed local
+bytes are snapshotted into the durable save queue before queued saves are
+flushed. Tune this with `recover_local_edits_on_connect` and
+`recover_local_edits_limit`, or call `recover_local_edits()` manually before
+`flush_queue()`.
 
 Small saves use one RPC request. Large saves stream through a chunked
 compare-and-swap upload: the agent checks the remote base hash before accepting

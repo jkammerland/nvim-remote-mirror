@@ -40,6 +40,8 @@ M.config = {
   reconnect_delay_ms = 1000,
   reconnect_max_attempts = 3,
   reconnect_stable_ms = 10000,
+  recover_local_edits_on_connect = true,
+  recover_local_edits_limit = 256,
   flush_queue_on_connect = true,
   flush_queue_on_connect_delay_ms = 500,
   flush_queue_on_connect_limit = 1,
@@ -416,13 +418,14 @@ local function schedule_deferred_flushes_on_connect(client, generation)
   end, 0)
 end
 
-local function schedule_flush_queue_on_connect(client, generation)
-  if not M.config.flush_queue_on_connect then
+local function schedule_save_recovery_on_connect(client, generation)
+  if not M.config.recover_local_edits_on_connect and not M.config.flush_queue_on_connect then
     return
   end
 
   local delay = math.max(tonumber(M.config.flush_queue_on_connect_delay_ms) or 0, 0)
   local limit = math.max(tonumber(M.config.flush_queue_on_connect_limit) or 1, 1)
+  local recover_limit = math.max(math.floor(tonumber(M.config.recover_local_edits_limit) or 256), 1)
 
   local function still_current()
     return M.client == client
@@ -461,6 +464,9 @@ local function schedule_flush_queue_on_connect(client, generation)
     if not still_current() then
       return
     end
+    if not M.config.flush_queue_on_connect then
+      return
+    end
     M.request("remote_probe", {}, function(err, result)
       if err or not result or result.preempted or not still_current() then
         return
@@ -472,7 +478,48 @@ local function schedule_flush_queue_on_connect(client, generation)
     end)
   end
 
-  vim.defer_fn(probe_then_replay, delay)
+  local function recover_then_replay()
+    if not still_current() then
+      return
+    end
+    if not M.config.recover_local_edits_on_connect then
+      probe_then_replay()
+      return
+    end
+
+    local after = nil
+    local function recover_page()
+      if not still_current() then
+        return
+      end
+      M.recover_local_edits({
+        background = true,
+        limit = recover_limit,
+        after = after,
+        quiet_empty = true,
+        on_done = function(err, result)
+          if not still_current() then
+            return
+          end
+          if err or not result then
+            probe_then_replay()
+            return
+          end
+          local next_after = optional_string(result.next_after)
+          if result.truncated and next_after then
+            after = next_after
+            vim.defer_fn(recover_page, 0)
+            return
+          end
+          probe_then_replay()
+        end,
+      })
+    end
+
+    recover_page()
+  end
+
+  vim.defer_fn(recover_then_replay, delay)
 end
 
 local function background_interval()
@@ -669,7 +716,7 @@ function M.connect(target, opts)
     local remote_suffix = result.remote_status == "unchecked" and " (remote unchecked)" or ""
     notify("connected: " .. result.remote_root .. remote_suffix)
     schedule_deferred_flushes_on_connect(client, generation)
-    schedule_flush_queue_on_connect(client, generation)
+    schedule_save_recovery_on_connect(client, generation)
     if M.config.background_mirror then
       M.start_background_mirror()
     end
@@ -1329,6 +1376,49 @@ function M.flush_queue(opts)
       return
     end
     notify_flush_queue_result(result, opts)
+    if opts.on_done then
+      opts.on_done(nil, result)
+    end
+  end)
+end
+
+function M.recover_local_edits(opts)
+  opts = opts or {}
+  local params = {
+    background = opts.background == true,
+  }
+  if opts.limit then
+    params.limit = opts.limit
+  end
+  if opts.after then
+    params.after = opts.after
+  end
+
+  M.request("recover_local_edits", params, function(err, result)
+    if err then
+      notify(err, vim.log.levels.ERROR)
+      if opts.on_done then
+        opts.on_done(err, nil)
+      end
+      return
+    end
+
+    result = result or {}
+    local queued = #(result.queued or {})
+    local errors = #(result.errors or {})
+    if queued > 0 or errors > 0 or (result.truncated and not opts.quiet_empty) then
+      local level = errors > 0 and vim.log.levels.WARN or vim.log.levels.INFO
+      notify(
+        "local edit recovery scanned "
+          .. tostring(result.scanned or 0)
+          .. " files, queued "
+          .. tostring(queued)
+          .. ", errors "
+          .. tostring(errors),
+        level
+      )
+    end
+
     if opts.on_done then
       opts.on_done(nil, result)
     end
