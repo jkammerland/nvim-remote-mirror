@@ -3712,10 +3712,7 @@ impl Sidecar {
             .map(|value| normalize_relative_path(value))
             .transpose()?
             .map(|value| value.to_string_lossy().replace('\\', "/"));
-        let max_files = params
-            .get("max_files")
-            .and_then(Value::as_u64)
-            .map(|value| value.min(usize::MAX as u64) as usize);
+        let max_files = optional_positive_usize_param(&params, "max_files");
         let max_file_bytes = params
             .get("max_file_bytes")
             .and_then(Value::as_u64)
@@ -5260,6 +5257,15 @@ fn optional_string_param<'a>(params: &'a Value, key: &str) -> Option<&'a str> {
         .filter(|value| !value.is_empty())
 }
 
+fn optional_positive_usize_param(params: &Value, key: &str) -> Option<usize> {
+    params.get(key).and_then(|value| {
+        value
+            .as_u64()
+            .map(|value| value.max(1).min(usize::MAX as u64) as usize)
+            .or_else(|| value.as_i64().map(|_| 1))
+    })
+}
+
 fn normalize_relative_path(path: &str) -> Result<PathBuf> {
     let path = Path::new(path);
     if path.is_absolute() {
@@ -5473,6 +5479,26 @@ mod tests {
         assert!(done_rx.recv_timeout(Duration::from_secs(1)).unwrap());
         sender.join().unwrap();
         assert_eq!(rx.recv().unwrap().id, 2);
+    }
+
+    #[test]
+    fn optional_positive_usize_param_clamps_non_positive_values() {
+        assert_eq!(
+            optional_positive_usize_param(&json!({"max_files": 0}), "max_files"),
+            Some(1)
+        );
+        assert_eq!(
+            optional_positive_usize_param(&json!({"max_files": -8}), "max_files"),
+            Some(1)
+        );
+        assert_eq!(
+            optional_positive_usize_param(&json!({"max_files": 32}), "max_files"),
+            Some(32)
+        );
+        assert_eq!(
+            optional_positive_usize_param(&json!({"max_files": "bad"}), "max_files"),
+            None
+        );
     }
 
     #[test]

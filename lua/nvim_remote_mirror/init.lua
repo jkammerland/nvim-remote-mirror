@@ -1139,6 +1139,7 @@ function M.grep(query)
   M.grep_generation = M.grep_generation + 1
   local generation = M.grep_generation
   local grep_limit = math.max(tonumber(M.config.grep_limit) or 0, 0)
+  local grep_remote_page_files = math.max(math.floor(tonumber(M.config.grep_remote_page_files) or 512), 1)
   local remote_result = {
     hits = {},
     truncated = false,
@@ -1198,7 +1199,7 @@ function M.grep(query)
       query = query,
       limit = remaining,
       after = after,
-      max_files = M.config.grep_remote_page_files,
+      max_files = grep_remote_page_files,
       hydrate = true,
       max_file_bytes = M.config.prefetch_max_file_bytes,
       max_total_bytes = M.config.prefetch_max_total_bytes,
@@ -1210,7 +1211,17 @@ function M.grep(query)
         notify(err, vim.log.levels.ERROR)
         return
       end
-      if not result or result.preempted then
+      if not result then
+        return
+      end
+      if result.preempted then
+        remote_result.truncated = true
+        remote_result.preempted = true
+        remote_result.next_after = optional_string(result.next_after) or after
+        if #(remote_result.hits or {}) > 0 or #(dirty_cache_hits or {}) > 0 or remote_applied then
+          apply_remote_result(true)
+        end
+        notify("grep stopped before remote search completed", vim.log.levels.WARN)
         return
       end
 

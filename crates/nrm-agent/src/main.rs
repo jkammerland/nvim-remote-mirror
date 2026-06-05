@@ -374,7 +374,7 @@ fn grep(
     let mut next_after = None;
     let mut after_seen = after.is_none();
     let mut scanned_files = 0_usize;
-    let max_files = max_files.unwrap_or(usize::MAX);
+    let max_files = max_files.unwrap_or(usize::MAX).max(1);
     for entry in WalkBuilder::new(root)
         .hidden(false)
         .parents(true)
@@ -426,6 +426,10 @@ fn grep(
         if hits.len() >= limit {
             break;
         }
+    }
+
+    if after.is_some() && !after_seen {
+        bail!("grep cursor not found");
     }
 
     if !truncated {
@@ -977,6 +981,43 @@ mod tests {
         assert!(next_after.is_none());
         assert_eq!(scanned_files, 1);
         assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn grep_errors_when_cursor_is_missing() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.txt"), "needle a").unwrap();
+
+        let error = grep(root, "needle", 10, Some("missing.txt"), Some(10))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("grep cursor not found"));
+    }
+
+    #[test]
+    fn grep_clamps_zero_file_page_to_one() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.txt"), "miss").unwrap();
+        fs::write(root.join("b.txt"), "needle b").unwrap();
+
+        let response = grep(root, "needle", 10, None, Some(0)).unwrap();
+        let Response::Grep {
+            hits,
+            truncated,
+            next_after,
+            scanned_files,
+        } = response
+        else {
+            panic!("unexpected grep response");
+        };
+
+        assert!(truncated);
+        assert_eq!(scanned_files, 1);
+        assert_eq!(next_after.as_deref(), Some("a.txt"));
+        assert!(hits.is_empty());
     }
 
     #[test]
