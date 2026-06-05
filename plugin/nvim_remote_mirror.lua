@@ -60,6 +60,14 @@ end, {
   complete = "file",
 })
 
+vim.api.nvim_create_user_command("RemoteRefresh", function(opts)
+  local paths = vim.split(opts.args, "%s+", { trimempty = true })
+  nrm.refresh(paths)
+end, {
+  nargs = "*",
+  complete = "file",
+})
+
 vim.api.nvim_create_user_command("RemoteStatus", function()
   nrm.status()
 end, {})

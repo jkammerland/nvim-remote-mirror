@@ -15,6 +15,7 @@ pub struct CapabilitySet {
     pub grep: bool,
     pub lsp_proxy: bool,
     pub batch_read: bool,
+    pub batch_validate: bool,
     pub request_ids: bool,
     pub cancellation: bool,
     pub streaming: bool,
@@ -31,6 +32,7 @@ impl CapabilitySet {
             grep: true,
             lsp_proxy: false,
             batch_read: true,
+            batch_validate: true,
             request_ids: true,
             cancellation: false,
             streaming: false,
@@ -73,6 +75,12 @@ pub struct BatchReadError {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BatchValidateFile {
+    pub path: String,
+    pub meta: Option<FileMeta>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SaveApplied {
     pub path: String,
     pub new_hash: String,
@@ -108,6 +116,10 @@ pub enum Request {
     },
     Checksum {
         path: String,
+    },
+    ValidateFiles {
+        paths: Vec<String>,
+        include_hash: bool,
     },
     ReadFile {
         path: String,
@@ -148,6 +160,10 @@ pub enum Response {
     Checksum {
         path: String,
         hash: Option<String>,
+    },
+    ValidateFiles {
+        files: Vec<BatchValidateFile>,
+        errors: Vec<BatchReadError>,
     },
     ReadFile {
         path: String,
@@ -304,6 +320,22 @@ mod tests {
                 paths: vec!["a.txt".to_string(), "src/lib.rs".to_string()],
                 max_file_bytes: 1024,
                 max_total_bytes: 4096,
+            },
+        };
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &request).unwrap();
+
+        let decoded: RpcMessage = read_frame(&mut Cursor::new(bytes)).unwrap();
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn round_trips_batch_validate_request() {
+        let request = RpcMessage::Request {
+            id: 9,
+            request: Request::ValidateFiles {
+                paths: vec!["a.txt".to_string(), "deleted.txt".to_string()],
+                include_hash: true,
             },
         };
         let mut bytes = Vec::new();

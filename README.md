@@ -26,6 +26,7 @@ This first implementation covers:
 - remote scan.
 - lazy file open/hydration into a local mirror.
 - batched prefetch hydration with per-file and total byte caps.
+- batched mirror refresh to mark cached files valid, stale, or deleted.
 - remote grep with streamed-style result payloads.
 - durable local save snapshots with checksum-aware flush/retry and conflict detection.
 - basic Neovim commands.
@@ -114,6 +115,10 @@ Use `:RemoteValidate [path]` to compare cached mirror metadata with the remote
 hash. Stale cached files are marked in the mirror and rehydrated on the next
 open instead of being treated as silently valid.
 
+Use `:RemoteRefresh [path...]` to validate many cached files in one remote
+request. Without arguments it refreshes a batch of clean cached files from the
+local mirror, oldest validation first.
+
 `:RemotePrefetch` uses a batched remote read request by default. Files larger
 than `prefetch_max_file_bytes` are skipped from the batch so explicit
 `:RemoteOpen` can hydrate them through the chunked path.
@@ -135,6 +140,6 @@ mirror model.
 Current transport state:
 
 - active: request IDs, typed remote errors, request timeout, SSH connect timeout,
-  batched small-file read for prefetch.
+  batched small-file read for prefetch, batched mirror validation.
 - pending: true multiplexing, cancellation, streaming results, reconnect resume,
   and backpressure.

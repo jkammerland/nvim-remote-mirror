@@ -294,14 +294,15 @@ function M.status()
     end
     notify(
       string.format(
-        "known=%d cached=%d dirty=%d pending=%d failed=%d conflicts=%d stale=%d",
+        "known=%d cached=%d dirty=%d pending=%d failed=%d conflicts=%d stale=%d deleted=%d",
         result.known_files,
         result.cached_files,
         result.dirty_files,
         result.pending_saves,
         result.failed_saves,
         result.conflicted_saves,
-        result.stale_files
+        result.stale_files,
+        result.deleted_files
       )
     )
   end)
@@ -328,6 +329,30 @@ function M.validate(path)
       return
     end
     notify(result.path .. " is " .. result.status)
+  end)
+end
+
+function M.refresh(paths)
+  local params = {}
+  if paths and #paths > 0 then
+    params.paths = paths
+  end
+  M.request("refresh", params, function(err, result)
+    if err then
+      notify(err, vim.log.levels.ERROR)
+      return
+    end
+    notify(
+      string.format(
+        "refresh checked=%d valid=%d stale=%d deleted=%d skipped=%d errors=%d",
+        result.checked,
+        result.valid,
+        result.stale,
+        result.deleted,
+        result.skipped,
+        #(result.errors or {})
+      )
+    )
   end)
 end
 

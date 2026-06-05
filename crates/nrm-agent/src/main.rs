@@ -2,9 +2,9 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use ignore::WalkBuilder;
 use nrm_protocol::{
-    read_frame, write_frame, BatchReadError, BatchReadFile, CapabilitySet, FileMeta, Request,
-    Response, RpcError, RpcMessage, SaveApplied, SaveConflict, SaveOutcome, SearchHit,
-    PROTOCOL_VERSION,
+    read_frame, write_frame, BatchReadError, BatchReadFile, BatchValidateFile, CapabilitySet,
+    FileMeta, Request, Response, RpcError, RpcMessage, SaveApplied, SaveConflict, SaveOutcome,
+    SearchHit, PROTOCOL_VERSION,
 };
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -126,6 +126,10 @@ fn handle_request(root: &Path, request: Request) -> Result<Response> {
             };
             Ok(Response::Checksum { path, hash })
         }
+        Request::ValidateFiles {
+            paths,
+            include_hash,
+        } => validate_files(root, paths, include_hash),
         Request::ReadFile { path, offset, len } => read_file(root, path, offset, len),
         Request::ReadFiles {
             paths,
@@ -237,6 +241,37 @@ fn read_files(
         files,
         errors,
         truncated,
+    })
+}
+
+fn validate_files(root: &Path, paths: Vec<String>, include_hash: bool) -> Result<Response> {
+    let mut files = Vec::new();
+    let mut errors = Vec::new();
+
+    for path in paths {
+        match validate_one_file(root, &path, include_hash) {
+            Ok(file) => files.push(file),
+            Err(error) => errors.push(BatchReadError {
+                path,
+                message: error.to_string(),
+            }),
+        }
+    }
+
+    Ok(Response::ValidateFiles { files, errors })
+}
+
+fn validate_one_file(root: &Path, path: &str, include_hash: bool) -> Result<BatchValidateFile> {
+    let abs = resolve_remote_path(root, path)?;
+    if !abs.exists() {
+        return Ok(BatchValidateFile {
+            path: path.to_string(),
+            meta: None,
+        });
+    }
+    Ok(BatchValidateFile {
+        path: path.to_string(),
+        meta: Some(file_meta(root, &abs, include_hash)?),
     })
 }
 
@@ -551,6 +586,32 @@ mod tests {
                 assert_eq!(errors.len(), 2);
                 assert_eq!(errors[0].path, "missing.txt");
                 assert_eq!(errors[1].path, "large.txt");
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_files_reports_valid_and_deleted_paths() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.txt"), "one").unwrap();
+
+        let response = validate_files(
+            root,
+            vec!["a.txt".to_string(), "deleted.txt".to_string()],
+            true,
+        )
+        .unwrap();
+
+        match response {
+            Response::ValidateFiles { files, errors } => {
+                assert!(errors.is_empty());
+                assert_eq!(files.len(), 2);
+                assert_eq!(files[0].path, "a.txt");
+                assert!(files[0].meta.as_ref().unwrap().hash.is_some());
+                assert_eq!(files[1].path, "deleted.txt");
+                assert!(files[1].meta.is_none());
             }
             other => panic!("unexpected response: {other:?}"),
         }

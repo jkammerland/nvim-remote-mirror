@@ -40,6 +40,10 @@ COMMANDS                                      *nvim-remote-mirror-commands*
     Validate the current remote buffer or a workspace-relative path against the
     remote checksum.
 
+:RemoteRefresh [path...]
+    Validate multiple cached files in one remote request and mark mirror entries
+    valid, stale, or deleted.
+
 :RemoteStatus
     Show known, cached, dirty, and pending mirror counts.
 

@@ -1,8 +1,8 @@
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 use nrm_protocol::{
-    read_frame, write_frame, BatchReadFile, FileMeta, Request, RequestId, Response, RpcError,
-    RpcMessage, SaveOutcome, MAX_FRAME_LEN, PROTOCOL_VERSION,
+    read_frame, write_frame, BatchReadFile, BatchValidateFile, FileMeta, Request, RequestId,
+    Response, RpcError, RpcMessage, SaveOutcome, MAX_FRAME_LEN, PROTOCOL_VERSION,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -827,6 +827,11 @@ impl Mirror {
             [],
             |row| row.get(0),
         )?;
+        let deleted: i64 = self.db.query_row(
+            "SELECT COUNT(*) FROM files WHERE validation_state='deleted'",
+            [],
+            |row| row.get(0),
+        )?;
         Ok(json!({
             "mirror_root": self.root.to_string_lossy(),
             "known_files": known,
@@ -835,7 +840,8 @@ impl Mirror {
             "pending_saves": pending,
             "failed_saves": failed,
             "conflicted_saves": conflicted,
-            "stale_files": stale
+            "stale_files": stale,
+            "deleted_files": deleted
         }))
     }
 
@@ -865,6 +871,38 @@ impl Mirror {
             ],
         )?;
         Ok(())
+    }
+
+    fn mark_validation_error(&self, relative_path: &str, error: &str) -> Result<()> {
+        self.db.execute(
+            "
+            UPDATE files SET
+              validation_state='error',
+              validated_at_ms=?2,
+              last_error=?3,
+              updated_at_ms=?2
+            WHERE relative_path=?1
+            ",
+            params![relative_path, now_ms(), error],
+        )?;
+        Ok(())
+    }
+
+    fn cached_clean_paths(&self, limit: usize) -> Result<Vec<String>> {
+        let mut statement = self.db.prepare(
+            "
+            SELECT relative_path FROM files
+            WHERE state='hydrated' AND dirty=0
+            ORDER BY validated_at_ms ASC, relative_path ASC
+            LIMIT ?1
+            ",
+        )?;
+        let rows = statement.query_map(params![limit as i64], |row| row.get::<_, String>(0))?;
+        let mut paths = Vec::new();
+        for row in rows {
+            paths.push(row?);
+        }
+        Ok(paths)
     }
 }
 
@@ -928,6 +966,7 @@ impl Sidecar {
             "flush" => self.flush(params),
             "flush_queue" => self.flush_queue(),
             "validate" => self.validate(params),
+            "refresh" => self.refresh(params),
             "shutdown" | "disconnect" => {
                 self.agent.shutdown();
                 Ok(json!({"shutdown": true}))
@@ -1326,6 +1365,122 @@ impl Sidecar {
             }
             other => bail!("unexpected checksum response: {other:?}"),
         }
+    }
+
+    fn refresh(&mut self, params: Value) -> Result<Value> {
+        let limit = params.get("limit").and_then(Value::as_u64).unwrap_or(500) as usize;
+        let paths = if let Some(values) = params.get("paths").and_then(Value::as_array) {
+            let mut paths = Vec::new();
+            for value in values {
+                let Some(path) = value.as_str() else {
+                    bail!("refresh params.paths entries must be strings");
+                };
+                let normalized = normalize_relative_path(path)?
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                paths.push(normalized);
+            }
+            paths
+        } else {
+            self.mirror.cached_clean_paths(limit)?
+        };
+        self.refresh_paths(paths)
+    }
+
+    fn refresh_paths(&mut self, paths: Vec<String>) -> Result<Value> {
+        if paths.is_empty() {
+            return Ok(json!({
+                "checked": 0,
+                "valid": 0,
+                "stale": 0,
+                "deleted": 0,
+                "skipped": 0,
+                "errors": []
+            }));
+        }
+        let response = self.agent.request(Request::ValidateFiles {
+            paths,
+            include_hash: true,
+        })?;
+        match response {
+            Response::ValidateFiles { files, errors } => {
+                let mut valid = 0;
+                let mut stale = 0;
+                let mut deleted = 0;
+                let mut skipped = 0;
+                let mut reported_errors = Vec::new();
+                for file in files {
+                    match self.record_validation_file(file) {
+                        Ok("valid") => valid += 1,
+                        Ok("stale") => stale += 1,
+                        Ok("deleted") => deleted += 1,
+                        Ok("dirty") => skipped += 1,
+                        Ok(other) => reported_errors.push(json!({
+                            "path": null,
+                            "error": format!("unexpected validation state {other}")
+                        })),
+                        Err(error) => reported_errors.push(json!({
+                            "path": null,
+                            "error": error.to_string()
+                        })),
+                    }
+                }
+                for error in errors {
+                    self.mirror
+                        .mark_validation_error(&error.path, &error.message)
+                        .ok();
+                    reported_errors.push(json!({
+                        "path": error.path,
+                        "error": error.message
+                    }));
+                }
+                Ok(json!({
+                    "checked": valid + stale + deleted + skipped + reported_errors.len(),
+                    "valid": valid,
+                    "stale": stale,
+                    "deleted": deleted,
+                    "skipped": skipped,
+                    "errors": reported_errors
+                }))
+            }
+            other => bail!("unexpected refresh response: {other:?}"),
+        }
+    }
+
+    fn record_validation_file(&self, file: BatchValidateFile) -> Result<&'static str> {
+        let entry = self
+            .mirror
+            .get(&file.path)?
+            .ok_or_else(|| anyhow!("{} is not known in the mirror", file.path))?;
+        if entry.dirty {
+            self.mirror
+                .record_validation(&entry.relative_path, "dirty", None, None)?;
+            return Ok("dirty");
+        }
+        let Some(meta) = file.meta else {
+            self.mirror.record_validation(
+                &entry.relative_path,
+                "deleted",
+                None,
+                Some("remote file no longer exists"),
+            )?;
+            return Ok("deleted");
+        };
+        let remote_hash = meta.hash.as_deref();
+        let state = if remote_hash == entry.remote_hash.as_deref() {
+            "valid"
+        } else {
+            "stale"
+        };
+        let error = if state == "stale" {
+            Some("remote hash differs from local mirror metadata")
+        } else {
+            None
+        };
+        let recorded_remote_hash = if state == "valid" { remote_hash } else { None };
+        self.mirror
+            .record_validation(&entry.relative_path, state, recorded_remote_hash, error)?;
+        Ok(state)
     }
 
     fn hydrate(&mut self, path: &str) -> Result<MirrorEntry> {
