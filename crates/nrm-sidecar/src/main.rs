@@ -2603,6 +2603,17 @@ impl RemoteQueue {
         self.ready.notify_all();
         drained
     }
+
+    fn cancel(&self, request_id: u64) -> Option<RemoteWork> {
+        let mut state = self.state.lock().expect("remote queue mutex poisoned");
+        let index = state
+            .queue
+            .iter()
+            .position(|work| work.request.id == request_id)?;
+        let work = state.remove(index);
+        self.ready.notify_all();
+        Some(work)
+    }
 }
 
 impl RemoteQueueState {
@@ -4216,6 +4227,37 @@ fn run_server(
             );
             break;
         }
+        if request.method == "cancel" {
+            let response = match cancel_request_id(&request.params) {
+                Ok(target_id) => {
+                    let canceled = cancel_queued_request(&remote_queue, &pending_remote, target_id);
+                    if let Some(work) = canceled {
+                        send_client_response(&response_tx, canceled_client_response(work));
+                        result_to_client_response(
+                            request.id,
+                            Ok(json!({
+                                "request_id": target_id,
+                                "canceled": true,
+                                "scope": "queued"
+                            })),
+                        )
+                    } else {
+                        result_to_client_response(
+                            request.id,
+                            Ok(json!({
+                                "request_id": target_id,
+                                "canceled": false,
+                                "scope": "queued",
+                                "reason": "request is not queued"
+                            })),
+                        )
+                    }
+                }
+                Err(error) => result_to_client_response(request.id, Err(error)),
+            };
+            send_client_response(&response_tx, response);
+            continue;
+        }
         if request.method == "flush" {
             request = match fast_state.prepare_flush(&request) {
                 Ok(request) => request,
@@ -4348,6 +4390,38 @@ fn clear_pending_hazard_refs(pending_remote: &Arc<Mutex<PendingRemote>>, works: 
 fn send_preempted_responses(tx: &mpsc::SyncSender<ClientResponse>, works: Vec<RemoteWork>) {
     for work in works {
         send_client_response(tx, preempted_client_response(work));
+    }
+}
+
+fn cancel_request_id(params: &Value) -> Result<u64> {
+    params
+        .get("request_id")
+        .or_else(|| params.get("id"))
+        .and_then(Value::as_u64)
+        .ok_or_else(|| anyhow!("missing required integer params.request_id"))
+}
+
+fn cancel_queued_request(
+    remote_queue: &RemoteQueue,
+    pending_remote: &Arc<Mutex<PendingRemote>>,
+    request_id: u64,
+) -> Option<RemoteWork> {
+    let canceled = remote_queue.cancel(request_id)?;
+    if let Ok(mut pending) = pending_remote.lock() {
+        pending.clear(&canceled.hazard);
+    }
+    Some(canceled)
+}
+
+fn canceled_client_response(work: RemoteWork) -> ClientResponse {
+    ClientResponse {
+        id: work.request.id,
+        ok: false,
+        result: None,
+        error: Some(format!(
+            "request `{}` canceled before remote execution",
+            work.request.method
+        )),
     }
 }
 
@@ -6030,6 +6104,50 @@ mod tests {
         assert_eq!(queue.pop().unwrap().request.id, 3);
         assert_eq!(queue.pop().unwrap().request.id, 1);
         queue.shutdown_and_drain();
+    }
+
+    #[test]
+    fn remote_queue_cancel_removes_queued_work_and_restores_capacity() {
+        let queue = RemoteQueue::new(1, 1);
+        queue
+            .try_push(test_remote_work(1, "prefetch"), None)
+            .unwrap();
+        assert!(queue
+            .try_push(test_remote_work(2, "prefetch_related"), None)
+            .is_err());
+
+        let canceled = queue.cancel(1).unwrap();
+
+        assert_eq!(canceled.request.id, 1);
+        queue
+            .try_push(test_remote_work(2, "prefetch_related"), None)
+            .unwrap();
+        assert_eq!(queue.pop().unwrap().request.id, 2);
+        assert!(queue.cancel(999).is_none());
+        queue.shutdown_and_drain();
+    }
+
+    #[test]
+    fn cancel_queued_request_clears_pending_hazard_and_reports_original_request() {
+        let queue = RemoteQueue::new(8, 8);
+        let pending = Arc::new(Mutex::new(PendingRemote::default()));
+        let request = test_client_request(7, "open", json!({"path": "src/main.rs", "force": true}));
+        let work = test_remote_work_from_request(request);
+        pending.lock().unwrap().register(&work.hazard);
+        queue.try_push(work, None).unwrap();
+        assert!(pending.lock().unwrap().blocks_path("src/main.rs"));
+
+        let canceled = cancel_queued_request(&queue, &pending, 7).unwrap();
+        let response = canceled_client_response(canceled);
+
+        assert!(!pending.lock().unwrap().blocks_path("src/main.rs"));
+        assert_eq!(response.id, 7);
+        assert!(!response.ok);
+        assert!(response
+            .error
+            .unwrap()
+            .contains("canceled before remote execution"));
+        assert!(queue.shutdown_and_drain().is_empty());
     }
 
     #[test]

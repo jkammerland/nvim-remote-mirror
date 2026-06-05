@@ -226,6 +226,22 @@ local function fail_pending(client, message)
   end
 end
 
+local function send_cancel_request(client, request_id)
+  if not client or not client.job_id or not request_id then
+    return
+  end
+  local cancel_id = client.next_id
+  client.next_id = client.next_id + 1
+  local payload = vim.json.encode({
+    id = cancel_id,
+    method = "cancel",
+    params = {
+      request_id = request_id,
+    },
+  }) .. "\n"
+  pcall(vim.fn.chansend, client.job_id, payload)
+end
+
 local function schedule_reconnect(target_arg, generation)
   generation = generation or M.reconnect_generation
   if not M.config.auto_reconnect then
@@ -719,6 +735,7 @@ function M.request(method, params, callback)
       vim.schedule(function()
         local timed_out = clear_pending(client, id)
         if timed_out then
+          send_cancel_request(client, id)
           pcall(
             timed_out,
             "request `" .. method .. "` timed out after " .. tostring(timeout_ms) .. " ms",
