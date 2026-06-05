@@ -36,6 +36,9 @@ M.config = {
   reconnect_delay_ms = 1000,
   reconnect_max_attempts = 3,
   reconnect_stable_ms = 10000,
+  flush_queue_on_connect = true,
+  flush_queue_on_connect_delay_ms = 500,
+  flush_queue_on_connect_limit = 1,
 }
 
 M.client = nil
@@ -209,6 +212,94 @@ local function schedule_reconnect_stable_reset(client, generation)
   end, math.max(delay, 0))
 end
 
+local function flush_queue_summary(result)
+  local counts = {
+    applied = 0,
+    queued = 0,
+    conflict = 0,
+    other = 0,
+  }
+  for _, attempt in ipairs(result.attempts or {}) do
+    local status = attempt.status
+    if counts[status] ~= nil then
+      counts[status] = counts[status] + 1
+    else
+      counts.other = counts.other + 1
+    end
+  end
+  return counts
+end
+
+local function notify_flush_queue_result(result, opts)
+  opts = opts or {}
+  local attempts = #(result.attempts or {})
+  if attempts == 0 and opts.quiet_empty then
+    return
+  end
+
+  local counts = flush_queue_summary(result)
+  local remaining = tonumber(result.remaining) or 0
+  local message = string.format(
+    "replayed %d queued saves: applied=%d queued=%d conflicts=%d remaining=%d",
+    attempts,
+    counts.applied,
+    counts.queued,
+    counts.conflict,
+    remaining
+  )
+  local level = vim.log.levels.INFO
+  if counts.conflict > 0 then
+    level = vim.log.levels.ERROR
+  elseif counts.queued > 0 or counts.other > 0 then
+    level = vim.log.levels.WARN
+  end
+  notify(message, level)
+end
+
+local function schedule_flush_queue_on_connect(client, generation)
+  if not M.config.flush_queue_on_connect then
+    return
+  end
+
+  local delay = math.max(tonumber(M.config.flush_queue_on_connect_delay_ms) or 0, 0)
+  local limit = math.max(tonumber(M.config.flush_queue_on_connect_limit) or 1, 1)
+
+  local function still_current()
+    return M.client == client
+      and not client.closing
+      and generation == M.reconnect_generation
+  end
+
+  local function replay_once()
+    if not still_current() then
+      return
+    end
+
+    M.flush_queue({
+      background = true,
+      limit = limit,
+      quiet_empty = true,
+      on_done = function(err, result)
+        if err or not result or not still_current() then
+          return
+        end
+        local counts = flush_queue_summary(result)
+        local remaining = tonumber(result.remaining) or 0
+        if
+          remaining > 0
+          and #(result.attempts or {}) > 0
+          and counts.queued == 0
+          and counts.conflict == 0
+        then
+          vim.defer_fn(replay_once, delay)
+        end
+      end,
+    })
+  end
+
+  vim.defer_fn(replay_once, delay)
+end
+
 function M.setup(opts)
   M.config = vim.tbl_deep_extend("force", M.config, opts or {})
 end
@@ -283,6 +374,7 @@ function M.connect(target, opts)
       schedule_reconnect_stable_reset(client, generation)
     end
     notify("connected: " .. result.remote_root)
+    schedule_flush_queue_on_connect(client, generation)
   end)
 end
 
@@ -633,13 +725,27 @@ function M.status()
   end)
 end
 
-function M.flush_queue()
-  M.request("flush_queue", {}, function(err, result)
+function M.flush_queue(opts)
+  opts = opts or {}
+  local params = {
+    background = opts.background == true,
+  }
+  if opts.limit then
+    params.limit = opts.limit
+  end
+
+  M.request("flush_queue", params, function(err, result)
     if err then
       notify(err, vim.log.levels.ERROR)
+      if opts.on_done then
+        opts.on_done(err, nil)
+      end
       return
     end
-    notify("replayed " .. tostring(#(result.attempts or {})) .. " queued saves")
+    notify_flush_queue_result(result, opts)
+    if opts.on_done then
+      opts.on_done(nil, result)
+    end
   end)
 end
 

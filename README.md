@@ -68,7 +68,8 @@ Or connect through SSH:
 If the sidecar exits unexpectedly, the plugin fails pending callbacks and can
 reconnect to the last target with capped retries. Use `:RemoteReconnect` to
 resume the last target manually; reconnect startup reuses the durable mirror and
-retries queued saves.
+retries queued saves in small background batches after the connection handshake
+has completed.
 
 By default the plugin expects these binaries:
 
@@ -97,6 +98,9 @@ require("nvim_remote_mirror").setup({
   reconnect_delay_ms = 1000,
   reconnect_max_attempts = 3,
   reconnect_stable_ms = 10000,
+  flush_queue_on_connect = true,
+  flush_queue_on_connect_delay_ms = 500,
+  flush_queue_on_connect_limit = 1,
 })
 ```
 

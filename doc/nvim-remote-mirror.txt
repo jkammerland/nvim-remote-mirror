@@ -49,7 +49,8 @@ COMMANDS                                      *nvim-remote-mirror-commands*
     compare-and-swap. Large saves are uploaded in chunks.
 
 :RemoteFlushQueue
-    Retry queued or previously failed remote saves.
+    Retry queued or previously failed remote saves and report applied, still
+    queued, conflict, and remaining counts.
 
 :RemoteValidate [path]
     Validate the current remote buffer or a workspace-relative path against the
@@ -87,6 +88,9 @@ CONFIGURATION                                  *nvim-remote-mirror-config*
     reconnect_delay_ms = 1000,
     reconnect_max_attempts = 3,
     reconnect_stable_ms = 10000,
+    flush_queue_on_connect = true,
+    flush_queue_on_connect_delay_ms = 500,
+    flush_queue_on_connect_limit = 1,
   })
 <
 

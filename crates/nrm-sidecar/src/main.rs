@@ -860,16 +860,18 @@ impl Mirror {
             .map_err(Into::into)
     }
 
-    fn pending_save_entries(&self) -> Result<Vec<SaveQueueEntry>> {
+    fn pending_save_entries(&self, limit: Option<usize>) -> Result<Vec<SaveQueueEntry>> {
+        let limit = limit.unwrap_or(usize::MAX).min(i64::MAX as usize) as i64;
         let mut statement = self.db.prepare(
             "
             SELECT id, relative_path, expected_hash, local_hash, snapshot_path
             FROM save_queue
             WHERE state IN ('pending', 'failed') AND snapshot_path IS NOT NULL
             ORDER BY id ASC
+            LIMIT ?1
             ",
         )?;
-        let rows = statement.query_map([], |row| {
+        let rows = statement.query_map(params![limit], |row| {
             Ok(SaveQueueEntry {
                 id: row.get(0)?,
                 relative_path: row.get(1)?,
@@ -883,6 +885,19 @@ impl Mirror {
             entries.push(row?);
         }
         Ok(entries)
+    }
+
+    fn pending_save_count(&self) -> Result<i64> {
+        self.db
+            .query_row(
+                "
+                SELECT COUNT(*) FROM save_queue
+                WHERE state IN ('pending', 'failed') AND snapshot_path IS NOT NULL
+                ",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
     }
 
     fn latest_unresolved_save_entry(&self, relative_path: &str) -> Result<Option<SaveQueueEntry>> {
@@ -1497,6 +1512,7 @@ impl RemotePriority {
     fn for_request(request: &ClientRequest) -> Self {
         match request.method.as_str() {
             "prefetch" | "prefetch_related" | "refresh" | "scan" => Self::Background,
+            "flush_queue" if request_background_flag(request) => Self::Background,
             _ => Self::Interactive,
         }
     }
@@ -1755,6 +1771,7 @@ impl PendingHazard {
                     .unwrap_or(true),
             },
             "flush" => path_hazard(request.params.get("path").and_then(Value::as_str)),
+            "flush_queue" if request_background_flag(request) => Self::default(),
             "flush_queue" => Self {
                 exact_paths: Vec::new(),
                 unknown_content_mutation: true,
@@ -1832,6 +1849,14 @@ fn request_path_interest(path: Option<&str>) -> RequestInterest {
         exact_paths: path.and_then(normalized_path_string).into_iter().collect(),
         unknown_content: false,
     }
+}
+
+fn request_background_flag(request: &ClientRequest) -> bool {
+    request
+        .params
+        .get("background")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
 }
 
 fn normalized_path_string(path: &str) -> Option<String> {
@@ -1948,13 +1973,12 @@ impl Sidecar {
         if !matches!(hello, Response::Hello { .. }) {
             bail!("unexpected hello response from agent: {hello:?}");
         }
-        let mut sidecar = Self {
+        let sidecar = Self {
             agent,
             mirror,
             remote_root,
             workspace_key,
         };
-        let _ = sidecar.replay_queued_saves();
         Ok(sidecar)
     }
 
@@ -1976,7 +2000,7 @@ impl Sidecar {
             "grep" => self.grep(params),
             "grep_cache" => self.mirror.grep_cache(&params),
             "flush" => self.flush(params),
-            "flush_queue" => self.flush_queue(),
+            "flush_queue" => self.flush_queue(params),
             "validate" => self.validate(params),
             "refresh" => self.refresh(params, preempt_epoch),
             "shutdown" | "disconnect" => {
@@ -2405,13 +2429,21 @@ impl Sidecar {
         Self::save_attempt_to_json(self.apply_save_entry(queued)?)
     }
 
-    fn flush_queue(&mut self) -> Result<Value> {
-        let attempts = self.replay_queued_saves()?;
-        Ok(json!({ "attempts": attempts }))
+    fn flush_queue(&mut self, params: Value) -> Result<Value> {
+        let limit = params
+            .get("limit")
+            .and_then(Value::as_u64)
+            .map(|value| value.min(usize::MAX as u64) as usize);
+        let attempts = self.replay_queued_saves(limit)?;
+        let remaining = self.mirror.pending_save_count()?;
+        Ok(json!({
+            "attempts": attempts,
+            "remaining": remaining
+        }))
     }
 
-    fn replay_queued_saves(&mut self) -> Result<Vec<Value>> {
-        let entries = self.mirror.pending_save_entries()?;
+    fn replay_queued_saves(&mut self, limit: Option<usize>) -> Result<Vec<Value>> {
+        let entries = self.mirror.pending_save_entries(limit)?;
         let mut attempts = Vec::new();
         for entry in entries {
             attempts.push(Self::save_attempt_to_json(self.apply_save_entry(entry)?)?);
@@ -3850,6 +3882,32 @@ mod tests {
     }
 
     #[test]
+    fn pending_save_entries_respect_limit_and_report_remaining() {
+        let dir = tempdir().unwrap();
+        let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
+        mirror
+            .record_hydrated(&test_meta("a.txt", "base-a", 1), "base-a", "base-a")
+            .unwrap();
+        mirror
+            .record_hydrated(&test_meta("b.txt", "base-b", 1), "base-b", "base-b")
+            .unwrap();
+        let a_hash = hash_bytes(b"dirty a");
+        let b_hash = hash_bytes(b"dirty b");
+        mirror
+            .enqueue_save("a.txt", &a_hash, Some("base-a"), b"dirty a")
+            .unwrap();
+        mirror
+            .enqueue_save("b.txt", &b_hash, Some("base-b"), b"dirty b")
+            .unwrap();
+
+        let entries = mirror.pending_save_entries(Some(1)).unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].relative_path, "a.txt");
+        assert_eq!(mirror.pending_save_count().unwrap(), 2);
+    }
+
+    #[test]
     fn validation_can_mark_cached_file_stale() {
         let dir = tempdir().unwrap();
         let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
@@ -4271,6 +4329,26 @@ mod tests {
     }
 
     #[test]
+    fn background_flush_queue_yields_to_interactive_work() {
+        let queue = RemoteQueue::new(8, 8);
+        queue
+            .try_push(
+                test_remote_work_from_request(test_client_request(
+                    1,
+                    "flush_queue",
+                    json!({"background": true, "limit": 1}),
+                )),
+                None,
+            )
+            .unwrap();
+        queue.try_push(test_remote_work(2, "open"), None).unwrap();
+
+        assert_eq!(queue.pop().unwrap().request.id, 2);
+        assert_eq!(queue.pop().unwrap().request.id, 1);
+        queue.shutdown_and_drain();
+    }
+
+    #[test]
     fn remote_queue_flush_bypasses_conflicting_background_hydration() {
         let queue = RemoteQueue::new(8, 8);
         queue
@@ -4444,6 +4522,20 @@ mod tests {
 
         pending.clear(&hazard);
         assert!(!pending.blocks_path("src/main.rs"));
+    }
+
+    #[test]
+    fn background_flush_queue_does_not_block_cached_opens_while_pending() {
+        let request = test_client_request(1, "flush_queue", json!({"background": true}));
+        let hazard = PendingHazard::for_request(&request);
+        let mut pending = PendingRemote::default();
+        pending.register(&hazard);
+
+        assert!(!pending.blocks_path("src/main.rs"));
+        assert_eq!(
+            RemotePriority::for_request(&request),
+            RemotePriority::Background
+        );
     }
 
     #[test]
