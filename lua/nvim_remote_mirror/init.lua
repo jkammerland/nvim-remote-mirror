@@ -231,6 +231,13 @@ function M.flush_buffer(bufnr)
       )
       return
     end
+    if result.status == "queued" then
+      notify(
+        "remote save queued for " .. result.path .. ": " .. result.reason,
+        vim.log.levels.WARN
+      )
+      return
+    end
     vim.schedule(function()
       if vim.api.nvim_buf_is_valid(bufnr) then
         vim.b[bufnr].nrm_remote_hash = result.hash
@@ -279,13 +286,40 @@ function M.status()
     end
     notify(
       string.format(
-        "known=%d cached=%d dirty=%d pending=%d",
+        "known=%d cached=%d dirty=%d pending=%d failed=%d conflicts=%d stale=%d",
         result.known_files,
         result.cached_files,
         result.dirty_files,
-        result.pending_saves
+        result.pending_saves,
+        result.failed_saves,
+        result.conflicted_saves,
+        result.stale_files
       )
     )
+  end)
+end
+
+function M.flush_queue()
+  M.request("flush_queue", {}, function(err, result)
+    if err then
+      notify(err, vim.log.levels.ERROR)
+      return
+    end
+    notify("replayed " .. tostring(#(result.attempts or {})) .. " queued saves")
+  end)
+end
+
+function M.validate(path)
+  path = path or vim.b.nrm_remote_path
+  if not path or path == "" then
+    error("validate requires a remote path or a remote buffer")
+  end
+  M.request("validate", { path = path }, function(err, result)
+    if err then
+      notify(err, vim.log.levels.ERROR)
+      return
+    end
+    notify(result.path .. " is " .. result.status)
   end)
 end
 

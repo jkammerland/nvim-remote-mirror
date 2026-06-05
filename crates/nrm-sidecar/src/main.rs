@@ -1,7 +1,8 @@
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 use nrm_protocol::{
-    read_frame, write_frame, FileMeta, Request, Response, SaveOutcome, PROTOCOL_VERSION,
+    read_frame, write_frame, FileMeta, Request, Response, SaveOutcome, MAX_FRAME_LEN,
+    PROTOCOL_VERSION,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -14,6 +15,7 @@ use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const DEFAULT_CHUNK_SIZE: u64 = 1024 * 1024;
+const MAX_SAVE_PAYLOAD_BYTES: usize = MAX_FRAME_LEN - (1024 * 1024);
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Local sidecar for nvim-remote-mirror")]
@@ -73,6 +75,37 @@ struct MirrorEntry {
     local_hash: Option<String>,
     state: String,
     dirty: bool,
+    validated_at_ms: i64,
+    validation_state: String,
+    last_error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct SaveQueueEntry {
+    id: i64,
+    relative_path: String,
+    expected_hash: Option<String>,
+    local_hash: String,
+    snapshot_path: PathBuf,
+}
+
+#[derive(Debug)]
+enum SaveAttempt {
+    Applied {
+        path: String,
+        hash: String,
+        size: u64,
+    },
+    Conflict {
+        path: String,
+        expected_hash: Option<String>,
+        actual_hash: Option<String>,
+        remote_path: PathBuf,
+    },
+    Queued {
+        path: String,
+        reason: String,
+    },
 }
 
 struct AgentClient {
@@ -147,6 +180,7 @@ struct Mirror {
     root: PathBuf,
     files_root: PathBuf,
     conflicts_root: PathBuf,
+    save_snapshots_root: PathBuf,
     db: Connection,
 }
 
@@ -156,13 +190,16 @@ impl Mirror {
         let root = state_dir.join("workspaces").join(workspace_key);
         let files_root = root.join("files");
         let conflicts_root = root.join("conflicts");
+        let save_snapshots_root = root.join("save-snapshots");
         fs::create_dir_all(&files_root)?;
         fs::create_dir_all(&conflicts_root)?;
+        fs::create_dir_all(&save_snapshots_root)?;
         let db = Connection::open(root.join("mirror.sqlite"))?;
         let mirror = Self {
             root,
             files_root,
             conflicts_root,
+            save_snapshots_root,
             db,
         };
         mirror.init_schema()?;
@@ -182,6 +219,9 @@ impl Mirror {
               local_hash TEXT,
               state TEXT NOT NULL,
               dirty INTEGER NOT NULL DEFAULT 0,
+              validated_at_ms INTEGER NOT NULL DEFAULT 0,
+              validation_state TEXT NOT NULL DEFAULT 'unknown',
+              last_error TEXT,
               updated_at_ms INTEGER NOT NULL
             );
             CREATE TABLE IF NOT EXISTS save_queue (
@@ -189,11 +229,41 @@ impl Mirror {
               relative_path TEXT NOT NULL,
               expected_hash TEXT,
               local_hash TEXT NOT NULL,
+              snapshot_path TEXT,
               state TEXT NOT NULL,
+              attempts INTEGER NOT NULL DEFAULT 0,
+              last_error TEXT,
+              remote_conflict_path TEXT,
               created_at_ms INTEGER NOT NULL,
               updated_at_ms INTEGER NOT NULL
             );
             ",
+        )?;
+        self.add_missing_column("files", "validated_at_ms", "INTEGER NOT NULL DEFAULT 0")?;
+        self.add_missing_column(
+            "files",
+            "validation_state",
+            "TEXT NOT NULL DEFAULT 'unknown'",
+        )?;
+        self.add_missing_column("files", "last_error", "TEXT")?;
+        self.add_missing_column("save_queue", "snapshot_path", "TEXT")?;
+        self.add_missing_column("save_queue", "attempts", "INTEGER NOT NULL DEFAULT 0")?;
+        self.add_missing_column("save_queue", "last_error", "TEXT")?;
+        self.add_missing_column("save_queue", "remote_conflict_path", "TEXT")?;
+        Ok(())
+    }
+
+    fn add_missing_column(&self, table: &str, column: &str, definition: &str) -> Result<()> {
+        let mut statement = self.db.prepare(&format!("PRAGMA table_info({table})"))?;
+        let columns = statement.query_map([], |row| row.get::<_, String>(1))?;
+        for existing in columns {
+            if existing? == column {
+                return Ok(());
+            }
+        }
+        self.db.execute(
+            &format!("ALTER TABLE {table} ADD COLUMN {column} {definition}"),
+            [],
         )?;
         Ok(())
     }
@@ -250,9 +320,9 @@ impl Mirror {
             "
             INSERT INTO files (
               relative_path, local_path, size, mtime_ms, mode, remote_hash,
-              local_hash, state, dirty, updated_at_ms
+              local_hash, state, dirty, validated_at_ms, validation_state, last_error, updated_at_ms
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'hydrated', 0, ?8)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'hydrated', 0, ?8, 'valid', NULL, ?8)
             ON CONFLICT(relative_path) DO UPDATE SET
               local_path=excluded.local_path,
               size=excluded.size,
@@ -262,6 +332,9 @@ impl Mirror {
               local_hash=excluded.local_hash,
               state='hydrated',
               dirty=0,
+              validated_at_ms=excluded.validated_at_ms,
+              validation_state='valid',
+              last_error=NULL,
               updated_at_ms=excluded.updated_at_ms
             ",
             params![
@@ -285,7 +358,8 @@ impl Mirror {
         self.db
             .query_row(
                 "
-                SELECT relative_path, local_path, size, remote_hash, local_hash, state, dirty
+                SELECT relative_path, local_path, size, remote_hash, local_hash, state, dirty,
+                       validated_at_ms, validation_state, last_error
                 FROM files WHERE relative_path = ?1
                 ",
                 params![relative_path],
@@ -298,6 +372,9 @@ impl Mirror {
                         local_hash: row.get(4)?,
                         state: row.get(5)?,
                         dirty: row.get::<_, i64>(6)? != 0,
+                        validated_at_ms: row.get(7)?,
+                        validation_state: row.get(8)?,
+                        last_error: row.get(9)?,
                     })
                 },
             )
@@ -305,41 +382,166 @@ impl Mirror {
             .map_err(Into::into)
     }
 
-    fn mark_dirty(
+    fn enqueue_save(
         &self,
         relative_path: &str,
         local_hash: &str,
         expected_hash: Option<&str>,
-    ) -> Result<()> {
+        content: &[u8],
+    ) -> Result<SaveQueueEntry> {
         let entry = self
             .get(relative_path)?
             .ok_or_else(|| anyhow!("{relative_path} is not known in the mirror"))?;
+        let relative_path = entry.relative_path;
+        let effective_expected_hash = self
+            .latest_unresolved_save_hash(&relative_path)?
+            .or_else(|| expected_hash.map(ToOwned::to_owned));
+        let snapshot_path = self.write_save_snapshot(&relative_path, local_hash, content)?;
         self.db.execute(
             "
-            UPDATE files SET local_hash=?2, dirty=1, updated_at_ms=?3
+            UPDATE files SET
+              local_hash=?2,
+              dirty=1,
+              validation_state='dirty',
+              last_error=NULL,
+              updated_at_ms=?3
             WHERE relative_path=?1
             ",
-            params![entry.relative_path, local_hash, now_ms()],
+            params![relative_path, local_hash, now_ms()],
         )?;
         self.db.execute(
             "
             INSERT INTO save_queue (
-              relative_path, expected_hash, local_hash, state, created_at_ms, updated_at_ms
+              relative_path, expected_hash, local_hash, snapshot_path, state,
+              attempts, created_at_ms, updated_at_ms
             )
-            VALUES (?1, ?2, ?3, 'pending', ?4, ?4)
+            VALUES (?1, ?2, ?3, ?4, 'pending', 0, ?5, ?5)
             ",
-            params![relative_path, expected_hash, local_hash, now_ms()],
+            params![
+                relative_path,
+                effective_expected_hash,
+                local_hash,
+                snapshot_path.to_string_lossy(),
+                now_ms()
+            ],
         )?;
-        Ok(())
+        Ok(SaveQueueEntry {
+            id: self.db.last_insert_rowid(),
+            relative_path: relative_path.to_string(),
+            expected_hash: effective_expected_hash,
+            local_hash: local_hash.to_string(),
+            snapshot_path,
+        })
     }
 
-    fn mark_clean_after_save(
+    fn write_save_snapshot(
         &self,
+        relative_path: &str,
+        local_hash: &str,
+        content: &[u8],
+    ) -> Result<PathBuf> {
+        let safe_name = relative_path.replace(['/', '\\'], "__");
+        let path = self.save_snapshots_root.join(format!(
+            "{safe_name}.{}.{}.snapshot",
+            now_ms(),
+            local_hash
+        ));
+        let tmp = path.with_extension("snapshot.tmp");
+        {
+            let mut file = File::create(&tmp)?;
+            file.write_all(content)?;
+            file.sync_all()?;
+        }
+        fs::rename(&tmp, &path)?;
+        Ok(path)
+    }
+
+    fn latest_unresolved_save_hash(&self, relative_path: &str) -> Result<Option<String>> {
+        self.db
+            .query_row(
+                "
+                SELECT local_hash FROM save_queue
+                WHERE relative_path=?1 AND state IN ('pending', 'failed')
+                ORDER BY id DESC LIMIT 1
+                ",
+                params![relative_path],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    fn pending_save_entries(&self) -> Result<Vec<SaveQueueEntry>> {
+        let mut statement = self.db.prepare(
+            "
+            SELECT id, relative_path, expected_hash, local_hash, snapshot_path
+            FROM save_queue
+            WHERE state IN ('pending', 'failed') AND snapshot_path IS NOT NULL
+            ORDER BY id ASC
+            ",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(SaveQueueEntry {
+                id: row.get(0)?,
+                relative_path: row.get(1)?,
+                expected_hash: row.get(2)?,
+                local_hash: row.get(3)?,
+                snapshot_path: PathBuf::from(row.get::<_, String>(4)?),
+            })
+        })?;
+        let mut entries = Vec::new();
+        for row in rows {
+            entries.push(row?);
+        }
+        Ok(entries)
+    }
+
+    fn unresolved_save_count(&self, relative_path: &str) -> Result<i64> {
+        self.db
+            .query_row(
+                "
+                SELECT COUNT(*) FROM save_queue
+                WHERE relative_path=?1 AND state IN ('pending', 'failed')
+                ",
+                params![relative_path],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
+    fn mark_save_applied(
+        &self,
+        queue_id: i64,
         relative_path: &str,
         new_hash: &str,
         size: u64,
         mtime_ms: i64,
     ) -> Result<()> {
+        self.db.execute(
+            "
+            UPDATE save_queue SET state='applied', last_error=NULL, updated_at_ms=?2
+            WHERE id=?1
+            ",
+            params![queue_id, now_ms()],
+        )?;
+        let unresolved = self.unresolved_save_count(relative_path)?;
+        if unresolved > 0 {
+            self.db.execute(
+                "
+                UPDATE files SET
+                  size=?2,
+                  mtime_ms=?3,
+                  remote_hash=?4,
+                  validation_state='dirty',
+                  last_error=NULL,
+                  updated_at_ms=?5
+                WHERE relative_path=?1
+                ",
+                params![relative_path, size as i64, mtime_ms, new_hash, now_ms()],
+            )?;
+            return Ok(());
+        }
+
         self.db.execute(
             "
             UPDATE files SET
@@ -349,22 +551,46 @@ impl Mirror {
               local_hash=?4,
               dirty=0,
               state='hydrated',
+              validated_at_ms=?5,
+              validation_state='valid',
+              last_error=NULL,
               updated_at_ms=?5
             WHERE relative_path=?1
             ",
             params![relative_path, size as i64, mtime_ms, new_hash, now_ms()],
         )?;
+        Ok(())
+    }
+
+    fn mark_save_failed(&self, queue_id: i64, relative_path: &str, error: &str) -> Result<()> {
         self.db.execute(
             "
-            UPDATE save_queue SET state='applied', updated_at_ms=?2
-            WHERE relative_path=?1 AND state='pending'
+            UPDATE save_queue SET
+              state='failed',
+              attempts=attempts+1,
+              last_error=?2,
+              updated_at_ms=?3
+            WHERE id=?1
             ",
-            params![relative_path, now_ms()],
+            params![queue_id, error, now_ms()],
+        )?;
+        self.db.execute(
+            "
+            UPDATE files SET last_error=?2, updated_at_ms=?3
+            WHERE relative_path=?1
+            ",
+            params![relative_path, error, now_ms()],
         )?;
         Ok(())
     }
 
-    fn record_conflict(&self, relative_path: &str, remote_content: &[u8]) -> Result<PathBuf> {
+    fn record_save_conflict(
+        &self,
+        queue_id: i64,
+        relative_path: &str,
+        remote_content: &[u8],
+        message: &str,
+    ) -> Result<PathBuf> {
         let safe_name = relative_path.replace(['/', '\\'], "__");
         let path = self
             .conflicts_root
@@ -372,10 +598,25 @@ impl Mirror {
         fs::write(&path, remote_content)?;
         self.db.execute(
             "
-            UPDATE save_queue SET state='conflict', updated_at_ms=?2
-            WHERE relative_path=?1 AND state='pending'
+            UPDATE save_queue SET
+              state='conflict',
+              attempts=attempts+1,
+              last_error=?2,
+              remote_conflict_path=?3,
+              updated_at_ms=?4
+            WHERE id=?1
             ",
-            params![relative_path, now_ms()],
+            params![queue_id, message, path.to_string_lossy(), now_ms()],
+        )?;
+        self.db.execute(
+            "
+            UPDATE files SET
+              validation_state='conflict',
+              last_error=?2,
+              updated_at_ms=?3
+            WHERE relative_path=?1
+            ",
+            params![relative_path, message, now_ms()],
         )?;
         Ok(path)
     }
@@ -399,13 +640,59 @@ impl Mirror {
             [],
             |row| row.get(0),
         )?;
+        let failed: i64 = self.db.query_row(
+            "SELECT COUNT(*) FROM save_queue WHERE state='failed'",
+            [],
+            |row| row.get(0),
+        )?;
+        let conflicted: i64 = self.db.query_row(
+            "SELECT COUNT(*) FROM save_queue WHERE state='conflict'",
+            [],
+            |row| row.get(0),
+        )?;
+        let stale: i64 = self.db.query_row(
+            "SELECT COUNT(*) FROM files WHERE validation_state='stale'",
+            [],
+            |row| row.get(0),
+        )?;
         Ok(json!({
             "mirror_root": self.root.to_string_lossy(),
             "known_files": known,
             "cached_files": cached,
             "dirty_files": dirty,
-            "pending_saves": pending
+            "pending_saves": pending,
+            "failed_saves": failed,
+            "conflicted_saves": conflicted,
+            "stale_files": stale
         }))
+    }
+
+    fn record_validation(
+        &self,
+        relative_path: &str,
+        validation_state: &str,
+        remote_hash: Option<&str>,
+        error: Option<&str>,
+    ) -> Result<()> {
+        self.db.execute(
+            "
+            UPDATE files SET
+              remote_hash=COALESCE(?2, remote_hash),
+              validation_state=?3,
+              validated_at_ms=?4,
+              last_error=?5,
+              updated_at_ms=?4
+            WHERE relative_path=?1
+            ",
+            params![
+                relative_path,
+                remote_hash,
+                validation_state,
+                now_ms(),
+                error
+            ],
+        )?;
+        Ok(())
     }
 }
 
@@ -433,12 +720,14 @@ impl Sidecar {
         if !matches!(hello, Response::Hello { .. }) {
             bail!("unexpected hello response from agent: {hello:?}");
         }
-        Ok(Self {
+        let mut sidecar = Self {
             agent,
             mirror,
             remote_root,
             workspace_key,
-        })
+        };
+        let _ = sidecar.replay_queued_saves();
+        Ok(sidecar)
     }
 
     fn handle(&mut self, method: &str, params: Value) -> Result<Value> {
@@ -457,6 +746,8 @@ impl Sidecar {
             "prefetch" => self.prefetch(params),
             "grep" => self.grep(params),
             "flush" => self.flush(params),
+            "flush_queue" => self.flush_queue(),
+            "validate" => self.validate(params),
             "shutdown" | "disconnect" => {
                 self.agent.shutdown();
                 Ok(json!({"shutdown": true}))
@@ -490,13 +781,20 @@ impl Sidecar {
             .unwrap_or(false);
         if !force {
             if let Some(entry) = self.mirror.get(path)? {
-                if entry.state == "hydrated" && entry.local_path.exists() && !entry.dirty {
+                if entry.state == "hydrated"
+                    && entry.local_path.exists()
+                    && !entry.dirty
+                    && entry.validation_state != "stale"
+                {
                     return Ok(json!({
                         "path": entry.relative_path,
                         "local_path": entry.local_path.to_string_lossy(),
                         "hash": entry.remote_hash,
                         "local_hash": entry.local_hash,
                         "size": entry.size,
+                        "validation_state": entry.validation_state,
+                        "validated_at_ms": entry.validated_at_ms,
+                        "last_error": entry.last_error,
                         "cached": true
                     }));
                 }
@@ -508,6 +806,8 @@ impl Sidecar {
             "local_path": hydrated.local_path.to_string_lossy(),
             "hash": hydrated.remote_hash,
             "size": hydrated.size,
+            "validation_state": hydrated.validation_state,
+            "validated_at_ms": hydrated.validated_at_ms,
             "cached": false
         }))
     }
@@ -561,46 +861,192 @@ impl Sidecar {
             )
         })?;
         let local_hash = hash_bytes(&content);
-        self.mirror
-            .mark_dirty(path, &local_hash, entry.remote_hash.as_deref())?;
+        let queued =
+            self.mirror
+                .enqueue_save(path, &local_hash, entry.remote_hash.as_deref(), &content)?;
+        Self::save_attempt_to_json(self.apply_save_entry(queued)?)
+    }
 
-        let response = self.agent.request(Request::WriteFileCas {
-            path: path.to_string(),
-            expected_hash: entry.remote_hash.clone(),
+    fn flush_queue(&mut self) -> Result<Value> {
+        let attempts = self.replay_queued_saves()?;
+        Ok(json!({ "attempts": attempts }))
+    }
+
+    fn replay_queued_saves(&mut self) -> Result<Vec<Value>> {
+        let entries = self.mirror.pending_save_entries()?;
+        let mut attempts = Vec::new();
+        for entry in entries {
+            attempts.push(Self::save_attempt_to_json(self.apply_save_entry(entry)?)?);
+        }
+        Ok(attempts)
+    }
+
+    fn apply_save_entry(&mut self, entry: SaveQueueEntry) -> Result<SaveAttempt> {
+        let content = match fs::read(&entry.snapshot_path) {
+            Ok(content) => content,
+            Err(error) => {
+                let reason = format!(
+                    "failed to read queued save snapshot {}: {error}",
+                    entry.snapshot_path.display()
+                );
+                self.mirror
+                    .mark_save_failed(entry.id, &entry.relative_path, &reason)?;
+                return Ok(SaveAttempt::Queued {
+                    path: entry.relative_path,
+                    reason,
+                });
+            }
+        };
+        let actual_local_hash = hash_bytes(&content);
+        if actual_local_hash != entry.local_hash {
+            let reason = format!(
+                "queued save snapshot hash mismatch: expected={} actual={actual_local_hash}",
+                entry.local_hash
+            );
+            self.mirror
+                .mark_save_failed(entry.id, &entry.relative_path, &reason)?;
+            return Ok(SaveAttempt::Queued {
+                path: entry.relative_path,
+                reason,
+            });
+        }
+        if content.len() > MAX_SAVE_PAYLOAD_BYTES {
+            let reason = format!(
+                "queued save is {} bytes; current whole-file CAS payload limit is {} bytes",
+                content.len(),
+                MAX_SAVE_PAYLOAD_BYTES
+            );
+            self.mirror
+                .mark_save_failed(entry.id, &entry.relative_path, &reason)?;
+            return Ok(SaveAttempt::Queued {
+                path: entry.relative_path,
+                reason,
+            });
+        }
+
+        let response = match self.agent.request(Request::WriteFileCas {
+            path: entry.relative_path.clone(),
+            expected_hash: entry.expected_hash.clone(),
             content,
-        })?;
+        }) {
+            Ok(response) => response,
+            Err(error) => {
+                let reason = format!("remote save attempt failed: {error}");
+                self.mirror
+                    .mark_save_failed(entry.id, &entry.relative_path, &reason)?;
+                return Ok(SaveAttempt::Queued {
+                    path: entry.relative_path,
+                    reason,
+                });
+            }
+        };
+
         match response {
             Response::WriteFileCas {
                 outcome: SaveOutcome::Applied(applied),
             } => {
-                self.mirror.mark_clean_after_save(
+                self.mirror.mark_save_applied(
+                    entry.id,
                     &applied.path,
                     &applied.new_hash,
                     applied.size,
                     applied.mtime_ms,
                 )?;
-                Ok(json!({
-                    "status": "applied",
-                    "path": applied.path,
-                    "hash": applied.new_hash,
-                    "size": applied.size
-                }))
+                Ok(SaveAttempt::Applied {
+                    path: applied.path,
+                    hash: applied.new_hash,
+                    size: applied.size,
+                })
             }
             Response::WriteFileCas {
                 outcome: SaveOutcome::Conflict(conflict),
             } => {
-                let conflict_path = self
-                    .mirror
-                    .record_conflict(&conflict.path, &conflict.remote_content)?;
-                Ok(json!({
-                    "status": "conflict",
-                    "path": conflict.path,
-                    "expected_hash": conflict.expected_hash,
-                    "actual_hash": conflict.actual_hash,
-                    "remote_path": conflict_path.to_string_lossy()
-                }))
+                let message = "remote content changed before queued save was applied";
+                let conflict_path = self.mirror.record_save_conflict(
+                    entry.id,
+                    &conflict.path,
+                    &conflict.remote_content,
+                    message,
+                )?;
+                Ok(SaveAttempt::Conflict {
+                    path: conflict.path,
+                    expected_hash: conflict.expected_hash,
+                    actual_hash: conflict.actual_hash,
+                    remote_path: conflict_path,
+                })
             }
             other => bail!("unexpected flush response: {other:?}"),
+        }
+    }
+
+    fn save_attempt_to_json(attempt: SaveAttempt) -> Result<Value> {
+        Ok(match attempt {
+            SaveAttempt::Applied { path, hash, size } => json!({
+                "status": "applied",
+                "path": path,
+                "hash": hash,
+                "size": size
+            }),
+            SaveAttempt::Conflict {
+                path,
+                expected_hash,
+                actual_hash,
+                remote_path,
+            } => json!({
+                "status": "conflict",
+                "path": path,
+                "expected_hash": expected_hash,
+                "actual_hash": actual_hash,
+                "remote_path": remote_path.to_string_lossy()
+            }),
+            SaveAttempt::Queued { path, reason } => json!({
+                "status": "queued",
+                "path": path,
+                "reason": reason
+            }),
+        })
+    }
+
+    fn validate(&mut self, params: Value) -> Result<Value> {
+        let path = required_string(&params, "path")?;
+        let entry = self
+            .mirror
+            .get(path)?
+            .ok_or_else(|| anyhow!("{path} is not known in the mirror"))?;
+        let response = self.agent.request(Request::Checksum {
+            path: entry.relative_path.clone(),
+        })?;
+        match response {
+            Response::Checksum { hash, .. } => {
+                let state = if hash == entry.remote_hash {
+                    "valid"
+                } else {
+                    "stale"
+                };
+                let error = if state == "stale" {
+                    Some("remote hash differs from local mirror metadata")
+                } else {
+                    None
+                };
+                let recorded_remote_hash = if state == "valid" {
+                    hash.as_deref()
+                } else {
+                    None
+                };
+                self.mirror.record_validation(
+                    &entry.relative_path,
+                    state,
+                    recorded_remote_hash,
+                    error,
+                )?;
+                Ok(json!({
+                    "path": entry.relative_path,
+                    "status": state,
+                    "remote_hash": hash,
+                    "local_hash": entry.local_hash
+                }))
+            }
+            other => bail!("unexpected checksum response: {other:?}"),
         }
     }
 
@@ -961,6 +1407,79 @@ mod tests {
         assert_eq!(entry.relative_path, "src/main.rs");
         assert_eq!(entry.remote_hash.as_deref(), Some("abc"));
         assert_eq!(entry.state, "hydrated");
+        assert_eq!(entry.validation_state, "valid");
+    }
+
+    #[test]
+    fn queued_saves_keep_exact_snapshots_and_chain_expected_hashes() {
+        let dir = tempdir().unwrap();
+        let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
+        let meta = FileMeta {
+            path: "src/main.rs".to_string(),
+            size: 3,
+            mtime_ms: 10,
+            mode: 0,
+            is_dir: false,
+            is_symlink: false,
+            hash: Some("base".to_string()),
+        };
+        mirror.record_hydrated(&meta, "base", "base").unwrap();
+
+        let first_content = b"one";
+        let first_hash = hash_bytes(first_content);
+        let first = mirror
+            .enqueue_save("src/main.rs", &first_hash, Some("base"), first_content)
+            .unwrap();
+        let second_content = b"two";
+        let second_hash = hash_bytes(second_content);
+        let second = mirror
+            .enqueue_save("src/main.rs", &second_hash, Some("base"), second_content)
+            .unwrap();
+
+        assert_eq!(first.expected_hash.as_deref(), Some("base"));
+        assert_eq!(second.expected_hash.as_deref(), Some(first_hash.as_str()));
+        assert_eq!(fs::read(&first.snapshot_path).unwrap(), first_content);
+        assert_eq!(fs::read(&second.snapshot_path).unwrap(), second_content);
+
+        mirror
+            .mark_save_applied(first.id, "src/main.rs", &first_hash, 3, 20)
+            .unwrap();
+        let entry = mirror.get("src/main.rs").unwrap().unwrap();
+        assert!(entry.dirty);
+        assert_eq!(entry.remote_hash.as_deref(), Some(first_hash.as_str()));
+        assert_eq!(entry.local_hash.as_deref(), Some(second_hash.as_str()));
+
+        mirror
+            .mark_save_applied(second.id, "src/main.rs", &second_hash, 3, 30)
+            .unwrap();
+        let entry = mirror.get("src/main.rs").unwrap().unwrap();
+        assert!(!entry.dirty);
+        assert_eq!(entry.remote_hash.as_deref(), Some(second_hash.as_str()));
+        assert_eq!(entry.local_hash.as_deref(), Some(second_hash.as_str()));
+    }
+
+    #[test]
+    fn validation_can_mark_cached_file_stale() {
+        let dir = tempdir().unwrap();
+        let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
+        let meta = FileMeta {
+            path: "a.txt".to_string(),
+            size: 3,
+            mtime_ms: 10,
+            mode: 0,
+            is_dir: false,
+            is_symlink: false,
+            hash: Some("local".to_string()),
+        };
+        mirror.record_hydrated(&meta, "local", "local").unwrap();
+        mirror
+            .record_validation("a.txt", "stale", None, Some("remote hash differs"))
+            .unwrap();
+
+        let entry = mirror.get("a.txt").unwrap().unwrap();
+        assert_eq!(entry.validation_state, "stale");
+        assert_eq!(entry.remote_hash.as_deref(), Some("local"));
+        assert_eq!(entry.last_error.as_deref(), Some("remote hash differs"));
     }
 
     #[test]

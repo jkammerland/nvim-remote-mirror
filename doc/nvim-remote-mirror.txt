@@ -33,6 +33,13 @@ COMMANDS                                      *nvim-remote-mirror-commands*
     Flush the current remote buffer to the remote workspace using checksum
     compare-and-swap.
 
+:RemoteFlushQueue
+    Retry queued or previously failed remote saves.
+
+:RemoteValidate [path]
+    Validate the current remote buffer or a workspace-relative path against the
+    remote checksum.
+
 :RemoteStatus
     Show known, cached, dirty, and pending mirror counts.
 

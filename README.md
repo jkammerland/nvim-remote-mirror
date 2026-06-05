@@ -24,7 +24,7 @@ This first implementation covers:
 - remote scan.
 - lazy file open/hydration into a local mirror.
 - remote grep with streamed-style result payloads.
-- checksum-aware flush/save with conflict detection.
+- durable local save snapshots with checksum-aware flush/retry and conflict detection.
 - basic Neovim commands.
 - basic LSP stdio proxying with local/remote path translation.
 
@@ -51,6 +51,7 @@ Then connect to a local workspace:
 :RemoteConnect /path/to/workspace
 :RemoteOpen README.md
 :RemoteGrep main
+:RemoteStatus
 ```
 
 Or connect through SSH:
@@ -94,6 +95,17 @@ end, 500)
 
 The proxy rewrites JSON LSP `file://` URI and absolute path prefixes between
 the local mirror and the remote workspace.
+
+## Save Recovery
+
+Writes are preserved locally before any remote upload attempt. `:RemoteFlush`
+creates a content-addressed snapshot in the workspace state directory, then
+tries a remote compare-and-swap write. If the upload fails, `:RemoteStatus`
+shows the queued or failed save and `:RemoteFlushQueue` retries it.
+
+Use `:RemoteValidate [path]` to compare cached mirror metadata with the remote
+hash. Stale cached files are marked in the mirror and rehydrated on the next
+open instead of being treated as silently valid.
 
 ## Protocol Notes
 

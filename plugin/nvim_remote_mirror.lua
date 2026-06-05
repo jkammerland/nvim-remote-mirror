@@ -48,6 +48,18 @@ vim.api.nvim_create_user_command("RemoteFlush", function()
   nrm.flush_buffer(0)
 end, {})
 
+vim.api.nvim_create_user_command("RemoteFlushQueue", function()
+  nrm.flush_queue()
+end, {})
+
+vim.api.nvim_create_user_command("RemoteValidate", function(opts)
+  local path = opts.args ~= "" and opts.args or nil
+  nrm.validate(path)
+end, {
+  nargs = "?",
+  complete = "file",
+})
+
 vim.api.nvim_create_user_command("RemoteStatus", function()
   nrm.status()
 end, {})
