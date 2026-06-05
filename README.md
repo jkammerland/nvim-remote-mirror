@@ -113,8 +113,11 @@ stalled sidecar replies clear their callback state instead of hanging forever.
 When a Neovim-side timeout fires, the plugin sends a best-effort sidecar
 cancel request so remote work that has not started yet is dropped from the
 queue and no longer blocks cached reads for the same path. If the matching
-request is active background work, the sidecar preempts the serial SSH/agent
-worker; active explicit opens and saves are not interrupted.
+request is active read-only work, such as `open`, `grep`, `validate`,
+background scan, refresh, or prefetch, the sidecar preempts the serial
+SSH/agent worker. Newer interactive remote requests can also supersede active
+read-only/background work; `preempted` results are expected no-op responses.
+Active save/flush work is not interrupted.
 
 By default the plugin expects these binaries:
 
@@ -295,13 +298,15 @@ Current transport state:
   normal request timeout. Deferred sidecar work uses separate interactive and
   background queues so explicit opens/saves are not rejected by, or drained
   behind, queued prefetch, scan, or refresh work. Active background maintenance
-  requests can be preempted by interactive work by restarting the serial
-  SSH/agent worker; save and explicit interactive requests are not preempted.
+  requests and read-only remote work can be preempted by newer interactive work
+  or explicit cancellation by restarting the serial SSH/agent worker;
+  `preempted` responses are normal no-op client results, and save/flush
+  requests are not preempted once started.
   Agent and LSP launches share a transport command planner, keeping SSH stdio as
   a replaceable implementation detail behind the sidecar-agent frame boundary.
   Timed-out Neovim requests send a best-effort sidecar cancellation for queued
   remote work, clearing pending path hazards before that work reaches SSH, and
-  can preempt matching active background work. Active explicit opens/saves still
-  run to completion once started.
-- pending: active in-flight cancellation for interactive/save requests, true
+  can preempt matching active read-only/background work. Active save/flush work
+  still runs to completion once started.
+- pending: active in-flight cancellation for save/flush requests, true
   multiplexing, streaming results, and transport-level flow control.

@@ -161,6 +161,11 @@ enum SaveAttempt {
     },
 }
 
+enum HydrateOutcome {
+    Hydrated(MirrorEntry),
+    Preempted,
+}
+
 #[derive(Debug, Clone)]
 struct ProcessLaunchPlan {
     program: String,
@@ -2458,7 +2463,6 @@ struct StartedRemoteWork {
 struct ActiveRemoteWork {
     id: u64,
     method: String,
-    priority: RemotePriority,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -2510,7 +2514,6 @@ impl ActiveRemote {
             *current = Some(ActiveRemoteWork {
                 id: work.request.id,
                 method: work.request.method.clone(),
-                priority: work.priority,
             });
         }
     }
@@ -2523,6 +2526,21 @@ impl ActiveRemote {
         }
     }
 
+    fn cancel_if_active(&self, request_id: u64, preempt: &AgentPreempt) -> Option<ActiveCancel> {
+        self.current.lock().ok().and_then(|current| {
+            let active = current
+                .as_ref()
+                .filter(|work| work.id == request_id)?
+                .clone();
+            let canceled = active_request_is_preemptible(&active);
+            if canceled {
+                preempt.request_preemption();
+            }
+            Some(ActiveCancel { active, canceled })
+        })
+    }
+
+    #[cfg(test)]
     fn get(&self, request_id: u64) -> Option<ActiveRemoteWork> {
         self.current.lock().ok().and_then(|current| {
             current
@@ -2531,6 +2549,11 @@ impl ActiveRemote {
                 .cloned()
         })
     }
+}
+
+struct ActiveCancel {
+    active: ActiveRemoteWork,
+    canceled: bool,
 }
 
 impl RemoteQueue {
@@ -3072,18 +3095,18 @@ impl Sidecar {
             })),
             "status" => self.status(),
             "find_paths" => self.mirror.find_paths(&params),
-            "remote_probe" => Ok(self.remote_probe()),
+            "remote_probe" => Ok(self.remote_probe(preempt_epoch)),
             "scan" => self.scan(params, preempt_epoch),
-            "open" => self.open(params),
+            "open" => self.open(params, preempt_epoch),
             "prefetch" => self.prefetch(params, preempt_epoch),
             "prefetch_known" => self.prefetch_known(params, preempt_epoch),
             "prefetch_related" => self.prefetch_related(params, preempt_epoch),
-            "grep" => self.grep(params),
+            "grep" => self.grep(params, preempt_epoch),
             "grep_cache" => self.mirror.grep_cache(&params),
             "flush" => self.flush(params),
             "flush_queued" => self.flush_queued(params),
             "flush_queue" => self.flush_queue(params),
-            "validate" => self.validate(params),
+            "validate" => self.validate(params, preempt_epoch),
             "refresh" => self.refresh(params, preempt_epoch),
             "shutdown" | "disconnect" => {
                 self.agent.shutdown();
@@ -3103,7 +3126,7 @@ impl Sidecar {
         }
     }
 
-    fn remote_probe(&mut self) -> Value {
+    fn remote_probe(&mut self, preempt_epoch: u64) -> Value {
         if self.agent.handshake_complete() {
             return json!({
                 "remote_status": "connected",
@@ -3121,15 +3144,18 @@ impl Sidecar {
             });
         }
 
-        match self.agent.request(Request::Hello {
-            client_version: env!("CARGO_PKG_VERSION").to_string(),
-            protocol_version: PROTOCOL_VERSION,
-        }) {
-            Ok(Response::Hello {
+        match self.agent.request_maybe_preemptible_since(
+            Request::Hello {
+                client_version: env!("CARGO_PKG_VERSION").to_string(),
+                protocol_version: PROTOCOL_VERSION,
+            },
+            preempt_epoch,
+        ) {
+            Ok(AgentRequestOutcome::Response(Response::Hello {
                 agent_version,
                 protocol_version,
                 capabilities,
-            }) => json!({
+            })) => json!({
                 "remote_status": "connected",
                 "remote_checked": true,
                 "remote_available": true,
@@ -3137,11 +3163,17 @@ impl Sidecar {
                 "protocol_version": protocol_version,
                 "capabilities": capabilities
             }),
-            Ok(other) => json!({
+            Ok(AgentRequestOutcome::Response(other)) => json!({
                 "remote_status": "unavailable",
                 "remote_checked": true,
                 "remote_available": false,
                 "remote_error": format!("unexpected hello response from agent: {other:?}")
+            }),
+            Ok(AgentRequestOutcome::Preempted) => json!({
+                "remote_status": "unchecked",
+                "remote_checked": false,
+                "remote_available": false,
+                "preempted": true
             }),
             Err(error) => json!({
                 "remote_status": "unavailable",
@@ -3195,7 +3227,7 @@ impl Sidecar {
         }
     }
 
-    fn open(&mut self, params: Value) -> Result<Value> {
+    fn open(&mut self, params: Value, preempt_epoch: u64) -> Result<Value> {
         let path = required_string(&params, "path")?;
         let force = params
             .get("force")
@@ -3238,7 +3270,15 @@ impl Sidecar {
                 }
             }
         }
-        let hydrated = self.hydrate(path)?;
+        let hydrated = match self.hydrate(path, Some(preempt_epoch))? {
+            HydrateOutcome::Hydrated(hydrated) => hydrated,
+            HydrateOutcome::Preempted => {
+                return Ok(json!({
+                    "path": path,
+                    "preempted": true
+                }));
+            }
+        };
         Ok(json!({
             "path": hydrated.relative_path,
             "local_path": hydrated.local_path.to_string_lossy(),
@@ -3479,7 +3519,7 @@ impl Sidecar {
         Ok(())
     }
 
-    fn grep(&mut self, params: Value) -> Result<Value> {
+    fn grep(&mut self, params: Value, preempt_epoch: u64) -> Result<Value> {
         let query = required_string(&params, "query")?;
         let limit = params.get("limit").and_then(Value::as_u64).unwrap_or(200) as usize;
         let hydrate = params
@@ -3494,10 +3534,25 @@ impl Sidecar {
             .get("max_total_bytes")
             .and_then(Value::as_u64)
             .unwrap_or(DEFAULT_BATCH_MAX_TOTAL_BYTES);
-        let response = self.agent.request(Request::Grep {
-            query: query.to_string(),
-            limit,
-        })?;
+        let response = match self.agent.request_maybe_preemptible_since(
+            Request::Grep {
+                query: query.to_string(),
+                limit,
+            },
+            preempt_epoch,
+        )? {
+            AgentRequestOutcome::Response(response) => response,
+            AgentRequestOutcome::Preempted => {
+                return Ok(json!({
+                    "hits": [],
+                    "truncated": true,
+                    "preempted": true,
+                    "hydrated": 0,
+                    "hydrate_errors": [],
+                    "hydrate_truncated": false
+                }));
+            }
+        };
         match response {
             Response::Grep { hits, truncated } => {
                 let mut hydrated = 0;
@@ -3505,11 +3560,25 @@ impl Sidecar {
                 let mut hydrate_truncated = false;
                 if hydrate {
                     let paths = self.grep_hydration_paths(&hits)?;
-                    let result =
-                        self.batch_hydrate(paths, max_file_bytes, max_total_bytes, None)?;
+                    let result = self.batch_hydrate(
+                        paths,
+                        max_file_bytes,
+                        max_total_bytes,
+                        Some(preempt_epoch),
+                    )?;
                     hydrated = result.0;
                     hydrate_errors = result.1;
                     hydrate_truncated = result.2;
+                    if result.3 {
+                        return Ok(json!({
+                            "hits": [],
+                            "truncated": true,
+                            "preempted": true,
+                            "hydrated": hydrated,
+                            "hydrate_errors": hydrate_errors,
+                            "hydrate_truncated": hydrate_truncated
+                        }));
+                    }
                 }
                 let hits = self.grep_hits_with_local_paths(hits)?;
                 Ok(json!({
@@ -3868,7 +3937,7 @@ impl Sidecar {
         })
     }
 
-    fn validate(&mut self, params: Value) -> Result<Value> {
+    fn validate(&mut self, params: Value, preempt_epoch: u64) -> Result<Value> {
         let path = required_string(&params, "path")?;
         let mut entry = self
             .mirror
@@ -3889,9 +3958,20 @@ impl Sidecar {
                 "skipped": true
             }));
         }
-        let response = self.agent.request(Request::Checksum {
-            path: entry.relative_path.clone(),
-        })?;
+        let response = match self.agent.request_maybe_preemptible_since(
+            Request::Checksum {
+                path: entry.relative_path.clone(),
+            },
+            preempt_epoch,
+        )? {
+            AgentRequestOutcome::Response(response) => response,
+            AgentRequestOutcome::Preempted => {
+                return Ok(json!({
+                    "path": entry.relative_path,
+                    "preempted": true
+                }));
+            }
+        };
         match response {
             Response::Checksum { hash, .. } => {
                 let state = if hash == entry.remote_hash {
@@ -4062,22 +4142,33 @@ impl Sidecar {
         Ok(state)
     }
 
-    fn hydrate(&mut self, path: &str) -> Result<MirrorEntry> {
+    fn hydrate(&mut self, path: &str, preempt_epoch: Option<u64>) -> Result<HydrateOutcome> {
         let local_path = self.mirror.local_path(path)?;
         if let Some(parent) = local_path.parent() {
             fs::create_dir_all(parent)?;
         }
         let part_path = local_path.with_extension("nrm-part");
-        let hydrated = (|| -> Result<(FileMeta, String, String)> {
+        let hydrated = (|| -> Result<Option<(FileMeta, String, String)>> {
             let mut part = File::create(&part_path)?;
             let mut offset = 0_u64;
 
             let (meta, remote_hash) = loop {
-                let response = self.agent.request(Request::ReadFile {
+                let request = Request::ReadFile {
                     path: path.to_string(),
                     offset,
                     len: Some(DEFAULT_CHUNK_SIZE),
-                })?;
+                };
+                let response = if let Some(preempt_epoch) = preempt_epoch {
+                    match self
+                        .agent
+                        .request_maybe_preemptible_since(request, preempt_epoch)?
+                    {
+                        AgentRequestOutcome::Response(response) => response,
+                        AgentRequestOutcome::Preempted => return Ok(None),
+                    }
+                } else {
+                    self.agent.request(request)?
+                };
                 match response {
                     Response::ReadFile {
                         eof,
@@ -4107,14 +4198,17 @@ impl Sidecar {
                     "local hydration hash mismatch for {path}: local={local_hash} remote={remote_hash}"
                 );
             }
-            Ok((meta, remote_hash, local_hash))
+            Ok(Some((meta, remote_hash, local_hash)))
         })();
-        let (meta, remote_hash, local_hash) = match hydrated {
+        let Some((meta, remote_hash, local_hash)) = (match hydrated {
             Ok(hydrated) => hydrated,
             Err(error) => {
                 let _ = fs::remove_file(&part_path);
                 return Err(error);
             }
+        }) else {
+            let _ = fs::remove_file(&part_path);
+            return Ok(HydrateOutcome::Preempted);
         };
         fs::rename(&part_path, &local_path)?;
         self.mirror
@@ -4128,7 +4222,7 @@ impl Sidecar {
             .unwrap_or(meta.size);
         self.mirror
             .rebuild_search_index_from_local_file(&hydrated, &local_hash, file_len)?;
-        Ok(hydrated)
+        Ok(HydrateOutcome::Hydrated(hydrated))
     }
 }
 
@@ -4483,9 +4577,9 @@ fn cancel_active_request(
     preempt: &AgentPreempt,
     request_id: u64,
 ) -> Option<Value> {
-    let active = active_remote.get(request_id)?;
-    if active.priority == RemotePriority::Background {
-        preempt.request_preemption();
+    let active_cancel = active_remote.cancel_if_active(request_id, preempt)?;
+    let active = active_cancel.active;
+    if active_cancel.canceled {
         return Some(json!({
             "request_id": request_id,
             "canceled": true,
@@ -4498,8 +4592,23 @@ fn cancel_active_request(
         "canceled": false,
         "scope": "active",
         "method": active.method,
-        "reason": "active interactive work is not interrupted"
+        "reason": "active request is not cancellation-preemptible"
     }))
+}
+
+fn active_request_is_preemptible(active: &ActiveRemoteWork) -> bool {
+    matches!(
+        active.method.as_str(),
+        "open"
+            | "grep"
+            | "validate"
+            | "scan"
+            | "prefetch"
+            | "prefetch_known"
+            | "prefetch_related"
+            | "refresh"
+            | "remote_probe"
+    )
 }
 
 fn canceled_client_response(work: RemoteWork) -> ClientResponse {
@@ -4581,6 +4690,12 @@ fn preempted_result(request: &ClientRequest) -> Value {
             "deleted": 0,
             "skipped": 0,
             "errors": [],
+            "preempted": true
+        }),
+        "remote_probe" => json!({
+            "remote_status": "unchecked",
+            "remote_checked": false,
+            "remote_available": false,
             "preempted": true
         }),
         _ => json!({"preempted": true}),
@@ -5055,7 +5170,7 @@ mod tests {
         assert_eq!(hello["remote_available"], false);
 
         let opened = sidecar
-            .open(json!({"path": "src/main.rs", "force": false}))
+            .open(json!({"path": "src/main.rs", "force": false}), 0)
             .unwrap();
         assert_eq!(opened["cached"], true);
         assert_eq!(
@@ -5063,12 +5178,12 @@ mod tests {
             local_path.to_string_lossy()
         );
 
-        let probe = sidecar.remote_probe();
+        let probe = sidecar.remote_probe(0);
         assert_eq!(probe["remote_status"], "unavailable");
         assert_eq!(probe["remote_checked"], true);
         assert_eq!(probe["remote_available"], false);
         assert!(probe["retry_after_ms"].as_u64().unwrap() > 0);
-        let probe = sidecar.remote_probe();
+        let probe = sidecar.remote_probe(0);
         assert_eq!(probe["remote_status"], "unavailable");
         assert!(probe["retry_after_ms"].as_u64().unwrap() > 0);
 
@@ -5449,7 +5564,7 @@ mod tests {
 
         let mut sidecar = test_sidecar(mirror);
         let result = sidecar
-            .open(json!({"path": "a.txt", "force": true}))
+            .open(json!({"path": "a.txt", "force": true}), 0)
             .unwrap();
 
         assert_eq!(result["cached"], true);
@@ -5470,7 +5585,7 @@ mod tests {
         fs::write(&local_path, b"local edit").unwrap();
 
         let mut sidecar = test_sidecar(mirror);
-        let result = sidecar.open(json!({"path": "a.txt"})).unwrap();
+        let result = sidecar.open(json!({"path": "a.txt"}), 0).unwrap();
         let entry = sidecar.mirror.get("a.txt").unwrap().unwrap();
         let queued = sidecar.mirror.pending_save_entries(Some(1)).unwrap();
 
@@ -5503,7 +5618,7 @@ mod tests {
 
         let mut sidecar = test_sidecar(mirror);
         let result = sidecar
-            .open(json!({"path": "a.txt", "force": true}))
+            .open(json!({"path": "a.txt", "force": true}), 0)
             .unwrap();
 
         assert_eq!(result["cached"], true);
@@ -5525,7 +5640,7 @@ mod tests {
             .unwrap();
 
         let mut sidecar = test_sidecar(mirror);
-        let result = sidecar.open(json!({"path": "a.txt"})).unwrap();
+        let result = sidecar.open(json!({"path": "a.txt"}), 0).unwrap();
 
         assert_eq!(result["cached"], true);
         assert_eq!(result["dirty"], false);
@@ -5549,7 +5664,7 @@ mod tests {
             .unwrap();
 
         let mut sidecar = test_sidecar(mirror);
-        let result = sidecar.open(json!({"path": "a.txt"})).unwrap();
+        let result = sidecar.open(json!({"path": "a.txt"}), 0).unwrap();
 
         assert_eq!(result["cached"], true);
         assert_eq!(result["dirty"], false);
@@ -5571,7 +5686,7 @@ mod tests {
             .unwrap();
 
         let mut sidecar = test_sidecar(mirror);
-        let result = sidecar.validate(json!({"path": "a.txt"})).unwrap();
+        let result = sidecar.validate(json!({"path": "a.txt"}), 0).unwrap();
 
         assert_eq!(result["status"], "dirty");
         assert_eq!(result["skipped"], true);
@@ -5588,7 +5703,7 @@ mod tests {
         fs::write(&local_path, b"local edit").unwrap();
 
         let mut sidecar = test_sidecar(mirror);
-        let result = sidecar.validate(json!({"path": "a.txt"})).unwrap();
+        let result = sidecar.validate(json!({"path": "a.txt"}), 0).unwrap();
         let entry = sidecar.mirror.get("a.txt").unwrap().unwrap();
 
         assert_eq!(result["status"], "dirty");
@@ -6259,7 +6374,7 @@ mod tests {
     }
 
     #[test]
-    fn cancel_active_interactive_request_reports_not_interrupted() {
+    fn cancel_active_open_request_requests_preemption() {
         let active = ActiveRemote::default();
         let preempt = AgentPreempt::default();
         let work = test_remote_work(10, "open");
@@ -6268,14 +6383,45 @@ mod tests {
         let result = cancel_active_request(&active, &preempt, 10).unwrap();
 
         assert_eq!(result["request_id"], 10);
-        assert_eq!(result["canceled"], false);
+        assert_eq!(result["canceled"], true);
         assert_eq!(result["scope"], "active");
         assert_eq!(result["method"], "open");
+        assert_eq!(preempt.epoch(), 1);
+    }
+
+    #[test]
+    fn cancel_active_save_request_reports_not_interrupted() {
+        let active = ActiveRemote::default();
+        let preempt = AgentPreempt::default();
+        let work = test_remote_work(11, "flush");
+        active.set(&work);
+
+        let result = cancel_active_request(&active, &preempt, 11).unwrap();
+
+        assert_eq!(result["request_id"], 11);
+        assert_eq!(result["canceled"], false);
+        assert_eq!(result["scope"], "active");
+        assert_eq!(result["method"], "flush");
         assert_eq!(
             result["reason"],
-            "active interactive work is not interrupted"
+            "active request is not cancellation-preemptible"
         );
         assert_eq!(preempt.epoch(), 0);
+    }
+
+    #[test]
+    fn cancel_stale_active_request_does_not_preempt_current_work() {
+        let active = ActiveRemote::default();
+        let preempt = AgentPreempt::default();
+        active.set(&test_remote_work(12, "open"));
+        active.clear(12);
+        active.set(&test_remote_work(13, "grep"));
+
+        let result = cancel_active_request(&active, &preempt, 12);
+
+        assert!(result.is_none());
+        assert_eq!(preempt.epoch(), 0);
+        assert_eq!(active.get(13).unwrap().id, 13);
     }
 
     #[test]
@@ -6595,6 +6741,104 @@ mod tests {
         assert!(stdout.contains("ARG1=<serve>"));
         assert!(stdout.contains("ARG2=<--root>"));
         assert!(stdout.contains(&format!("ARG3=<{}>", remote_root.display())));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn active_open_preemption_cleans_partial_hydration() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let remote_root = dir.path().join("remote");
+        fs::create_dir_all(&remote_root).unwrap();
+
+        let fake_agent = dir.path().join("fake-agent");
+        fs::write(&fake_agent, "#!/bin/sh\nexec sleep 60\n").unwrap();
+        let mut permissions = fs::metadata(&fake_agent).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&fake_agent, permissions).unwrap();
+
+        let interrupt = AgentInterrupt::default();
+        let mut sidecar = Sidecar::new(
+            remote_root,
+            None,
+            fake_agent.to_string_lossy().to_string(),
+            Some(dir.path().join("state")),
+            30_000,
+            1,
+            interrupt.clone(),
+        )
+        .unwrap();
+
+        let local_path = sidecar.mirror.local_path("src/main.rs").unwrap();
+        let part_path = local_path.with_extension("nrm-part");
+        let preempt = sidecar.agent.preempt_handle();
+        let preempt_epoch = sidecar.agent.preempt_epoch();
+        let handle =
+            thread::spawn(move || sidecar.open(json!({"path": "src/main.rs"}), preempt_epoch));
+
+        for _ in 0..100 {
+            if interrupt.child.lock().unwrap().is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(interrupt.child.lock().unwrap().is_some());
+
+        preempt.request_preemption();
+
+        let result = handle.join().unwrap().unwrap();
+        assert_eq!(result["preempted"], true);
+        assert_eq!(result["path"], "src/main.rs");
+        assert!(!part_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_probe_preemption_reports_noop_probe_result() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let remote_root = dir.path().join("remote");
+        fs::create_dir_all(&remote_root).unwrap();
+
+        let fake_agent = dir.path().join("fake-agent");
+        fs::write(&fake_agent, "#!/bin/sh\nexec sleep 60\n").unwrap();
+        let mut permissions = fs::metadata(&fake_agent).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&fake_agent, permissions).unwrap();
+
+        let interrupt = AgentInterrupt::default();
+        let mut sidecar = Sidecar::new(
+            remote_root,
+            None,
+            fake_agent.to_string_lossy().to_string(),
+            Some(dir.path().join("state")),
+            30_000,
+            1,
+            interrupt.clone(),
+        )
+        .unwrap();
+
+        let preempt = sidecar.agent.preempt_handle();
+        let preempt_epoch = sidecar.agent.preempt_epoch();
+        let handle = thread::spawn(move || sidecar.remote_probe(preempt_epoch));
+
+        for _ in 0..100 {
+            if interrupt.child.lock().unwrap().is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(interrupt.child.lock().unwrap().is_some());
+
+        preempt.request_preemption();
+
+        let result = handle.join().unwrap();
+        assert_eq!(result["preempted"], true);
+        assert_eq!(result["remote_status"], "unchecked");
+        assert_eq!(result["remote_checked"], false);
+        assert_eq!(result["remote_available"], false);
     }
 
     #[test]

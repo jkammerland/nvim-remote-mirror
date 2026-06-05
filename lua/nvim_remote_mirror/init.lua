@@ -460,7 +460,7 @@ local function schedule_flush_queue_on_connect(client, generation)
       return
     end
     M.request("remote_probe", {}, function(err, result)
-      if err or not result or not still_current() then
+      if err or not result or result.preempted or not still_current() then
         return
       end
       update_remote_state(client, result)
@@ -762,7 +762,7 @@ function M.remote_probe(callback)
   end
 
   M.request("remote_probe", {}, function(err, result)
-    if not err and M.client == client then
+    if not err and M.client == client and not (result and result.preempted) then
       update_remote_state(client, result)
     end
     if callback then
@@ -856,6 +856,9 @@ function setup_mirror_autohydrate(client)
           notify("failed to hydrate " .. relative_path .. ": " .. err, vim.log.levels.ERROR)
           return
         end
+        if not result or result.preempted then
+          return
+        end
         vim.schedule(function()
           if M.client ~= client or client.closing or not vim.api.nvim_buf_is_valid(bufnr) then
             return
@@ -896,7 +899,7 @@ function prefetch_related(anchor)
       notify("related prefetch failed: " .. err, vim.log.levels.WARN)
       return
     end
-    if result.preempted then
+    if not result or result.preempted then
       return
     end
     local errors = #(result.errors or {})
@@ -918,6 +921,9 @@ function M.open(path, opts)
   M.request("open", { path = path, force = opts.force == true }, function(err, result)
     if err then
       notify(err, vim.log.levels.ERROR)
+      return
+    end
+    if not result or result.preempted then
       return
     end
     vim.schedule(function()
@@ -998,7 +1004,7 @@ function M.scan(limit)
       notify(err, vim.log.levels.ERROR)
       return
     end
-    if result.preempted then
+    if not result or result.preempted then
       return
     end
     notify("indexed " .. tostring(#result.entries) .. " paths")
@@ -1155,6 +1161,9 @@ function M.grep(query)
       notify(err, vim.log.levels.ERROR)
       return
     end
+    if not result or result.preempted then
+      return
+    end
     remote_result = result
     apply_remote_result()
     local hydrate_errors = #(result.hydrate_errors or {})
@@ -1264,6 +1273,9 @@ function M.validate(path)
       notify(err, vim.log.levels.ERROR)
       return
     end
+    if not result or result.preempted then
+      return
+    end
     notify(result.path .. " is " .. result.status)
   end)
 end
@@ -1278,7 +1290,7 @@ function M.refresh(paths)
       notify(err, vim.log.levels.ERROR)
       return
     end
-    if result.preempted then
+    if result and result.preempted then
       return
     end
     notify(
@@ -1305,7 +1317,7 @@ function M.prefetch(paths)
       notify(err, vim.log.levels.ERROR)
       return
     end
-    if result.preempted then
+    if result and result.preempted then
       return
     end
     local suffix = ""
@@ -1382,6 +1394,9 @@ function M.start_lsp(command, opts)
     end
     if err then
       notify("remote probe failed before LSP start: " .. tostring(err), vim.log.levels.ERROR)
+      return
+    end
+    if result and result.preempted then
       return
     end
     if not result or result.remote_available ~= true then
