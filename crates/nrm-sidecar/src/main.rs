@@ -1667,6 +1667,32 @@ impl Mirror {
         Ok(paths)
     }
 
+    fn known_prefetch_paths(&self, limit: usize) -> Result<Vec<String>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let limit = limit.min(100_000);
+        let mut statement = self.db.prepare(
+            "
+            SELECT relative_path FROM files
+            WHERE state != 'hydrated'
+              AND dirty = 0
+              AND is_dir = 0
+              AND is_symlink = 0
+              AND metadata_kind_known = 1
+              AND validation_state != 'deleted'
+            ORDER BY validated_at_ms ASC, relative_path ASC
+            LIMIT ?1
+            ",
+        )?;
+        let rows = statement.query_map(params![limit as i64], |row| row.get::<_, String>(0))?;
+        let mut paths = Vec::new();
+        for row in rows {
+            paths.push(row?);
+        }
+        Ok(paths)
+    }
+
     fn push_related_prefetch_bucket(
         &self,
         paths: &mut Vec<String>,
@@ -1792,9 +1818,8 @@ struct RemoteQueueState {
 impl RemotePriority {
     fn for_request(request: &ClientRequest) -> Self {
         match request.method.as_str() {
-            "prefetch" | "prefetch_related" | "refresh" | "scan" | "remote_probe" => {
-                Self::Background
-            }
+            "prefetch" | "prefetch_known" | "prefetch_related" | "refresh" | "scan"
+            | "remote_probe" => Self::Background,
             "flush_queue" if request_background_flag(request) => Self::Background,
             _ => Self::Interactive,
         }
@@ -2319,6 +2344,7 @@ impl Sidecar {
             "scan" => self.scan(params, preempt_epoch),
             "open" => self.open(params),
             "prefetch" => self.prefetch(params, preempt_epoch),
+            "prefetch_known" => self.prefetch_known(params, preempt_epoch),
             "prefetch_related" => self.prefetch_related(params, preempt_epoch),
             "grep" => self.grep(params),
             "grep_cache" => self.mirror.grep_cache(&params),
@@ -2390,21 +2416,38 @@ impl Sidecar {
             .get("limit")
             .and_then(Value::as_u64)
             .unwrap_or(10_000) as usize;
-        let response = match self
-            .agent
-            .request_maybe_preemptible_since(Request::Scan { limit }, preempt_epoch)?
-        {
+        let after = optional_string_param(&params, "after")
+            .map(|value| normalize_relative_path(value))
+            .transpose()?
+            .map(|value| value.to_string_lossy().replace('\\', "/"));
+        let response = match self.agent.request_maybe_preemptible_since(
+            Request::Scan {
+                limit,
+                after: after.clone(),
+            },
+            preempt_epoch,
+        )? {
             AgentRequestOutcome::Response(response) => response,
             AgentRequestOutcome::Preempted => {
-                return Ok(json!({"entries": [], "truncated": true, "preempted": true}));
+                return Ok(json!({
+                    "entries": [],
+                    "truncated": true,
+                    "next_after": after,
+                    "preempted": true
+                }));
             }
         };
         match response {
             Response::Scan { entries, truncated } => {
+                let next_after = entries.last().map(|entry| entry.path.clone());
                 for entry in &entries {
                     self.mirror.upsert_metadata(entry, "metadata")?;
                 }
-                Ok(json!({ "entries": entries, "truncated": truncated }))
+                Ok(json!({
+                    "entries": entries,
+                    "truncated": truncated,
+                    "next_after": next_after
+                }))
             }
             other => bail!("unexpected scan response: {other:?}"),
         }
@@ -2521,6 +2564,36 @@ impl Sidecar {
         )?;
         errors.extend(batch_errors);
         Ok(json!({
+            "hydrated": hydrated,
+            "errors": errors,
+            "truncated": truncated,
+            "preempted": preempted,
+            "max_file_bytes": max_file_bytes,
+            "max_total_bytes": max_total_bytes
+        }))
+    }
+
+    fn prefetch_known(&mut self, params: Value, preempt_epoch: u64) -> Result<Value> {
+        let limit = params.get("limit").and_then(Value::as_u64).unwrap_or(16) as usize;
+        let max_file_bytes = params
+            .get("max_file_bytes")
+            .and_then(Value::as_u64)
+            .unwrap_or(DEFAULT_BATCH_MAX_FILE_BYTES);
+        let max_total_bytes = params
+            .get("max_total_bytes")
+            .and_then(Value::as_u64)
+            .unwrap_or(DEFAULT_BATCH_MAX_TOTAL_BYTES);
+        let paths = self.mirror.known_prefetch_paths(limit)?;
+        let requested = paths.len();
+        let (hydrated, errors, truncated, preempted) = self.batch_hydrate(
+            paths.clone(),
+            max_file_bytes,
+            max_total_bytes,
+            Some(preempt_epoch),
+        )?;
+        Ok(json!({
+            "requested": requested,
+            "paths": paths,
             "hydrated": hydrated,
             "errors": errors,
             "truncated": truncated,
@@ -3602,6 +3675,24 @@ fn preempted_result(request: &ClientRequest) -> Value {
                 .and_then(Value::as_u64)
                 .unwrap_or(DEFAULT_BATCH_MAX_TOTAL_BYTES)
         }),
+        "prefetch_known" => json!({
+            "requested": 0,
+            "paths": [],
+            "hydrated": 0,
+            "errors": [],
+            "truncated": true,
+            "preempted": true,
+            "max_file_bytes": request
+                .params
+                .get("max_file_bytes")
+                .and_then(Value::as_u64)
+                .unwrap_or(DEFAULT_BATCH_MAX_FILE_BYTES),
+            "max_total_bytes": request
+                .params
+                .get("max_total_bytes")
+                .and_then(Value::as_u64)
+                .unwrap_or(DEFAULT_BATCH_MAX_TOTAL_BYTES)
+        }),
         "prefetch_related" => json!({
             "anchor": request.params.get("anchor").and_then(Value::as_str).unwrap_or(""),
             "requested": 0,
@@ -3852,6 +3943,13 @@ fn required_string<'a>(params: &'a Value, key: &str) -> Result<&'a str> {
         .get(key)
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("missing required string params.{key}"))
+}
+
+fn optional_string_param<'a>(params: &'a Value, key: &str) -> Option<&'a str> {
+    params
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
 }
 
 fn normalize_relative_path(path: &str) -> Result<PathBuf> {
@@ -4621,6 +4719,35 @@ mod tests {
                 "tests/main.rs".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn known_prefetch_paths_select_clean_uncached_metadata_files() {
+        let dir = tempdir().unwrap();
+        let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
+        mirror
+            .upsert_metadata(&test_meta("src/a.rs", "a", 1), "metadata")
+            .unwrap();
+        mirror
+            .upsert_metadata(&test_meta("src/b.rs", "b", 1), "metadata")
+            .unwrap();
+        record_hydrated_content(&mirror, "src/cached.rs", b"cached");
+        mirror
+            .upsert_metadata(
+                &test_meta_kind("src/dir", "dir", 0, true, false),
+                "metadata",
+            )
+            .unwrap();
+        mirror
+            .upsert_metadata(&test_meta("src/deleted.rs", "deleted", 1), "metadata")
+            .unwrap();
+        mirror
+            .record_validation("src/deleted.rs", "deleted", None, None)
+            .unwrap();
+
+        let paths = mirror.known_prefetch_paths(10).unwrap();
+
+        assert_eq!(paths, vec!["src/a.rs".to_string(), "src/b.rs".to_string()]);
     }
 
     #[test]

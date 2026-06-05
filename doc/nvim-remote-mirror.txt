@@ -53,6 +53,13 @@ COMMANDS                                      *nvim-remote-mirror-commands*
 :RemotePrefetch {path...}
     Hydrate one or more workspace-relative files in the background request.
 
+:RemoteMirrorStart
+    Start the background mirror builder. It probes the remote, scans metadata
+    with a cursor, then hydrates a small batch of clean uncached known files.
+
+:RemoteMirrorStop
+    Stop the background mirror builder.
+
 :RemoteFlush
     Flush the current remote buffer to the remote workspace using checksum
     compare-and-swap. Large saves are uploaded in chunks. If no sidecar is
@@ -101,11 +108,19 @@ CONFIGURATION                                  *nvim-remote-mirror-config*
     flush_queue_on_connect = true,
     flush_queue_on_connect_delay_ms = 500,
     flush_queue_on_connect_limit = 1,
+    background_mirror = true,
+    background_mirror_interval_ms = 5000,
+    background_mirror_scan_limit = 256,
+    background_mirror_prefetch_limit = 4,
+    background_mirror_max_file_bytes = 128 * 1024,
+    background_mirror_max_total_bytes = 512 * 1024,
   })
 <
 
 request_timeout_ms bounds both sidecar/agent work and pending Neovim-side
 callbacks waiting for sidecar JSON replies.
+background_mirror controls the idle mirror builder; set it false and use
+:RemoteMirrorStart manually on especially fragile links.
 
 ==============================================================================
 LSP                                                *nvim-remote-mirror-lsp*

@@ -49,6 +49,14 @@ end, {
   complete = "file",
 })
 
+vim.api.nvim_create_user_command("RemoteMirrorStart", function()
+  nrm.start_background_mirror()
+end, {})
+
+vim.api.nvim_create_user_command("RemoteMirrorStop", function()
+  nrm.stop_background_mirror()
+end, {})
+
 vim.api.nvim_create_user_command("RemoteFlush", function()
   nrm.flush_buffer(0)
 end, {})

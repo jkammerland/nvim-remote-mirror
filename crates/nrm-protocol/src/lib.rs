@@ -123,6 +123,7 @@ pub enum Request {
     },
     Scan {
         limit: usize,
+        after: Option<String>,
     },
     Stat {
         path: String,
@@ -363,6 +364,22 @@ mod tests {
                 paths: vec!["a.txt".to_string(), "src/lib.rs".to_string()],
                 max_file_bytes: 1024,
                 max_total_bytes: 4096,
+            },
+        };
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &request).unwrap();
+
+        let decoded: RpcMessage = read_frame(&mut Cursor::new(bytes)).unwrap();
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn round_trips_scan_cursor_request() {
+        let request = RpcMessage::Request {
+            id: 11,
+            request: Request::Scan {
+                limit: 128,
+                after: Some("src/main.rs".to_string()),
             },
         };
         let mut bytes = Vec::new();

@@ -50,6 +50,8 @@ This first implementation covers:
 - remote scan.
 - lazy file open/hydration into a local mirror with dirty/stale cached opens.
 - batched prefetch hydration with per-file and total byte caps.
+- cursor-based background mirror scan and known-file prefetch in small
+  preemptible batches.
 - batched mirror refresh to mark cached files valid, stale, or deleted.
 - remote grep that batch-hydrates result files for local quickfix jumps.
 - local mirror rehash before cached reads or batch overwrites, with
@@ -136,6 +138,12 @@ require("nvim_remote_mirror").setup({
   flush_queue_on_connect = true,
   flush_queue_on_connect_delay_ms = 500,
   flush_queue_on_connect_limit = 1,
+  background_mirror = true,
+  background_mirror_interval_ms = 5000,
+  background_mirror_scan_limit = 256,
+  background_mirror_prefetch_limit = 4,
+  background_mirror_max_file_bytes = 128 * 1024,
+  background_mirror_max_total_bytes = 512 * 1024,
 })
 ```
 
@@ -199,6 +207,12 @@ local mirror, oldest validation first.
 than `prefetch_max_file_bytes` are skipped from the batch so explicit
 `:RemoteOpen` can hydrate them through the chunked path.
 
+When `background_mirror` is enabled, the plugin starts a conservative idle
+mirror builder after connect. Each tick probes the remote, scans the next
+metadata cursor batch, and hydrates a small set of clean uncached metadata paths
+through `prefetch_known`. Use `:RemoteMirrorStart` and `:RemoteMirrorStop` to
+control the scheduler manually on very slow links.
+
 `:RemoteOpen` prefers an existing clean or dirty local mirror file, including
 entries previously marked stale or deleted, so navigation does not block on a
 slow or unreachable remote. `:RemoteOpen!` forces a remote rehydrate for clean
@@ -232,8 +246,8 @@ mirror model.
 Current transport state:
 
 - active: request IDs, typed remote errors, request timeout, SSH connect timeout,
-  batched small-file read for prefetch, batched mirror validation, chunked
-  compare-and-swap writes, and sidecar fast-path responses for cached mirror
+  cursor-based scan, batched small-file read for prefetch, batched mirror
+  validation, chunked compare-and-swap writes, and sidecar fast-path responses for cached mirror
   opens/status while remote worker requests are in flight. Neovim-side JSON RPC
   requests also use the configured request timeout to clean up pending callbacks
   when a sidecar reply is lost. Sidecar response delivery applies backpressure

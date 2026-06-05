@@ -125,7 +125,7 @@ fn handle_request(state: &mut AgentState, request: Request) -> Result<Response> 
                 capabilities: CapabilitySet::v1_agent(),
             })
         }
-        Request::Scan { limit } => scan(&state.root, limit),
+        Request::Scan { limit, after } => scan(&state.root, limit, after.as_deref()),
         Request::Stat { path } => {
             let abs = resolve_remote_path(&state.root, &path)?;
             Ok(Response::Stat {
@@ -178,9 +178,10 @@ fn handle_request(state: &mut AgentState, request: Request) -> Result<Response> 
     }
 }
 
-fn scan(root: &Path, limit: usize) -> Result<Response> {
+fn scan(root: &Path, limit: usize, after: Option<&str>) -> Result<Response> {
     let mut entries = Vec::new();
     let mut truncated = false;
+    let mut after_seen = after.is_none();
 
     for entry in WalkBuilder::new(root)
         .hidden(false)
@@ -194,11 +195,18 @@ fn scan(root: &Path, limit: usize) -> Result<Response> {
         if path == root {
             continue;
         }
+        let meta = file_meta(root, path, false)?;
+        if !after_seen {
+            if after == Some(meta.path.as_str()) {
+                after_seen = true;
+            }
+            continue;
+        }
         if entries.len() >= limit {
             truncated = true;
             break;
         }
-        entries.push(file_meta(root, path, false)?);
+        entries.push(meta);
     }
 
     Ok(Response::Scan { entries, truncated })
@@ -789,6 +797,31 @@ mod tests {
             }
             other => panic!("unexpected response: {other:?}"),
         }
+    }
+
+    #[test]
+    fn scan_resumes_after_cursor() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.txt"), "a").unwrap();
+        fs::write(root.join("b.txt"), "b").unwrap();
+        fs::write(root.join("c.txt"), "c").unwrap();
+
+        let first = scan(root, 1, None).unwrap();
+        let Response::Scan { entries, truncated } = first else {
+            panic!("unexpected scan response");
+        };
+        assert!(truncated);
+        assert_eq!(entries.len(), 1);
+
+        let cursor = entries[0].path.clone();
+        let second = scan(root, 10, Some(&cursor)).unwrap();
+        let Response::Scan { entries, truncated } = second else {
+            panic!("unexpected scan response");
+        };
+        assert!(!truncated);
+        assert!(!entries.iter().any(|entry| entry.path == cursor));
+        assert_eq!(entries.len(), 2);
     }
 
     #[test]

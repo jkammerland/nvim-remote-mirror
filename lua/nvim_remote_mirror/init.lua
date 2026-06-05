@@ -39,6 +39,12 @@ M.config = {
   flush_queue_on_connect = true,
   flush_queue_on_connect_delay_ms = 500,
   flush_queue_on_connect_limit = 1,
+  background_mirror = true,
+  background_mirror_interval_ms = 5000,
+  background_mirror_scan_limit = 256,
+  background_mirror_prefetch_limit = 4,
+  background_mirror_max_file_bytes = 128 * 1024,
+  background_mirror_max_total_bytes = 512 * 1024,
 }
 
 M.client = nil
@@ -47,6 +53,9 @@ M.reconnect_attempts = 0
 M.reconnect_generation = 0
 M.grep_generation = 0
 M.deferred_flushes = {}
+M.background_mirror_running = false
+M.background_mirror_generation = 0
+M.background_scan_after = nil
 
 local function notify(message, level)
   vim.schedule(function()
@@ -401,6 +410,96 @@ local function schedule_flush_queue_on_connect(client, generation)
   vim.defer_fn(probe_then_replay, delay)
 end
 
+local function background_interval()
+  return math.max(tonumber(M.config.background_mirror_interval_ms) or 0, 0)
+end
+
+local function schedule_background_mirror(delay, generation)
+  vim.defer_fn(function()
+    if not M.background_mirror_running or generation ~= M.background_mirror_generation then
+      return
+    end
+    if not M.client or not M.client.hello then
+      schedule_background_mirror(background_interval(), generation)
+      return
+    end
+
+    local client = M.client
+    M.remote_probe(function(err, probe)
+      if
+        not M.background_mirror_running
+        or generation ~= M.background_mirror_generation
+        or M.client ~= client
+      then
+        return
+      end
+      if err or not probe or probe.remote_available ~= true then
+        local retry_after = probe and tonumber(probe.retry_after_ms) or nil
+        schedule_background_mirror(retry_after or background_interval(), generation)
+        return
+      end
+
+      local scan_params = {
+        limit = M.config.background_mirror_scan_limit,
+      }
+      if M.background_scan_after then
+        scan_params.after = M.background_scan_after
+      end
+      M.request("scan", scan_params, function(scan_err, scan_result)
+        if
+          not M.background_mirror_running
+          or generation ~= M.background_mirror_generation
+          or M.client ~= client
+        then
+          return
+        end
+        if scan_err or not scan_result or scan_result.preempted then
+          schedule_background_mirror(background_interval(), generation)
+          return
+        end
+
+        if scan_result.truncated and optional_string(scan_result.next_after) then
+          M.background_scan_after = scan_result.next_after
+        else
+          M.background_scan_after = nil
+        end
+
+        local prefetch_limit = math.max(tonumber(M.config.background_mirror_prefetch_limit) or 0, 0)
+        if prefetch_limit == 0 then
+          schedule_background_mirror(background_interval(), generation)
+          return
+        end
+
+        M.request("prefetch_known", {
+          limit = prefetch_limit,
+          max_file_bytes = M.config.background_mirror_max_file_bytes,
+          max_total_bytes = M.config.background_mirror_max_total_bytes,
+        }, function()
+          if
+            not M.background_mirror_running
+            or generation ~= M.background_mirror_generation
+            or M.client ~= client
+          then
+            return
+          end
+          schedule_background_mirror(background_interval(), generation)
+        end)
+      end)
+    end)
+  end, math.max(tonumber(delay) or 0, 0))
+end
+
+function M.start_background_mirror()
+  M.background_mirror_running = true
+  M.background_mirror_generation = M.background_mirror_generation + 1
+  schedule_background_mirror(0, M.background_mirror_generation)
+end
+
+function M.stop_background_mirror()
+  M.background_mirror_running = false
+  M.background_mirror_generation = M.background_mirror_generation + 1
+end
+
 function M.setup(opts)
   M.config = vim.tbl_deep_extend("force", M.config, opts or {})
 end
@@ -478,6 +577,9 @@ function M.connect(target, opts)
     notify("connected: " .. result.remote_root .. remote_suffix)
     schedule_deferred_flushes_on_connect(client, generation)
     schedule_flush_queue_on_connect(client, generation)
+    if M.config.background_mirror then
+      M.start_background_mirror()
+    end
   end)
 end
 
@@ -501,6 +603,7 @@ function M.disconnect(opts)
   end, 250)
   M.client = nil
   if not opts.preserve_last_target then
+    M.stop_background_mirror()
     M.reconnect_generation = M.reconnect_generation + 1
     M.reconnect_attempts = 0
   end
