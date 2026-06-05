@@ -3793,6 +3793,7 @@ impl Sidecar {
             .map(|value| normalize_relative_path(value))
             .transpose()?
             .map(|value| value.to_string_lossy().replace('\\', "/"));
+        let session_id = optional_string_param(&params, "session_id").map(ToOwned::to_owned);
         let max_files = optional_positive_usize_param(&params, "max_files");
         let max_file_bytes = params
             .get("max_file_bytes")
@@ -3808,6 +3809,7 @@ impl Sidecar {
                 limit,
                 after: after.clone(),
                 max_files,
+                session_id: session_id.clone(),
             },
             preempt_epoch,
         )? {
@@ -3821,6 +3823,7 @@ impl Sidecar {
                     "hydrate_errors": [],
                     "hydrate_truncated": false,
                     "next_after": after,
+                    "session_id": session_id,
                     "scanned_files": 0
                 }));
             }
@@ -3830,6 +3833,7 @@ impl Sidecar {
                 hits,
                 truncated,
                 next_after,
+                session_id,
                 scanned_files,
             } => {
                 let mut hydrated = 0;
@@ -3855,6 +3859,7 @@ impl Sidecar {
                             "hydrate_errors": hydrate_errors,
                             "hydrate_truncated": hydrate_truncated,
                             "next_after": next_after,
+                            "session_id": session_id,
                             "scanned_files": scanned_files
                         }));
                     }
@@ -3867,6 +3872,7 @@ impl Sidecar {
                     "hydrate_errors": hydrate_errors,
                     "hydrate_truncated": hydrate_truncated,
                     "next_after": next_after,
+                    "session_id": session_id,
                     "scanned_files": scanned_files
                 }))
             }
@@ -5148,6 +5154,7 @@ fn preempted_result(request: &ClientRequest) -> Value {
             "hydrate_errors": [],
             "hydrate_truncated": false,
             "next_after": request.params.get("after").and_then(Value::as_str),
+            "session_id": request.params.get("session_id").and_then(Value::as_str),
             "scanned_files": 0
         }),
         "remote_probe" => json!({

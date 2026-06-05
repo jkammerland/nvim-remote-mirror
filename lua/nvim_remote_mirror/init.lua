@@ -1231,6 +1231,7 @@ function M.grep(query)
     end
     remote_result.truncated = result.truncated == true
     remote_result.next_after = result.next_after
+    remote_result.session_id = result.session_id
     remote_result.scanned_files = (remote_result.scanned_files or 0) + (tonumber(result.scanned_files) or 0)
     remote_result.hydrated = (remote_result.hydrated or 0) + (tonumber(result.hydrated) or 0)
     remote_result.hydrate_truncated = remote_result.hydrate_truncated or result.hydrate_truncated == true
@@ -1239,7 +1240,7 @@ function M.grep(query)
     end
   end
 
-  local function request_remote_page(after)
+  local function request_remote_page(after, session_id)
     local remaining = math.max(grep_limit - #(remote_result.hits or {}), 0)
     if remaining <= 0 then
       apply_remote_result(true)
@@ -1250,6 +1251,7 @@ function M.grep(query)
       query = query,
       limit = remaining,
       after = after,
+      session_id = session_id,
       max_files = grep_remote_page_files,
       hydrate = true,
       max_file_bytes = M.config.prefetch_max_file_bytes,
@@ -1269,6 +1271,7 @@ function M.grep(query)
         remote_result.truncated = true
         remote_result.preempted = true
         remote_result.next_after = optional_string(result.next_after) or after
+        remote_result.session_id = optional_string(result.session_id) or session_id
         if #(remote_result.hits or {}) > 0 or #(dirty_cache_hits or {}) > 0 or remote_applied then
           apply_remote_result(true)
         end
@@ -1292,15 +1295,18 @@ function M.grep(query)
       end
 
       local next_after = optional_string(result.next_after)
-      local has_more = result.truncated == true and next_after and #(remote_result.hits or {}) < grep_limit
+      local next_session_id = optional_string(result.session_id)
+      local has_more = result.truncated == true
+        and (next_after or next_session_id)
+        and #(remote_result.hits or {}) < grep_limit
       apply_remote_result(not has_more)
       if has_more then
-        request_remote_page(next_after)
+        request_remote_page(next_after, next_session_id)
       end
     end)
   end
 
-  request_remote_page(nil)
+  request_remote_page(nil, nil)
 
   M.request("grep_cache", {
     query = query,

@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 
-pub const PROTOCOL_VERSION: u16 = 3;
+pub const PROTOCOL_VERSION: u16 = 4;
 pub const MAX_FRAME_LEN: usize = 64 * 1024 * 1024;
 pub const MAX_CONFLICT_CONTENT_BYTES: usize = 4 * 1024 * 1024;
 
@@ -153,6 +153,7 @@ pub enum Request {
         limit: usize,
         after: Option<String>,
         max_files: Option<usize>,
+        session_id: Option<String>,
     },
     WriteFileCas {
         path: String,
@@ -221,6 +222,7 @@ pub enum Response {
         hits: Vec<SearchHit>,
         truncated: bool,
         next_after: Option<String>,
+        session_id: Option<String>,
         scanned_files: usize,
     },
     WriteFileCas {
@@ -408,6 +410,7 @@ mod tests {
                 limit: 50,
                 after: Some("src/lib.rs".to_string()),
                 max_files: Some(128),
+                session_id: Some("grep-7".to_string()),
             },
         };
         let mut bytes = Vec::new();
@@ -415,6 +418,30 @@ mod tests {
 
         let decoded: RpcMessage = read_frame(&mut Cursor::new(bytes)).unwrap();
         assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn round_trips_grep_page_response() {
+        let response = RpcMessage::Response {
+            id: 13,
+            response: Response::Grep {
+                hits: vec![SearchHit {
+                    path: "src/lib.rs".to_string(),
+                    line: 7,
+                    column: 3,
+                    text: "needle".to_string(),
+                }],
+                truncated: true,
+                next_after: Some("src/lib.rs".to_string()),
+                session_id: Some("grep-7".to_string()),
+                scanned_files: 128,
+            },
+        };
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &response).unwrap();
+
+        let decoded: RpcMessage = read_frame(&mut Cursor::new(bytes)).unwrap();
+        assert_eq!(decoded, response);
     }
 
     #[test]

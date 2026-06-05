@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use ignore::WalkBuilder;
+use ignore::{Walk, WalkBuilder};
 use nrm_protocol::{
     read_frame, write_frame, BatchReadError, BatchReadFile, BatchValidateFile, CapabilitySet,
     FileMeta, Request, Response, RpcError, RpcMessage, SaveApplied, SaveConflict, SaveOutcome,
@@ -15,7 +15,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 struct AgentState {
     root: PathBuf,
     uploads: HashMap<String, PendingUpload>,
+    grep_sessions: HashMap<String, GrepSession>,
+    next_grep_session: u64,
 }
+
+struct GrepSession {
+    query: String,
+    walk: Walk,
+}
+
+const MAX_GREP_SESSIONS: usize = 8;
 
 struct PendingUpload {
     path: String,
@@ -55,6 +64,8 @@ fn serve(root: PathBuf) -> Result<()> {
     let mut state = AgentState {
         root,
         uploads: HashMap::new(),
+        grep_sessions: HashMap::new(),
+        next_grep_session: 1,
     };
     let stdin = io::stdin();
     let stdout = io::stdout();
@@ -160,7 +171,15 @@ fn handle_request(state: &mut AgentState, request: Request) -> Result<Response> 
             limit,
             after,
             max_files,
-        } => grep(&state.root, &query, limit, after.as_deref(), max_files),
+            session_id,
+        } => grep(
+            state,
+            &query,
+            limit,
+            after.as_deref(),
+            max_files,
+            session_id.as_deref(),
+        ),
         Request::WriteFileCas {
             path,
             expected_hash,
@@ -354,50 +373,67 @@ fn read_file_for_batch(root: &Path, path: &str, max_file_bytes: u64) -> Result<B
 }
 
 fn grep(
-    root: &Path,
+    state: &mut AgentState,
     query: &str,
     limit: usize,
     after: Option<&str>,
     max_files: Option<usize>,
+    session_id: Option<&str>,
 ) -> Result<Response> {
     if query.is_empty() || limit == 0 {
+        if let Some(session_id) = session_id {
+            state.grep_sessions.remove(session_id);
+        }
         return Ok(Response::Grep {
             hits: Vec::new(),
             truncated: false,
             next_after: None,
+            session_id: None,
             scanned_files: 0,
         });
     }
 
+    let mut session = session_id
+        .and_then(|session_id| state.grep_sessions.remove(session_id))
+        .filter(|session| session.query == query);
+    let resumed_session = session.is_some();
+    let mut walk = session
+        .take()
+        .map(|session| session.walk)
+        .unwrap_or_else(|| grep_walk(&state.root));
+    let mut after_seen = resumed_session;
+    let mut active_session_id = if after_seen {
+        session_id.map(ToOwned::to_owned)
+    } else {
+        None
+    };
+    if active_session_id.is_none() {
+        after_seen = after.is_none();
+    }
+
     let mut hits = Vec::new();
-    let mut truncated = false;
     let mut next_after = None;
-    let mut after_seen = after.is_none();
     let mut scanned_files = 0_usize;
     let max_files = max_files.unwrap_or(usize::MAX).max(1);
-    for entry in WalkBuilder::new(root)
-        .hidden(false)
-        .parents(true)
-        .git_ignore(true)
-        .git_exclude(true)
-        .sort_by_file_name(|a, b| a.cmp(b))
-        .build()
-    {
+    let mut exhausted = false;
+    let mut hit_limit_reached = false;
+
+    while scanned_files < max_files {
+        let Some(entry) = walk.next() else {
+            exhausted = true;
+            break;
+        };
         let entry = entry?;
         let path = entry.path();
         if !path.is_file() {
             continue;
         }
-        let relative = relative_path(root, path)?;
+        let relative = relative_path(&state.root, path)?;
         if !after_seen {
             if after == Some(relative.as_str()) {
                 after_seen = true;
             }
             continue;
-        }
-        if scanned_files >= max_files {
-            truncated = true;
-            break;
         }
         scanned_files += 1;
         next_after = Some(relative.clone());
@@ -417,30 +453,63 @@ fn grep(
                     text: line.to_string(),
                 });
                 if hits.len() >= limit {
-                    truncated = true;
+                    hit_limit_reached = true;
                     next_after = None;
                     break;
                 }
             }
         }
-        if hits.len() >= limit {
+        if hit_limit_reached {
             break;
         }
     }
 
-    if after.is_some() && !after_seen {
+    if active_session_id.is_none() && after.is_some() && !after_seen {
         bail!("grep cursor not found");
     }
 
-    if !truncated {
+    let truncated = hit_limit_reached || (!exhausted && scanned_files >= max_files);
+    let response_session_id = if truncated && next_after.is_some() {
+        let id = active_session_id.take().unwrap_or_else(|| {
+            let id = format!("grep-{}", state.next_grep_session);
+            state.next_grep_session = state.next_grep_session.saturating_add(1).max(1);
+            id
+        });
+        if state.grep_sessions.len() >= MAX_GREP_SESSIONS {
+            if let Some(oldest) = state.grep_sessions.keys().next().cloned() {
+                state.grep_sessions.remove(&oldest);
+            }
+        }
+        state.grep_sessions.insert(
+            id.clone(),
+            GrepSession {
+                query: query.to_string(),
+                walk,
+            },
+        );
+        Some(id)
+    } else {
         next_after = None;
-    }
+        None
+    };
+
     Ok(Response::Grep {
         hits,
         truncated,
         next_after,
+        session_id: response_session_id,
         scanned_files,
     })
+}
+
+fn grep_walk(root: &Path) -> Walk {
+    WalkBuilder::new(root)
+        .hidden(false)
+        .parents(true)
+        .git_ignore(true)
+        .git_exclude(true)
+        .sort_by_file_name(|a, b| a.cmp(b))
+        .build()
 }
 
 fn write_file_cas(
@@ -778,6 +847,15 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    fn test_state(root: &Path) -> AgentState {
+        AgentState {
+            root: root.to_path_buf(),
+            uploads: HashMap::new(),
+            grep_sessions: HashMap::new(),
+            next_grep_session: 1,
+        }
+    }
+
     #[test]
     fn rejects_path_traversal() {
         assert!(normalize_relative_path("../secret").is_err());
@@ -975,11 +1053,13 @@ mod tests {
         fs::write(root.join("b.txt"), "needle b").unwrap();
         fs::write(root.join("c.txt"), "needle c").unwrap();
 
-        let first = grep(root, "needle", 10, None, Some(2)).unwrap();
+        let mut state = test_state(root);
+        let first = grep(&mut state, "needle", 10, None, Some(2), None).unwrap();
         let Response::Grep {
             hits,
             truncated,
             next_after,
+            session_id,
             scanned_files,
         } = first
         else {
@@ -988,14 +1068,24 @@ mod tests {
         assert!(truncated);
         assert_eq!(scanned_files, 2);
         assert_eq!(next_after.as_deref(), Some("b.txt"));
+        assert_eq!(session_id.as_deref(), Some("grep-1"));
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].path, "b.txt");
 
-        let second = grep(root, "needle", 10, next_after.as_deref(), Some(2)).unwrap();
+        let second = grep(
+            &mut state,
+            "needle",
+            10,
+            next_after.as_deref(),
+            Some(2),
+            session_id.as_deref(),
+        )
+        .unwrap();
         let Response::Grep {
             hits,
             truncated,
             next_after,
+            session_id,
             scanned_files,
         } = second
         else {
@@ -1004,6 +1094,55 @@ mod tests {
         assert!(!truncated);
         assert_eq!(scanned_files, 1);
         assert!(next_after.is_none());
+        assert!(session_id.is_none());
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path, "c.txt");
+    }
+
+    #[test]
+    fn grep_session_continues_when_path_cursor_file_disappears() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.txt"), "miss").unwrap();
+        fs::write(root.join("b.txt"), "miss").unwrap();
+        fs::write(root.join("c.txt"), "needle c").unwrap();
+
+        let mut state = test_state(root);
+        let first = grep(&mut state, "needle", 10, None, Some(2), None).unwrap();
+        let Response::Grep {
+            truncated,
+            next_after,
+            session_id,
+            ..
+        } = first
+        else {
+            panic!("unexpected grep response");
+        };
+        assert!(truncated);
+        assert_eq!(next_after.as_deref(), Some("b.txt"));
+        let session_id = session_id.expect("expected grep session");
+        fs::remove_file(root.join("b.txt")).unwrap();
+
+        let second = grep(
+            &mut state,
+            "needle",
+            10,
+            next_after.as_deref(),
+            Some(2),
+            Some(&session_id),
+        )
+        .unwrap();
+        let Response::Grep {
+            hits,
+            truncated,
+            session_id,
+            ..
+        } = second
+        else {
+            panic!("unexpected grep response");
+        };
+        assert!(!truncated);
+        assert!(session_id.is_none());
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].path, "c.txt");
     }
@@ -1015,11 +1154,13 @@ mod tests {
         fs::write(root.join("a.txt"), "needle a").unwrap();
         fs::write(root.join("b.txt"), "needle b").unwrap();
 
-        let response = grep(root, "needle", 1, None, Some(10)).unwrap();
+        let mut state = test_state(root);
+        let response = grep(&mut state, "needle", 1, None, Some(10), None).unwrap();
         let Response::Grep {
             hits,
             truncated,
             next_after,
+            session_id,
             scanned_files,
         } = response
         else {
@@ -1027,6 +1168,7 @@ mod tests {
         };
         assert!(truncated);
         assert!(next_after.is_none());
+        assert!(session_id.is_none());
         assert_eq!(scanned_files, 1);
         assert_eq!(hits.len(), 1);
     }
@@ -1037,9 +1179,17 @@ mod tests {
         let root = dir.path();
         fs::write(root.join("a.txt"), "needle a").unwrap();
 
-        let error = grep(root, "needle", 10, Some("missing.txt"), Some(10))
-            .unwrap_err()
-            .to_string();
+        let mut state = test_state(root);
+        let error = grep(
+            &mut state,
+            "needle",
+            10,
+            Some("missing.txt"),
+            Some(10),
+            None,
+        )
+        .unwrap_err()
+        .to_string();
 
         assert!(error.contains("grep cursor not found"));
     }
@@ -1051,11 +1201,13 @@ mod tests {
         fs::write(root.join("a.txt"), "miss").unwrap();
         fs::write(root.join("b.txt"), "needle b").unwrap();
 
-        let response = grep(root, "needle", 10, None, Some(0)).unwrap();
+        let mut state = test_state(root);
+        let response = grep(&mut state, "needle", 10, None, Some(0), None).unwrap();
         let Response::Grep {
             hits,
             truncated,
             next_after,
+            session_id,
             scanned_files,
         } = response
         else {
@@ -1065,7 +1217,38 @@ mod tests {
         assert!(truncated);
         assert_eq!(scanned_files, 1);
         assert_eq!(next_after.as_deref(), Some("a.txt"));
+        assert_eq!(session_id.as_deref(), Some("grep-1"));
         assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn grep_sessions_are_bounded_when_clients_abandon_pages() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.txt"), "miss").unwrap();
+        fs::write(root.join("b.txt"), "miss").unwrap();
+        let mut state = test_state(root);
+
+        for index in 0..(MAX_GREP_SESSIONS + 3) {
+            let response = grep(
+                &mut state,
+                &format!("needle-{index}"),
+                10,
+                None,
+                Some(1),
+                None,
+            )
+            .unwrap();
+            assert!(matches!(
+                response,
+                Response::Grep {
+                    session_id: Some(_),
+                    ..
+                }
+            ));
+        }
+
+        assert!(state.grep_sessions.len() <= MAX_GREP_SESSIONS);
     }
 
     #[test]
@@ -1102,10 +1285,7 @@ mod tests {
         let old_hash = hash_file(&root.join("large.bin")).unwrap();
         let content = b"new-content-in-two-chunks".to_vec();
         let content_hash = hash_bytes(&content);
-        let mut state = AgentState {
-            root: root.clone(),
-            uploads: HashMap::new(),
-        };
+        let mut state = test_state(&root);
 
         let begin = begin_write_file_cas(
             &mut state,
@@ -1143,10 +1323,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let root = dir.path().to_path_buf();
         fs::write(root.join("large.bin"), "remote").unwrap();
-        let mut state = AgentState {
-            root,
-            uploads: HashMap::new(),
-        };
+        let mut state = test_state(&root);
 
         let begin = begin_write_file_cas(
             &mut state,
