@@ -271,7 +271,9 @@ Enable that with `open_prefetch_related = true` and tune the batch with
 When `auto_hydrate_mirror_buffers` is enabled, Neovim edits under the local
 mirror root are mapped back to workspace-relative remote paths. This lets LSP
 definition/reference jumps into not-yet-cached mirror files hydrate through the
-sidecar instead of opening an empty local path.
+sidecar instead of opening an empty local path. Pending or failed hydrations are
+kept read-only and are not treated as remote-save buffers, so an empty failed
+hydrate cannot be flushed over the remote file.
 
 `:RemoteFind [query]` searches known mirror metadata locally and fills quickfix
 with mirror paths. Selecting an uncached result hydrates it through the same

@@ -445,11 +445,53 @@ local function flush_target_buffers(bufnr, identity)
   return targets
 end
 
+local function set_buffer_editable(bufnr, editable)
+  if not bufnr or not vim.api.nvim_buf_is_valid(bufnr) then
+    return
+  end
+  pcall(vim.api.nvim_set_option_value, "modifiable", editable, { buf = bufnr })
+  pcall(vim.api.nvim_set_option_value, "readonly", not editable, { buf = bufnr })
+end
+
+local function set_buffer_hydrate_pending(bufnr, client, relative_path)
+  if not vim.api.nvim_buf_is_valid(bufnr) then
+    return
+  end
+  local identity = client_identity(client)
+  vim.b[bufnr].nrm_hydrate_pending = true
+  vim.b[bufnr].nrm_hydrate_failed = false
+  vim.b[bufnr].nrm_hydrate_path = relative_path
+  vim.b[bufnr].nrm_remote_path = nil
+  vim.b[bufnr].nrm_remote_hash = nil
+  vim.b[bufnr].nrm_workspace_key = identity and identity.workspace_key or nil
+  vim.b[bufnr].nrm_target_arg = identity and identity.target_arg or nil
+  vim.b[bufnr].nrm_files_root = identity and identity.files_root or nil
+  vim.b[bufnr].nrm_flush_pending = false
+  set_buffer_editable(bufnr, false)
+end
+
+local function set_buffer_hydrate_failed(bufnr, relative_path)
+  if not vim.api.nvim_buf_is_valid(bufnr) then
+    return
+  end
+  vim.b[bufnr].nrm_hydrate_pending = false
+  vim.b[bufnr].nrm_hydrate_failed = true
+  vim.b[bufnr].nrm_hydrate_path = relative_path
+  vim.b[bufnr].nrm_remote_path = nil
+  vim.b[bufnr].nrm_remote_hash = nil
+  vim.b[bufnr].nrm_flush_pending = false
+  set_buffer_editable(bufnr, false)
+end
+
 local function set_remote_buffer_identity(bufnr, client, result)
   if not result or not result.path or not vim.api.nvim_buf_is_valid(bufnr) then
     return
   end
   local identity = client_identity(client)
+  set_buffer_editable(bufnr, true)
+  vim.b[bufnr].nrm_hydrate_pending = false
+  vim.b[bufnr].nrm_hydrate_failed = false
+  vim.b[bufnr].nrm_hydrate_path = nil
   vim.b[bufnr].nrm_remote_path = result.path
   vim.b[bufnr].nrm_remote_hash = result.hash
   vim.b[bufnr].nrm_workspace_key = identity and identity.workspace_key or nil
@@ -964,6 +1006,7 @@ local function apply_mirror_file_to_buffer(bufnr, local_path, result, client)
   if not vim.api.nvim_buf_is_valid(bufnr) then
     return false
   end
+  set_buffer_editable(bufnr, true)
   vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, lines)
   vim.api.nvim_set_option_value("modified", false, { buf = bufnr })
   if result then
@@ -1001,11 +1044,12 @@ function setup_mirror_autohydrate(client)
       if not relative_path then
         return
       end
-      set_remote_buffer_identity(bufnr, client, {
-        path = relative_path,
-        local_path = local_path,
-        cached = true,
-      })
+      if vim.b[bufnr].nrm_hydrate_pending and vim.b[bufnr].nrm_hydrate_path == relative_path then
+        return
+      end
+      if vim.b[bufnr].nrm_remote_path == relative_path and not vim.b[bufnr].nrm_hydrate_failed then
+        return
+      end
 
       if uv.fs_stat(local_path) then
         apply_mirror_file_to_buffer(bufnr, local_path, {
@@ -1016,6 +1060,7 @@ function setup_mirror_autohydrate(client)
         return
       end
 
+      set_buffer_hydrate_pending(bufnr, client, relative_path)
       M.request(
         "open",
         {
@@ -1025,10 +1070,23 @@ function setup_mirror_autohydrate(client)
         },
         function(err, result)
           if err then
+            vim.schedule(function()
+              if M.client == client and vim.api.nvim_buf_is_valid(bufnr) then
+                set_buffer_hydrate_failed(bufnr, relative_path)
+              end
+            end)
             notify("failed to hydrate " .. relative_path .. ": " .. err, vim.log.levels.ERROR)
             return
           end
-          if not result or result.preempted then
+          if not result then
+            return
+          end
+          if result.preempted then
+            vim.schedule(function()
+              if M.client == client and vim.api.nvim_buf_is_valid(bufnr) then
+                set_buffer_hydrate_failed(bufnr, relative_path)
+              end
+            end)
             return
           end
           vim.schedule(function()
@@ -1039,6 +1097,7 @@ function setup_mirror_autohydrate(client)
               return
             end
             if vim.api.nvim_get_option_value("modified", { buf = bufnr }) then
+              set_buffer_hydrate_failed(bufnr, relative_path)
               notify("skipped hydrate for modified mirror buffer " .. relative_path, vim.log.levels.WARN)
               return
             end
@@ -1175,6 +1234,22 @@ end
 
 function M.flush_buffer(bufnr)
   bufnr = bufnr or vim.api.nvim_get_current_buf()
+  if vim.b[bufnr].nrm_hydrate_pending then
+    notify(
+      "remote save skipped while hydrate is pending for "
+        .. tostring(vim.b[bufnr].nrm_hydrate_path or "buffer"),
+      vim.log.levels.WARN
+    )
+    return
+  end
+  if vim.b[bufnr].nrm_hydrate_failed then
+    notify(
+      "remote save disabled because hydrate failed for "
+        .. tostring(vim.b[bufnr].nrm_hydrate_path or "buffer"),
+      vim.log.levels.ERROR
+    )
+    return
+  end
   local path = vim.b[bufnr].nrm_remote_path
   flush_remote_path(path, { bufnr = bufnr, identity = buffer_identity(bufnr) })
 end

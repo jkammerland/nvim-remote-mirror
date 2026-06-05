@@ -168,7 +168,8 @@ metadata.
 open_batch_max_file_bytes controls how large a direct uncached open may be
 before it falls back from one-request batch read hydration to chunked reads.
 auto_hydrate_mirror_buffers makes LSP jumps into missing local mirror files call
-the sidecar open path and hydrate the corresponding remote file.
+the sidecar open path and hydrate the corresponding remote file. Pending or
+failed hydrations are read-only and are not flushed as remote saves.
 
 Agent and LSP launch commands share a sidecar transport planner. Local targets
 spawn binaries directly; SSH targets use configured connection options and a
