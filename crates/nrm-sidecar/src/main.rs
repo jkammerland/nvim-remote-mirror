@@ -60,6 +60,8 @@ enum CommandKind {
         local_root: PathBuf,
         #[arg(long)]
         ssh: Option<String>,
+        #[arg(long, default_value_t = 10)]
+        ssh_connect_timeout_seconds: u64,
         #[arg(last = true, required = true)]
         command: Vec<String>,
     },
@@ -2779,8 +2781,15 @@ fn main() -> Result<()> {
             remote_root,
             local_root,
             ssh,
+            ssh_connect_timeout_seconds,
             command,
-        } => run_lsp_proxy(remote_root, local_root, ssh, command),
+        } => run_lsp_proxy(
+            remote_root,
+            local_root,
+            ssh,
+            ssh_connect_timeout_seconds,
+            command,
+        ),
     }
 }
 
@@ -3069,21 +3078,21 @@ fn run_lsp_proxy(
     remote_root: PathBuf,
     local_root: PathBuf,
     ssh: Option<String>,
+    ssh_connect_timeout_seconds: u64,
     command: Vec<String>,
 ) -> Result<()> {
     if command.is_empty() {
         bail!("lsp-proxy requires a language server command after --");
     }
 
-    let mut child_command = if let Some(target) = ssh {
-        let mut child_command = Command::new("ssh");
-        child_command.arg(target).args(&command);
-        child_command
-    } else {
-        let mut child_command = Command::new(&command[0]);
-        child_command.args(&command[1..]);
-        child_command
-    };
+    let launch = LspLaunch::new(
+        remote_root.clone(),
+        ssh,
+        ssh_connect_timeout_seconds,
+        command,
+    );
+    let mut child_command = launch.command();
+    configure_agent_process(&mut child_command);
 
     let mut child = child_command
         .stdin(Stdio::piped())
@@ -3128,6 +3137,85 @@ fn run_lsp_proxy(
         bail!("language server exited with {status}");
     }
     Ok(())
+}
+
+struct LspLaunch {
+    program: String,
+    args: Vec<String>,
+    current_dir: Option<PathBuf>,
+}
+
+impl LspLaunch {
+    fn new(
+        remote_root: PathBuf,
+        ssh: Option<String>,
+        ssh_connect_timeout_seconds: u64,
+        command: Vec<String>,
+    ) -> Self {
+        if let Some(target) = ssh {
+            let mut args = vec![
+                "-o".to_string(),
+                "BatchMode=yes".to_string(),
+                "-o".to_string(),
+                format!("ConnectTimeout={ssh_connect_timeout_seconds}"),
+                "-o".to_string(),
+                "ServerAliveInterval=15".to_string(),
+                "-o".to_string(),
+                "ServerAliveCountMax=2".to_string(),
+                target,
+            ];
+            args.push(lsp_remote_command(remote_root, command));
+            Self {
+                program: "ssh".to_string(),
+                args,
+                current_dir: None,
+            }
+        } else {
+            Self {
+                program: command[0].clone(),
+                args: command[1..].to_vec(),
+                current_dir: Some(remote_root),
+            }
+        }
+    }
+
+    fn command(&self) -> Command {
+        let mut command = Command::new(&self.program);
+        command.args(&self.args);
+        if let Some(current_dir) = &self.current_dir {
+            command.current_dir(current_dir);
+        }
+        command
+    }
+}
+
+fn lsp_remote_command(remote_root: PathBuf, command: Vec<String>) -> String {
+    let mut parts = vec![
+        shell_quote("sh"),
+        shell_quote("-lc"),
+        shell_quote("cd \"$1\" && shift && exec \"$@\""),
+        shell_quote("nrm-lsp-proxy"),
+        shell_quote(remote_root.to_string_lossy()),
+    ];
+    parts.extend(command.into_iter().map(shell_quote));
+    parts.join(" ")
+}
+
+fn shell_quote(value: impl AsRef<str>) -> String {
+    let value = value.as_ref();
+    if value.is_empty() {
+        return "''".to_string();
+    }
+    let mut quoted = String::from("'");
+    for ch in value.chars() {
+        if ch == '\'' {
+            quoted.push_str("'\\''");
+        } else {
+            quoted.push(ch);
+        }
+    }
+    quoted.push('\'');
+    quoted
 }
 
 fn read_lsp_message<R: BufRead>(reader: &mut R) -> Result<Option<Vec<u8>>> {
@@ -4026,6 +4114,94 @@ mod tests {
             "file:///remote/repo/src/main.rs"
         );
         assert_eq!(value["params"]["rootPath"], "/remote/repo");
+    }
+
+    #[test]
+    fn lsp_local_launch_runs_in_remote_root() {
+        let launch = LspLaunch::new(
+            PathBuf::from("/repo"),
+            None,
+            10,
+            vec!["rust-analyzer".to_string(), "--stdio".to_string()],
+        );
+
+        assert_eq!(launch.program, "rust-analyzer");
+        assert_eq!(launch.args, vec!["--stdio"]);
+        assert_eq!(launch.current_dir.as_deref(), Some(Path::new("/repo")));
+    }
+
+    #[test]
+    fn lsp_ssh_launch_uses_remote_root_and_connection_options() {
+        let launch = LspLaunch::new(
+            PathBuf::from("/tmp/repo with 'quote' ; x"),
+            Some("host".to_string()),
+            7,
+            vec![
+                "rust-analyzer".to_string(),
+                "--config".to_string(),
+                "check.command=\"clippy\"; $(echo no)".to_string(),
+            ],
+        );
+
+        assert_eq!(launch.program, "ssh");
+        assert_eq!(launch.current_dir, None);
+        assert_eq!(
+            launch.args,
+            vec![
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=7",
+                "-o",
+                "ServerAliveInterval=15",
+                "-o",
+                "ServerAliveCountMax=2",
+                "host",
+                "'sh' '-lc' 'cd \"$1\" && shift && exec \"$@\"' 'nrm-lsp-proxy' '/tmp/repo with '\\''quote'\\'' ; x' 'rust-analyzer' '--config' 'check.command=\"clippy\"; $(echo no)'"
+            ]
+        );
+    }
+
+    #[test]
+    fn shell_quote_handles_metacharacters() {
+        assert_eq!(shell_quote(""), "''");
+        assert_eq!(shell_quote("plain"), "'plain'");
+        assert_eq!(shell_quote("two words"), "'two words'");
+        assert_eq!(shell_quote("it's"), "'it'\\''s'");
+        assert_eq!(shell_quote("semi; $(echo nope)"), "'semi; $(echo nope)'");
+        assert_eq!(shell_quote("line\nbreak"), "'line\nbreak'");
+    }
+
+    #[test]
+    fn lsp_ssh_remote_command_preserves_cwd_and_args_through_shell_parse() {
+        let dir = tempdir().unwrap();
+        let remote_root = dir.path().join("repo with 'quote' ; x");
+        fs::create_dir_all(&remote_root).unwrap();
+        let remote_command = lsp_remote_command(
+            remote_root.clone(),
+            vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                "printf 'PWD=<%s>\\nARG=<%s>\\n' \"$PWD\" \"$1\"".to_string(),
+                "inner".to_string(),
+                "arg with spaces; $(echo nope)".to_string(),
+            ],
+        );
+
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(remote_command)
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(stdout.contains(&format!("PWD=<{}>", remote_root.display())));
+        assert!(stdout.contains("ARG=<arg with spaces; $(echo nope)>"));
     }
 
     #[test]

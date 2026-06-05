@@ -613,6 +613,8 @@ function M.lsp_client_config(command, opts)
   if M.client.target.ssh then
     table.insert(cmd, "--ssh")
     table.insert(cmd, M.client.target.ssh)
+    table.insert(cmd, "--ssh-connect-timeout-seconds")
+    table.insert(cmd, tostring(M.config.ssh_connect_timeout_seconds))
   end
   table.insert(cmd, "--")
   for _, value in ipairs(command) do

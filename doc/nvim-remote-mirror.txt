@@ -90,6 +90,8 @@ LSP                                                *nvim-remote-mirror-lsp*
 
 After :RemoteConnect completes, use lsp_client_config() to run a language
 server on the remote side while Neovim receives local mirror paths.
+The proxy starts the server in the remote workspace directory. SSH targets use
+the configured connect timeout and cd to the remote root before server launch.
 
 >
   local nrm = require("nvim_remote_mirror")
