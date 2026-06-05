@@ -85,6 +85,10 @@ require("nvim_remote_mirror").setup({
   agent = "/path/to/nrm-agent",
   request_timeout_ms = 30000,
   ssh_connect_timeout_seconds = 10,
+  grep_limit = 200,
+  grep_cache_max_files = 2000,
+  grep_cache_max_file_bytes = 512 * 1024,
+  grep_cache_max_total_bytes = 8 * 1024 * 1024,
   prefetch_max_file_bytes = 4 * 1024 * 1024,
   prefetch_max_total_bytes = 16 * 1024 * 1024,
   open_prefetch_related = false,
@@ -154,9 +158,11 @@ existing mirror metadata, prioritizing same-directory and same-extension files.
 Enable that with `open_prefetch_related = true` and tune the batch with
 `open_prefetch_related_limit`.
 
-`:RemoteGrep` runs search on the remote agent, batch-hydrates matching files
-within the prefetch byte caps, and populates quickfix with local mirror paths
-when hydration succeeds.
+`:RemoteGrep` queues the authoritative remote search first, then searches a
+bounded slice of already hydrated local mirror files. Cached hits are
+provisional and can populate quickfix while the remote search is still running.
+The final quickfix refresh uses only safe local mirror paths from the remote
+result, preserving dirty cached matches as local truth.
 
 ## Protocol Notes
 

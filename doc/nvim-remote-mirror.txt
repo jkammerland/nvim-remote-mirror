@@ -36,8 +36,10 @@ COMMANDS                                      *nvim-remote-mirror-commands*
     is restored instead.
 
 :RemoteGrep {query}
-    Run grep on the remote agent, hydrate matching files in a batch, and
-    populate the quickfix list with local mirror paths when available.
+    Queue remote grep, search a bounded slice of already hydrated local mirror
+    files as a provisional cache result, hydrate remote matches in a batch, and
+    refresh quickfix with safe local mirror paths. Dirty cached matches are kept
+    as local truth.
 
 :RemotePrefetch {path...}
     Hydrate one or more workspace-relative files in the background request.
@@ -72,6 +74,9 @@ CONFIGURATION                                  *nvim-remote-mirror-config*
     agent = "/path/to/nrm-agent",
     state_dir = "/path/to/state",
     grep_limit = 200,
+    grep_cache_max_files = 2000,
+    grep_cache_max_file_bytes = 512 * 1024,
+    grep_cache_max_total_bytes = 8 * 1024 * 1024,
     request_timeout_ms = 30000,
     ssh_connect_timeout_seconds = 10,
     prefetch_max_file_bytes = 4 * 1024 * 1024,

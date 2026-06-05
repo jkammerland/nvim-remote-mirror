@@ -5,6 +5,7 @@ use nrm_protocol::{
     Response, RpcError, RpcMessage, SaveOutcome, WriteStartOutcome, MAX_FRAME_LEN,
     PROTOCOL_VERSION,
 };
+use rusqlite::Row;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -26,6 +27,9 @@ const DEFAULT_CHUNK_SIZE: u64 = 1024 * 1024;
 const SAVE_UPLOAD_CHUNK_BYTES: usize = 1024 * 1024;
 const DEFAULT_BATCH_MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
 const DEFAULT_BATCH_MAX_TOTAL_BYTES: u64 = 16 * 1024 * 1024;
+const DEFAULT_GREP_CACHE_MAX_FILES: usize = 2_000;
+const DEFAULT_GREP_CACHE_MAX_FILE_BYTES: u64 = 512 * 1024;
+const DEFAULT_GREP_CACHE_MAX_TOTAL_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_SAVE_PAYLOAD_BYTES: usize = MAX_FRAME_LEN - (1024 * 1024);
 const REMOTE_INTERACTIVE_QUEUE_CAPACITY: usize = 128;
 const REMOTE_BACKGROUND_QUEUE_CAPACITY: usize = 128;
@@ -97,6 +101,21 @@ struct MirrorEntry {
     validated_at_ms: i64,
     validation_state: String,
     last_error: Option<String>,
+}
+
+fn mirror_entry_from_row(row: &Row<'_>) -> rusqlite::Result<MirrorEntry> {
+    Ok(MirrorEntry {
+        relative_path: row.get(0)?,
+        local_path: PathBuf::from(row.get::<_, String>(1)?),
+        size: row.get::<_, i64>(2)? as u64,
+        remote_hash: row.get(3)?,
+        local_hash: row.get(4)?,
+        state: row.get(5)?,
+        dirty: row.get::<_, i64>(6)? != 0,
+        validated_at_ms: row.get(7)?,
+        validation_state: row.get(8)?,
+        last_error: row.get(9)?,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -746,20 +765,7 @@ impl Mirror {
                 FROM files WHERE relative_path = ?1
                 ",
                 params![relative_path],
-                |row| {
-                    Ok(MirrorEntry {
-                        relative_path: row.get(0)?,
-                        local_path: PathBuf::from(row.get::<_, String>(1)?),
-                        size: row.get::<_, i64>(2)? as u64,
-                        remote_hash: row.get(3)?,
-                        local_hash: row.get(4)?,
-                        state: row.get(5)?,
-                        dirty: row.get::<_, i64>(6)? != 0,
-                        validated_at_ms: row.get(7)?,
-                        validation_state: row.get(8)?,
-                        last_error: row.get(9)?,
-                    })
-                },
+                mirror_entry_from_row,
             )
             .optional()
             .map_err(Into::into)
@@ -1138,6 +1144,156 @@ impl Mirror {
             paths.push(row?);
         }
         Ok(paths)
+    }
+
+    fn hydrated_file_entries(&self, limit: usize) -> Result<Vec<MirrorEntry>> {
+        let db_limit = limit.min(i64::MAX as usize) as i64;
+        let mut statement = self.db.prepare(
+            "
+            SELECT relative_path, local_path, size, remote_hash, local_hash, state, dirty,
+                   validated_at_ms, validation_state, last_error
+            FROM files
+            WHERE state='hydrated'
+              AND is_dir=0
+              AND is_symlink=0
+            ORDER BY relative_path ASC
+            LIMIT ?1
+            ",
+        )?;
+        let rows = statement.query_map(params![db_limit], mirror_entry_from_row)?;
+        let mut entries = Vec::new();
+        for row in rows {
+            entries.push(row?);
+        }
+        Ok(entries)
+    }
+
+    fn grep_cache(&self, params: &Value) -> Result<Value> {
+        let query = required_string(params, "query")?;
+        let limit = params.get("limit").and_then(Value::as_u64).unwrap_or(200) as usize;
+        let max_files = params
+            .get("max_files")
+            .and_then(Value::as_u64)
+            .map(|value| value.min(usize::MAX as u64) as usize)
+            .unwrap_or(DEFAULT_GREP_CACHE_MAX_FILES);
+        let max_file_bytes = params
+            .get("max_file_bytes")
+            .and_then(Value::as_u64)
+            .unwrap_or(DEFAULT_GREP_CACHE_MAX_FILE_BYTES);
+        let max_total_bytes = params
+            .get("max_total_bytes")
+            .and_then(Value::as_u64)
+            .unwrap_or(DEFAULT_GREP_CACHE_MAX_TOTAL_BYTES);
+        let mut hits = Vec::new();
+        let mut searched_files = 0_usize;
+        let mut searched_bytes = 0_u64;
+        let mut skipped_files = 0_usize;
+        let mut truncated = false;
+
+        if query.is_empty() || limit == 0 {
+            return Ok(json!({
+                "hits": [],
+                "truncated": false,
+                "searched_files": 0,
+                "searched_bytes": 0,
+                "skipped_files": 0,
+                "cached": true
+            }));
+        }
+
+        let mut entries = self.hydrated_file_entries(max_files.saturating_add(1))?;
+        if entries.len() > max_files {
+            entries.truncate(max_files);
+            truncated = true;
+        }
+
+        for entry in entries {
+            if hits.len() >= limit {
+                truncated = true;
+                break;
+            }
+            if !entry.local_path.is_file() {
+                continue;
+            }
+            let metadata = match fs::metadata(&entry.local_path) {
+                Ok(metadata) => metadata,
+                Err(_) => {
+                    skipped_files += 1;
+                    continue;
+                }
+            };
+            let file_len = metadata.len();
+            if file_len > max_file_bytes {
+                skipped_files += 1;
+                truncated = true;
+                continue;
+            }
+            if searched_bytes.saturating_add(file_len) > max_total_bytes {
+                truncated = true;
+                break;
+            }
+            let file = match File::open(&entry.local_path) {
+                Ok(file) => file,
+                Err(_) => {
+                    skipped_files += 1;
+                    continue;
+                }
+            };
+            searched_bytes = searched_bytes.saturating_add(file_len);
+            let mut reader = BufReader::new(file);
+            let mut line = String::new();
+            let mut line_number = 0_u64;
+            let mut invalid_text = false;
+            loop {
+                line.clear();
+                let bytes_read = match reader.read_line(&mut line) {
+                    Ok(0) => break,
+                    Ok(bytes_read) => bytes_read,
+                    Err(_) => {
+                        invalid_text = true;
+                        break;
+                    }
+                };
+                if bytes_read == 0 {
+                    break;
+                }
+                line_number += 1;
+                let line = line.trim_end_matches(&['\r', '\n'][..]);
+                if let Some(byte_idx) = line.find(query) {
+                    hits.push(json!({
+                        "path": entry.relative_path,
+                        "local_path": entry.local_path.to_string_lossy(),
+                        "line": line_number,
+                        "column": byte_idx as u64 + 1,
+                        "text": line,
+                        "cached": true,
+                        "dirty": entry.dirty,
+                        "validation_state": entry.validation_state
+                    }));
+                    if hits.len() >= limit {
+                        truncated = true;
+                        break;
+                    }
+                }
+            }
+            if invalid_text {
+                skipped_files += 1;
+            } else {
+                searched_files += 1;
+            }
+        }
+
+        Ok(json!({
+            "hits": hits,
+            "truncated": truncated,
+            "searched_files": searched_files,
+            "searched_bytes": searched_bytes,
+            "skipped_files": skipped_files,
+            "max_files": max_files,
+            "max_file_bytes": max_file_bytes,
+            "max_total_bytes": max_total_bytes,
+            "cached": true
+        }))
     }
 
     fn related_prefetch_paths(&self, anchor: &str, limit: usize) -> Result<Vec<String>> {
@@ -1709,6 +1865,10 @@ impl FastState {
                 Mirror::open_root(self.mirror_root.clone()).and_then(|mirror| mirror.status()),
             ),
             "open" => self.try_open(&request.params),
+            "grep_cache" => FastHandle::Handled(
+                Mirror::open_root(self.mirror_root.clone())
+                    .and_then(|mirror| mirror.grep_cache(&request.params)),
+            ),
             _ => FastHandle::Defer,
         }
     }
@@ -1814,6 +1974,7 @@ impl Sidecar {
             "prefetch" => self.prefetch(params, preempt_epoch),
             "prefetch_related" => self.prefetch_related(params, preempt_epoch),
             "grep" => self.grep(params),
+            "grep_cache" => self.mirror.grep_cache(&params),
             "flush" => self.flush(params),
             "flush_queue" => self.flush_queue(),
             "validate" => self.validate(params),
@@ -2207,7 +2368,9 @@ impl Sidecar {
             let entry = self.mirror.get(&hit.path)?;
             let local_path = entry
                 .as_ref()
-                .filter(|entry| entry.local_path.exists())
+                .filter(|entry| {
+                    !entry.dirty && entry.validation_state == "valid" && entry.local_path.is_file()
+                })
                 .map(|entry| entry.local_path.to_string_lossy().to_string());
             let mut value = json!({
                 "path": hit.path,
@@ -3491,6 +3654,162 @@ mod tests {
     }
 
     #[test]
+    fn grep_cache_searches_hydrated_and_dirty_local_files() {
+        let dir = tempdir().unwrap();
+        let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
+        mirror
+            .record_hydrated(&test_meta("src/main.rs", "base", 4), "base", "base")
+            .unwrap();
+        let main_path = mirror.local_path("src/main.rs").unwrap();
+        fs::create_dir_all(main_path.parent().unwrap()).unwrap();
+        fs::write(&main_path, b"fn cached_hit() {}\n").unwrap();
+
+        mirror
+            .record_hydrated(&test_meta("src/dirty.rs", "base", 4), "base", "base")
+            .unwrap();
+        let dirty_path = mirror.local_path("src/dirty.rs").unwrap();
+        fs::write(&dirty_path, b"fn dirty_hit() {}\n").unwrap();
+        let dirty_hash = hash_bytes(b"fn dirty_hit() {}\n");
+        mirror
+            .enqueue_save(
+                "src/dirty.rs",
+                &dirty_hash,
+                Some("base"),
+                b"fn dirty_hit() {}\n",
+            )
+            .unwrap();
+
+        mirror
+            .record_hydrated(&test_meta("src/binary.rs", "bin", 3), "bin", "bin")
+            .unwrap();
+        let binary_path = mirror.local_path("src/binary.rs").unwrap();
+        fs::write(&binary_path, b"\xff\x00hit").unwrap();
+
+        let result = mirror
+            .grep_cache(&json!({"query": "hit", "limit": 10}))
+            .unwrap();
+        let hits = result["hits"].as_array().unwrap();
+
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0]["path"], "src/dirty.rs");
+        assert_eq!(hits[0]["dirty"], true);
+        assert_eq!(
+            hits[0]["local_path"].as_str().unwrap(),
+            dirty_path.to_string_lossy().as_ref()
+        );
+        assert_eq!(hits[1]["path"], "src/main.rs");
+        assert_eq!(hits[1]["dirty"], false);
+        assert_eq!(result["searched_files"], 2);
+        assert_eq!(result["truncated"], false);
+    }
+
+    #[test]
+    fn grep_cache_respects_hit_limit() {
+        let dir = tempdir().unwrap();
+        let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
+        mirror
+            .record_hydrated(&test_meta("a.rs", "a", 1), "a", "a")
+            .unwrap();
+        let a_path = mirror.local_path("a.rs").unwrap();
+        fs::write(&a_path, b"hit one\nhit two\n").unwrap();
+
+        let result = mirror
+            .grep_cache(&json!({"query": "hit", "limit": 1}))
+            .unwrap();
+        let hits = result["hits"].as_array().unwrap();
+
+        assert_eq!(hits.len(), 1);
+        assert_eq!(result["truncated"], true);
+    }
+
+    #[test]
+    fn grep_cache_reports_file_limit_truncation() {
+        let dir = tempdir().unwrap();
+        let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
+        mirror
+            .record_hydrated(&test_meta("a.rs", "a", 1), "a", "a")
+            .unwrap();
+        let a_path = mirror.local_path("a.rs").unwrap();
+        fs::write(&a_path, b"no match\n").unwrap();
+        mirror
+            .record_hydrated(&test_meta("b.rs", "b", 1), "b", "b")
+            .unwrap();
+        let b_path = mirror.local_path("b.rs").unwrap();
+        fs::write(&b_path, b"hit beyond cutoff\n").unwrap();
+
+        let result = mirror
+            .grep_cache(&json!({"query": "hit", "limit": 10, "max_files": 1}))
+            .unwrap();
+        let hits = result["hits"].as_array().unwrap();
+
+        assert!(hits.is_empty());
+        assert_eq!(result["searched_files"], 1);
+        assert_eq!(result["max_files"], 1);
+        assert_eq!(result["truncated"], true);
+    }
+
+    #[test]
+    fn remote_grep_paths_skip_dirty_and_stale_mirror_entries() {
+        let dir = tempdir().unwrap();
+        let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
+        mirror
+            .record_hydrated(&test_meta("clean.rs", "clean", 1), "clean", "clean")
+            .unwrap();
+        let clean_path = mirror.local_path("clean.rs").unwrap();
+        fs::write(&clean_path, b"hit clean\n").unwrap();
+
+        mirror
+            .record_hydrated(&test_meta("dirty.rs", "base", 1), "base", "base")
+            .unwrap();
+        let dirty_path = mirror.local_path("dirty.rs").unwrap();
+        fs::write(&dirty_path, b"hit dirty\n").unwrap();
+        let dirty_hash = hash_bytes(b"hit dirty\n");
+        mirror
+            .enqueue_save("dirty.rs", &dirty_hash, Some("base"), b"hit dirty\n")
+            .unwrap();
+
+        mirror
+            .record_hydrated(&test_meta("stale.rs", "old", 1), "old", "old")
+            .unwrap();
+        let stale_path = mirror.local_path("stale.rs").unwrap();
+        fs::write(&stale_path, b"hit stale\n").unwrap();
+        mirror
+            .record_validation("stale.rs", "stale", Some("new"), None)
+            .unwrap();
+
+        let sidecar = test_sidecar(mirror);
+        let hits = sidecar
+            .grep_hits_with_local_paths(vec![
+                nrm_protocol::SearchHit {
+                    path: "clean.rs".to_string(),
+                    line: 1,
+                    column: 1,
+                    text: "hit clean".to_string(),
+                },
+                nrm_protocol::SearchHit {
+                    path: "dirty.rs".to_string(),
+                    line: 1,
+                    column: 1,
+                    text: "hit dirty".to_string(),
+                },
+                nrm_protocol::SearchHit {
+                    path: "stale.rs".to_string(),
+                    line: 1,
+                    column: 1,
+                    text: "hit stale".to_string(),
+                },
+            ])
+            .unwrap();
+
+        assert_eq!(
+            hits[0]["local_path"].as_str().unwrap(),
+            clean_path.to_string_lossy().as_ref()
+        );
+        assert!(hits[1]["local_path"].is_null());
+        assert!(hits[2]["local_path"].is_null());
+    }
+
+    #[test]
     fn queued_saves_keep_exact_snapshots_and_chain_expected_hashes() {
         let dir = tempdir().unwrap();
         let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
@@ -3783,6 +4102,38 @@ mod tests {
             panic!("status should be handled by fast state");
         };
         assert_eq!(result.unwrap()["cached_files"], 1);
+    }
+
+    #[test]
+    fn fast_state_serves_grep_cache_from_reopened_mirror() {
+        let dir = tempdir().unwrap();
+        let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
+        mirror
+            .record_hydrated(&test_meta("src/main.rs", "hash", 4), "hash", "hash")
+            .unwrap();
+        let local_path = mirror.local_path("src/main.rs").unwrap();
+        fs::create_dir_all(local_path.parent().unwrap()).unwrap();
+        fs::write(&local_path, b"fn cached_symbol() {}\n").unwrap();
+        let sidecar = test_sidecar(mirror);
+        let fast =
+            FastState::from_sidecar(&sidecar, Arc::new(Mutex::new(PendingRemote::default())));
+
+        let request = ClientRequest {
+            id: 1,
+            method: "grep_cache".to_string(),
+            params: json!({"query": "cached_symbol", "limit": 10}),
+        };
+        let FastHandle::Handled(result) = fast.try_handle(&request) else {
+            panic!("grep_cache should be handled by fast state");
+        };
+        let result = result.unwrap();
+
+        assert_eq!(result["cached"], true);
+        assert_eq!(result["hits"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            result["hits"][0]["local_path"].as_str().unwrap(),
+            local_path.to_string_lossy().as_ref()
+        );
     }
 
     #[test]

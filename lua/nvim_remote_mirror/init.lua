@@ -23,6 +23,9 @@ M.config = {
   agent = executable_or_default("nrm-agent"),
   state_dir = nil,
   grep_limit = 200,
+  grep_cache_max_files = 2000,
+  grep_cache_max_file_bytes = 512 * 1024,
+  grep_cache_max_total_bytes = 8 * 1024 * 1024,
   request_timeout_ms = 30000,
   ssh_connect_timeout_seconds = 10,
   prefetch_max_file_bytes = 4 * 1024 * 1024,
@@ -39,6 +42,7 @@ M.client = nil
 M.last_target = nil
 M.reconnect_attempts = 0
 M.reconnect_generation = 0
+M.grep_generation = 0
 
 local function notify(message, level)
   vim.schedule(function()
@@ -457,7 +461,92 @@ function M.scan(limit)
   end)
 end
 
+local function set_grep_quickfix(query, result, title, should_apply)
+  local items = {}
+  local skipped = 0
+  for _, hit in ipairs(result.hits or {}) do
+    local filename = optional_string(hit.local_path)
+    if filename then
+      table.insert(items, {
+        filename = filename,
+        lnum = hit.line,
+        col = hit.column,
+        text = hit.text,
+      })
+    else
+      skipped = skipped + 1
+    end
+  end
+  vim.schedule(function()
+    if should_apply and not should_apply() then
+      return
+    end
+    vim.fn.setqflist({}, " ", { title = title .. " " .. query, items = items })
+    vim.cmd.copen()
+  end)
+  return skipped
+end
+
+local function merge_remote_with_dirty_cache(remote_result, dirty_hits)
+  local merged = {}
+  for key, value in pairs(remote_result or {}) do
+    if key ~= "hits" then
+      merged[key] = value
+    end
+  end
+
+  local seen = {}
+  merged.hits = {}
+  local function add(hit)
+    local key = table.concat({
+      hit.local_path or "",
+      hit.path or "",
+      tostring(hit.line or ""),
+      tostring(hit.column or ""),
+      hit.text or "",
+    }, "\31")
+    if not seen[key] then
+      seen[key] = true
+      table.insert(merged.hits, hit)
+    end
+  end
+
+  for _, hit in ipairs(remote_result.hits or {}) do
+    add(hit)
+  end
+  for _, hit in ipairs(dirty_hits or {}) do
+    add(hit)
+  end
+
+  return merged
+end
+
 function M.grep(query)
+  M.grep_generation = M.grep_generation + 1
+  local generation = M.grep_generation
+  local remote_result = nil
+  local remote_applied = false
+  local dirty_cache_hits = {}
+
+  local function is_current()
+    return generation == M.grep_generation
+  end
+
+  local function apply_remote_result()
+    if not is_current() or not remote_result then
+      return
+    end
+    remote_applied = true
+    local merged = merge_remote_with_dirty_cache(remote_result, dirty_cache_hits)
+    local skipped = set_grep_quickfix(query, merged, "RemoteGrep", is_current)
+    if skipped > 0 then
+      notify(
+        "grep skipped " .. tostring(skipped) .. " remote hits without safe local mirror paths",
+        vim.log.levels.WARN
+      )
+    end
+  end
+
   M.request("grep", {
     query = query,
     limit = M.config.grep_limit,
@@ -465,23 +554,15 @@ function M.grep(query)
     max_file_bytes = M.config.prefetch_max_file_bytes,
     max_total_bytes = M.config.prefetch_max_total_bytes,
   }, function(err, result)
+    if not is_current() then
+      return
+    end
     if err then
       notify(err, vim.log.levels.ERROR)
       return
     end
-    local items = {}
-    for _, hit in ipairs(result.hits or {}) do
-      table.insert(items, {
-        filename = optional_string(hit.local_path) or hit.path,
-        lnum = hit.line,
-        col = hit.column,
-        text = hit.text,
-      })
-    end
-    vim.schedule(function()
-      vim.fn.setqflist({}, " ", { title = "RemoteGrep " .. query, items = items })
-      vim.cmd.copen()
-    end)
+    remote_result = result
+    apply_remote_result()
     local hydrate_errors = #(result.hydrate_errors or {})
     if hydrate_errors > 0 or result.hydrate_truncated then
       notify(
@@ -492,6 +573,40 @@ function M.grep(query)
           .. " errors",
         vim.log.levels.WARN
       )
+    end
+  end)
+
+  M.request("grep_cache", {
+    query = query,
+    limit = M.config.grep_limit,
+    max_files = M.config.grep_cache_max_files,
+    max_file_bytes = M.config.grep_cache_max_file_bytes,
+    max_total_bytes = M.config.grep_cache_max_total_bytes,
+  }, function(err, result)
+    if not is_current() then
+      return
+    end
+    if err then
+      notify("cache grep failed: " .. err, vim.log.levels.WARN)
+      return
+    end
+
+    dirty_cache_hits = {}
+    for _, hit in ipairs(result.hits or {}) do
+      if hit.dirty and optional_string(hit.local_path) then
+        table.insert(dirty_cache_hits, hit)
+      end
+    end
+
+    if remote_result then
+      apply_remote_result()
+      return
+    end
+
+    if #(result.hits or {}) > 0 then
+      set_grep_quickfix(query, result, "RemoteGrep cache", function()
+        return is_current() and not remote_applied
+      end)
     end
   end)
 end
