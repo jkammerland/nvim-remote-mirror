@@ -22,6 +22,7 @@ M.config = {
   sidecar = executable_or_default("nrm-sidecar"),
   agent = executable_or_default("nrm-agent"),
   state_dir = nil,
+  find_limit = 200,
   grep_limit = 200,
   grep_cache_max_files = 2000,
   grep_cache_max_file_bytes = 512 * 1024,
@@ -969,6 +970,56 @@ function M.scan(limit)
       return
     end
     notify("indexed " .. tostring(#result.entries) .. " paths")
+  end)
+end
+
+local function find_label(hit)
+  local labels = {}
+  if hit.cached then
+    table.insert(labels, "cached")
+  else
+    table.insert(labels, "known")
+  end
+  if hit.dirty then
+    table.insert(labels, "dirty")
+  end
+  local validation_state = optional_string(hit.validation_state)
+  if validation_state and validation_state ~= "valid" and validation_state ~= "unknown" then
+    table.insert(labels, validation_state)
+  end
+  return hit.path .. " [" .. table.concat(labels, ",") .. "]"
+end
+
+function M.find(query, opts)
+  opts = opts or {}
+  query = query or ""
+  M.request("find_paths", {
+    query = query,
+    limit = opts.limit or M.config.find_limit,
+  }, function(err, result)
+    if err then
+      notify(err, vim.log.levels.ERROR)
+      return
+    end
+    local items = {}
+    for _, hit in ipairs(result.hits or {}) do
+      local filename = optional_string(hit.local_path)
+      if filename then
+        table.insert(items, {
+          filename = filename,
+          lnum = 1,
+          col = 1,
+          text = find_label(hit),
+        })
+      end
+    end
+    vim.schedule(function()
+      vim.fn.setqflist({}, " ", { title = "RemoteFind " .. query, items = items })
+      vim.cmd.copen()
+      if result.truncated then
+        notify("RemoteFind truncated at " .. tostring(result.limit) .. " paths", vim.log.levels.WARN)
+      end
+    end)
   end)
 end
 

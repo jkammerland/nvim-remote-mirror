@@ -44,6 +44,11 @@ COMMANDS                                      *nvim-remote-mirror-commands*
     overwritten; if the local file is missing, the latest queued save snapshot
     is restored instead.
 
+:RemoteFind [query]
+    Search known mirror paths locally and fill quickfix with mirror-local
+    filenames. Selecting an uncached result hydrates it lazily through the
+    mirror buffer autohydration path.
+
 :RemoteGrep {query}
     Queue remote grep, search a bounded slice of already hydrated local mirror
     files as a provisional cache result, hydrate remote matches in a batch, and
@@ -91,6 +96,7 @@ CONFIGURATION                                  *nvim-remote-mirror-config*
     sidecar = "/path/to/nrm-sidecar",
     agent = "/path/to/nrm-agent",
     state_dir = "/path/to/state",
+    find_limit = 200,
     grep_limit = 200,
     grep_cache_max_files = 2000,
     grep_cache_max_file_bytes = 512 * 1024,

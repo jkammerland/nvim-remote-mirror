@@ -427,6 +427,7 @@ impl AgentClient {
         self.last_remote_error = None;
     }
 
+    #[cfg(test)]
     fn preempt_epoch(&self) -> u64 {
         self.preempt.epoch()
     }
@@ -1826,6 +1827,49 @@ impl Mirror {
         }))
     }
 
+    fn find_paths(&self, params: &Value) -> Result<Value> {
+        let query = optional_string_param(params, "query").unwrap_or("");
+        let limit = params.get("limit").and_then(Value::as_u64).unwrap_or(200) as usize;
+        let db_limit = limit.saturating_add(1).min(i64::MAX as usize) as i64;
+        let mut statement = self.db.prepare(
+            "
+            SELECT relative_path, local_path, state, dirty, validation_state
+            FROM files
+            WHERE is_dir=0
+              AND is_symlink=0
+              AND metadata_kind_known=1
+              AND (?1='' OR instr(relative_path, ?1) > 0)
+            ORDER BY relative_path ASC
+            LIMIT ?2
+            ",
+        )?;
+        let rows = statement.query_map(params![query, db_limit], |row| {
+            Ok(json!({
+                "path": row.get::<_, String>(0)?,
+                "local_path": row.get::<_, String>(1)?,
+                "cached": row.get::<_, String>(2)? == "hydrated",
+                "dirty": row.get::<_, i64>(3)? != 0,
+                "validation_state": row.get::<_, String>(4)?
+            }))
+        })?;
+        let mut hits = Vec::new();
+        for row in rows {
+            hits.push(row?);
+        }
+        let mut truncated = false;
+        if hits.len() > limit {
+            hits.truncate(limit);
+            truncated = true;
+        }
+        Ok(json!({
+            "query": query,
+            "hits": hits,
+            "truncated": truncated,
+            "limit": limit,
+            "cached": true
+        }))
+    }
+
     fn record_validation(
         &self,
         relative_path: &str,
@@ -2326,6 +2370,7 @@ impl RemoteQueue {
         }
     }
 
+    #[cfg(test)]
     fn pop(&self) -> Option<RemoteWork> {
         self.pop_started_with_epoch(None)
             .map(|started| started.work)
@@ -2640,6 +2685,10 @@ impl FastState {
             "status" => FastHandle::Handled(
                 Mirror::open_root(self.mirror_root.clone()).and_then(|mirror| mirror.status()),
             ),
+            "find_paths" => FastHandle::Handled(
+                Mirror::open_root(self.mirror_root.clone())
+                    .and_then(|mirror| mirror.find_paths(&request.params)),
+            ),
             "open" => self.try_open(&request.params),
             "grep_cache" => FastHandle::Handled(
                 Mirror::open_root(self.mirror_root.clone())
@@ -2778,6 +2827,7 @@ impl Sidecar {
                 "remote_available": false
             })),
             "status" => self.mirror.status(),
+            "find_paths" => self.mirror.find_paths(&params),
             "remote_probe" => Ok(self.remote_probe()),
             "scan" => self.scan(params, preempt_epoch),
             "open" => self.open(params),
@@ -5327,6 +5377,76 @@ mod tests {
     }
 
     #[test]
+    fn find_paths_searches_cached_and_metadata_entries_locally() {
+        let dir = tempdir().unwrap();
+        let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
+        mirror
+            .upsert_metadata(&test_meta("src/main.rs", "main", 4), "metadata")
+            .unwrap();
+        record_hydrated_content(&mirror, "src/lib.rs", b"lib");
+        mirror
+            .upsert_metadata(
+                &test_meta_kind("src/dir", "dir", 0, true, false),
+                "metadata",
+            )
+            .unwrap();
+        mirror
+            .upsert_metadata(
+                &test_meta_kind("src/link.rs", "link", 0, false, true),
+                "metadata",
+            )
+            .unwrap();
+
+        let result = mirror
+            .find_paths(&json!({"query": "src/", "limit": 10}))
+            .unwrap();
+        let hits = result["hits"].as_array().unwrap();
+
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0]["path"], "src/lib.rs");
+        assert_eq!(hits[0]["cached"], true);
+        assert!(hits[0]["local_path"]
+            .as_str()
+            .unwrap()
+            .ends_with("src/lib.rs"));
+        assert_eq!(hits[1]["path"], "src/main.rs");
+        assert_eq!(hits[1]["cached"], false);
+        assert!(hits[1]["local_path"]
+            .as_str()
+            .unwrap()
+            .ends_with("src/main.rs"));
+        assert_eq!(result["truncated"], false);
+    }
+
+    #[test]
+    fn find_paths_uses_literal_query_and_reports_truncation() {
+        let dir = tempdir().unwrap();
+        let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
+        mirror
+            .upsert_metadata(&test_meta("src/percent%name.rs", "a", 1), "metadata")
+            .unwrap();
+        mirror
+            .upsert_metadata(&test_meta("src/percent-name.rs", "b", 1), "metadata")
+            .unwrap();
+        mirror
+            .upsert_metadata(&test_meta("src/other.rs", "c", 1), "metadata")
+            .unwrap();
+
+        let literal = mirror
+            .find_paths(&json!({"query": "%name", "limit": 10}))
+            .unwrap();
+        let hits = literal["hits"].as_array().unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["path"], "src/percent%name.rs");
+
+        let limited = mirror
+            .find_paths(&json!({"query": "src/", "limit": 1}))
+            .unwrap();
+        assert_eq!(limited["hits"].as_array().unwrap().len(), 1);
+        assert_eq!(limited["truncated"], true);
+    }
+
+    #[test]
     fn fast_state_serves_cached_open_and_status_from_reopened_mirror() {
         let dir = tempdir().unwrap();
         let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
@@ -5360,6 +5480,32 @@ mod tests {
             panic!("status should be handled by fast state");
         };
         assert_eq!(result.unwrap()["cached_files"], 1);
+    }
+
+    #[test]
+    fn fast_state_serves_find_paths_from_reopened_mirror() {
+        let dir = tempdir().unwrap();
+        let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
+        mirror
+            .upsert_metadata(&test_meta("src/main.rs", "main", 4), "metadata")
+            .unwrap();
+        let sidecar = test_sidecar(mirror);
+        let fast =
+            FastState::from_sidecar(&sidecar, Arc::new(Mutex::new(PendingRemote::default())));
+
+        let request = ClientRequest {
+            id: 1,
+            method: "find_paths".to_string(),
+            params: json!({"query": "main", "limit": 10}),
+        };
+        let FastHandle::Handled(result) = fast.try_handle(&request) else {
+            panic!("find_paths should be handled by fast state");
+        };
+        let result = result.unwrap();
+        let hits = result["hits"].as_array().unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["path"], "src/main.rs");
+        assert_eq!(hits[0]["cached"], false);
     }
 
     #[test]

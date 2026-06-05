@@ -35,6 +35,12 @@ end, {
   nargs = "?",
 })
 
+vim.api.nvim_create_user_command("RemoteFind", function(opts)
+  nrm.find(opts.args)
+end, {
+  nargs = "?",
+})
+
 vim.api.nvim_create_user_command("RemoteGrep", function(opts)
   nrm.grep(opts.args)
 end, {

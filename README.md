@@ -83,6 +83,7 @@ Then connect to a local workspace:
 
 ```vim
 :RemoteConnect /path/to/workspace
+:RemoteFind readme
 :RemoteOpen README.md
 :RemoteGrep main
 :RemoteStatus
@@ -124,6 +125,7 @@ require("nvim_remote_mirror").setup({
   agent = "/path/to/nrm-agent",
   request_timeout_ms = 30000,
   ssh_connect_timeout_seconds = 10,
+  find_limit = 200,
   grep_limit = 200,
   grep_cache_max_files = 2000,
   grep_cache_max_file_bytes = 512 * 1024,
@@ -232,6 +234,11 @@ When `auto_hydrate_mirror_buffers` is enabled, Neovim edits under the local
 mirror root are mapped back to workspace-relative remote paths. This lets LSP
 definition/reference jumps into not-yet-cached mirror files hydrate through the
 sidecar instead of opening an empty local path.
+
+`:RemoteFind [query]` searches known mirror metadata locally and fills quickfix
+with mirror paths. Selecting an uncached result hydrates it through the same
+mirror-buffer autohydration path, so path navigation remains useful while SSH is
+slow or temporarily unavailable after metadata has been scanned.
 
 `:RemoteGrep` queues the authoritative remote search first, then searches a
 bounded slice of already hydrated local mirror files. Cached hits are
