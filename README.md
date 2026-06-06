@@ -43,10 +43,10 @@ Completion criteria:
   JSON-line RPC. Neovim is the only client today.
 - `lua/nvim_remote_mirror`: Neovim client facade.
 
-Today the Neovim facade launches one stdio sidecar process per editor session;
-the reusable boundary is the sidecar JSON command/notification protocol plus
-durable workspace state. A long-lived socket listener can be added as a thin
-process-lifetime wrapper around that protocol without changing the mirror model.
+By default the Neovim facade launches one stdio sidecar process per editor
+session. For a reusable endpoint, set `connection = "socket"`; Neovim will
+connect to a Unix-domain sidecar listener or start one with the same JSON
+command/notification protocol and durable workspace state.
 
 This first implementation covers:
 
@@ -55,6 +55,7 @@ This first implementation covers:
 - request-id framed sidecar/agent RPC with typed remote errors.
 - sidecar command responses plus optional server notifications for remote
   health changes.
+- opt-in Unix-domain sidecar listener mode for a reusable daemon endpoint.
 - fast local `workspace_info` daemon introspection with workspace paths,
   transport metadata, supported commands, notifications, and capabilities.
 - configurable request and SSH connect timeouts.
@@ -149,6 +150,10 @@ require("nvim_remote_mirror").setup({
   sidecar = "/path/to/nrm-sidecar",
   agent = "/path/to/local/nrm-agent",
   remote_agent = "nrm-agent",
+  connection = "stdio",
+  socket_path = nil,
+  socket_dir = nil,
+  daemon_start_timeout_ms = 1000,
   request_timeout_ms = 30000,
   ssh_connect_timeout_seconds = 10,
   find_limit = 200,
@@ -188,6 +193,12 @@ require("nvim_remote_mirror").setup({
 For `ssh://` targets, `remote_agent` is executed on the remote host. The local
 `agent` path is used only for local targets, so a checkout-local
 `target/debug/nrm-agent` is not accidentally sent to SSH hosts.
+Set `connection = "socket"` to connect through a reusable Unix-domain sidecar
+listener. If `socket_path` is unset, the plugin derives a stable path under
+`socket_dir`, `state_dir/sockets`, or the system temp directory from the target
+and daemon-affecting config. The listener is detached from Neovim and currently
+serves one active client session at a time; `:RemoteDisconnect` closes the
+client session but leaves the listener available for the next editor.
 
 ## LSP Proxy
 

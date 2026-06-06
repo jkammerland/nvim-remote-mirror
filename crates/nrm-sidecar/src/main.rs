@@ -13,6 +13,10 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read, Write};
 #[cfg(unix)]
+use std::os::unix::fs::FileTypeExt;
+#[cfg(unix)]
+use std::os::unix::net::{UnixListener, UnixStream};
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -153,6 +157,22 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum CommandKind {
     Serve {
+        #[arg(long)]
+        remote_root: PathBuf,
+        #[arg(long)]
+        ssh: Option<String>,
+        #[arg(long, default_value = "nrm-agent")]
+        agent: String,
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        #[arg(long, default_value_t = 30_000)]
+        request_timeout_ms: u64,
+        #[arg(long, default_value_t = 10)]
+        ssh_connect_timeout_seconds: u64,
+    },
+    Listen {
+        #[arg(long)]
+        socket: PathBuf,
         #[arg(long)]
         remote_root: PathBuf,
         #[arg(long)]
@@ -3048,7 +3068,8 @@ fn workspace_info_value(
             "lsp_proxy": true,
             "transport_neutral_agent_frames": true,
             "agent_abort_handle": true,
-            "agent_abort_scope": "lane_worker"
+            "agent_abort_scope": "lane_worker",
+            "sidecar_socket_listener": cfg!(unix)
         },
         "remote_health": remote_health_value
     });
@@ -5293,6 +5314,22 @@ fn main() -> Result<()> {
             state_dir,
             request_timeout_ms,
         ),
+        CommandKind::Listen {
+            socket,
+            remote_root,
+            ssh,
+            agent,
+            state_dir,
+            request_timeout_ms,
+            ssh_connect_timeout_seconds,
+        } => run_listener(
+            socket,
+            remote_root,
+            RemoteTransport::from_ssh(ssh, ssh_connect_timeout_seconds),
+            agent,
+            state_dir,
+            request_timeout_ms,
+        ),
         CommandKind::LspProxy {
             remote_root,
             local_root,
@@ -5315,7 +5352,148 @@ fn run_server(
     state_dir: Option<PathBuf>,
     request_timeout_ms: u64,
 ) -> Result<()> {
+    let (response_tx, response_rx) = mpsc::sync_channel::<ServerMessage>(1024);
+    let writer = spawn_stdout_writer(response_rx);
     let stdin = io::stdin();
+    let session = run_server_session(
+        remote_root,
+        transport,
+        agent,
+        state_dir,
+        request_timeout_ms,
+        stdin.lock(),
+        response_tx,
+        true,
+    );
+    join_writer(writer, "server writer thread")?;
+    session.map(|_| ())
+}
+
+#[cfg(unix)]
+fn run_listener(
+    socket: PathBuf,
+    remote_root: PathBuf,
+    transport: RemoteTransport,
+    agent: String,
+    state_dir: Option<PathBuf>,
+    request_timeout_ms: u64,
+) -> Result<()> {
+    prepare_listener_socket(&socket)?;
+    let listener = UnixListener::bind(&socket)
+        .with_context(|| format!("failed to bind sidecar socket {}", socket.display()))?;
+    sync_parent_dir(&socket)?;
+
+    let listen_result = (|| -> Result<()> {
+        for stream in listener.incoming() {
+            let stream = stream.with_context(|| {
+                format!(
+                    "failed to accept sidecar socket connection on {}",
+                    socket.display()
+                )
+            })?;
+            let exit = run_socket_server_session(
+                remote_root.clone(),
+                transport.clone(),
+                agent.clone(),
+                state_dir.clone(),
+                request_timeout_ms,
+                stream,
+            )?;
+            if exit.shutdown_listener {
+                break;
+            }
+        }
+        Ok(())
+    })();
+
+    drop(listener);
+    let _ = fs::remove_file(&socket);
+    let _ = sync_parent_dir(&socket);
+    listen_result
+}
+
+#[cfg(not(unix))]
+fn run_listener(
+    _socket: PathBuf,
+    _remote_root: PathBuf,
+    _transport: RemoteTransport,
+    _agent: String,
+    _state_dir: Option<PathBuf>,
+    _request_timeout_ms: u64,
+) -> Result<()> {
+    bail!("sidecar socket listener is only supported on Unix platforms")
+}
+
+#[cfg(unix)]
+fn prepare_listener_socket(socket: &Path) -> Result<()> {
+    if let Some(parent) = socket.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if let Ok(metadata) = fs::symlink_metadata(socket) {
+        if !metadata.file_type().is_socket() {
+            bail!(
+                "socket path already exists and is not a socket: {}",
+                socket.display()
+            );
+        }
+        if UnixStream::connect(socket).is_ok() {
+            bail!("sidecar socket is already in use: {}", socket.display());
+        }
+        fs::remove_file(socket)
+            .with_context(|| format!("failed to remove stale socket {}", socket.display()))?;
+        sync_parent_dir(socket)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn run_socket_server_session(
+    remote_root: PathBuf,
+    transport: RemoteTransport,
+    agent: String,
+    state_dir: Option<PathBuf>,
+    request_timeout_ms: u64,
+    stream: UnixStream,
+) -> Result<ServerSessionExit> {
+    let reader = BufReader::new(
+        stream
+            .try_clone()
+            .context("failed to clone sidecar socket stream for reading")?,
+    );
+    let (response_tx, response_rx) = mpsc::sync_channel::<ServerMessage>(1024);
+    let writer = spawn_message_writer(stream, response_rx);
+    let session = run_server_session(
+        remote_root,
+        transport,
+        agent,
+        state_dir,
+        request_timeout_ms,
+        reader,
+        response_tx,
+        false,
+    );
+    join_writer(writer, "socket writer thread")?;
+    session
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct ServerSessionExit {
+    shutdown_listener: bool,
+}
+
+fn run_server_session<R>(
+    remote_root: PathBuf,
+    transport: RemoteTransport,
+    agent: String,
+    state_dir: Option<PathBuf>,
+    request_timeout_ms: u64,
+    reader: R,
+    response_tx: mpsc::SyncSender<ServerMessage>,
+    propagate_read_errors: bool,
+) -> Result<ServerSessionExit>
+where
+    R: BufRead,
+{
     let agent_interrupt = AgentInterrupt::default();
     let sidecar = Sidecar::new(
         remote_root,
@@ -5336,16 +5514,6 @@ fn run_server(
         read: read_preempt.clone(),
         write: write_preempt.clone(),
     };
-    let (response_tx, response_rx) = mpsc::sync_channel::<ServerMessage>(1024);
-    let writer = thread::spawn(move || -> Result<()> {
-        let stdout = io::stdout();
-        let mut stdout = stdout.lock();
-        for message in response_rx {
-            writeln!(stdout, "{}", serde_json::to_string(&message)?)?;
-            stdout.flush()?;
-        }
-        Ok(())
-    });
 
     let read_queue = Arc::new(RemoteQueue::new(
         REMOTE_INTERACTIVE_QUEUE_CAPACITY,
@@ -5377,186 +5545,217 @@ fn run_server(
         response_tx.clone(),
     );
 
-    for line in stdin.lock().lines() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let mut request: ClientRequest = match serde_json::from_str(&line) {
-            Ok(request) => request,
-            Err(error) => {
-                send_client_response(
-                    &response_tx,
-                    ClientResponse {
-                        id: 0,
-                        ok: false,
-                        result: None,
-                        error: Some(format!("invalid request JSON: {error}")),
-                    },
-                );
+    let mut exit = ServerSessionExit::default();
+    let mut explicit_end = false;
+    let mut read_error = None;
+    let read_result = (|| -> Result<()> {
+        for line in reader.lines() {
+            let line = match line {
+                Ok(line) => line,
+                Err(error) => {
+                    read_error = Some(error);
+                    break;
+                }
+            };
+            if line.trim().is_empty() {
                 continue;
             }
-        };
-
-        let should_shutdown = matches!(request.method.as_str(), "shutdown" | "disconnect");
-        if should_shutdown {
-            agent_interrupt.request_shutdown();
-            write_interrupt.request_shutdown();
-            clear_pending_works(
-                &pending_remote,
-                &pending_writes,
-                read_queue.shutdown_and_drain(),
-            );
-            clear_pending_works(
-                &pending_remote,
-                &pending_writes,
-                write_queue.shutdown_and_drain(),
-            );
-            send_client_response(
-                &response_tx,
-                ClientResponse {
-                    id: request.id,
-                    ok: true,
-                    result: Some(json!({"shutdown": true})),
-                    error: None,
-                },
-            );
-            break;
-        }
-        if request.method == "cancel" {
-            let response = match cancel_request_id(&request.params) {
-                Ok(target_id) => {
-                    if let Some(work) = cancel_queued_request(
-                        &read_queue,
-                        &pending_remote,
-                        &pending_writes,
-                        target_id,
-                    )
-                    .or_else(|| {
-                        cancel_queued_request(
-                            &write_queue,
-                            &pending_remote,
-                            &pending_writes,
-                            target_id,
-                        )
-                    }) {
-                        send_client_response(&response_tx, canceled_client_response(work));
-                        result_to_client_response(
-                            request.id,
-                            Ok(json!({
-                                "request_id": target_id,
-                                "canceled": true,
-                                "scope": "queued"
-                            })),
-                        )
-                    } else if let Some(result) =
-                        cancel_active_request(&active_remote, &remote_preempts, target_id)
-                    {
-                        result_to_client_response(request.id, Ok(result))
-                    } else {
-                        result_to_client_response(
-                            request.id,
-                            Ok(json!({
-                                "request_id": target_id,
-                                "canceled": false,
-                                "scope": "unknown",
-                                "reason": "request is neither queued nor active"
-                            })),
-                        )
-                    }
-                }
-                Err(error) => result_to_client_response(request.id, Err(error)),
-            };
-            send_client_response(&response_tx, response);
-            continue;
-        }
-        if request.method == "flush" {
-            request = match fast_state.prepare_flush(&request) {
+            let mut request: ClientRequest = match serde_json::from_str(&line) {
                 Ok(request) => request,
                 Err(error) => {
                     send_client_response(
                         &response_tx,
-                        result_to_client_response(request.id, Err(error)),
+                        ClientResponse {
+                            id: 0,
+                            ok: false,
+                            result: None,
+                            error: Some(format!("invalid request JSON: {error}")),
+                        },
                     );
                     continue;
                 }
             };
-        }
-        match fast_state.try_handle(&request) {
-            FastHandle::Handled(result) => {
-                send_client_response(&response_tx, result_to_client_response(request.id, result));
+
+            let should_end_session = matches!(request.method.as_str(), "shutdown" | "disconnect");
+            if should_end_session {
+                explicit_end = true;
+                exit.shutdown_listener = request.method == "shutdown";
+                agent_interrupt.request_shutdown();
+                write_interrupt.request_shutdown();
+                clear_pending_works(
+                    &pending_remote,
+                    &pending_writes,
+                    read_queue.shutdown_and_drain(),
+                );
+                clear_pending_works(
+                    &pending_remote,
+                    &pending_writes,
+                    write_queue.shutdown_and_drain(),
+                );
+                send_client_response(
+                    &response_tx,
+                    ClientResponse {
+                        id: request.id,
+                        ok: true,
+                        result: Some(json!({"shutdown": true})),
+                        error: None,
+                    },
+                );
+                break;
             }
-            FastHandle::Defer => {
-                let hazard = PendingHazard::for_request(&request);
-                let lane = pending_writes
-                    .lock()
-                    .map(|pending| RemoteLane::for_request(&request, &pending))
-                    .unwrap_or(RemoteLane::Write);
-                let write_hazard_registered = request_is_write_lane(&request);
-                if let Ok(mut pending) = pending_remote.lock() {
-                    pending.register(&hazard);
-                }
-                if write_hazard_registered {
-                    if let Ok(mut pending) = pending_writes.lock() {
-                        pending.register(&hazard);
-                    }
-                }
-                let priority = RemotePriority::for_request(&request);
-                let work = RemoteWork {
-                    request,
-                    hazard,
-                    priority,
-                    lane,
-                    write_hazard_registered,
-                };
-                let queue = match lane {
-                    RemoteLane::Read => &read_queue,
-                    RemoteLane::Write => &write_queue,
-                };
-                let preempt = (priority == RemotePriority::Interactive)
-                    .then_some(remote_preempts.for_lane(lane));
-                match queue.try_push(work, preempt) {
-                    Ok(canceled) => {
-                        clear_pending_work_refs(&pending_remote, &pending_writes, &canceled);
-                        send_preempted_responses(&response_tx, canceled);
-                    }
-                    Err(work) => {
-                        clear_pending_work(&pending_remote, &pending_writes, &work);
-                        let response = if work.request.method == "flush_queued" {
+
+            if request.method == "cancel" {
+                let response = match cancel_request_id(&request.params) {
+                    Ok(target_id) => {
+                        if let Some(work) = cancel_queued_request(
+                            &read_queue,
+                            &pending_remote,
+                            &pending_writes,
+                            target_id,
+                        )
+                        .or_else(|| {
+                            cancel_queued_request(
+                                &write_queue,
+                                &pending_remote,
+                                &pending_writes,
+                                target_id,
+                            )
+                        }) {
+                            send_client_response(&response_tx, canceled_client_response(work));
                             result_to_client_response(
-                                work.request.id,
+                                request.id,
                                 Ok(json!({
-                                    "status": "queued",
-                                    "path": work.request.params.get("path").and_then(Value::as_str).unwrap_or(""),
-                                    "reason": format!(
-                                        "remote {} {} queue is full or not available; saved locally",
-                                        work.lane.label(),
-                                        work.priority.label()
-                                    )
+                                    "request_id": target_id,
+                                    "canceled": true,
+                                    "scope": "queued"
                                 })),
                             )
+                        } else if let Some(result) =
+                            cancel_active_request(&active_remote, &remote_preempts, target_id)
+                        {
+                            result_to_client_response(request.id, Ok(result))
                         } else {
-                            ClientResponse {
-                                id: work.request.id,
-                                ok: false,
-                                result: None,
-                                error: Some(format!(
-                                    "remote {} {} queue is full or not available",
-                                    work.lane.label(),
-                                    work.priority.label()
-                                )),
-                            }
-                        };
-                        send_client_response(&response_tx, response);
+                            result_to_client_response(
+                                request.id,
+                                Ok(json!({
+                                    "request_id": target_id,
+                                    "canceled": false,
+                                    "scope": "unknown",
+                                    "reason": "request is neither queued nor active"
+                                })),
+                            )
+                        }
+                    }
+                    Err(error) => result_to_client_response(request.id, Err(error)),
+                };
+                send_client_response(&response_tx, response);
+                continue;
+            }
+
+            if request.method == "flush" {
+                request = match fast_state.prepare_flush(&request) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        send_client_response(
+                            &response_tx,
+                            result_to_client_response(request.id, Err(error)),
+                        );
+                        continue;
+                    }
+                };
+            }
+
+            match fast_state.try_handle(&request) {
+                FastHandle::Handled(result) => {
+                    send_client_response(
+                        &response_tx,
+                        result_to_client_response(request.id, result),
+                    );
+                }
+                FastHandle::Defer => {
+                    let hazard = PendingHazard::for_request(&request);
+                    let lane = pending_writes
+                        .lock()
+                        .map(|pending| RemoteLane::for_request(&request, &pending))
+                        .unwrap_or(RemoteLane::Write);
+                    let write_hazard_registered = request_is_write_lane(&request);
+                    if let Ok(mut pending) = pending_remote.lock() {
+                        pending.register(&hazard);
+                    }
+                    if write_hazard_registered {
+                        if let Ok(mut pending) = pending_writes.lock() {
+                            pending.register(&hazard);
+                        }
+                    }
+                    let priority = RemotePriority::for_request(&request);
+                    let work = RemoteWork {
+                        request,
+                        hazard,
+                        priority,
+                        lane,
+                        write_hazard_registered,
+                    };
+                    let queue = match lane {
+                        RemoteLane::Read => &read_queue,
+                        RemoteLane::Write => &write_queue,
+                    };
+                    let preempt = (priority == RemotePriority::Interactive)
+                        .then_some(remote_preempts.for_lane(lane));
+                    match queue.try_push(work, preempt) {
+                        Ok(canceled) => {
+                            clear_pending_work_refs(&pending_remote, &pending_writes, &canceled);
+                            send_preempted_responses(&response_tx, canceled);
+                        }
+                        Err(work) => {
+                            clear_pending_work(&pending_remote, &pending_writes, &work);
+                            let response = if work.request.method == "flush_queued" {
+                                result_to_client_response(
+                                    work.request.id,
+                                    Ok(json!({
+                                        "status": "queued",
+                                        "path": work.request.params.get("path").and_then(Value::as_str).unwrap_or(""),
+                                        "reason": format!(
+                                            "remote {} {} queue is full or not available; saved locally",
+                                            work.lane.label(),
+                                            work.priority.label()
+                                        )
+                                    })),
+                                )
+                            } else {
+                                ClientResponse {
+                                    id: work.request.id,
+                                    ok: false,
+                                    result: None,
+                                    error: Some(format!(
+                                        "remote {} {} queue is full or not available",
+                                        work.lane.label(),
+                                        work.priority.label()
+                                    )),
+                                }
+                            };
+                            send_client_response(&response_tx, response);
+                        }
                     }
                 }
             }
         }
-        if should_shutdown {
-            break;
-        }
-    }
+        Ok(())
+    })();
 
+    if !explicit_end {
+        agent_interrupt.request_shutdown();
+        write_interrupt.request_shutdown();
+        clear_pending_works(
+            &pending_remote,
+            &pending_writes,
+            read_queue.shutdown_and_drain(),
+        );
+        clear_pending_works(
+            &pending_remote,
+            &pending_writes,
+            write_queue.shutdown_and_drain(),
+        );
+    }
     clear_pending_works(
         &pending_remote,
         &pending_writes,
@@ -5570,11 +5769,72 @@ fn run_server(
     let _ = read_worker.join();
     let _ = write_worker.join();
     drop(response_tx);
-    match writer.join() {
-        Ok(result) => result?,
-        Err(_) => bail!("server writer thread panicked"),
+    read_result?;
+    if propagate_read_errors {
+        if let Some(error) = read_error {
+            return Err(error).context("failed to read sidecar request");
+        }
+    }
+    Ok(exit)
+}
+
+fn spawn_stdout_writer(
+    response_rx: mpsc::Receiver<ServerMessage>,
+) -> thread::JoinHandle<Result<()>> {
+    thread::spawn(move || {
+        let stdout = io::stdout();
+        let stdout = stdout.lock();
+        write_server_messages(stdout, response_rx)
+    })
+}
+
+fn spawn_message_writer<W>(
+    writer: W,
+    response_rx: mpsc::Receiver<ServerMessage>,
+) -> thread::JoinHandle<Result<()>>
+where
+    W: Write + Send + 'static,
+{
+    thread::spawn(move || write_server_messages(writer, response_rx))
+}
+
+fn write_server_messages<W>(mut writer: W, response_rx: mpsc::Receiver<ServerMessage>) -> Result<()>
+where
+    W: Write,
+{
+    for message in response_rx {
+        let encoded = serde_json::to_string(&message)?;
+        if let Err(error) = writeln!(writer, "{encoded}") {
+            if matches!(
+                error.kind(),
+                io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::ConnectionAborted
+            ) {
+                return Ok(());
+            }
+            return Err(error).context("failed to write sidecar response");
+        }
+        if let Err(error) = writer.flush() {
+            if matches!(
+                error.kind(),
+                io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::ConnectionAborted
+            ) {
+                return Ok(());
+            }
+            return Err(error).context("failed to flush sidecar response");
+        }
     }
     Ok(())
+}
+
+fn join_writer(handle: thread::JoinHandle<Result<()>>, name: &str) -> Result<()> {
+    match handle.join() {
+        Ok(result) => result,
+        Err(_) => bail!("{name} panicked"),
+    }
 }
 
 fn spawn_remote_worker(
@@ -6364,6 +6624,8 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::AtomicUsize;
     use tempfile::tempdir;
 
@@ -6717,6 +6979,7 @@ mod tests {
         assert_eq!(info["capabilities"]["transport_neutral_agent_frames"], true);
         assert_eq!(info["capabilities"]["agent_abort_handle"], true);
         assert_eq!(info["capabilities"]["agent_abort_scope"], "lane_worker");
+        assert_eq!(info["capabilities"]["sidecar_socket_listener"], cfg!(unix));
         assert_eq!(
             info["commands"]
                 .as_array()
@@ -6788,6 +7051,353 @@ mod tests {
                 .any(|method| method.as_str() == Some("workspace/remote_health")),
             true
         );
+    }
+
+    struct FailingRequestReader;
+
+    impl Read for FailingRequestReader {
+        fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::new(
+                io::ErrorKind::Other,
+                "request stream failed",
+            ))
+        }
+    }
+
+    impl BufRead for FailingRequestReader {
+        fn fill_buf(&mut self) -> io::Result<&[u8]> {
+            Err(io::Error::new(
+                io::ErrorKind::Other,
+                "request stream failed",
+            ))
+        }
+
+        fn consume(&mut self, _amt: usize) {}
+    }
+
+    #[test]
+    fn stdio_session_propagates_request_read_errors() {
+        let state_dir = tempdir().unwrap();
+        let remote_dir = tempdir().unwrap();
+        let (response_tx, _response_rx) = mpsc::sync_channel::<ServerMessage>(1);
+
+        let error = run_server_session(
+            remote_dir.path().join("repo"),
+            RemoteTransport::Local,
+            "missing-agent".to_string(),
+            Some(state_dir.path().to_path_buf()),
+            1,
+            FailingRequestReader,
+            response_tx,
+            true,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("failed to read sidecar request"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn socket_listener_accepts_sequential_sessions() {
+        let socket_dir = tempdir().unwrap();
+        let state_dir = tempdir().unwrap();
+        let remote_dir = tempdir().unwrap();
+        let socket = socket_dir.path().join("sidecar.sock");
+        let remote_root = remote_dir.path().join("repo");
+        let listener_socket = socket.clone();
+        let listener_state = state_dir.path().to_path_buf();
+        let listener_root = remote_root.clone();
+        let listener = thread::spawn(move || {
+            run_listener(
+                listener_socket,
+                listener_root,
+                RemoteTransport::Local,
+                "missing-agent".to_string(),
+                Some(listener_state),
+                1,
+            )
+        });
+
+        for _ in 0..100 {
+            if socket.exists() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(socket.exists());
+
+        fn connect_socket(socket: &Path) -> UnixStream {
+            for _ in 0..100 {
+                if let Ok(stream) = UnixStream::connect(socket) {
+                    return stream;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            panic!("timed out connecting to {}", socket.display());
+        }
+
+        fn request(stream: &mut UnixStream, id: u64, method: &str) -> Value {
+            writeln!(
+                stream,
+                "{}",
+                json!({
+                    "id": id,
+                    "method": method,
+                    "params": {}
+                })
+            )
+            .unwrap();
+            stream.flush().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            serde_json::from_str(&line).unwrap()
+        }
+
+        let mut first = connect_socket(&socket);
+        let first_info = request(&mut first, 1, "workspace_info");
+        assert_eq!(first_info["id"], 1);
+        assert_eq!(first_info["ok"], true);
+        assert_eq!(
+            first_info["result"]["remote_root"].as_str(),
+            Some(remote_root.to_string_lossy().as_ref())
+        );
+        let first_disconnect = request(&mut first, 2, "disconnect");
+        assert_eq!(first_disconnect["id"], 2);
+        assert_eq!(first_disconnect["ok"], true);
+        drop(first);
+
+        let mut second = connect_socket(&socket);
+        let second_info = request(&mut second, 1, "workspace_info");
+        assert_eq!(second_info["id"], 1);
+        assert_eq!(second_info["ok"], true);
+        let shutdown = request(&mut second, 2, "shutdown");
+        assert_eq!(shutdown["id"], 2);
+        assert_eq!(shutdown["ok"], true);
+        drop(second);
+
+        listener.join().unwrap().unwrap();
+        assert!(!socket.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn socket_listener_interrupts_active_request_on_client_eof() {
+        let socket_dir = tempdir().unwrap();
+        let state_dir = tempdir().unwrap();
+        let remote_dir = tempdir().unwrap();
+        let agent_dir = tempdir().unwrap();
+        let socket = socket_dir.path().join("sidecar.sock");
+        let remote_root = remote_dir.path().join("repo");
+        let agent = agent_dir.path().join("stall-agent");
+        let marker = agent_dir.path().join("started");
+        fs::write(
+            &agent,
+            format!(
+                "#!/bin/sh\n: > {}\nsleep 30\n",
+                shell_quote(&marker.to_string_lossy())
+            ),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&agent).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&agent, perms).unwrap();
+
+        let listener_socket = socket.clone();
+        let listener_state = state_dir.path().to_path_buf();
+        let listener_root = remote_root;
+        let listener_agent = agent.to_string_lossy().to_string();
+        let listener = thread::spawn(move || {
+            run_listener(
+                listener_socket,
+                listener_root,
+                RemoteTransport::Local,
+                listener_agent,
+                Some(listener_state),
+                30_000,
+            )
+        });
+
+        for _ in 0..100 {
+            if socket.exists() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(socket.exists());
+
+        let mut first = UnixStream::connect(&socket).unwrap();
+        writeln!(
+            first,
+            "{}",
+            json!({
+                "id": 1,
+                "method": "scan",
+                "params": {"limit": 1}
+            })
+        )
+        .unwrap();
+        first.flush().unwrap();
+        for _ in 0..100 {
+            if marker.exists() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(marker.exists());
+        drop(first);
+
+        let mut second = None;
+        for _ in 0..100 {
+            match UnixStream::connect(&socket) {
+                Ok(stream) => {
+                    second = Some(stream);
+                    break;
+                }
+                Err(_) => thread::sleep(Duration::from_millis(10)),
+            }
+        }
+        let mut second = second.expect("listener did not accept a second session after EOF");
+        writeln!(
+            second,
+            "{}",
+            json!({
+                "id": 2,
+                "method": "shutdown",
+                "params": {}
+            })
+        )
+        .unwrap();
+        second.flush().unwrap();
+        second
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut reader = BufReader::new(second);
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let shutdown: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(shutdown["id"], 2);
+        assert_eq!(shutdown["ok"], true);
+
+        listener.join().unwrap().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn socket_listener_interrupts_active_write_request_on_client_eof() {
+        let socket_dir = tempdir().unwrap();
+        let state_dir = tempdir().unwrap();
+        let remote_dir = tempdir().unwrap();
+        let agent_dir = tempdir().unwrap();
+        let socket = socket_dir.path().join("sidecar.sock");
+        let remote_root = remote_dir.path().join("repo");
+        let transport = RemoteTransport::Local;
+        let key = workspace_key(&transport, &remote_root);
+        let mirror = Mirror::open(Some(state_dir.path().to_path_buf()), &key).unwrap();
+        record_hydrated_content(&mirror, "a.txt", b"base");
+        mirror
+            .enqueue_save(
+                "a.txt",
+                &hash_bytes(b"local"),
+                Some(&hash_bytes(b"base")),
+                b"local",
+            )
+            .unwrap();
+        drop(mirror);
+
+        let agent = agent_dir.path().join("stall-agent");
+        let marker = agent_dir.path().join("started");
+        fs::write(
+            &agent,
+            format!(
+                "#!/bin/sh\n: > {}\nsleep 30\n",
+                shell_quote(&marker.to_string_lossy())
+            ),
+        )
+        .unwrap();
+        let mut perms = fs::metadata(&agent).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&agent, perms).unwrap();
+
+        let listener_socket = socket.clone();
+        let listener_state = state_dir.path().to_path_buf();
+        let listener_root = remote_root;
+        let listener_agent = agent.to_string_lossy().to_string();
+        let listener = thread::spawn(move || {
+            run_listener(
+                listener_socket,
+                listener_root,
+                transport,
+                listener_agent,
+                Some(listener_state),
+                30_000,
+            )
+        });
+
+        for _ in 0..100 {
+            if socket.exists() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(socket.exists());
+
+        let mut first = UnixStream::connect(&socket).unwrap();
+        writeln!(
+            first,
+            "{}",
+            json!({
+                "id": 1,
+                "method": "flush_queue",
+                "params": {"limit": 1}
+            })
+        )
+        .unwrap();
+        first.flush().unwrap();
+        for _ in 0..100 {
+            if marker.exists() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(marker.exists());
+        drop(first);
+
+        let mut second = None;
+        for _ in 0..100 {
+            match UnixStream::connect(&socket) {
+                Ok(stream) => {
+                    second = Some(stream);
+                    break;
+                }
+                Err(_) => thread::sleep(Duration::from_millis(10)),
+            }
+        }
+        let mut second =
+            second.expect("listener did not accept a second session after write-lane EOF");
+        writeln!(
+            second,
+            "{}",
+            json!({
+                "id": 2,
+                "method": "shutdown",
+                "params": {}
+            })
+        )
+        .unwrap();
+        second.flush().unwrap();
+        second
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut reader = BufReader::new(second);
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let shutdown: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(shutdown["id"], 2);
+        assert_eq!(shutdown["ok"], true);
+
+        listener.join().unwrap().unwrap();
     }
 
     #[test]

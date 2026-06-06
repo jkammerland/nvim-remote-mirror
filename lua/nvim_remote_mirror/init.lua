@@ -22,6 +22,10 @@ M.config = {
   sidecar = executable_or_default("nrm-sidecar"),
   agent = executable_or_default("nrm-agent"),
   remote_agent = "nrm-agent",
+  connection = "stdio",
+  socket_path = nil,
+  socket_dir = nil,
+  daemon_start_timeout_ms = 1000,
   state_dir = nil,
   find_limit = 200,
   grep_limit = 200,
@@ -248,8 +252,58 @@ local function sidecar_args(target)
   return args
 end
 
+local function listener_args(target, socket_path)
+  local args = sidecar_args(target)
+  args[1] = "listen"
+  table.insert(args, 2, "--socket")
+  table.insert(args, 3, socket_path)
+  return args
+end
+
+local function path_join(root, leaf)
+  return tostring(root):gsub("[/\\]+$", "") .. "/" .. leaf
+end
+
+local function default_socket_dir()
+  if optional_string(M.config.socket_dir) then
+    return M.config.socket_dir
+  end
+  if optional_string(M.config.state_dir) then
+    return path_join(M.config.state_dir, "sockets")
+  end
+  local ok, run_dir = pcall(vim.fn.stdpath, "run")
+  if ok and optional_string(run_dir) then
+    return path_join(run_dir, "nvim-remote-mirror")
+  end
+  local user = (uv.os_getuid and tostring(uv.os_getuid())) or os.getenv("USER") or "unknown"
+  local tmp = uv.os_tmpdir and uv.os_tmpdir() or "/tmp"
+  return path_join(tmp, "nvim-remote-mirror-" .. user)
+end
+
+local function socket_path_for(target_arg, target)
+  if optional_string(M.config.socket_path) then
+    return M.config.socket_path
+  end
+  local agent = M.config.agent
+  if target and target.ssh then
+    agent = optional_string(M.config.remote_agent) or "nrm-agent"
+  end
+  local identity = table.concat({
+    target_arg or "",
+    M.config.sidecar or "",
+    agent or "",
+    M.config.state_dir or "",
+    tostring(M.config.request_timeout_ms or ""),
+    tostring(M.config.ssh_connect_timeout_seconds or ""),
+  }, "\31")
+  local hash = vim.fn.sha256(identity):sub(1, 24)
+  return path_join(default_socket_dir(), hash .. ".sock")
+end
+
 if vim.g.nvim_remote_mirror_test then
   M._test_sidecar_args = sidecar_args
+  M._test_listener_args = listener_args
+  M._test_socket_path_for = socket_path_for
 end
 
 local function fail_pending(client, message)
@@ -294,6 +348,72 @@ local function fail_sidecar_send(client, message)
   if not client.closing then
     schedule_reconnect(client.target_arg, generation)
   end
+end
+
+local function connect_socket_channel(client, socket_path)
+  local ok, channel = pcall(vim.fn.sockconnect, "pipe", socket_path, {
+    on_data = function(_, data)
+      if data == nil or (type(data) == "table" and #data == 1 and data[1] == "") then
+        fail_sidecar_send(client, "sidecar socket closed")
+        return
+      end
+      handle_stdout(client, data)
+    end,
+  })
+  local channel_id = tonumber(channel)
+  if ok and channel_id and channel_id > 0 then
+    return channel_id
+  end
+  return nil
+end
+
+local function start_socket_daemon(client, target, socket_path)
+  vim.fn.mkdir(vim.fn.fnamemodify(socket_path, ":h"), "p", 448)
+  local command = vim.list_extend({ M.config.sidecar }, listener_args(target, socket_path))
+  local job_id = vim.fn.jobstart(command, {
+    detach = true,
+    stdout_buffered = false,
+    stderr_buffered = false,
+    on_stdout = function(_, data)
+      for _, line in ipairs(data or {}) do
+        if line ~= "" then
+          notify(line, vim.log.levels.INFO)
+        end
+      end
+    end,
+    on_stderr = function(_, data)
+      for _, line in ipairs(data or {}) do
+        if line ~= "" then
+          notify(line, vim.log.levels.WARN)
+        end
+      end
+    end,
+  })
+  if job_id <= 0 then
+    error("failed to start sidecar daemon: " .. table.concat(command, " "))
+  end
+  return job_id
+end
+
+local function connect_or_start_socket(client, target)
+  local socket_path = socket_path_for(client.target_arg, target)
+  client.socket_path = socket_path
+  local channel = connect_socket_channel(client, socket_path)
+  if channel then
+    return channel, nil
+  end
+
+  local daemon_job_id = start_socket_daemon(client, target, socket_path)
+  local deadline_ms = math.max(tonumber(M.config.daemon_start_timeout_ms) or 1000, 1)
+  vim.wait(deadline_ms, function()
+    channel = connect_socket_channel(client, socket_path)
+    return channel ~= nil
+  end, 25)
+  if not channel then
+    pcall(vim.fn.jobstop, daemon_job_id)
+    error("failed to connect sidecar socket: " .. socket_path)
+  end
+  return channel, daemon_job_id
 end
 
 function schedule_reconnect(target_arg, generation)
@@ -974,48 +1094,70 @@ function M.connect(target, opts)
     closing = false,
   }
 
-  local command = vim.list_extend({ M.config.sidecar }, sidecar_args(target))
-  client.job_id = vim.fn.jobstart(command, {
-    stdout_buffered = false,
-    stderr_buffered = false,
-    on_stdout = function(_, data)
-      handle_stdout(client, data)
-    end,
-    on_stderr = function(_, data)
-      for _, line in ipairs(data or {}) do
-        if line ~= "" then
-          notify(line, vim.log.levels.WARN)
+  local connection = opts.connection or M.config.connection or "stdio"
+  if connection == "socket" then
+    client.transport = "socket"
+    local ok, channel, daemon_job_id = pcall(connect_or_start_socket, client, target)
+    if not ok then
+      M.connection_status = "disconnected"
+      M.connection_reason = nil
+      M.connection_error = tostring(channel)
+      M.reconnect_pending = false
+      error(channel)
+    end
+    client.job_id = channel
+    client.daemon_job_id = daemon_job_id
+  elseif connection == "stdio" then
+    client.transport = "stdio"
+    local command = vim.list_extend({ M.config.sidecar }, sidecar_args(target))
+    client.job_id = vim.fn.jobstart(command, {
+      stdout_buffered = false,
+      stderr_buffered = false,
+      on_stdout = function(_, data)
+        handle_stdout(client, data)
+      end,
+      on_stderr = function(_, data)
+        for _, line in ipairs(data or {}) do
+          if line ~= "" then
+            notify(line, vim.log.levels.WARN)
+          end
         end
-      end
-    end,
-    on_exit = function(_, code)
-      if M.client == client then
-        M.client = nil
-        clear_mirror_autohydrate()
-      end
-      local unexpected = not client.closing
-      if unexpected then
-        local exit_generation = M.reconnect_generation
-        fail_pending(client, "sidecar exited with code " .. tostring(code))
-        M.connection_status = M.config.auto_reconnect and "reconnect_pending" or "disconnected"
-        M.connection_target = client.target_arg
-        M.connection_reason = nil
-        M.connection_error = "sidecar exited with code " .. tostring(code)
-        M.reconnect_pending = M.config.auto_reconnect == true
-        notify("sidecar exited with code " .. tostring(code), vim.log.levels.ERROR)
-        schedule_reconnect(client.target_arg, exit_generation)
-      else
-        fail_pending(client, "disconnected")
-      end
-    end,
-  })
+      end,
+      on_exit = function(_, code)
+        if M.client == client then
+          M.client = nil
+          clear_mirror_autohydrate()
+        end
+        local unexpected = not client.closing
+        if unexpected then
+          local exit_generation = M.reconnect_generation
+          fail_pending(client, "sidecar exited with code " .. tostring(code))
+          M.connection_status = M.config.auto_reconnect and "reconnect_pending" or "disconnected"
+          M.connection_target = client.target_arg
+          M.connection_reason = nil
+          M.connection_error = "sidecar exited with code " .. tostring(code)
+          M.reconnect_pending = M.config.auto_reconnect == true
+          notify("sidecar exited with code " .. tostring(code), vim.log.levels.ERROR)
+          schedule_reconnect(client.target_arg, exit_generation)
+        else
+          fail_pending(client, "disconnected")
+        end
+      end,
+    })
 
-  if client.job_id <= 0 then
+    if client.job_id <= 0 then
+      M.connection_status = "disconnected"
+      M.connection_reason = nil
+      M.connection_error = "failed to start sidecar"
+      M.reconnect_pending = false
+      error("failed to start sidecar: " .. table.concat(command, " "))
+    end
+  else
     M.connection_status = "disconnected"
     M.connection_reason = nil
-    M.connection_error = "failed to start sidecar"
+    M.connection_error = "unsupported sidecar connection mode: " .. tostring(connection)
     M.reconnect_pending = false
-    error("failed to start sidecar: " .. table.concat(command, " "))
+    error(M.connection_error)
   end
 
   M.client = client
@@ -1066,8 +1208,13 @@ function M.disconnect(opts)
   pcall(M.request, "disconnect", {}, function() end)
   fail_pending(client, "disconnected")
   vim.defer_fn(function()
-    if client.job_id then
+    if client.transport == "socket" and client.job_id then
+      pcall(vim.fn.chanclose, client.job_id)
+    elseif client.job_id then
       pcall(vim.fn.jobstop, client.job_id)
+    end
+    if opts.stop_daemon and client.daemon_job_id then
+      pcall(vim.fn.jobstop, client.daemon_job_id)
     end
   end, 250)
   clear_mirror_autohydrate()
