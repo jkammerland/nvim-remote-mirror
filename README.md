@@ -377,6 +377,13 @@ configured connection options and a single shell-quoted remote command. This
 keeps SSH-specific launch details outside the Neovim-facing JSON API and the
 agent protocol frame format.
 
+Workspace state keys intentionally preserve the legacy identity material:
+`local` for local workspaces and the bare SSH target string for SSH workspaces.
+That keeps existing mirrors stable, including the historical collision between
+local workspaces and an SSH target literally named `local`. Future non-SSH
+transports must define namespaced identity material before sharing durable
+mirror state.
+
 Current transport state:
 
 - active: request IDs, typed remote errors, request timeout, SSH connect timeout,

@@ -8831,12 +8831,32 @@ mod tests {
     fn workspace_key_uses_stable_transport_identity() {
         let path = PathBuf::from("/repo");
         assert_eq!(
+            workspace_key(&RemoteTransport::Local, &path),
+            "12641c7f13ac356c035ce63c"
+        );
+        assert_eq!(
+            workspace_key(
+                &RemoteTransport::from_ssh(Some("host".to_string()), 10),
+                &path
+            ),
+            "d72defea26893914ac542b53"
+        );
+        assert_eq!(
             workspace_key(
                 &RemoteTransport::from_ssh(Some("host".to_string()), 5),
                 &path
             ),
             workspace_key(
                 &RemoteTransport::from_ssh(Some("host".to_string()), 60),
+                &path
+            )
+        );
+        // This preserves the legacy key format. Future non-SSH transports must
+        // use namespaced identities instead of reusing bare endpoint strings.
+        assert_eq!(
+            workspace_key(&RemoteTransport::Local, &path),
+            workspace_key(
+                &RemoteTransport::from_ssh(Some("local".to_string()), 10),
                 &path
             )
         );
