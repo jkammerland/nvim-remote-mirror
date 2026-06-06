@@ -52,6 +52,8 @@ local function status_result()
     remote_available = false,
     remote_error = "ssh connect failed",
     retry_after_ms = 1500,
+    background_scan_state = "completed",
+    background_scan_completed_at_ms = os.time() * 1000,
   }
 end
 
@@ -100,6 +102,8 @@ local function main()
   assert_contains(message, "remote=unavailable")
   assert_contains(message, "retry_after_ms=1500")
   assert_contains(message, "error=ssh connect failed")
+  assert_contains(message, "scan=completed")
+  assert_contains(message, "rescan_due_ms=")
 end
 
 local ok, err = xpcall(main, debug.traceback)

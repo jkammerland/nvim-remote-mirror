@@ -112,9 +112,10 @@ mirror file into the durable queue.
 `:RemoteConnect` starts from the durable local mirror and does not block on an
 SSH agent handshake. Cached opens, cached grep, and status remain available if
 the remote is unreachable; status reports plugin connection state, pending
-reconnect attempts or explicit disconnects, and the last known remote health
-without probing SSH. The first operation that needs the remote agent performs
-the protocol handshake and reports connection failures normally.
+reconnect attempts or explicit disconnects, background metadata scan progress
+or recent completion, and the last known remote health without probing SSH. The
+first operation that needs the remote agent performs the protocol handshake and
+reports connection failures normally.
 Pending Neovim requests are also bounded by `request_timeout_ms`, so lost or
 stalled sidecar replies clear their callback state instead of hanging forever.
 If Neovim cannot write to the sidecar channel because the job has already

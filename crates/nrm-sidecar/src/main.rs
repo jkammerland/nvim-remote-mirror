@@ -2316,6 +2316,15 @@ impl Mirror {
             [],
             |row| row.get(0),
         )?;
+        let background_scan_cursor = self.background_scan_cursor()?;
+        let background_scan_completed_at_ms = self.background_scan_completed_at_ms()?;
+        let background_scan_state = if background_scan_cursor.is_some() {
+            "in_progress"
+        } else if background_scan_completed_at_ms.is_some() {
+            "completed"
+        } else {
+            "not_started"
+        };
         Ok(json!({
             "mirror_root": self.root.to_string_lossy(),
             "known_files": known,
@@ -2326,7 +2335,10 @@ impl Mirror {
             "failed_saves": failed,
             "conflicted_saves": conflicted,
             "stale_files": stale,
-            "deleted_files": deleted
+            "deleted_files": deleted,
+            "background_scan_state": background_scan_state,
+            "background_scan_cursor": background_scan_cursor,
+            "background_scan_completed_at_ms": background_scan_completed_at_ms
         }))
     }
 
@@ -6564,6 +6576,10 @@ mod tests {
             sidecar.mirror.background_scan_cursor().unwrap().as_deref(),
             Some("src/main.rs")
         );
+        let status = sidecar.mirror.status().unwrap();
+        assert_eq!(status["background_scan_state"], "in_progress");
+        assert_eq!(status["background_scan_cursor"], "src/main.rs");
+        assert_eq!(status["background_scan_completed_at_ms"], Value::Null);
         assert_eq!(
             sidecar.mirror.background_scan_completed_at_ms().unwrap(),
             None
@@ -6590,6 +6606,10 @@ mod tests {
                 .unwrap()
                 > 0
         );
+        let status = sidecar.mirror.status().unwrap();
+        assert_eq!(status["background_scan_state"], "completed");
+        assert_eq!(status["background_scan_cursor"], Value::Null);
+        assert!(status["background_scan_completed_at_ms"].as_i64().unwrap() > 0);
     }
 
     #[test]
@@ -7716,6 +7736,9 @@ mod tests {
         };
         let result = result.unwrap();
         assert_eq!(result["cached_files"], 1);
+        assert_eq!(result["background_scan_state"], "not_started");
+        assert_eq!(result["background_scan_cursor"], Value::Null);
+        assert_eq!(result["background_scan_completed_at_ms"], Value::Null);
         assert_eq!(result["remote_status"], "unchecked");
         assert_eq!(result["remote_checked"], false);
         assert_eq!(result["remote_available"], false);

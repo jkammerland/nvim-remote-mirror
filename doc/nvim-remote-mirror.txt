@@ -96,8 +96,8 @@ COMMANDS                                      *nvim-remote-mirror-commands*
 :RemoteStatus
     Show known, cached, indexed, dirty, and pending mirror counts plus the
     plugin connection state, pending reconnect or explicit disconnect state,
-    and last known remote health. This is a local fast path and does not probe
-    SSH.
+    background metadata scan state, and last known remote health. This is a
+    local fast path and does not probe SSH.
 
 :RemoteDisconnect
     Stop the sidecar and agent.

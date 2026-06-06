@@ -418,6 +418,28 @@ local function status_remote_summary(result)
   return table.concat(parts, " ")
 end
 
+local function background_scan_summary(result)
+  local state = optional_string(result.background_scan_state)
+  if not state or state == "not_started" then
+    return nil
+  end
+  local parts = { "scan=" .. state }
+  if state == "in_progress" then
+    local cursor = optional_string(result.background_scan_cursor)
+    if cursor then
+      table.insert(parts, "after=" .. cursor)
+    end
+  elseif state == "completed" then
+    local completed_at = tonumber(result.background_scan_completed_at_ms)
+    local rescan_after = tonumber(M.config.background_mirror_rescan_interval_ms)
+    if completed_at and rescan_after and rescan_after > 0 then
+      local due = math.max(math.floor(completed_at + rescan_after - (os.time() * 1000)), 0)
+      table.insert(parts, "rescan_due_ms=" .. tostring(due))
+    end
+  end
+  return table.concat(parts, " ")
+end
+
 local function connection_summary()
   local parts = { "connection=" .. tostring(M.connection_status or "disconnected") }
   if M.reconnect_pending then
@@ -1689,9 +1711,10 @@ function M.status()
       return
     end
     update_remote_state(M.client, result)
+    local scan_summary = background_scan_summary(result)
     notify(
       string.format(
-        "known=%d cached=%d indexed=%d dirty=%d pending=%d failed=%d conflicts=%d stale=%d deleted=%d %s %s",
+        "known=%d cached=%d indexed=%d dirty=%d pending=%d failed=%d conflicts=%d stale=%d deleted=%d %s %s%s",
         result.known_files,
         result.cached_files,
         result.indexed_files or 0,
@@ -1702,7 +1725,8 @@ function M.status()
         result.stale_files,
         result.deleted_files,
         connection_summary(),
-        status_remote_summary(result)
+        status_remote_summary(result),
+        scan_summary and (" " .. scan_summary) or ""
       )
     )
   end)
