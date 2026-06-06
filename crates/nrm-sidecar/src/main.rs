@@ -9258,6 +9258,48 @@ mod tests {
     }
 
     #[test]
+    fn framed_agent_session_reports_response_id_mismatch() {
+        let mut inbound = Vec::new();
+        write_frame(
+            &mut inbound,
+            &RpcMessage::Response {
+                id: 999,
+                response: Response::Ack,
+            },
+        )
+        .unwrap();
+        let mut session = FramedAgentSession::new(Vec::new(), io::Cursor::new(inbound));
+
+        let error = session
+            .request(7, Request::Shutdown)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("agent response id mismatch"));
+    }
+
+    #[test]
+    fn framed_agent_session_rejects_unexpected_request_frame() {
+        let mut inbound = Vec::new();
+        write_frame(
+            &mut inbound,
+            &RpcMessage::Request {
+                id: 7,
+                request: Request::Shutdown,
+            },
+        )
+        .unwrap();
+        let mut session = FramedAgentSession::new(Vec::new(), io::Cursor::new(inbound));
+
+        let error = session
+            .request(7, Request::Shutdown)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("unexpected agent frame"));
+    }
+
+    #[test]
     fn agent_request_after_shutdown_does_not_spawn_worker() {
         let interrupt = AgentInterrupt::default();
         interrupt.request_shutdown();

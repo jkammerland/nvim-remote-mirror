@@ -414,10 +414,14 @@ Current transport state:
   or explicit cancellation by restarting that lane's serial SSH/agent worker;
   `preempted` responses are normal no-op client results, and save/flush
   requests are not preempted once started.
-  Agent and LSP launches share a transport command planner, keeping SSH stdio as
-  a replaceable implementation detail behind the sidecar-agent frame boundary.
-  Sidecar request scheduling now exchanges agent frames through an AgentSession
-  abstraction; stdio-backed local/SSH processes are the current session type.
+  Agent and LSP launches share a transport command planner. Sidecar request
+  scheduling exchanges agent frames through an AgentSession abstraction;
+  stdio-backed local/SSH child processes are the current session type and still
+  own worker lifecycle, timeout, and preemption aborts. A future QUIC or UDP over
+  WireGuard session must provide reliable ordered delivery per lane, preserve
+  matching request IDs, honor today's serial request semantics unless
+  multiplexing is explicitly added, surface timeout/backoff-compatible errors,
+  and expose an abort path equivalent to restarting the current lane worker.
   Timed-out Neovim requests send a best-effort sidecar cancellation for queued
   remote work, clearing pending path hazards before that work reaches SSH, and
   can preempt matching active read-only/background work. Active save/flush work
