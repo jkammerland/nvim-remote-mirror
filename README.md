@@ -220,10 +220,10 @@ to another target and save an older remote buffer, the plugin defers that save
 instead of flushing the same relative path into the wrong workspace; it replays
 when the original workspace is active again.
 
-Small saves use one RPC request. Large saves stream through a chunked
-compare-and-swap upload: the agent checks the remote base hash before accepting
-chunks, verifies the uploaded content hash, rechecks the remote base hash, then
-renames the temp file into place.
+Saves up to 4 MiB use one RPC request. Larger saves stream through a 1 MiB
+chunked compare-and-swap upload: the agent checks the remote base hash before
+accepting chunks, verifies the uploaded content hash, rechecks the remote base
+hash, then renames the temp file into place.
 If a compare-and-swap conflict occurs, the local save snapshot stays preserved
 as local truth. Small remote conflict copies are stored completely under
 `conflicts/`; large remote conflict copies are capped to a protocol-bounded

@@ -33,7 +33,8 @@ const DEFAULT_GREP_CACHE_MAX_TOTAL_BYTES: u64 = 8 * 1024 * 1024;
 const SEARCH_INDEX_MAX_FILE_BYTES: u64 = DEFAULT_BATCH_MAX_FILE_BYTES;
 const SEARCH_TRIGRAM_BYTES: usize = 3;
 const REMOTE_UNAVAILABLE_BACKOFF_MS: u64 = 2_000;
-const MAX_SAVE_PAYLOAD_BYTES: usize = MAX_FRAME_LEN - (1024 * 1024);
+const MAX_SAVE_PAYLOAD_BYTES: u64 = (MAX_FRAME_LEN - (1024 * 1024)) as u64;
+const SAVE_INLINE_MAX_BYTES: u64 = 4 * 1024 * 1024;
 const REMOTE_INTERACTIVE_QUEUE_CAPACITY: usize = 128;
 const REMOTE_BACKGROUND_QUEUE_CAPACITY: usize = 128;
 const BACKGROUND_SCAN_CURSOR_KEY: &str = "background_scan_cursor";
@@ -2579,6 +2580,10 @@ fn status_with_remote_health(mut status: Value, remote_health: RemoteHealth) -> 
     Ok(status)
 }
 
+fn save_should_use_chunked_upload(snapshot_size: u64) -> bool {
+    snapshot_size > SAVE_INLINE_MAX_BYTES || snapshot_size > MAX_SAVE_PAYLOAD_BYTES
+}
+
 struct Sidecar {
     agent: AgentClient,
     mirror: Mirror,
@@ -4167,7 +4172,7 @@ impl Sidecar {
                 reason,
             });
         }
-        if snapshot_size as usize > MAX_SAVE_PAYLOAD_BYTES {
+        if save_should_use_chunked_upload(snapshot_size) {
             return self.apply_chunked_save_entry(entry, snapshot_size);
         }
 
@@ -5936,6 +5941,20 @@ mod tests {
             optional_positive_usize_param(&json!({"max_files": "bad"}), "max_files"),
             None
         );
+    }
+
+    #[test]
+    fn save_upload_route_chunks_above_inline_threshold() {
+        assert!(!save_should_use_chunked_upload(SAVE_INLINE_MAX_BYTES - 1));
+        assert!(!save_should_use_chunked_upload(SAVE_INLINE_MAX_BYTES));
+        assert!(save_should_use_chunked_upload(SAVE_INLINE_MAX_BYTES + 1));
+    }
+
+    #[test]
+    fn save_upload_inline_threshold_stays_below_protocol_limit() {
+        assert!(SAVE_UPLOAD_CHUNK_BYTES as u64 <= SAVE_INLINE_MAX_BYTES);
+        assert!(SAVE_INLINE_MAX_BYTES < MAX_SAVE_PAYLOAD_BYTES);
+        assert!(save_should_use_chunked_upload(MAX_SAVE_PAYLOAD_BYTES + 1));
     }
 
     #[test]
