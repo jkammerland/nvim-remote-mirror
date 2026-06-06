@@ -40,31 +40,108 @@ const REMOTE_INTERACTIVE_QUEUE_CAPACITY: usize = 128;
 const REMOTE_BACKGROUND_QUEUE_CAPACITY: usize = 128;
 const BACKGROUND_SCAN_CURSOR_KEY: &str = "background_scan_cursor";
 const BACKGROUND_SCAN_COMPLETED_AT_KEY: &str = "background_scan_completed_at_ms";
-const SIDECAR_COMMANDS: &[&str] = &[
-    "hello",
-    "workspace_info",
-    "status",
-    "save_queue",
-    "find_paths",
-    "remote_probe",
-    "scan",
-    "open",
-    "prefetch",
-    "prefetch_known",
-    "prefetch_related",
-    "grep",
-    "grep_cache",
-    "recover_local_edits",
-    "flush",
-    "flush_queued",
-    "flush_queue",
-    "validate",
-    "refresh",
-    "cancel",
-    "disconnect",
-    "shutdown",
+const SIDECAR_COMMAND_SPECS: &[SidecarCommandSpec] = &[
+    SidecarCommandSpec::public("hello", "local", None, false, true, false),
+    SidecarCommandSpec::public("workspace_info", "local", None, false, true, false),
+    SidecarCommandSpec::public("status", "local", None, false, true, false),
+    SidecarCommandSpec::public("save_queue", "local", None, false, true, false),
+    SidecarCommandSpec::public("find_paths", "local", None, false, true, false),
+    SidecarCommandSpec::public("remote_probe", "remote", Some("read"), false, false, true),
+    SidecarCommandSpec::public("scan", "remote", Some("read"), false, false, true),
+    SidecarCommandSpec::public("open", "hybrid", Some("read_or_write"), false, true, true),
+    SidecarCommandSpec::public("prefetch", "remote", Some("read"), false, false, true),
+    SidecarCommandSpec::public("prefetch_known", "remote", Some("read"), false, false, true),
+    SidecarCommandSpec::public(
+        "prefetch_related",
+        "remote",
+        Some("read"),
+        false,
+        false,
+        true,
+    ),
+    SidecarCommandSpec::public("grep", "hybrid", Some("read_or_write"), false, false, true),
+    SidecarCommandSpec::public("grep_cache", "local", None, false, true, false),
+    SidecarCommandSpec::public("recover_local_edits", "local", None, false, false, false),
+    SidecarCommandSpec::public("flush", "hybrid", Some("write"), true, false, false),
+    SidecarCommandSpec::internal("flush_queued", "remote", Some("write"), true, false, false),
+    SidecarCommandSpec::public("flush_queue", "remote", Some("write"), true, false, false),
+    SidecarCommandSpec::public(
+        "validate",
+        "hybrid",
+        Some("read_or_write"),
+        false,
+        false,
+        true,
+    ),
+    SidecarCommandSpec::public("refresh", "remote", Some("read"), false, false, true),
+    SidecarCommandSpec::public("cancel", "control", None, false, false, false),
+    SidecarCommandSpec::public("disconnect", "control", None, false, false, false),
+    SidecarCommandSpec::public("shutdown", "control", None, false, false, false),
 ];
 const SIDECAR_NOTIFICATIONS: &[&str] = &["workspace/remote_health"];
+
+#[derive(Debug, Clone, Copy)]
+struct SidecarCommandSpec {
+    name: &'static str,
+    visibility: &'static str,
+    execution: &'static str,
+    remote_lane: Option<&'static str>,
+    mutates_remote: bool,
+    fast_path: bool,
+    preemptible: bool,
+}
+
+impl SidecarCommandSpec {
+    const fn public(
+        name: &'static str,
+        execution: &'static str,
+        remote_lane: Option<&'static str>,
+        mutates_remote: bool,
+        fast_path: bool,
+        preemptible: bool,
+    ) -> Self {
+        Self {
+            name,
+            visibility: "public",
+            execution,
+            remote_lane,
+            mutates_remote,
+            fast_path,
+            preemptible,
+        }
+    }
+
+    const fn internal(
+        name: &'static str,
+        execution: &'static str,
+        remote_lane: Option<&'static str>,
+        mutates_remote: bool,
+        fast_path: bool,
+        preemptible: bool,
+    ) -> Self {
+        Self {
+            name,
+            visibility: "internal",
+            execution,
+            remote_lane,
+            mutates_remote,
+            fast_path,
+            preemptible,
+        }
+    }
+
+    fn to_value(self) -> Value {
+        json!({
+            "name": self.name,
+            "visibility": self.visibility,
+            "execution": self.execution,
+            "remote_lane": self.remote_lane,
+            "mutates_remote": self.mutates_remote,
+            "fast_path": self.fast_path,
+            "preemptible": self.preemptible
+        })
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Local sidecar for nvim-remote-mirror")]
@@ -335,10 +412,16 @@ impl RemoteTransport {
     fn to_value(&self) -> Value {
         match self {
             Self::Local => json!({
-                "kind": "local"
+                "kind": "local",
+                "endpoint": Value::Null,
+                "connect_timeout_ms": Value::Null,
+                "agent_io": "stdio"
             }),
             Self::Ssh(ssh) => json!({
                 "kind": "ssh",
+                "endpoint": ssh.target,
+                "connect_timeout_ms": ssh.connect_timeout_seconds.saturating_mul(1000),
+                "agent_io": "stdio",
                 "target": ssh.target,
                 "ssh_connect_timeout_seconds": ssh.connect_timeout_seconds
             }),
@@ -2834,6 +2917,27 @@ fn status_with_remote_health(mut status: Value, remote_health: RemoteHealth) -> 
     Ok(status)
 }
 
+fn sidecar_commands() -> Vec<&'static str> {
+    SIDECAR_COMMAND_SPECS
+        .iter()
+        .map(|command| command.name)
+        .collect()
+}
+
+fn sidecar_commands_by_visibility(visibility: &str) -> Vec<&'static str> {
+    SIDECAR_COMMAND_SPECS
+        .iter()
+        .filter_map(|command| (command.visibility == visibility).then_some(command.name))
+        .collect()
+}
+
+fn sidecar_command_specs_value() -> Vec<Value> {
+    SIDECAR_COMMAND_SPECS
+        .iter()
+        .map(|command| command.to_value())
+        .collect()
+}
+
 fn workspace_info_value(
     workspace_key: &str,
     remote_root: &Path,
@@ -2851,10 +2955,14 @@ fn workspace_info_value(
         "mirror_root": mirror_root.to_string_lossy(),
         "files_root": files_root.to_string_lossy(),
         "transport": transport.to_value(),
-        "commands": SIDECAR_COMMANDS,
+        "commands": sidecar_commands(),
+        "public_commands": sidecar_commands_by_visibility("public"),
+        "internal_commands": sidecar_commands_by_visibility("internal"),
+        "command_specs": sidecar_command_specs_value(),
         "notifications": SIDECAR_NOTIFICATIONS,
         "capabilities": {
             "command_responses": true,
+            "command_metadata": true,
             "server_notifications": true,
             "durable_mirror": true,
             "checksum_validation": true,
@@ -6519,6 +6627,9 @@ mod tests {
             Some(expected_workspace_key.as_str())
         );
         assert_eq!(info["transport"]["kind"], "ssh");
+        assert_eq!(info["transport"]["endpoint"], "host");
+        assert_eq!(info["transport"]["connect_timeout_ms"], 7000);
+        assert_eq!(info["transport"]["agent_io"], "stdio");
         assert_eq!(info["transport"]["target"], "host");
         assert_eq!(info["transport"]["ssh_connect_timeout_seconds"], 7);
         assert_eq!(info["remote_status"], "unchecked");
@@ -6533,6 +6644,61 @@ mod tests {
             true
         );
         assert_eq!(
+            info["commands"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|method| method.as_str() == Some("flush_queued")),
+            true
+        );
+        assert_eq!(
+            info["public_commands"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|method| method.as_str() == Some("flush")),
+            true
+        );
+        assert_eq!(
+            info["public_commands"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|method| method.as_str() == Some("flush_queued")),
+            false
+        );
+        assert_eq!(
+            info["internal_commands"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|method| method.as_str() == Some("flush_queued")),
+            true
+        );
+        let command_specs = info["command_specs"].as_array().unwrap();
+        let flush_queued = command_specs
+            .iter()
+            .find(|command| command["name"] == "flush_queued")
+            .unwrap();
+        assert_eq!(flush_queued["visibility"], "internal");
+        assert_eq!(flush_queued["execution"], "remote");
+        assert_eq!(flush_queued["remote_lane"], "write");
+        assert_eq!(flush_queued["mutates_remote"], true);
+        let save_queue = command_specs
+            .iter()
+            .find(|command| command["name"] == "save_queue")
+            .unwrap();
+        assert_eq!(save_queue["visibility"], "public");
+        assert_eq!(save_queue["execution"], "local");
+        assert_eq!(save_queue["fast_path"], true);
+        let cancel = command_specs
+            .iter()
+            .find(|command| command["name"] == "cancel")
+            .unwrap();
+        assert_eq!(cancel["visibility"], "public");
+        assert_eq!(cancel["execution"], "control");
+        assert_eq!(info["capabilities"]["command_metadata"], true);
+        assert_eq!(
             info["notifications"]
                 .as_array()
                 .unwrap()
@@ -6540,6 +6706,49 @@ mod tests {
                 .any(|method| method.as_str() == Some("workspace/remote_health")),
             true
         );
+    }
+
+    #[test]
+    fn sidecar_command_metadata_covers_implemented_commands() {
+        let commands = sidecar_commands();
+        let command_set: HashSet<_> = commands.iter().copied().collect();
+        let specs: HashSet<_> = SIDECAR_COMMAND_SPECS
+            .iter()
+            .map(|command| command.name)
+            .collect();
+        assert_eq!(commands.len(), command_set.len());
+        assert_eq!(specs, command_set);
+
+        let public = sidecar_commands_by_visibility("public");
+        let internal = sidecar_commands_by_visibility("internal");
+        let public_set: HashSet<_> = public.iter().copied().collect();
+        let internal_set: HashSet<_> = internal.iter().copied().collect();
+        let partition: HashSet<_> = public_set.union(&internal_set).copied().collect();
+        assert!(public_set.is_disjoint(&internal_set));
+        assert_eq!(partition, command_set);
+        assert!(public.contains(&"flush"));
+        assert!(!public.contains(&"flush_queued"));
+        assert!(public.contains(&"cancel"));
+        assert_eq!(internal, vec!["flush_queued"]);
+
+        for command in SIDECAR_COMMAND_SPECS {
+            assert!(matches!(command.visibility, "public" | "internal"));
+            assert!(matches!(
+                command.execution,
+                "local" | "remote" | "hybrid" | "control"
+            ));
+            assert!(matches!(
+                command.remote_lane,
+                None | Some("read") | Some("write") | Some("read_or_write")
+            ));
+            assert_eq!(
+                command.remote_lane.is_some(),
+                matches!(command.execution, "remote" | "hybrid")
+            );
+            if command.mutates_remote {
+                assert_eq!(command.remote_lane, Some("write"));
+            }
+        }
     }
 
     #[test]

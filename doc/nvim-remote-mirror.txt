@@ -202,7 +202,16 @@ responses.
 The workspace_info command returns workspace identity, mirror paths, transport
 metadata, supported command names, notification names, capabilities, and
 last-known remote health from local state without starting or probing SSH.
-hello is kept as a compatibility alias for the same payload.
+Transport metadata includes generic kind, endpoint, connect_timeout_ms, and
+agent_io fields while preserving SSH aliases. The legacy commands list includes
+every implemented method for compatibility; new clients should check
+capabilities.command_metadata, then use public_commands and command_specs to
+distinguish public API from internal helpers such as flush_queued and to
+identify local, remote, hybrid, or control commands. If the capability is
+absent, fall back to commands. local means no remote dependency, not read-only.
+command_specs also reports remote lane, mutation, fast-path, and preemption
+metadata; clients should ignore unknown fields. hello is kept as a compatibility
+alias for the same payload.
 
 ==============================================================================
 LSP                                                *nvim-remote-mirror-lsp*

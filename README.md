@@ -342,6 +342,20 @@ consume or ignore them independently of command responses:
 Clients can call `workspace_info` immediately after starting the sidecar to get
 the local workspace identity, mirror paths, transport kind, supported command
 names, notification names, daemon capabilities, and last-known remote health.
+Transport metadata includes a generic `kind`, `endpoint`,
+`connect_timeout_ms`, and `agent_io`, while preserving SSH-specific aliases such
+as `target` and `ssh_connect_timeout_seconds` for compatibility.
+The legacy `commands` list reports every implemented method for compatibility.
+New daemon clients should check `capabilities.command_metadata`, then prefer
+`public_commands` for callable client API and `command_specs` for visibility
+plus execution class (`local`, `remote`, `hybrid`, or `control`), remote lane,
+mutation, fast-path, and preemption metadata. If the capability is absent, fall
+back to `commands`. In this schema, `local` means no remote dependency; it does
+not imply read-only or free. Internal helpers such as `flush_queued` remain
+callable by the sidecar's own request rewriting path but are not listed as
+public API. Compatibility aliases such as `hello` can still be public and
+callable. Clients should ignore unknown `command_specs` fields so the daemon can
+add transport metadata without changing the Neovim-facing protocol.
 `workspace_info` is served from local state and does not start or probe SSH.
 `hello` remains a compatibility alias for the same payload.
 
