@@ -63,6 +63,7 @@ M.reconnect_attempts = 0
 M.reconnect_generation = 0
 M.grep_generation = 0
 M.find_generation = 0
+M.save_queue_generation = 0
 M.connection_status = "disconnected"
 M.connection_target = nil
 M.connection_reason = nil
@@ -390,6 +391,41 @@ local function notify_flush_queue_result(result, opts)
     level = vim.log.levels.WARN
   end
   notify(message, level)
+end
+
+local function save_queue_entry_text(entry)
+  local state = optional_string(entry.state) or "unknown"
+  local path = optional_string(entry.path) or "<unknown>"
+  local parts = { "[" .. state .. "]" }
+  local queue_id = tonumber(entry.queue_id)
+  if queue_id then
+    table.insert(parts, "#" .. tostring(queue_id))
+  end
+  table.insert(parts, path)
+  local attempts = tonumber(entry.attempts)
+  if attempts and attempts > 0 then
+    table.insert(parts, "attempts=" .. tostring(attempts))
+  end
+  local remote_conflict_path = optional_string(entry.remote_conflict_path)
+  if remote_conflict_path then
+    table.insert(parts, "remote=" .. remote_conflict_path)
+  end
+  local last_error = optional_string(entry.last_error)
+  if last_error then
+    table.insert(parts, "error=" .. last_error:sub(1, 160))
+  end
+  return table.concat(parts, " ")
+end
+
+local function save_queue_level(counts)
+  counts = counts or {}
+  if (tonumber(counts.conflict) or 0) > 0 then
+    return vim.log.levels.ERROR
+  end
+  if (tonumber(counts.failed) or 0) > 0 then
+    return vim.log.levels.WARN
+  end
+  return vim.log.levels.INFO
 end
 
 update_remote_state = function(client, result)
@@ -1729,6 +1765,87 @@ function M.status()
         scan_summary and (" " .. scan_summary) or ""
       )
     )
+  end)
+end
+
+function M.save_queue(opts)
+  opts = opts or {}
+  M.save_queue_generation = M.save_queue_generation + 1
+  local generation = M.save_queue_generation
+  local client = M.client
+  local function is_current()
+    return generation == M.save_queue_generation and M.client == client
+  end
+
+  local params = {}
+  if opts.limit then
+    params.limit = opts.limit
+  end
+
+  M.request("save_queue", params, function(err, result)
+    if not is_current() then
+      return
+    end
+    if err then
+      notify(err, vim.log.levels.ERROR)
+      return
+    end
+
+    local entries = result.entries or {}
+    if #entries == 0 then
+      notify("save queue is empty")
+      return
+    end
+
+    local items = {}
+    local skipped = 0
+    for _, entry in ipairs(entries) do
+      local filename
+      if entry.state == "conflict" then
+        filename = optional_string(entry.remote_conflict_path)
+          or optional_string(entry.local_path)
+          or optional_string(entry.snapshot_path)
+      else
+        filename = optional_string(entry.local_path)
+          or optional_string(entry.snapshot_path)
+          or optional_string(entry.remote_conflict_path)
+      end
+      if filename then
+        table.insert(items, {
+          filename = filename,
+          lnum = 1,
+          col = 1,
+          text = save_queue_entry_text(entry),
+        })
+      else
+        skipped = skipped + 1
+      end
+    end
+
+    vim.schedule(function()
+      if not is_current() then
+        return
+      end
+      vim.fn.setqflist({}, " ", { title = "RemoteSaveQueue", items = items })
+      vim.cmd.copen()
+      local counts = result.counts or {}
+      local total = tonumber(result.total) or #entries
+      local message = string.format(
+        "save queue: showing=%d total=%d pending=%d failed=%d conflicts=%d",
+        #entries,
+        total,
+        tonumber(counts.pending) or 0,
+        tonumber(counts.failed) or 0,
+        tonumber(counts.conflict) or 0
+      )
+      if result.truncated then
+        message = message .. " truncated_at=" .. tostring(result.limit or #entries)
+      end
+      if skipped > 0 then
+        message = message .. " skipped_without_path=" .. tostring(skipped)
+      end
+      notify(message, save_queue_level(counts))
+    end)
   end)
 end
 

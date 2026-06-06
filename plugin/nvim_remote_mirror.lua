@@ -71,6 +71,12 @@ vim.api.nvim_create_user_command("RemoteFlushQueue", function()
   nrm.flush_queue()
 end, {})
 
+vim.api.nvim_create_user_command("RemoteSaveQueue", function(opts)
+  nrm.save_queue({ limit = tonumber(opts.args) })
+end, {
+  nargs = "?",
+})
+
 vim.api.nvim_create_user_command("RemoteValidate", function(opts)
   local path = opts.args ~= "" and opts.args or nil
   nrm.validate(path)

@@ -85,6 +85,11 @@ COMMANDS                                      *nvim-remote-mirror-commands*
     Retry queued or previously failed remote saves and report applied, still
     queued, conflict, and remaining counts.
 
+:RemoteSaveQueue [limit]
+    List pending, failed, and conflicted saves from the local durable queue in
+    quickfix. This command reads local mirror state only, so it remains useful
+    while the remote is unavailable.
+
 :RemoteValidate [path]
     Validate the current remote buffer or a workspace-relative path against the
     remote checksum.

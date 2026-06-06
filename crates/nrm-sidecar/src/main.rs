@@ -44,6 +44,7 @@ const SIDECAR_COMMANDS: &[&str] = &[
     "hello",
     "workspace_info",
     "status",
+    "save_queue",
     "find_paths",
     "remote_probe",
     "scan",
@@ -2037,6 +2038,90 @@ impl Mirror {
             .map_err(Into::into)
     }
 
+    fn save_queue(&self, params: &Value) -> Result<Value> {
+        let limit = optional_positive_usize_param(params, "limit").unwrap_or(256);
+        let db_limit = if limit >= i64::MAX as usize {
+            i64::MAX
+        } else {
+            (limit + 1) as i64
+        };
+        let mut statement = self.db.prepare(
+            "
+            SELECT id, relative_path, expected_hash, local_hash, snapshot_path,
+                   state, attempts, last_error, remote_conflict_path,
+                   created_at_ms, updated_at_ms
+            FROM save_queue
+            WHERE state IN ('pending', 'failed', 'conflict')
+            ORDER BY id ASC
+            LIMIT ?1
+            ",
+        )?;
+        let mut rows = statement.query(params![db_limit])?;
+        let mut entries = Vec::new();
+        let mut truncated = false;
+        while let Some(row) = rows.next()? {
+            if entries.len() >= limit {
+                truncated = true;
+                break;
+            }
+
+            let relative_path: String = row.get(1)?;
+            let snapshot_path: Option<String> = row.get(4)?;
+            let remote_conflict_path: Option<String> = row.get(8)?;
+            let local_path = self
+                .local_path(&relative_path)?
+                .to_string_lossy()
+                .to_string();
+            entries.push(json!({
+                "queue_id": row.get::<_, i64>(0)?,
+                "path": relative_path,
+                "expected_hash": row.get::<_, Option<String>>(2)?,
+                "local_hash": row.get::<_, String>(3)?,
+                "snapshot_path": snapshot_path,
+                "state": row.get::<_, String>(5)?,
+                "attempts": row.get::<_, i64>(6)?,
+                "last_error": row.get::<_, Option<String>>(7)?,
+                "remote_conflict_path": remote_conflict_path,
+                "local_path": local_path,
+                "created_at_ms": row.get::<_, i64>(9)?,
+                "updated_at_ms": row.get::<_, i64>(10)?,
+            }));
+        }
+
+        let total: i64 = self.db.query_row(
+            "SELECT COUNT(*) FROM save_queue WHERE state IN ('pending', 'failed', 'conflict')",
+            [],
+            |row| row.get(0),
+        )?;
+        let pending: i64 = self.db.query_row(
+            "SELECT COUNT(*) FROM save_queue WHERE state='pending'",
+            [],
+            |row| row.get(0),
+        )?;
+        let failed: i64 = self.db.query_row(
+            "SELECT COUNT(*) FROM save_queue WHERE state='failed'",
+            [],
+            |row| row.get(0),
+        )?;
+        let conflict: i64 = self.db.query_row(
+            "SELECT COUNT(*) FROM save_queue WHERE state='conflict'",
+            [],
+            |row| row.get(0),
+        )?;
+
+        Ok(json!({
+            "entries": entries,
+            "limit": limit,
+            "truncated": truncated,
+            "total": total,
+            "counts": {
+                "pending": pending,
+                "failed": failed,
+                "conflict": conflict
+            }
+        }))
+    }
+
     fn latest_unresolved_save_entry(&self, relative_path: &str) -> Result<Option<SaveQueueEntry>> {
         self.db
             .query_row(
@@ -3389,6 +3474,10 @@ impl FastState {
             "status" => FastHandle::Handled(Mirror::open_root(self.mirror_root.clone()).and_then(
                 |mirror| status_with_remote_health(mirror.status()?, self.remote_health_snapshot()),
             )),
+            "save_queue" => FastHandle::Handled(
+                Mirror::open_root(self.mirror_root.clone())
+                    .and_then(|mirror| mirror.save_queue(&request.params)),
+            ),
             "find_paths" => FastHandle::Handled(
                 Mirror::open_root(self.mirror_root.clone())
                     .and_then(|mirror| mirror.find_paths(&request.params)),
@@ -3556,6 +3645,7 @@ impl Sidecar {
         match method {
             "hello" | "workspace_info" => Ok(self.workspace_info()),
             "status" => self.status(),
+            "save_queue" => self.mirror.save_queue(&params),
             "find_paths" => self.mirror.find_paths(&params),
             "remote_probe" => Ok(self.remote_probe(preempt_epoch)),
             "scan" => self.scan(params, preempt_epoch),
@@ -7114,6 +7204,100 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].relative_path, "a.txt");
         assert_eq!(mirror.pending_save_count().unwrap(), 2);
+    }
+
+    #[test]
+    fn save_queue_lists_unresolved_states_with_paths_and_counts() {
+        let dir = tempdir().unwrap();
+        let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
+        record_hydrated_content(&mirror, "a.txt", b"base a");
+        record_hydrated_content(&mirror, "b.txt", b"base b");
+        record_hydrated_content(&mirror, "c.txt", b"base c");
+
+        let a_hash = hash_bytes(b"dirty a");
+        let b_hash = hash_bytes(b"dirty b");
+        let c_hash = hash_bytes(b"dirty c");
+        let queued_a = mirror
+            .enqueue_save("a.txt", &a_hash, Some("base-a"), b"dirty a")
+            .unwrap();
+        let queued_b = mirror
+            .enqueue_save("b.txt", &b_hash, Some("base-b"), b"dirty b")
+            .unwrap();
+        let queued_c = mirror
+            .enqueue_save("c.txt", &c_hash, Some("base-c"), b"dirty c")
+            .unwrap();
+        mirror
+            .mark_save_failed(queued_b.id, "b.txt", "ssh connect failed")
+            .unwrap();
+        let conflict_path = mirror
+            .record_save_conflict(queued_c.id, "c.txt", b"remote c", false, "remote changed")
+            .unwrap();
+
+        let result = mirror.save_queue(&json!({"limit": 2})).unwrap();
+        let entries = result["entries"].as_array().unwrap();
+
+        assert_eq!(result["total"], 3);
+        assert_eq!(result["limit"], 2);
+        assert_eq!(result["truncated"], true);
+        assert_eq!(result["counts"]["pending"], 1);
+        assert_eq!(result["counts"]["failed"], 1);
+        assert_eq!(result["counts"]["conflict"], 1);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["queue_id"], queued_a.id);
+        assert_eq!(entries[0]["path"], "a.txt");
+        assert_eq!(entries[0]["state"], "pending");
+        assert_eq!(entries[0]["local_hash"], a_hash);
+        assert!(entries[0]["snapshot_path"]
+            .as_str()
+            .unwrap()
+            .ends_with(".snapshot"));
+        assert!(entries[0]["local_path"]
+            .as_str()
+            .unwrap()
+            .ends_with("/files/a.txt"));
+        assert_eq!(entries[1]["queue_id"], queued_b.id);
+        assert_eq!(entries[1]["state"], "failed");
+        assert_eq!(entries[1]["attempts"], 1);
+        assert_eq!(entries[1]["last_error"], "ssh connect failed");
+
+        let full = mirror.save_queue(&json!({"limit": 10})).unwrap();
+        let entries = full["entries"].as_array().unwrap();
+        assert_eq!(full["truncated"], false);
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[2]["queue_id"], queued_c.id);
+        assert_eq!(entries[2]["state"], "conflict");
+        assert_eq!(
+            entries[2]["remote_conflict_path"].as_str().unwrap(),
+            conflict_path.to_string_lossy().as_ref()
+        );
+    }
+
+    #[test]
+    fn fast_state_serves_save_queue_from_reopened_mirror() {
+        let dir = tempdir().unwrap();
+        let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
+        record_hydrated_content(&mirror, "src/main.rs", b"base");
+        let queued = mirror
+            .enqueue_save("src/main.rs", &hash_bytes(b"dirty"), Some("base"), b"dirty")
+            .unwrap();
+        let sidecar = test_sidecar(mirror);
+        let fast =
+            FastState::from_sidecar(&sidecar, Arc::new(Mutex::new(PendingRemote::default())));
+
+        let request = ClientRequest {
+            id: 1,
+            method: "save_queue".to_string(),
+            params: json!({"limit": 5}),
+        };
+        let FastHandle::Handled(result) = fast.try_handle(&request) else {
+            panic!("save_queue should be handled by fast state");
+        };
+        let result = result.unwrap();
+        let entries = result["entries"].as_array().unwrap();
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["queue_id"], queued.id);
+        assert_eq!(entries[0]["path"], "src/main.rs");
     }
 
     #[test]

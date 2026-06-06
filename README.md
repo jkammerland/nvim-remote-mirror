@@ -211,7 +211,9 @@ and `cd` to `remote_root` before starting the language server.
 Writes are preserved locally before any remote upload attempt. `:RemoteFlush`
 creates a content-addressed snapshot in the workspace state directory, then
 tries a remote compare-and-swap write. If the upload fails, `:RemoteStatus`
-shows the queued or failed save and `:RemoteFlushQueue` retries it.
+shows the queued or failed save counts, `:RemoteSaveQueue` lists pending,
+failed, and conflicted saves from the local durable queue, and
+`:RemoteFlushQueue` retries retryable entries.
 If `:RemoteFlush` or automatic `BufWritePost` runs while disconnected, the path
 is kept in memory and replayed after reconnect so the sidecar can snapshot the
 already-written local mirror file. On reconnect the sidecar also runs a bounded
@@ -342,6 +344,12 @@ the local workspace identity, mirror paths, transport kind, supported command
 names, notification names, daemon capabilities, and last-known remote health.
 `workspace_info` is served from local state and does not start or probe SSH.
 `hello` remains a compatibility alias for the same payload.
+
+The reusable workspace daemon surface is this command/response plus
+notification protocol. The current LSP proxy is an optional Neovim integration
+helper for forwarding one language-server stdio session; it is not required for
+generic mirror clients and should not be expanded into a second mirror-control
+API.
 
 The sidecar talks to the agent using a 4-byte big-endian length prefix followed
 by a bincode-encoded `RpcMessage`. Every request has a request ID and every
