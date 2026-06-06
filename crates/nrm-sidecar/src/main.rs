@@ -368,6 +368,13 @@ impl RemoteTransport {
         }
     }
 
+    fn workspace_identity(&self) -> String {
+        match self {
+            Self::Local => "local".to_string(),
+            Self::Ssh(ssh) => ssh.target.clone(),
+        }
+    }
+
     fn agent_plan(&self, agent: &str, remote_root: &Path) -> ProcessLaunchPlan {
         match self {
             Self::Local => ProcessLaunchPlan {
@@ -734,10 +741,9 @@ fn remote_unavailable_backoff_ms(consecutive_failures: u32) -> u64 {
 impl AgentClient {
     fn new(
         agent: String,
-        ssh: Option<String>,
+        transport: RemoteTransport,
         remote_root: PathBuf,
         request_timeout: Duration,
-        ssh_connect_timeout_seconds: u64,
         interrupt: AgentInterrupt,
     ) -> Self {
         Self {
@@ -745,7 +751,7 @@ impl AgentClient {
                 agent,
                 remote_root,
                 request_timeout,
-                transport: RemoteTransport::from_ssh(ssh, ssh_connect_timeout_seconds),
+                transport,
             },
             interrupt,
             preempt: AgentPreempt::default(),
@@ -3706,21 +3712,19 @@ impl FastState {
 impl Sidecar {
     fn new(
         remote_root: PathBuf,
-        ssh: Option<String>,
+        transport: RemoteTransport,
         agent: String,
         state_dir: Option<PathBuf>,
         request_timeout_ms: u64,
-        ssh_connect_timeout_seconds: u64,
         agent_interrupt: AgentInterrupt,
     ) -> Result<Self> {
-        let workspace_key = workspace_key(ssh.as_deref(), &remote_root);
+        let workspace_key = workspace_key(&transport, &remote_root);
         let mirror = Mirror::open(state_dir, &workspace_key)?;
         let agent = AgentClient::new(
             agent,
-            ssh,
+            transport,
             remote_root.clone(),
             Duration::from_millis(request_timeout_ms),
-            ssh_connect_timeout_seconds,
             agent_interrupt,
         );
         let sidecar = Self {
@@ -5213,11 +5217,10 @@ fn main() -> Result<()> {
             ssh_connect_timeout_seconds,
         } => run_server(
             remote_root,
-            ssh,
+            RemoteTransport::from_ssh(ssh, ssh_connect_timeout_seconds),
             agent,
             state_dir,
             request_timeout_ms,
-            ssh_connect_timeout_seconds,
         ),
         CommandKind::LspProxy {
             remote_root,
@@ -5228,8 +5231,7 @@ fn main() -> Result<()> {
         } => run_lsp_proxy(
             remote_root,
             local_root,
-            ssh,
-            ssh_connect_timeout_seconds,
+            RemoteTransport::from_ssh(ssh, ssh_connect_timeout_seconds),
             command,
         ),
     }
@@ -5237,21 +5239,19 @@ fn main() -> Result<()> {
 
 fn run_server(
     remote_root: PathBuf,
-    ssh: Option<String>,
+    transport: RemoteTransport,
     agent: String,
     state_dir: Option<PathBuf>,
     request_timeout_ms: u64,
-    ssh_connect_timeout_seconds: u64,
 ) -> Result<()> {
     let stdin = io::stdin();
     let agent_interrupt = AgentInterrupt::default();
     let sidecar = Sidecar::new(
         remote_root,
-        ssh,
+        transport,
         agent,
         state_dir,
         request_timeout_ms,
-        ssh_connect_timeout_seconds,
         agent_interrupt.clone(),
     )?;
     let write_interrupt = AgentInterrupt::default();
@@ -5835,20 +5835,14 @@ fn send_client_notification(
 fn run_lsp_proxy(
     remote_root: PathBuf,
     local_root: PathBuf,
-    ssh: Option<String>,
-    ssh_connect_timeout_seconds: u64,
+    transport: RemoteTransport,
     command: Vec<String>,
 ) -> Result<()> {
     if command.is_empty() {
         bail!("lsp-proxy requires a language server command after --");
     }
 
-    let launch = LspLaunch::new(
-        remote_root.clone(),
-        ssh,
-        ssh_connect_timeout_seconds,
-        command,
-    );
+    let launch = LspLaunch::new(remote_root.clone(), transport, command);
     let mut child_command = launch.command();
     configure_agent_process(&mut child_command);
 
@@ -5902,15 +5896,9 @@ struct LspLaunch {
 }
 
 impl LspLaunch {
-    fn new(
-        remote_root: PathBuf,
-        ssh: Option<String>,
-        ssh_connect_timeout_seconds: u64,
-        command: Vec<String>,
-    ) -> Self {
+    fn new(remote_root: PathBuf, transport: RemoteTransport, command: Vec<String>) -> Self {
         Self {
-            plan: RemoteTransport::from_ssh(ssh, ssh_connect_timeout_seconds)
-                .lsp_plan(remote_root, command),
+            plan: transport.lsp_plan(remote_root, command),
         }
     }
 
@@ -6215,9 +6203,9 @@ fn default_state_dir() -> PathBuf {
     }
 }
 
-fn workspace_key(ssh: Option<&str>, remote_root: &Path) -> String {
+fn workspace_key(transport: &RemoteTransport, remote_root: &Path) -> String {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(ssh.unwrap_or("local").as_bytes());
+    hasher.update(transport.workspace_identity().as_bytes());
     hasher.update(b"\0");
     hasher.update(remote_root.to_string_lossy().as_bytes());
     hasher.finalize().to_hex()[..24].to_string()
@@ -6328,10 +6316,9 @@ mod tests {
         Sidecar {
             agent: AgentClient::new(
                 "unused-agent".to_string(),
-                None,
+                RemoteTransport::Local,
                 PathBuf::from("/unused"),
                 Duration::from_millis(1),
-                1,
                 AgentInterrupt::default(),
             ),
             mirror,
@@ -6549,21 +6536,20 @@ mod tests {
         let state_dir = tempdir().unwrap();
         let remote_dir = tempdir().unwrap();
         let remote_root = remote_dir.path().join("repo");
-        let key = workspace_key(None, &remote_root);
+        let key = workspace_key(&RemoteTransport::Local, &remote_root);
         let mirror = Mirror::open(Some(state_dir.path().to_path_buf()), &key).unwrap();
         let local_path = record_hydrated_content(&mirror, "src/main.rs", b"main");
         drop(mirror);
 
         let mut sidecar = Sidecar::new(
             remote_root,
-            None,
+            RemoteTransport::Local,
             state_dir
                 .path()
                 .join("missing-agent")
                 .to_string_lossy()
                 .to_string(),
             Some(state_dir.path().to_path_buf()),
-            1,
             1,
             AgentInterrupt::default(),
         )
@@ -6604,9 +6590,10 @@ mod tests {
         let state_dir = tempdir().unwrap();
         let remote_dir = tempdir().unwrap();
         let remote_root = remote_dir.path().join("repo");
+        let transport = RemoteTransport::from_ssh(Some("host".to_string()), 7);
         let mut sidecar = Sidecar::new(
             remote_root.clone(),
-            Some("host".to_string()),
+            transport.clone(),
             state_dir
                 .path()
                 .join("missing-agent")
@@ -6614,14 +6601,13 @@ mod tests {
                 .to_string(),
             Some(state_dir.path().to_path_buf()),
             30_000,
-            7,
             AgentInterrupt::default(),
         )
         .unwrap();
 
         let info = sidecar.handle("workspace_info", json!({}), 0).unwrap();
 
-        let expected_workspace_key = workspace_key(Some("host"), &remote_root);
+        let expected_workspace_key = workspace_key(&transport, &remote_root);
         assert_eq!(
             info["workspace_key"].as_str(),
             Some(expected_workspace_key.as_str())
@@ -6758,7 +6744,7 @@ mod tests {
         let remote_root = remote_dir.path().join("repo");
         let mut sidecar = Sidecar::new(
             remote_root.clone(),
-            None,
+            RemoteTransport::Local,
             state_dir
                 .path()
                 .join("missing-agent")
@@ -6766,14 +6752,13 @@ mod tests {
                 .to_string(),
             Some(state_dir.path().to_path_buf()),
             1,
-            1,
             AgentInterrupt::default(),
         )
         .unwrap();
 
         let probe = sidecar.handle("remote_probe", json!({}), 0).unwrap();
         let notification = sidecar.remote_health_notification();
-        let expected_workspace_key = workspace_key(None, &remote_root);
+        let expected_workspace_key = workspace_key(&RemoteTransport::Local, &remote_root);
         let expected_remote_root = remote_root.to_string_lossy().to_string();
 
         assert_eq!(probe["remote_status"], "unavailable");
@@ -8831,8 +8816,29 @@ mod tests {
     fn workspace_key_changes_by_host() {
         let path = PathBuf::from("/repo");
         assert_ne!(
-            workspace_key(Some("host-a"), &path),
-            workspace_key(Some("host-b"), &path)
+            workspace_key(
+                &RemoteTransport::from_ssh(Some("host-a".to_string()), 10),
+                &path
+            ),
+            workspace_key(
+                &RemoteTransport::from_ssh(Some("host-b".to_string()), 10),
+                &path
+            )
+        );
+    }
+
+    #[test]
+    fn workspace_key_uses_stable_transport_identity() {
+        let path = PathBuf::from("/repo");
+        assert_eq!(
+            workspace_key(
+                &RemoteTransport::from_ssh(Some("host".to_string()), 5),
+                &path
+            ),
+            workspace_key(
+                &RemoteTransport::from_ssh(Some("host".to_string()), 60),
+                &path
+            )
         );
     }
 
@@ -8938,8 +8944,7 @@ mod tests {
     fn lsp_local_launch_runs_in_remote_root() {
         let launch = LspLaunch::new(
             PathBuf::from("/repo"),
-            None,
-            10,
+            RemoteTransport::Local,
             vec!["rust-analyzer".to_string(), "--stdio".to_string()],
         );
 
@@ -8952,8 +8957,7 @@ mod tests {
     fn lsp_ssh_launch_uses_remote_root_and_connection_options() {
         let launch = LspLaunch::new(
             PathBuf::from("/tmp/repo with 'quote' ; x"),
-            Some("host".to_string()),
-            7,
+            RemoteTransport::from_ssh(Some("host".to_string()), 7),
             vec![
                 "rust-analyzer".to_string(),
                 "--config".to_string(),
@@ -9077,11 +9081,10 @@ mod tests {
         let interrupt = AgentInterrupt::default();
         let mut sidecar = Sidecar::new(
             remote_root,
-            None,
+            RemoteTransport::Local,
             fake_agent.to_string_lossy().to_string(),
             Some(dir.path().join("state")),
             30_000,
-            1,
             interrupt.clone(),
         )
         .unwrap();
@@ -9127,11 +9130,10 @@ mod tests {
         let interrupt = AgentInterrupt::default();
         let mut sidecar = Sidecar::new(
             remote_root,
-            None,
+            RemoteTransport::Local,
             fake_agent.to_string_lossy().to_string(),
             Some(dir.path().join("state")),
             30_000,
-            1,
             interrupt.clone(),
         )
         .unwrap();
@@ -9180,10 +9182,9 @@ mod tests {
         interrupt.request_shutdown();
         let mut client = AgentClient::new(
             "unused-agent".to_string(),
-            None,
+            RemoteTransport::Local,
             PathBuf::from("/unused"),
             Duration::from_secs(30),
-            1,
             interrupt.clone(),
         );
 
@@ -9201,10 +9202,9 @@ mod tests {
                 .join("missing-agent")
                 .to_string_lossy()
                 .to_string(),
-            None,
+            RemoteTransport::Local,
             dir.path().to_path_buf(),
             Duration::from_secs(30),
-            1,
             AgentInterrupt::default(),
         );
 
@@ -9236,10 +9236,9 @@ mod tests {
                 .join("missing-agent")
                 .to_string_lossy()
                 .to_string(),
-            None,
+            RemoteTransport::Local,
             dir.path().to_path_buf(),
             Duration::from_secs(30),
-            1,
             AgentInterrupt::default(),
         );
         let mut write_client = read_client.clone_for_lane(AgentInterrupt::default());
@@ -9272,10 +9271,9 @@ mod tests {
                 .join("missing-agent")
                 .to_string_lossy()
                 .to_string(),
-            None,
+            RemoteTransport::Local,
             dir.path().to_path_buf(),
             Duration::from_secs(30),
-            1,
             AgentInterrupt::default(),
         );
         let mut write_client = read_client.clone_for_lane(AgentInterrupt::default());
@@ -9308,10 +9306,9 @@ mod tests {
                 .join("missing-agent")
                 .to_string_lossy()
                 .to_string(),
-            None,
+            RemoteTransport::Local,
             dir.path().to_path_buf(),
             Duration::from_secs(30),
-            1,
             AgentInterrupt::default(),
         );
         let mut write_client = read_client.clone_for_lane(AgentInterrupt::default());
@@ -9339,10 +9336,9 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut read_client = AgentClient::new(
             dir.path().join("agent").to_string_lossy().to_string(),
-            None,
+            RemoteTransport::Local,
             dir.path().to_path_buf(),
             Duration::from_secs(30),
-            1,
             AgentInterrupt::default(),
         );
         let mut write_client = read_client.clone_for_lane(AgentInterrupt::default());
@@ -9371,10 +9367,9 @@ mod tests {
 
         let mut client = AgentClient::new(
             fake_agent.to_string_lossy().to_string(),
-            None,
+            RemoteTransport::Local,
             dir.path().to_path_buf(),
             Duration::from_millis(50),
-            1,
             AgentInterrupt::default(),
         );
         let error = client
@@ -9403,10 +9398,9 @@ mod tests {
         let client_interrupt = interrupt.clone();
         let mut client = AgentClient::new(
             fake_agent.to_string_lossy().to_string(),
-            None,
+            RemoteTransport::Local,
             dir.path().to_path_buf(),
             Duration::from_secs(30),
-            1,
             client_interrupt,
         );
         let started = std::time::Instant::now();
@@ -9446,10 +9440,9 @@ mod tests {
         let interrupt = AgentInterrupt::default();
         let mut client = AgentClient::new(
             fake_agent.to_string_lossy().to_string(),
-            None,
+            RemoteTransport::Local,
             dir.path().to_path_buf(),
             Duration::from_secs(30),
-            1,
             interrupt.clone(),
         );
         let preempt = client.preempt_handle();
@@ -9497,10 +9490,9 @@ mod tests {
         let interrupt = AgentInterrupt::default();
         let mut client = AgentClient::new(
             fake_agent.to_string_lossy().to_string(),
-            None,
+            RemoteTransport::Local,
             dir.path().to_path_buf(),
             Duration::from_secs(30),
-            1,
             interrupt,
         );
         let preempt = client.preempt_handle();
