@@ -169,6 +169,7 @@ require("nvim_remote_mirror").setup({
   flush_queue_on_connect_limit = 1,
   background_mirror = true,
   background_mirror_interval_ms = 5000,
+  background_mirror_rescan_interval_ms = 300000,
   background_mirror_scan_limit = 256,
   background_mirror_prefetch_limit = 4,
   background_mirror_refresh_limit = 32,
@@ -266,9 +267,11 @@ through `prefetch_known`. It then validates a small batch of clean cached files
 oldest-check first, so the mirror gradually checksums itself against the remote
 without blocking navigation. The sidecar persists the background scan cursor in
 the mirror database, so reconnects continue building metadata from the last
-completed batch instead of restarting every scan from the root. Use
-`:RemoteMirrorStart` and `:RemoteMirrorStop` to control the scheduler manually
-on very slow links.
+completed batch instead of restarting every scan from the root. Once a
+resumable scan reaches the end, the completion timestamp is persisted and
+`background_mirror_rescan_interval_ms` prevents the next idle ticks from
+rewalking the full tree immediately. Use `:RemoteMirrorStart` and
+`:RemoteMirrorStop` to control the scheduler manually on very slow links.
 
 `:RemoteOpen` prefers an existing clean or dirty local mirror file, including
 entries previously marked stale or deleted, so navigation does not block on a

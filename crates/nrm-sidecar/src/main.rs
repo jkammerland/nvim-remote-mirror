@@ -38,6 +38,7 @@ const SAVE_INLINE_MAX_BYTES: u64 = 4 * 1024 * 1024;
 const REMOTE_INTERACTIVE_QUEUE_CAPACITY: usize = 128;
 const REMOTE_BACKGROUND_QUEUE_CAPACITY: usize = 128;
 const BACKGROUND_SCAN_CURSOR_KEY: &str = "background_scan_cursor";
+const BACKGROUND_SCAN_COMPLETED_AT_KEY: &str = "background_scan_completed_at_ms";
 const SIDECAR_COMMANDS: &[&str] = &[
     "hello",
     "workspace_info",
@@ -1260,6 +1261,21 @@ impl Mirror {
 
     fn set_background_scan_cursor(&self, cursor: Option<&str>) -> Result<()> {
         self.set_workspace_state_value(BACKGROUND_SCAN_CURSOR_KEY, cursor)
+    }
+
+    fn background_scan_completed_at_ms(&self) -> Result<Option<i64>> {
+        self.workspace_state_value(BACKGROUND_SCAN_COMPLETED_AT_KEY)?
+            .map(|value| {
+                value.parse::<i64>().with_context(|| {
+                    format!("invalid {BACKGROUND_SCAN_COMPLETED_AT_KEY} value `{value}`")
+                })
+            })
+            .transpose()
+    }
+
+    fn set_background_scan_completed_at_ms(&self, completed_at_ms: Option<i64>) -> Result<()> {
+        let value = completed_at_ms.map(|value| value.to_string());
+        self.set_workspace_state_value(BACKGROUND_SCAN_COMPLETED_AT_KEY, value.as_deref())
     }
 
     fn local_path(&self, relative_path: &str) -> Result<PathBuf> {
@@ -3643,7 +3659,14 @@ impl Sidecar {
             .get("resume")
             .and_then(Value::as_bool)
             .unwrap_or(false);
+        let explicit_after = optional_string_param(&params, "after").is_some();
+        let rescan_after_ms = params.get("rescan_after_ms").and_then(Value::as_u64);
         let after = self.scan_after_param(&params, resume)?;
+        if resume && after.is_none() && !explicit_after {
+            if let Some(skipped) = self.completed_scan_skip_response(rescan_after_ms)? {
+                return Ok(skipped);
+            }
+        }
         let response = match self.agent.request_maybe_preemptible_since(
             Request::Scan {
                 limit,
@@ -3706,10 +3729,38 @@ impl Sidecar {
             if let Some(next_after) = next_after {
                 self.mirror.set_background_scan_cursor(Some(next_after))?;
             }
+            self.mirror.set_background_scan_completed_at_ms(None)?;
         } else {
             self.mirror.set_background_scan_cursor(None)?;
+            self.mirror
+                .set_background_scan_completed_at_ms(Some(now_ms()))?;
         }
         Ok(())
+    }
+
+    fn completed_scan_skip_response(&self, rescan_after_ms: Option<u64>) -> Result<Option<Value>> {
+        let Some(rescan_after_ms) = rescan_after_ms else {
+            return Ok(None);
+        };
+        let Some(completed_at_ms) = self.mirror.background_scan_completed_at_ms()? else {
+            return Ok(None);
+        };
+        let now = now_ms();
+        let age_ms = now.saturating_sub(completed_at_ms);
+        if age_ms as u64 >= rescan_after_ms {
+            return Ok(None);
+        }
+        Ok(Some(json!({
+            "entries": [],
+            "truncated": false,
+            "next_after": Value::Null,
+            "resumed_after": Value::Null,
+            "skipped": true,
+            "skip_reason": "background scan completed recently",
+            "scan_completed_at_ms": completed_at_ms,
+            "rescan_after_ms": rescan_after_ms,
+            "rescan_due_in_ms": rescan_after_ms.saturating_sub(age_ms as u64)
+        })))
     }
 
     fn open(&mut self, params: Value, preempt_epoch: u64) -> Result<Value> {
@@ -6377,8 +6428,12 @@ mod tests {
         let mirror_root = mirror.root().to_path_buf();
 
         assert_eq!(mirror.background_scan_cursor().unwrap(), None);
+        assert_eq!(mirror.background_scan_completed_at_ms().unwrap(), None);
         mirror
             .set_background_scan_cursor(Some("src/lib.rs"))
+            .unwrap();
+        mirror
+            .set_background_scan_completed_at_ms(Some(12345))
             .unwrap();
         drop(mirror);
 
@@ -6387,11 +6442,17 @@ mod tests {
             reopened.background_scan_cursor().unwrap().as_deref(),
             Some("src/lib.rs")
         );
+        assert_eq!(
+            reopened.background_scan_completed_at_ms().unwrap(),
+            Some(12345)
+        );
         reopened.set_background_scan_cursor(None).unwrap();
+        reopened.set_background_scan_completed_at_ms(None).unwrap();
         drop(reopened);
 
         let reopened = Mirror::open_root(mirror_root).unwrap();
         assert_eq!(reopened.background_scan_cursor().unwrap(), None);
+        assert_eq!(reopened.background_scan_completed_at_ms().unwrap(), None);
     }
 
     #[test]
@@ -6426,6 +6487,10 @@ mod tests {
             sidecar.mirror.background_scan_cursor().unwrap().as_deref(),
             Some("src/main.rs")
         );
+        assert_eq!(
+            sidecar.mirror.background_scan_completed_at_ms().unwrap(),
+            None
+        );
         sidecar.record_scan_progress(true, true, None).unwrap();
         assert_eq!(
             sidecar.mirror.background_scan_cursor().unwrap().as_deref(),
@@ -6440,6 +6505,42 @@ mod tests {
         );
         sidecar.record_scan_progress(true, false, None).unwrap();
         assert_eq!(sidecar.mirror.background_scan_cursor().unwrap(), None);
+        assert!(
+            sidecar
+                .mirror
+                .background_scan_completed_at_ms()
+                .unwrap()
+                .unwrap()
+                > 0
+        );
+    }
+
+    #[test]
+    fn completed_resumable_scan_skips_until_rescan_interval_expires() {
+        let dir = tempdir().unwrap();
+        let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
+        let mut sidecar = test_sidecar(mirror);
+        sidecar.agent.launch.agent = dir
+            .path()
+            .join("missing-agent")
+            .to_string_lossy()
+            .to_string();
+        sidecar.record_scan_progress(true, false, None).unwrap();
+
+        let skipped = sidecar
+            .scan(json!({"resume": true, "rescan_after_ms": 60_000}), 0)
+            .unwrap();
+        assert_eq!(skipped["skipped"], true);
+        assert_eq!(skipped["skip_reason"], "background scan completed recently");
+        assert_eq!(skipped["entries"].as_array().unwrap().len(), 0);
+        assert_eq!(skipped["truncated"], false);
+        assert!(skipped["rescan_due_in_ms"].as_u64().unwrap() <= 60_000);
+
+        let error = sidecar
+            .scan(json!({"resume": true, "rescan_after_ms": 0}), 0)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("failed to launch agent"));
     }
 
     #[test]

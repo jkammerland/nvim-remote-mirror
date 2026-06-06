@@ -49,6 +49,7 @@ M.config = {
   flush_queue_on_connect_limit = 1,
   background_mirror = true,
   background_mirror_interval_ms = 5000,
+  background_mirror_rescan_interval_ms = 300000,
   background_mirror_scan_limit = 256,
   background_mirror_prefetch_limit = 4,
   background_mirror_refresh_limit = 32,
@@ -787,6 +788,7 @@ local function schedule_background_mirror(delay, generation)
       local scan_params = {
         limit = M.config.background_mirror_scan_limit,
         resume = true,
+        rescan_after_ms = M.config.background_mirror_rescan_interval_ms,
       }
       if M.background_scan_after then
         scan_params.after = M.background_scan_after
