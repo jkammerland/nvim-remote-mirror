@@ -4448,8 +4448,9 @@ impl Sidecar {
             }));
         }
         let response = match self.agent.request_maybe_preemptible_since(
-            Request::Checksum {
-                path: entry.relative_path.clone(),
+            Request::ValidateFiles {
+                paths: vec![entry.relative_path.clone()],
+                include_hash: true,
             },
             preempt_epoch,
         )? {
@@ -4462,36 +4463,24 @@ impl Sidecar {
             }
         };
         match response {
-            Response::Checksum { hash, .. } => {
-                let state = if hash == entry.remote_hash {
-                    "valid"
-                } else {
-                    "stale"
-                };
-                let error = if state == "stale" {
-                    Some("remote hash differs from local mirror metadata")
-                } else {
-                    None
-                };
-                let recorded_remote_hash = if state == "valid" {
-                    hash.as_deref()
-                } else {
-                    None
-                };
-                self.mirror.record_validation(
-                    &entry.relative_path,
-                    state,
-                    recorded_remote_hash,
-                    error,
-                )?;
-                Ok(json!({
-                    "path": entry.relative_path,
-                    "status": state,
-                    "remote_hash": hash,
-                    "local_hash": entry.local_hash
-                }))
+            Response::ValidateFiles { files, errors } => {
+                if let Some(error) = errors.into_iter().next() {
+                    self.mirror
+                        .mark_validation_error(&error.path, &error.message)?;
+                    return Ok(json!({
+                        "path": error.path,
+                        "status": "error",
+                        "error": error.message,
+                        "local_hash": entry.local_hash,
+                        "remote_hash": null
+                    }));
+                }
+                let file = files.into_iter().next().ok_or_else(|| {
+                    anyhow!("validate returned no result for {}", entry.relative_path)
+                })?;
+                self.validation_file_to_json(file)
             }
-            other => bail!("unexpected checksum response: {other:?}"),
+            other => bail!("unexpected validate response: {other:?}"),
         }
     }
 
@@ -4629,6 +4618,23 @@ impl Sidecar {
         self.mirror
             .record_validation(&entry.relative_path, state, recorded_remote_hash, error)?;
         Ok(state)
+    }
+
+    fn validation_file_to_json(&self, file: BatchValidateFile) -> Result<Value> {
+        let path = file.path.clone();
+        let remote_hash = file.meta.as_ref().and_then(|meta| meta.hash.clone());
+        let status = self.record_validation_file(file)?;
+        let entry = self
+            .mirror
+            .get(&path)?
+            .ok_or_else(|| anyhow!("{path} is not known in the mirror"))?;
+        Ok(json!({
+            "path": entry.relative_path,
+            "status": status,
+            "remote_hash": remote_hash,
+            "local_hash": entry.local_hash,
+            "skipped": status == "dirty"
+        }))
     }
 
     fn hydrate(&mut self, path: &str, preempt_epoch: Option<u64>) -> Result<HydrateOutcome> {
@@ -6761,6 +6767,93 @@ mod tests {
         assert_eq!(sidecar.mirror.pending_save_count().unwrap(), 1);
         assert!(entry.dirty);
         assert_eq!(entry.validation_state, "dirty");
+    }
+
+    #[test]
+    fn single_validate_reports_deleted_for_metadata_entry_without_hash() {
+        let dir = tempdir().unwrap();
+        let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
+        mirror
+            .upsert_metadata(
+                &FileMeta {
+                    path: "missing.txt".to_string(),
+                    size: 0,
+                    mtime_ms: 0,
+                    mode: 0,
+                    is_dir: false,
+                    is_symlink: false,
+                    hash: None,
+                },
+                "metadata",
+            )
+            .unwrap();
+        let sidecar = test_sidecar(mirror);
+
+        let result = sidecar
+            .validation_file_to_json(BatchValidateFile {
+                path: "missing.txt".to_string(),
+                meta: None,
+            })
+            .unwrap();
+
+        assert_eq!(result["path"], "missing.txt");
+        assert_eq!(result["status"], "deleted");
+        assert!(result["remote_hash"].is_null());
+        assert!(result["local_hash"].is_null());
+        let entry = sidecar.mirror.get("missing.txt").unwrap().unwrap();
+        assert_eq!(entry.validation_state, "deleted");
+        assert!(entry
+            .last_error
+            .as_deref()
+            .unwrap()
+            .contains("remote file no longer exists"));
+    }
+
+    #[test]
+    fn single_validate_reports_deleted_for_hydrated_file_missing_remote() {
+        let dir = tempdir().unwrap();
+        let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
+        let local_hash = hash_bytes(b"base");
+        record_hydrated_content(&mirror, "a.txt", b"base");
+        let sidecar = test_sidecar(mirror);
+
+        let result = sidecar
+            .validation_file_to_json(BatchValidateFile {
+                path: "a.txt".to_string(),
+                meta: None,
+            })
+            .unwrap();
+
+        assert_eq!(result["status"], "deleted");
+        assert!(result["remote_hash"].is_null());
+        assert_eq!(result["local_hash"].as_str().unwrap(), local_hash);
+        let entry = sidecar.mirror.get("a.txt").unwrap().unwrap();
+        assert_eq!(entry.validation_state, "deleted");
+        assert_eq!(entry.remote_hash.as_deref(), Some(local_hash.as_str()));
+    }
+
+    #[test]
+    fn single_validate_reports_stale_remote_hash() {
+        let dir = tempdir().unwrap();
+        let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
+        let local_hash = hash_bytes(b"base");
+        let remote_hash = hash_bytes(b"remote");
+        record_hydrated_content(&mirror, "a.txt", b"base");
+        let sidecar = test_sidecar(mirror);
+
+        let result = sidecar
+            .validation_file_to_json(BatchValidateFile {
+                path: "a.txt".to_string(),
+                meta: Some(test_meta("a.txt", &remote_hash, 6)),
+            })
+            .unwrap();
+
+        assert_eq!(result["status"], "stale");
+        assert_eq!(result["remote_hash"].as_str().unwrap(), remote_hash);
+        assert_eq!(result["local_hash"].as_str().unwrap(), local_hash);
+        let entry = sidecar.mirror.get("a.txt").unwrap().unwrap();
+        assert_eq!(entry.validation_state, "stale");
+        assert_eq!(entry.remote_hash.as_deref(), Some(local_hash.as_str()));
     }
 
     #[test]
