@@ -64,6 +64,7 @@ M.config = {
 
 M.client = nil
 M.last_target = nil
+M.last_workspace_identity = nil
 M.reconnect_attempts = 0
 M.reconnect_generation = 0
 M.grep_generation = 0
@@ -133,9 +134,11 @@ local function reconnect_arg(target)
   return target.remote_root
 end
 
-local function mirror_relative_path(client, local_path)
-  local hello = client and client.hello
-  local files_root = hello and hello.files_root
+local function files_root_relative_path(files_root, local_path)
+  local_path = optional_string(local_path)
+  if not local_path then
+    return nil
+  end
   if not files_root or files_root == "" then
     return nil
   end
@@ -146,6 +149,11 @@ local function mirror_relative_path(client, local_path)
     return nil
   end
   return path:sub(#prefix + 1)
+end
+
+local function mirror_relative_path(client, local_path)
+  local hello = client and client.hello
+  return files_root_relative_path(hello and hello.files_root, local_path)
 end
 
 local function close_timer(timer)
@@ -664,6 +672,18 @@ local function identity_key(identity)
   }, "\30")
 end
 
+local function identity_has_scope(identity)
+  return identity
+    and (identity.workspace_key ~= nil or identity.target_arg ~= nil or identity.files_root ~= nil)
+end
+
+local function identity_relative_path(identity, local_path)
+  if not identity_has_scope(identity) then
+    return nil
+  end
+  return files_root_relative_path(identity.files_root, local_path)
+end
+
 local function deferred_flush_key(path, identity)
   return identity_key(identity) .. "\31" .. path
 end
@@ -765,6 +785,22 @@ local function set_remote_buffer_identity(bufnr, client, result)
   vim.b[bufnr].nrm_target_arg = identity and identity.target_arg or nil
   vim.b[bufnr].nrm_files_root = identity and identity.files_root or nil
   vim.b[bufnr].nrm_flush_pending = has_deferred_flush(result.path, identity)
+end
+
+local function adopt_mirror_buffer_for_save(bufnr, identity, relative_path)
+  if not relative_path or relative_path == "" or not vim.api.nvim_buf_is_valid(bufnr) then
+    return
+  end
+  set_buffer_editable(bufnr, true)
+  vim.b[bufnr].nrm_hydrate_pending = false
+  vim.b[bufnr].nrm_hydrate_failed = false
+  vim.b[bufnr].nrm_hydrate_path = nil
+  vim.b[bufnr].nrm_remote_path = relative_path
+  vim.b[bufnr].nrm_remote_hash = nil
+  vim.b[bufnr].nrm_workspace_key = identity and identity.workspace_key or nil
+  vim.b[bufnr].nrm_target_arg = identity and identity.target_arg or nil
+  vim.b[bufnr].nrm_files_root = identity and identity.files_root or nil
+  vim.b[bufnr].nrm_flush_pending = has_deferred_flush(relative_path, identity)
 end
 
 local function mark_deferred_flush(bufnr, path, reason, identity)
@@ -1169,6 +1205,7 @@ function M.connect(target, opts)
       return
     end
     client.hello = result
+    M.last_workspace_identity = client_identity(client)
     M.connection_status = "connected"
     M.connection_target = target_arg
     M.connection_reason = nil
@@ -1566,8 +1603,9 @@ local function flush_remote_path(path, opts)
   end)
 end
 
-function M.flush_buffer(bufnr)
+function M.flush_buffer(bufnr, opts)
   bufnr = bufnr or vim.api.nvim_get_current_buf()
+  opts = opts or {}
   if vim.b[bufnr].nrm_hydrate_pending then
     notify(
       "remote save skipped while hydrate is pending for "
@@ -1584,8 +1622,26 @@ function M.flush_buffer(bufnr)
     )
     return
   end
-  local path = vim.b[bufnr].nrm_remote_path
-  flush_remote_path(path, { bufnr = bufnr, identity = buffer_identity(bufnr) })
+  local path = optional_string(vim.b[bufnr].nrm_remote_path)
+  local buffer_identity_value = buffer_identity(bufnr)
+  if not identity_has_scope(buffer_identity_value) then
+    buffer_identity_value = nil
+  end
+  local client = M.client
+  local write_path = optional_string(opts.local_path) or vim.api.nvim_buf_get_name(bufnr)
+  local adopt_identity = nil
+  if not path and client then
+    path = mirror_relative_path(client, write_path)
+    adopt_identity = client_identity(client)
+  end
+  if not path then
+    adopt_identity = buffer_identity_value or M.last_workspace_identity
+    path = identity_relative_path(adopt_identity, write_path)
+  end
+  if path and not optional_string(vim.b[bufnr].nrm_remote_path) then
+    adopt_mirror_buffer_for_save(bufnr, adopt_identity, path)
+  end
+  flush_remote_path(path, { bufnr = bufnr, identity = buffer_identity(bufnr) or adopt_identity })
 end
 
 function M.flush_deferred()
@@ -2229,7 +2285,7 @@ vim.api.nvim_create_augroup("NvimRemoteMirror", { clear = true })
 vim.api.nvim_create_autocmd("BufWritePost", {
   group = "NvimRemoteMirror",
   callback = function(args)
-    M.flush_buffer(args.buf)
+    M.flush_buffer(args.buf, { local_path = args.file })
   end,
 })
 

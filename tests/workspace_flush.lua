@@ -40,7 +40,16 @@ end
 
 vim.notify = function() end
 
+local function deferred_count()
+  local count = 0
+  for _ in pairs(nrm.deferred_flushes) do
+    count = count + 1
+  end
+  return count
+end
+
 local function main()
+  nrm.deferred_flushes = {}
   local buf = vim.api.nvim_create_buf(true, false)
   vim.api.nvim_set_current_buf(buf)
   vim.b[buf].nrm_remote_path = "src/main.rs"
@@ -67,6 +76,54 @@ local function main()
   assert_eq(vim.b[buf].nrm_flush_pending, false, "successful replay should clear pending flag")
   assert_eq(vim.b[buf].nrm_remote_hash, "hash:src/main.rs")
   assert(next(nrm.deferred_flushes) == nil, "successful replay should clear deferred save")
+
+  local files_root = vim.fn.tempname()
+  vim.fn.mkdir(files_root .. "/src", "p")
+  vim.fn.writefile({ "new" }, files_root .. "/src/new.rs")
+  local new_buf = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_buf_set_name(new_buf, files_root .. "/src/new.rs")
+  nrm.client = fake_client("workspace-new", "ssh://new.example/repo", files_root)
+
+  nrm.flush_buffer(new_buf)
+
+  assert_eq(calls[#calls].method, "flush")
+  assert_eq(calls[#calls].params.path, "src/new.rs")
+  assert_eq(vim.b[new_buf].nrm_remote_path, "src/new.rs")
+
+  local write_target = files_root .. "/src/write-target.rs"
+  vim.fn.writefile({ "write target" }, write_target)
+  local write_buf = vim.api.nvim_create_buf(true, false)
+  nrm.client = fake_client("workspace-write", "ssh://write.example/repo", files_root)
+
+  nrm.flush_buffer(write_buf, { local_path = write_target })
+
+  assert_eq(calls[#calls].method, "flush")
+  assert_eq(calls[#calls].params.path, "src/write-target.rs")
+  assert_eq(vim.b[write_buf].nrm_remote_path, "src/write-target.rs")
+
+  local offline_path = files_root .. "/src/offline.rs"
+  vim.fn.writefile({ "offline" }, offline_path)
+  local offline_buf = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_buf_set_name(offline_buf, offline_path)
+  nrm.client = nil
+  nrm.last_workspace_identity = {
+    workspace_key = "workspace-offline",
+    target_arg = "ssh://offline.example/repo",
+    files_root = files_root,
+  }
+  local call_count = #calls
+
+  nrm.flush_buffer(offline_buf)
+
+  assert_eq(#calls, call_count, "disconnected new save must not call sidecar immediately")
+  assert_eq(vim.b[offline_buf].nrm_remote_path, "src/offline.rs")
+  assert_eq(vim.b[offline_buf].nrm_flush_pending, true)
+  assert_eq(deferred_count(), 1)
+
+  nrm.client = fake_client("workspace-offline", "ssh://offline.example/repo", files_root)
+  assert_eq(nrm.flush_deferred(), 1)
+  assert_eq(calls[#calls].method, "flush")
+  assert_eq(calls[#calls].params.path, "src/offline.rs")
 end
 
 local ok, err = xpcall(main, debug.traceback)

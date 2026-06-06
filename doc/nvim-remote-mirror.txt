@@ -84,6 +84,10 @@ COMMANDS                                      *nvim-remote-mirror-commands*
     sidecar is connected, the path is marked for replay after reconnect. Buffers are
     tagged with the workspace that opened them; if another target is active,
     the save is deferred until the original workspace is reconnected.
+    Automatic BufWritePost flushing uses the actual write target, so
+    :write {mirror_path} can adopt an unnamed buffer. New mirror-root paths saved
+    during reconnect are deferred when they map to the last known workspace
+    mirror root.
 
 :RemoteFlushQueue
     Retry queued or previously failed remote saves and report applied, still
@@ -207,7 +211,11 @@ open_batch_max_file_bytes controls how large a direct uncached open may be
 before it falls back from one-request batch read hydration to chunked reads.
 auto_hydrate_mirror_buffers makes LSP jumps into missing local mirror files call
 the sidecar open path and hydrate the corresponding remote file. Pending or
-failed hydrations are read-only and are not flushed as remote saves.
+failed hydrations are read-only and are not flushed as remote saves. If the user
+creates or saves a new file under the mirror root, the plugin adopts the
+mirror-relative path and the sidecar snapshots it into the durable save queue
+with no expected remote hash, so replay creates the remote file only if it is
+still absent.
 
 Agent and LSP launch commands share a sidecar transport planner. Local targets
 spawn binaries directly; SSH targets use configured connection options and a

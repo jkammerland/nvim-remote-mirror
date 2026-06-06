@@ -1943,27 +1943,40 @@ impl Mirror {
         expected_hash: Option<&str>,
         content: &[u8],
     ) -> Result<SaveQueueEntry> {
-        let entry = self
-            .get(relative_path)?
-            .ok_or_else(|| anyhow!("{relative_path} is not known in the mirror"))?;
-        let relative_path = entry.relative_path;
+        let relative_path = normalize_relative_path(relative_path)?
+            .to_string_lossy()
+            .replace('\\', "/");
+        let local_path = self.local_path(&relative_path)?;
         let effective_expected_hash = self
             .latest_unresolved_save_hash(&relative_path)?
             .or_else(|| expected_hash.map(ToOwned::to_owned));
         let snapshot_path = self.write_save_snapshot(&relative_path, local_hash, content)?;
+        let now = now_ms();
         self.immediate_transaction(|| {
             self.db.execute(
                 "
-                UPDATE files SET
-                  size=?3,
-                  local_hash=?2,
+                INSERT INTO files (
+                  relative_path, local_path, size, mtime_ms, mode, is_dir, is_symlink,
+                  metadata_kind_known, remote_hash, local_hash, state, dirty,
+                  validated_at_ms, validation_state, last_error, updated_at_ms
+                )
+                VALUES (?1, ?2, ?3, 0, 0, 0, 0, 0, ?4, ?5, 'hydrated', 1, 0, 'dirty', NULL, ?6)
+                ON CONFLICT(relative_path) DO UPDATE SET
+                  size=excluded.size,
+                  local_hash=excluded.local_hash,
                   dirty=1,
                   validation_state='dirty',
                   last_error=NULL,
-                  updated_at_ms=?4
-                WHERE relative_path=?1
+                  updated_at_ms=excluded.updated_at_ms
                 ",
-                params![relative_path, local_hash, content.len() as i64, now_ms()],
+                params![
+                    relative_path,
+                    local_path.to_string_lossy(),
+                    content.len() as i64,
+                    effective_expected_hash,
+                    local_hash,
+                    now
+                ],
             )?;
             self.db.execute(
                 "
@@ -1978,7 +1991,7 @@ impl Mirror {
                     effective_expected_hash,
                     local_hash,
                     snapshot_path.to_string_lossy(),
-                    now_ms()
+                    now
                 ],
             )?;
             Ok(())
@@ -1995,20 +2008,24 @@ impl Mirror {
     }
 
     fn enqueue_local_save(&self, relative_path: &str) -> Result<SaveQueueEntry> {
-        let entry = self
-            .get(relative_path)?
-            .ok_or_else(|| anyhow!("{relative_path} is not known in the mirror"))?;
-        let content = fs::read(&entry.local_path).with_context(|| {
-            format!(
-                "failed to read local mirror file {}",
-                entry.local_path.display()
-            )
+        let relative_path = normalize_relative_path(relative_path)?
+            .to_string_lossy()
+            .replace('\\', "/");
+        let entry = self.get(&relative_path)?;
+        let local_path = entry
+            .as_ref()
+            .map(|entry| entry.local_path.clone())
+            .unwrap_or(self.local_path(&relative_path)?);
+        let content = fs::read(&local_path).with_context(|| {
+            format!("failed to read local mirror file {}", local_path.display())
         })?;
         let local_hash = hash_bytes(&content);
         self.enqueue_save(
-            relative_path,
+            &relative_path,
             &local_hash,
-            entry.remote_hash.as_deref(),
+            entry
+                .as_ref()
+                .and_then(|entry| entry.remote_hash.as_deref()),
             &content,
         )
     }
@@ -2424,6 +2441,9 @@ impl Mirror {
                     UPDATE files SET
                       size=?2,
                       mtime_ms=?3,
+                      metadata_kind_known=1,
+                      is_dir=0,
+                      is_symlink=0,
                       remote_hash=?4,
                       validation_state='dirty',
                       last_error=NULL,
@@ -2440,6 +2460,9 @@ impl Mirror {
                 UPDATE files SET
                   size=?2,
                   mtime_ms=?3,
+                  metadata_kind_known=1,
+                  is_dir=0,
+                  is_symlink=0,
                   remote_hash=?4,
                   local_hash=?4,
                   dirty=0,
@@ -8170,6 +8193,90 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].relative_path, "a.txt");
         assert_eq!(mirror.pending_save_count().unwrap(), 2);
+    }
+
+    #[test]
+    fn enqueue_local_save_creates_unknown_mirror_entry() {
+        let dir = tempdir().unwrap();
+        let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
+        let local_path = mirror.local_path("src/new.rs").unwrap();
+        fs::create_dir_all(local_path.parent().unwrap()).unwrap();
+        fs::write(&local_path, b"new file").unwrap();
+        let expected_hash = hash_bytes(b"new file");
+
+        let queued = mirror.enqueue_local_save("src/new.rs").unwrap();
+
+        assert_eq!(queued.relative_path, "src/new.rs");
+        assert_eq!(queued.expected_hash, None);
+        assert_eq!(queued.local_hash, expected_hash);
+        assert_eq!(fs::read(&queued.snapshot_path).unwrap(), b"new file");
+        let entry = mirror.get("src/new.rs").unwrap().unwrap();
+        assert_eq!(entry.state, "hydrated");
+        assert!(entry.dirty);
+        assert_eq!(entry.remote_hash, None);
+        assert_eq!(entry.local_hash.as_deref(), Some(expected_hash.as_str()));
+        assert_eq!(mirror.pending_save_count().unwrap(), 1);
+    }
+
+    #[test]
+    fn applied_unknown_save_becomes_known_for_find_paths() {
+        let dir = tempdir().unwrap();
+        let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
+        let local_path = mirror.local_path("src/new.rs").unwrap();
+        fs::create_dir_all(local_path.parent().unwrap()).unwrap();
+        fs::write(&local_path, b"new file").unwrap();
+        let hash = hash_bytes(b"new file");
+        let queued = mirror.enqueue_local_save("src/new.rs").unwrap();
+        let before = mirror
+            .find_paths(&json!({"query": "src/new", "limit": 10}))
+            .unwrap();
+        assert_eq!(before["hits"].as_array().unwrap().len(), 0);
+
+        mirror
+            .mark_save_applied(queued.id, "src/new.rs", &hash, 8, 123)
+            .unwrap();
+
+        let after = mirror
+            .find_paths(&json!({"query": "src/new", "limit": 10}))
+            .unwrap();
+        let hits = after["hits"].as_array().unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0]["path"], "src/new.rs");
+        assert_eq!(hits[0]["cached"], true);
+        assert_eq!(hits[0]["dirty"], false);
+        assert_eq!(hits[0]["validation_state"], "valid");
+    }
+
+    #[test]
+    fn flush_unknown_local_file_preserves_snapshot_when_remote_unavailable() {
+        let state_dir = tempdir().unwrap();
+        let remote_dir = tempdir().unwrap();
+        let remote_root = remote_dir.path().join("repo");
+        let mut sidecar = Sidecar::new(
+            remote_root,
+            RemoteTransport::Local,
+            state_dir
+                .path()
+                .join("missing-agent")
+                .to_string_lossy()
+                .to_string(),
+            Some(state_dir.path().to_path_buf()),
+            1,
+            AgentInterrupt::default(),
+        )
+        .unwrap();
+        let local_path = sidecar.mirror.local_path("src/new.rs").unwrap();
+        fs::create_dir_all(local_path.parent().unwrap()).unwrap();
+        fs::write(&local_path, b"new file").unwrap();
+
+        let result = sidecar.flush(json!({"path": "src/new.rs"})).unwrap();
+
+        assert_eq!(result["status"], "queued");
+        assert_eq!(result["path"], "src/new.rs");
+        let queued = sidecar.mirror.pending_save_entries(Some(1)).unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].expected_hash, None);
+        assert_eq!(fs::read(&queued[0].snapshot_path).unwrap(), b"new file");
     }
 
     #[test]

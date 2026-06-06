@@ -237,10 +237,13 @@ failed, and conflicted saves from the local durable queue, and
 `:RemoteFlushQueue` retries retryable entries.
 If `:RemoteFlush` or automatic `BufWritePost` runs while disconnected, the path
 is kept in memory and replayed after reconnect so the sidecar can snapshot the
-already-written local mirror file. On reconnect the sidecar also runs a bounded
-local recovery scan over hydrated mirror files. If Neovim saved a mirror file
-while the sidecar was unavailable and then crashed before replay, changed local
-bytes are snapshotted into the durable save queue before queued saves are
+already-written local mirror file. `BufWritePost` uses the actual write target,
+so flows such as `:write {mirror_path}` from an unnamed buffer can still be
+adopted. New mirror-root paths are deferred while reconnecting when they map to
+the last known workspace mirror root. On reconnect the sidecar also runs a
+bounded local recovery scan over hydrated mirror files. If Neovim saved a mirror
+file while the sidecar was unavailable and then crashed before replay, changed
+local bytes are snapshotted into the durable save queue before queued saves are
 flushed. Tune this with `recover_local_edits_on_connect` and
 `recover_local_edits_limit`, or call `recover_local_edits()` manually before
 `flush_queue()`.
@@ -312,7 +315,10 @@ mirror root are mapped back to workspace-relative remote paths. This lets LSP
 definition/reference jumps into not-yet-cached mirror files hydrate through the
 sidecar instead of opening an empty local path. Pending or failed hydrations are
 kept read-only and are not treated as remote-save buffers, so an empty failed
-hydrate cannot be flushed over the remote file.
+hydrate cannot be flushed over the remote file. If the user creates or saves a
+new file under the mirror root, the plugin adopts the mirror-relative path and
+the sidecar snapshots it into the durable save queue with no expected remote
+hash, so replay creates the remote file only if it is still absent.
 
 `:RemoteFind [query]` searches known mirror metadata locally and fills quickfix
 with mirror paths. Selecting an uncached result hydrates it through the same
