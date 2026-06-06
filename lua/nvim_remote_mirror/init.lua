@@ -951,7 +951,7 @@ function M.connect(target, opts)
 
   M.client = client
   M.last_target = target_arg
-  M.request("hello", {}, function(err, result)
+  M.request("workspace_info", {}, function(err, result)
     if err then
       M.connection_error = err
       notify(err, vim.log.levels.ERROR)

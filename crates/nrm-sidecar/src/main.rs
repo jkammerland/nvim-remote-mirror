@@ -38,6 +38,30 @@ const SAVE_INLINE_MAX_BYTES: u64 = 4 * 1024 * 1024;
 const REMOTE_INTERACTIVE_QUEUE_CAPACITY: usize = 128;
 const REMOTE_BACKGROUND_QUEUE_CAPACITY: usize = 128;
 const BACKGROUND_SCAN_CURSOR_KEY: &str = "background_scan_cursor";
+const SIDECAR_COMMANDS: &[&str] = &[
+    "hello",
+    "workspace_info",
+    "status",
+    "find_paths",
+    "remote_probe",
+    "scan",
+    "open",
+    "prefetch",
+    "prefetch_known",
+    "prefetch_related",
+    "grep",
+    "grep_cache",
+    "recover_local_edits",
+    "flush",
+    "flush_queued",
+    "flush_queue",
+    "validate",
+    "refresh",
+    "cancel",
+    "disconnect",
+    "shutdown",
+];
+const SIDECAR_NOTIFICATIONS: &[&str] = &["workspace/remote_health"];
 
 #[derive(Debug, Parser)]
 #[command(version, about = "Local sidecar for nvim-remote-mirror")]
@@ -302,6 +326,19 @@ impl RemoteTransport {
         match self {
             Self::Local => String::new(),
             Self::Ssh(ssh) => format!(" through ssh target `{}`", ssh.target),
+        }
+    }
+
+    fn to_value(&self) -> Value {
+        match self {
+            Self::Local => json!({
+                "kind": "local"
+            }),
+            Self::Ssh(ssh) => json!({
+                "kind": "ssh",
+                "target": ssh.target,
+                "ssh_connect_timeout_seconds": ssh.connect_timeout_seconds
+            }),
         }
     }
 }
@@ -2668,6 +2705,43 @@ fn status_with_remote_health(mut status: Value, remote_health: RemoteHealth) -> 
     Ok(status)
 }
 
+fn workspace_info_value(
+    workspace_key: &str,
+    remote_root: &Path,
+    mirror_root: &Path,
+    files_root: &Path,
+    transport: &RemoteTransport,
+    remote_health: RemoteHealth,
+) -> Value {
+    let remote_health_value = remote_health.to_value();
+    let mut value = json!({
+        "sidecar_version": env!("CARGO_PKG_VERSION"),
+        "protocol_version": PROTOCOL_VERSION,
+        "workspace_key": workspace_key,
+        "remote_root": remote_root.to_string_lossy(),
+        "mirror_root": mirror_root.to_string_lossy(),
+        "files_root": files_root.to_string_lossy(),
+        "transport": transport.to_value(),
+        "commands": SIDECAR_COMMANDS,
+        "notifications": SIDECAR_NOTIFICATIONS,
+        "capabilities": {
+            "command_responses": true,
+            "server_notifications": true,
+            "durable_mirror": true,
+            "checksum_validation": true,
+            "batched_hydration": true,
+            "conflict_safe_saves": true,
+            "lazy_agent_handshake": true,
+            "remote_agent": true,
+            "lsp_proxy": true,
+            "transport_neutral_agent_frames": true
+        },
+        "remote_health": remote_health_value
+    });
+    remote_health.insert_into(&mut value);
+    value
+}
+
 fn save_should_use_chunked_upload(snapshot_size: u64) -> bool {
     snapshot_size > SAVE_INLINE_MAX_BYTES || snapshot_size > MAX_SAVE_PAYLOAD_BYTES
 }
@@ -2685,6 +2759,7 @@ struct FastState {
     mirror_root: PathBuf,
     files_root: PathBuf,
     remote_root: PathBuf,
+    transport: RemoteTransport,
     workspace_key: String,
     pending_remote: Arc<Mutex<PendingRemote>>,
     remote_health: Arc<Mutex<RemoteHealth>>,
@@ -3257,6 +3332,7 @@ impl FastState {
             mirror_root: sidecar.mirror.root().to_path_buf(),
             files_root: sidecar.mirror.files_root().to_path_buf(),
             remote_root: sidecar.remote_root.clone(),
+            transport: sidecar.agent.launch.transport.clone(),
             workspace_key: sidecar.workspace_key.clone(),
             pending_remote,
             remote_health: Arc::clone(&sidecar.remote_health),
@@ -3265,17 +3341,7 @@ impl FastState {
 
     fn try_handle(&self, request: &ClientRequest) -> FastHandle {
         match request.method.as_str() {
-            "hello" => FastHandle::Handled(Ok(json!({
-                "sidecar_version": env!("CARGO_PKG_VERSION"),
-                "protocol_version": PROTOCOL_VERSION,
-                "workspace_key": self.workspace_key,
-                "remote_root": self.remote_root.to_string_lossy(),
-                "mirror_root": self.mirror_root.to_string_lossy(),
-                "files_root": self.files_root.to_string_lossy(),
-                "remote_status": "unchecked",
-                "remote_checked": false,
-                "remote_available": false
-            }))),
+            "hello" | "workspace_info" => FastHandle::Handled(Ok(self.workspace_info())),
             "status" => FastHandle::Handled(Mirror::open_root(self.mirror_root.clone()).and_then(
                 |mirror| status_with_remote_health(mirror.status()?, self.remote_health_snapshot()),
             )),
@@ -3290,6 +3356,17 @@ impl FastState {
             ),
             _ => FastHandle::Defer,
         }
+    }
+
+    fn workspace_info(&self) -> Value {
+        workspace_info_value(
+            &self.workspace_key,
+            &self.remote_root,
+            &self.mirror_root,
+            &self.files_root,
+            &self.transport,
+            self.remote_health_snapshot(),
+        )
     }
 
     fn try_open(&self, params: &Value) -> FastHandle {
@@ -3433,17 +3510,7 @@ impl Sidecar {
 
     fn handle_inner(&mut self, method: &str, params: Value, preempt_epoch: u64) -> Result<Value> {
         match method {
-            "hello" => Ok(json!({
-                "sidecar_version": env!("CARGO_PKG_VERSION"),
-                "protocol_version": PROTOCOL_VERSION,
-                "workspace_key": self.workspace_key,
-                "remote_root": self.remote_root.to_string_lossy(),
-                "mirror_root": self.mirror.root().to_string_lossy(),
-                "files_root": self.mirror.files_root().to_string_lossy(),
-                "remote_status": "unchecked",
-                "remote_checked": false,
-                "remote_available": false
-            })),
+            "hello" | "workspace_info" => Ok(self.workspace_info()),
             "status" => self.status(),
             "find_paths" => self.mirror.find_paths(&params),
             "remote_probe" => Ok(self.remote_probe(preempt_epoch)),
@@ -3466,6 +3533,17 @@ impl Sidecar {
             }
             other => bail!("unknown method `{other}`"),
         }
+    }
+
+    fn workspace_info(&self) -> Value {
+        workspace_info_value(
+            &self.workspace_key,
+            &self.remote_root,
+            self.mirror.root(),
+            self.mirror.files_root(),
+            &self.agent.launch.transport,
+            self.agent.remote_health(),
+        )
     }
 
     fn status(&self) -> Result<Value> {
@@ -6184,6 +6262,57 @@ mod tests {
     }
 
     #[test]
+    fn workspace_info_reports_daemon_capabilities_without_agent_handshake() {
+        let state_dir = tempdir().unwrap();
+        let remote_dir = tempdir().unwrap();
+        let remote_root = remote_dir.path().join("repo");
+        let mut sidecar = Sidecar::new(
+            remote_root.clone(),
+            Some("host".to_string()),
+            state_dir
+                .path()
+                .join("missing-agent")
+                .to_string_lossy()
+                .to_string(),
+            Some(state_dir.path().to_path_buf()),
+            30_000,
+            7,
+            AgentInterrupt::default(),
+        )
+        .unwrap();
+
+        let info = sidecar.handle("workspace_info", json!({}), 0).unwrap();
+
+        let expected_workspace_key = workspace_key(Some("host"), &remote_root);
+        assert_eq!(
+            info["workspace_key"].as_str(),
+            Some(expected_workspace_key.as_str())
+        );
+        assert_eq!(info["transport"]["kind"], "ssh");
+        assert_eq!(info["transport"]["target"], "host");
+        assert_eq!(info["transport"]["ssh_connect_timeout_seconds"], 7);
+        assert_eq!(info["remote_status"], "unchecked");
+        assert_eq!(info["remote_health"]["remote_status"], "unchecked");
+        assert_eq!(info["capabilities"]["server_notifications"], true);
+        assert_eq!(
+            info["commands"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|method| method.as_str() == Some("open")),
+            true
+        );
+        assert_eq!(
+            info["notifications"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|method| method.as_str() == Some("workspace/remote_health")),
+            true
+        );
+    }
+
+    #[test]
     fn sidecar_remote_health_notification_reports_workspace_state() {
         let state_dir = tempdir().unwrap();
         let remote_dir = tempdir().unwrap();
@@ -7455,6 +7584,28 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("failed to launch agent"));
+
+        let request = ClientRequest {
+            id: 3,
+            method: "workspace_info".to_string(),
+            params: json!({}),
+        };
+        let FastHandle::Handled(info) = fast.try_handle(&request) else {
+            panic!("workspace_info should stay on fast path after a failed probe");
+        };
+        let info = info.unwrap();
+
+        assert_eq!(info["remote_status"], "unavailable");
+        assert_eq!(info["remote_health"]["remote_status"], "unavailable");
+        assert!(info["remote_error"]
+            .as_str()
+            .unwrap()
+            .contains("failed to launch agent"));
+        assert!(info["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|method| method.as_str() == Some("workspace_info")));
     }
 
     #[test]

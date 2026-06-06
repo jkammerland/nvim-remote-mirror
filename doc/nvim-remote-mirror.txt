@@ -191,6 +191,10 @@ and result or error. The sidecar may also send id-less notification lines such
 as workspace/remote_health; Neovim consumes those to keep last-known remote
 health current, and future clients can ignore them without affecting command
 responses.
+The workspace_info command returns workspace identity, mirror paths, transport
+metadata, supported command names, notification names, capabilities, and
+last-known remote health from local state without starting or probing SSH.
+hello is kept as a compatibility alias for the same payload.
 
 ==============================================================================
 LSP                                                *nvim-remote-mirror-lsp*

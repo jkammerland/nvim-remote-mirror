@@ -50,6 +50,8 @@ This first implementation covers:
 - request-id framed sidecar/agent RPC with typed remote errors.
 - sidecar command responses plus optional server notifications for remote
   health changes.
+- fast local `workspace_info` daemon introspection with workspace paths,
+  transport metadata, supported commands, notifications, and capabilities.
 - configurable request and SSH connect timeouts.
 - remote scan.
 - lazy file open/hydration into a local mirror with dirty/stale cached opens.
@@ -330,6 +332,12 @@ consume or ignore them independently of command responses:
 ```json
 {"method":"workspace/remote_health","params":{"workspace_key":"...","remote_status":"unavailable","remote_checked":true,"remote_available":false}}
 ```
+
+Clients can call `workspace_info` immediately after starting the sidecar to get
+the local workspace identity, mirror paths, transport kind, supported command
+names, notification names, daemon capabilities, and last-known remote health.
+`workspace_info` is served from local state and does not start or probe SSH.
+`hello` remains a compatibility alias for the same payload.
 
 The sidecar talks to the agent using a 4-byte big-endian length prefix followed
 by a bincode-encoded `RpcMessage`. Every request has a request ID and every
