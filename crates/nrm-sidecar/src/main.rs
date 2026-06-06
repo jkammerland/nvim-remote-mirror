@@ -32,7 +32,8 @@ const DEFAULT_GREP_CACHE_MAX_FILE_BYTES: u64 = 512 * 1024;
 const DEFAULT_GREP_CACHE_MAX_TOTAL_BYTES: u64 = 8 * 1024 * 1024;
 const SEARCH_INDEX_MAX_FILE_BYTES: u64 = DEFAULT_BATCH_MAX_FILE_BYTES;
 const SEARCH_TRIGRAM_BYTES: usize = 3;
-const REMOTE_UNAVAILABLE_BACKOFF_MS: u64 = 2_000;
+const REMOTE_UNAVAILABLE_BACKOFF_BASE_MS: u64 = 2_000;
+const REMOTE_UNAVAILABLE_BACKOFF_MAX_MS: u64 = 60_000;
 const MAX_SAVE_PAYLOAD_BYTES: u64 = (MAX_FRAME_LEN - (1024 * 1024)) as u64;
 const SAVE_INLINE_MAX_BYTES: u64 = 4 * 1024 * 1024;
 const REMOTE_INTERACTIVE_QUEUE_CAPACITY: usize = 128;
@@ -554,6 +555,7 @@ struct RemoteBackoffSlot {
     unavailable_until: Option<Instant>,
     last_remote_error: Option<String>,
     last_remote_error_at: Option<Instant>,
+    consecutive_failures: u32,
 }
 
 #[derive(Debug, Default)]
@@ -598,9 +600,11 @@ impl RemoteBackoffState {
     fn mark_unavailable(&mut self, lane: AgentBackoffLane, error: String) {
         let now = Instant::now();
         let slot = self.slot_mut(lane);
+        slot.consecutive_failures = slot.consecutive_failures.saturating_add(1).max(1);
+        let backoff_ms = remote_unavailable_backoff_ms(slot.consecutive_failures);
         slot.last_remote_error = Some(error);
         slot.last_remote_error_at = Some(now);
-        slot.unavailable_until = Some(now + Duration::from_millis(REMOTE_UNAVAILABLE_BACKOFF_MS));
+        slot.unavailable_until = Some(now + Duration::from_millis(backoff_ms));
     }
 
     fn clear_lane(&mut self, lane: AgentBackoffLane) {
@@ -608,6 +612,7 @@ impl RemoteBackoffState {
         slot.unavailable_until = None;
         slot.last_remote_error = None;
         slot.last_remote_error_at = None;
+        slot.consecutive_failures = 0;
     }
 
     fn health_error(&self) -> Option<(Option<Instant>, String)> {
@@ -629,6 +634,17 @@ impl RemoteBackoffState {
         }
         selected.map(|(_, unavailable_until, error)| (unavailable_until, error))
     }
+}
+
+fn remote_unavailable_backoff_ms(consecutive_failures: u32) -> u64 {
+    if consecutive_failures == 0 {
+        return 0;
+    }
+    let exponent = consecutive_failures.saturating_sub(1).min(20);
+    let multiplier = 1u64.checked_shl(exponent).unwrap_or(u64::MAX);
+    REMOTE_UNAVAILABLE_BACKOFF_BASE_MS
+        .saturating_mul(multiplier)
+        .min(REMOTE_UNAVAILABLE_BACKOFF_MAX_MS)
 }
 
 impl AgentClient {
@@ -6128,12 +6144,73 @@ mod tests {
         local_path
     }
 
+    fn slot_backoff_window_ms(slot: &RemoteBackoffSlot) -> u64 {
+        slot.unavailable_until
+            .unwrap()
+            .duration_since(slot.last_remote_error_at.unwrap())
+            .as_millis() as u64
+    }
+
     #[test]
     fn local_paths_reject_traversal() {
         let dir = tempdir().unwrap();
         let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
         assert!(mirror.local_path("../x").is_err());
         assert!(mirror.local_path("/x").is_err());
+    }
+
+    #[test]
+    fn remote_unavailable_backoff_grows_and_caps() {
+        assert_eq!(remote_unavailable_backoff_ms(0), 0);
+        assert_eq!(
+            remote_unavailable_backoff_ms(1),
+            REMOTE_UNAVAILABLE_BACKOFF_BASE_MS
+        );
+        assert_eq!(
+            remote_unavailable_backoff_ms(2),
+            REMOTE_UNAVAILABLE_BACKOFF_BASE_MS * 2
+        );
+        assert_eq!(
+            remote_unavailable_backoff_ms(5),
+            REMOTE_UNAVAILABLE_BACKOFF_BASE_MS * 16
+        );
+        assert_eq!(
+            remote_unavailable_backoff_ms(6),
+            REMOTE_UNAVAILABLE_BACKOFF_MAX_MS
+        );
+        assert_eq!(
+            remote_unavailable_backoff_ms(u32::MAX),
+            REMOTE_UNAVAILABLE_BACKOFF_MAX_MS
+        );
+    }
+
+    #[test]
+    fn remote_backoff_state_resets_lane_failure_count_on_clear() {
+        let mut backoff = RemoteBackoffState::default();
+
+        backoff.mark_unavailable(AgentBackoffLane::Read, "first".to_string());
+        assert_eq!(
+            slot_backoff_window_ms(backoff.slot(AgentBackoffLane::Read)),
+            REMOTE_UNAVAILABLE_BACKOFF_BASE_MS
+        );
+
+        backoff.mark_unavailable(AgentBackoffLane::Read, "second".to_string());
+        assert_eq!(
+            slot_backoff_window_ms(backoff.slot(AgentBackoffLane::Read)),
+            REMOTE_UNAVAILABLE_BACKOFF_BASE_MS * 2
+        );
+        assert_eq!(
+            backoff.slot(AgentBackoffLane::Write).consecutive_failures,
+            0
+        );
+
+        backoff.clear_lane(AgentBackoffLane::Read);
+        assert_eq!(backoff.slot(AgentBackoffLane::Read).consecutive_failures, 0);
+        backoff.mark_unavailable(AgentBackoffLane::Read, "third".to_string());
+        assert_eq!(
+            slot_backoff_window_ms(backoff.slot(AgentBackoffLane::Read)),
+            REMOTE_UNAVAILABLE_BACKOFF_BASE_MS
+        );
     }
 
     #[test]
@@ -7680,7 +7757,7 @@ mod tests {
         assert_eq!(result["remote_status"], "unavailable");
         assert_eq!(result["remote_checked"], true);
         assert_eq!(result["remote_available"], false);
-        assert!(result["retry_after_ms"].as_u64().unwrap() <= REMOTE_UNAVAILABLE_BACKOFF_MS);
+        assert!(result["retry_after_ms"].as_u64().unwrap() <= REMOTE_UNAVAILABLE_BACKOFF_BASE_MS);
         assert!(result["remote_error"]
             .as_str()
             .unwrap()
