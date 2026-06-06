@@ -192,8 +192,10 @@ failed hydrations are read-only and are not flushed as remote saves.
 
 Agent and LSP launch commands share a sidecar transport planner. Local targets
 spawn binaries directly; SSH targets use configured connection options and a
-single shell-quoted remote command. Neovim still talks only to the sidecar JSON
-API, so SSH stdio can be replaced later without changing editor-facing behavior.
+single shell-quoted remote command. Agent frames pass through an AgentSession
+boundary, with stdio-backed local/SSH processes as the current session type.
+Neovim still talks only to the sidecar JSON API, so SSH stdio can be replaced
+later without changing editor-facing behavior.
 Sidecar command responses are newline-delimited JSON objects with an id, ok,
 and result or error. The sidecar may also send id-less notification lines such
 as workspace/remote_health; Neovim consumes those to keep last-known remote

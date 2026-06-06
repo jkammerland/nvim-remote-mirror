@@ -515,6 +515,39 @@ struct AgentWorker {
     child: Arc<Mutex<Child>>,
 }
 
+trait AgentSession: Send {
+    fn request(&mut self, id: RequestId, request: Request) -> Result<AgentWorkerReply>;
+}
+
+struct FramedAgentSession<W, R> {
+    writer: W,
+    reader: BufReader<R>,
+}
+
+impl<W, R: Read> FramedAgentSession<W, R> {
+    fn new(writer: W, reader: R) -> Self {
+        Self {
+            writer,
+            reader: BufReader::new(reader),
+        }
+    }
+
+    #[cfg(test)]
+    fn into_writer(self) -> W {
+        self.writer
+    }
+}
+
+impl<W, R> AgentSession for FramedAgentSession<W, R>
+where
+    W: Write + Send,
+    R: Read + Send,
+{
+    fn request(&mut self, id: RequestId, request: Request) -> Result<AgentWorkerReply> {
+        send_agent_frame(&mut self.writer, &mut self.reader, id, request)
+    }
+}
+
 struct AgentWorkerCommand {
     id: RequestId,
     request: Request,
@@ -803,12 +836,12 @@ impl AgentClient {
         let (tx, rx) = mpsc::channel::<AgentWorkerCommand>();
         let worker_child = Arc::clone(&child);
         thread::spawn(move || {
-            let mut stdin = stdin;
-            let mut stdout = BufReader::new(stdout);
+            let mut session: Box<dyn AgentSession> =
+                Box::new(FramedAgentSession::new(stdin, stdout));
             while let Ok(command) = rx.recv() {
-                let response =
-                    send_agent_frame(&mut stdin, &mut stdout, command.id, command.request)
-                        .unwrap_or_else(|error| AgentWorkerReply::Error(error.to_string()));
+                let response = session
+                    .request(command.id, command.request)
+                    .unwrap_or_else(|error| AgentWorkerReply::Error(error.to_string()));
                 let _ = command.reply.send(response);
             }
             let _ = worker_child.lock().map(|mut child| {
@@ -9194,6 +9227,34 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("response id mismatch"));
+    }
+
+    #[test]
+    fn framed_agent_session_exchanges_request_and_response() {
+        let mut inbound = Vec::new();
+        write_frame(
+            &mut inbound,
+            &RpcMessage::Response {
+                id: 7,
+                response: Response::Ack,
+            },
+        )
+        .unwrap();
+        let mut session = FramedAgentSession::new(Vec::new(), io::Cursor::new(inbound));
+
+        let reply = session.request(7, Request::Shutdown).unwrap();
+
+        assert!(matches!(reply, AgentWorkerReply::Response(Response::Ack)));
+        let outbound = session.into_writer();
+        let mut outbound = BufReader::new(io::Cursor::new(outbound));
+        let message: RpcMessage = read_frame(&mut outbound).unwrap();
+        assert!(matches!(
+            message,
+            RpcMessage::Request {
+                id: 7,
+                request: Request::Shutdown
+            }
+        ));
     }
 
     #[test]

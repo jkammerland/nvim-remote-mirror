@@ -416,6 +416,8 @@ Current transport state:
   requests are not preempted once started.
   Agent and LSP launches share a transport command planner, keeping SSH stdio as
   a replaceable implementation detail behind the sidecar-agent frame boundary.
+  Sidecar request scheduling now exchanges agent frames through an AgentSession
+  abstraction; stdio-backed local/SSH processes are the current session type.
   Timed-out Neovim requests send a best-effort sidecar cancellation for queued
   remote work, clearing pending path hazards before that work reaches SSH, and
   can preempt matching active read-only/background work. Active save/flush work
