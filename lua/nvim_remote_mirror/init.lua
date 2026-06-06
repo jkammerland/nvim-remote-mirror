@@ -74,6 +74,7 @@ M.background_scan_after = nil
 M.mirror_autocmd_group = nil
 
 local setup_mirror_autohydrate
+local update_remote_state
 
 local function notify(message, level)
   vim.schedule(function()
@@ -174,6 +175,13 @@ local function handle_response(client, line)
     return
   end
 
+  if decoded.id == nil and decoded.method then
+    if decoded.method == "workspace/remote_health" then
+      update_remote_state(client, decoded.params or {})
+    end
+    return
+  end
+
   local callback = clear_pending(client, decoded.id)
   if not callback then
     return
@@ -204,6 +212,10 @@ local function handle_stdout(client, data)
       handle_response(client, chunk)
     end
   end
+end
+
+if vim.g.nvim_remote_mirror_test then
+  M._test_handle_stdout = handle_stdout
 end
 
 local function sidecar_args(target)
@@ -379,7 +391,7 @@ local function notify_flush_queue_result(result, opts)
   notify(message, level)
 end
 
-local function update_remote_state(client, result)
+update_remote_state = function(client, result)
   if not client or not client.hello or not result then
     return
   end

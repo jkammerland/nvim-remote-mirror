@@ -94,6 +94,19 @@ struct ClientResponse {
     error: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+struct ClientNotification {
+    method: String,
+    params: Value,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum ServerMessage {
+    Response(ClientResponse),
+    Notification(ClientNotification),
+}
+
 #[derive(Debug, Clone)]
 struct MirrorEntry {
     relative_path: String,
@@ -443,6 +456,12 @@ impl RemoteHealth {
                 .as_millis()
                 .min(u128::from(u64::MAX)) as u64,
         )
+    }
+
+    fn to_value(&self) -> Value {
+        let mut value = json!({});
+        self.insert_into(&mut value);
+        value
     }
 
     fn insert_into(&self, value: &mut Value) {
@@ -3459,6 +3478,25 @@ impl Sidecar {
         }
     }
 
+    fn remote_health_notification(&self) -> ClientNotification {
+        let mut params = self
+            .remote_health
+            .lock()
+            .map(|health| health.to_value())
+            .unwrap_or_else(|_| RemoteHealth::default().to_value());
+        if let Some(object) = params.as_object_mut() {
+            object.insert("workspace_key".to_string(), json!(self.workspace_key));
+            object.insert(
+                "remote_root".to_string(),
+                json!(self.remote_root.to_string_lossy()),
+            );
+        }
+        ClientNotification {
+            method: "workspace/remote_health".to_string(),
+            params,
+        }
+    }
+
     fn remote_probe(&mut self, preempt_epoch: u64) -> Value {
         if self.agent.handshake_complete() {
             return json!({
@@ -4872,12 +4910,12 @@ fn run_server(
         read: read_preempt.clone(),
         write: write_preempt.clone(),
     };
-    let (response_tx, response_rx) = mpsc::sync_channel::<ClientResponse>(1024);
+    let (response_tx, response_rx) = mpsc::sync_channel::<ServerMessage>(1024);
     let writer = thread::spawn(move || -> Result<()> {
         let stdout = io::stdout();
         let mut stdout = stdout.lock();
-        for response in response_rx {
-            writeln!(stdout, "{}", serde_json::to_string(&response)?)?;
+        for message in response_rx {
+            writeln!(stdout, "{}", serde_json::to_string(&message)?)?;
             stdout.flush()?;
         }
         Ok(())
@@ -5121,7 +5159,7 @@ fn spawn_remote_worker(
     pending_remote: Arc<Mutex<PendingRemote>>,
     pending_writes: Arc<Mutex<PendingRemote>>,
     interrupt: AgentInterrupt,
-    response_tx: mpsc::SyncSender<ClientResponse>,
+    response_tx: mpsc::SyncSender<ServerMessage>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         while let Some(started) = queue.pop_started(&preempt) {
@@ -5152,6 +5190,7 @@ fn spawn_remote_worker(
             );
             active.clear(request_id);
             send_client_response(&response_tx, response);
+            send_client_notification(&response_tx, sidecar.remote_health_notification());
             if should_shutdown || interrupt.is_shutdown_requested() {
                 clear_pending_works(&pending_remote, &pending_writes, queue.shutdown_and_drain());
                 break;
@@ -5261,7 +5300,7 @@ fn clear_pending_hazard(
     }
 }
 
-fn send_preempted_responses(tx: &mpsc::SyncSender<ClientResponse>, works: Vec<RemoteWork>) {
+fn send_preempted_responses(tx: &mpsc::SyncSender<ServerMessage>, works: Vec<RemoteWork>) {
     for work in works {
         send_client_response(tx, preempted_client_response(work));
     }
@@ -5427,8 +5466,15 @@ fn preempted_result(request: &ClientRequest) -> Value {
     }
 }
 
-fn send_client_response(tx: &mpsc::SyncSender<ClientResponse>, response: ClientResponse) -> bool {
-    tx.send(response).is_ok()
+fn send_client_response(tx: &mpsc::SyncSender<ServerMessage>, response: ClientResponse) -> bool {
+    tx.send(ServerMessage::Response(response)).is_ok()
+}
+
+fn send_client_notification(
+    tx: &mpsc::SyncSender<ServerMessage>,
+    notification: ClientNotification,
+) -> bool {
+    tx.send(ServerMessage::Notification(notification)).is_ok()
 }
 
 fn run_lsp_proxy(
@@ -5986,10 +6032,35 @@ mod tests {
         });
 
         assert!(done_rx.recv_timeout(Duration::from_millis(20)).is_err());
-        assert_eq!(rx.recv().unwrap().id, 1);
+        match rx.recv().unwrap() {
+            ServerMessage::Response(response) => assert_eq!(response.id, 1),
+            ServerMessage::Notification(_) => panic!("expected response"),
+        }
         assert!(done_rx.recv_timeout(Duration::from_secs(1)).unwrap());
         sender.join().unwrap();
-        assert_eq!(rx.recv().unwrap().id, 2);
+        match rx.recv().unwrap() {
+            ServerMessage::Response(response) => assert_eq!(response.id, 2),
+            ServerMessage::Notification(_) => panic!("expected response"),
+        }
+    }
+
+    #[test]
+    fn client_notification_serializes_as_method_params_message() {
+        let message = ServerMessage::Notification(ClientNotification {
+            method: "workspace/remote_health".to_string(),
+            params: json!({
+                "workspace_key": "workspace",
+                "remote_status": "unavailable",
+                "remote_checked": true,
+                "remote_available": false
+            }),
+        });
+
+        let value: Value = serde_json::from_str(&serde_json::to_string(&message).unwrap()).unwrap();
+
+        assert_eq!(value["method"], "workspace/remote_health");
+        assert_eq!(value["params"]["workspace_key"], "workspace");
+        assert_eq!(value.get("id"), None);
     }
 
     #[test]
@@ -6110,6 +6181,47 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("failed to launch agent"));
+    }
+
+    #[test]
+    fn sidecar_remote_health_notification_reports_workspace_state() {
+        let state_dir = tempdir().unwrap();
+        let remote_dir = tempdir().unwrap();
+        let remote_root = remote_dir.path().join("repo");
+        let mut sidecar = Sidecar::new(
+            remote_root.clone(),
+            None,
+            state_dir
+                .path()
+                .join("missing-agent")
+                .to_string_lossy()
+                .to_string(),
+            Some(state_dir.path().to_path_buf()),
+            1,
+            1,
+            AgentInterrupt::default(),
+        )
+        .unwrap();
+
+        let probe = sidecar.handle("remote_probe", json!({}), 0).unwrap();
+        let notification = sidecar.remote_health_notification();
+        let expected_workspace_key = workspace_key(None, &remote_root);
+        let expected_remote_root = remote_root.to_string_lossy().to_string();
+
+        assert_eq!(probe["remote_status"], "unavailable");
+        assert_eq!(notification.method, "workspace/remote_health");
+        assert_eq!(
+            notification.params["workspace_key"].as_str(),
+            Some(expected_workspace_key.as_str())
+        );
+        assert_eq!(
+            notification.params["remote_root"].as_str(),
+            Some(expected_remote_root.as_str())
+        );
+        assert_eq!(notification.params["remote_status"], "unavailable");
+        assert_eq!(notification.params["remote_checked"], true);
+        assert_eq!(notification.params["remote_available"], false);
+        assert!(notification.params["retry_after_ms"].as_u64().unwrap() > 0);
     }
 
     #[test]

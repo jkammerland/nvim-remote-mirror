@@ -48,6 +48,8 @@ This first implementation covers:
 - SSH or local agent launch.
 - lazy versioned hello/capability handshake on first remote agent request.
 - request-id framed sidecar/agent RPC with typed remote errors.
+- sidecar command responses plus optional server notifications for remote
+  health changes.
 - configurable request and SSH connect timeouts.
 - remote scan.
 - lazy file open/hydration into a local mirror with dirty/stale cached opens.
@@ -316,6 +318,19 @@ Neovim talks to the sidecar through newline-delimited JSON:
 {"id":1,"method":"open","params":{"path":"src/main.rs"}}
 ```
 
+Responses keep the same request ID:
+
+```json
+{"id":1,"ok":true,"result":{"path":"src/main.rs"}}
+```
+
+The sidecar may also emit notification lines without an `id`; clients can
+consume or ignore them independently of command responses:
+
+```json
+{"method":"workspace/remote_health","params":{"workspace_key":"...","remote_status":"unavailable","remote_checked":true,"remote_available":false}}
+```
+
 The sidecar talks to the agent using a 4-byte big-endian length prefix followed
 by a bincode-encoded `RpcMessage`. Every request has a request ID and every
 agent reply carries the matching ID. That boundary is transport-agnostic, so a
@@ -337,7 +352,8 @@ Current transport state:
   opens/status while remote worker requests are in flight. Neovim-side JSON RPC
   requests also use the configured request timeout to clean up pending callbacks
   when a sidecar reply is lost. Sidecar response delivery applies backpressure
-  instead of dropping completed replies when the writer is saturated. Sidecar
+  instead of dropping completed replies when the writer is saturated, and the
+  same ordered writer carries optional workspace notifications. Sidecar
   startup is local-mirror-only; the remote agent handshake is lazy so cached
   work survives disconnected SSH. Failed remote attempts enter a short
   unavailable backoff so repeated remote-dependent commands fail quickly while
