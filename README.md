@@ -349,9 +349,11 @@ Current transport state:
   read and write lanes with separate agent sessions, so unrelated opens, grep,
   validation, and probes can continue while save/flush work is in flight; reads
   that could conflict with pending writes are routed through the write lane to
-  preserve ordering. Active background maintenance requests and read-only remote
-  work can be preempted by newer interactive work or explicit cancellation by
-  restarting that lane's serial SSH/agent worker;
+  preserve ordering. Lane backoff is also separated, so a failed background
+  scan, grep, or probe does not immediately reject write-lane save replay;
+  status still reports the latest lane error. Active background maintenance
+  requests and read-only remote work can be preempted by newer interactive work
+  or explicit cancellation by restarting that lane's serial SSH/agent worker;
   `preempted` responses are normal no-op client results, and save/flush
   requests are not preempted once started.
   Agent and LSP launches share a transport command planner, keeping SSH stdio as

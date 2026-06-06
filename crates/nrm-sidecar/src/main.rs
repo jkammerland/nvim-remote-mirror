@@ -481,14 +481,97 @@ struct AgentClient {
     preempt: AgentPreempt,
     worker: Option<AgentWorker>,
     handshake_complete: bool,
+    backoff_lane: AgentBackoffLane,
     remote_backoff: Arc<Mutex<RemoteBackoffState>>,
     next_id: RequestId,
 }
 
-#[derive(Debug, Default)]
-struct RemoteBackoffState {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentBackoffLane {
+    Read,
+    Write,
+}
+
+#[derive(Debug, Default, Clone)]
+struct RemoteBackoffSlot {
     unavailable_until: Option<Instant>,
     last_remote_error: Option<String>,
+    last_remote_error_at: Option<Instant>,
+}
+
+#[derive(Debug, Default)]
+struct RemoteBackoffState {
+    read: RemoteBackoffSlot,
+    write: RemoteBackoffSlot,
+}
+
+impl RemoteBackoffState {
+    fn slot(&self, lane: AgentBackoffLane) -> &RemoteBackoffSlot {
+        match lane {
+            AgentBackoffLane::Read => &self.read,
+            AgentBackoffLane::Write => &self.write,
+        }
+    }
+
+    fn slot_mut(&mut self, lane: AgentBackoffLane) -> &mut RemoteBackoffSlot {
+        match lane {
+            AgentBackoffLane::Read => &mut self.read,
+            AgentBackoffLane::Write => &mut self.write,
+        }
+    }
+
+    fn lane_backoff(&self, lane: AgentBackoffLane) -> Option<(u64, String)> {
+        let slot = self.slot(lane);
+        let until = slot.unavailable_until?;
+        let now = Instant::now();
+        if now >= until {
+            return None;
+        }
+        let remaining_ms = until
+            .duration_since(now)
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64;
+        let error = slot
+            .last_remote_error
+            .clone()
+            .unwrap_or_else(|| "last remote attempt failed".to_string());
+        Some((remaining_ms, error))
+    }
+
+    fn mark_unavailable(&mut self, lane: AgentBackoffLane, error: String) {
+        let now = Instant::now();
+        let slot = self.slot_mut(lane);
+        slot.last_remote_error = Some(error);
+        slot.last_remote_error_at = Some(now);
+        slot.unavailable_until = Some(now + Duration::from_millis(REMOTE_UNAVAILABLE_BACKOFF_MS));
+    }
+
+    fn clear_lane(&mut self, lane: AgentBackoffLane) {
+        let slot = self.slot_mut(lane);
+        slot.unavailable_until = None;
+        slot.last_remote_error = None;
+        slot.last_remote_error_at = None;
+    }
+
+    fn health_error(&self) -> Option<(Option<Instant>, String)> {
+        let now = Instant::now();
+        let slots = [&self.read, &self.write];
+        let mut selected = None;
+        for slot in slots {
+            let Some(error) = slot.last_remote_error.clone() else {
+                continue;
+            };
+            let error_at = slot.last_remote_error_at.unwrap_or(now);
+            let replace = selected
+                .as_ref()
+                .map(|(selected_at, _, _)| error_at >= *selected_at)
+                .unwrap_or(true);
+            if replace {
+                selected = Some((error_at, slot.unavailable_until, error));
+            }
+        }
+        selected.map(|(_, unavailable_until, error)| (unavailable_until, error))
+    }
 }
 
 impl AgentClient {
@@ -511,6 +594,7 @@ impl AgentClient {
             preempt: AgentPreempt::default(),
             worker: None,
             handshake_complete: false,
+            backoff_lane: AgentBackoffLane::Read,
             remote_backoff: Arc::new(Mutex::new(RemoteBackoffState::default())),
             next_id: 1,
         }
@@ -523,6 +607,7 @@ impl AgentClient {
             preempt: AgentPreempt::default(),
             worker: None,
             handshake_complete: false,
+            backoff_lane: AgentBackoffLane::Write,
             remote_backoff: Arc::clone(&self.remote_backoff),
             next_id: 1,
         }
@@ -594,33 +679,20 @@ impl AgentClient {
     }
 
     fn remote_health(&self) -> RemoteHealth {
+        if let Ok(backoff) = self.remote_backoff.lock() {
+            if let Some((unavailable_until, error)) = backoff.health_error() {
+                return RemoteHealth::unavailable(unavailable_until, error);
+            }
+        }
         if self.handshake_complete {
             return RemoteHealth::connected();
-        }
-        if let Ok(backoff) = self.remote_backoff.lock() {
-            if let Some(error) = backoff.last_remote_error.clone() {
-                return RemoteHealth::unavailable(backoff.unavailable_until, error);
-            }
         }
         RemoteHealth::default()
     }
 
     fn remote_backoff(&self) -> Option<(u64, String)> {
         let backoff = self.remote_backoff.lock().ok()?;
-        let until = backoff.unavailable_until?;
-        let now = Instant::now();
-        if now >= until {
-            return None;
-        }
-        let remaining_ms = until
-            .duration_since(now)
-            .as_millis()
-            .min(u128::from(u64::MAX)) as u64;
-        let error = backoff
-            .last_remote_error
-            .clone()
-            .unwrap_or_else(|| "last remote attempt failed".to_string());
-        Some((remaining_ms, error))
+        backoff.lane_backoff(self.backoff_lane)
     }
 
     fn check_remote_backoff(&mut self) -> Result<()> {
@@ -628,7 +700,7 @@ impl AgentClient {
             bail!("remote unavailable; retry after {remaining_ms} ms: {error}");
         }
         if let Ok(mut backoff) = self.remote_backoff.lock() {
-            backoff.unavailable_until = None;
+            backoff.slot_mut(self.backoff_lane).unavailable_until = None;
         }
         Ok(())
     }
@@ -637,17 +709,14 @@ impl AgentClient {
         self.handshake_complete = false;
         let error = error.into();
         if let Ok(mut backoff) = self.remote_backoff.lock() {
-            backoff.last_remote_error = Some(error.clone());
-            backoff.unavailable_until =
-                Some(Instant::now() + Duration::from_millis(REMOTE_UNAVAILABLE_BACKOFF_MS));
+            backoff.mark_unavailable(self.backoff_lane, error.clone());
         }
         anyhow!(error)
     }
 
     fn clear_remote_unavailable(&mut self) {
         if let Ok(mut backoff) = self.remote_backoff.lock() {
-            backoff.unavailable_until = None;
-            backoff.last_remote_error = None;
+            backoff.clear_lane(self.backoff_lane);
         }
     }
 
@@ -8303,7 +8372,7 @@ mod tests {
     }
 
     #[test]
-    fn cloned_agent_lanes_share_remote_backoff_after_launch_failure() {
+    fn read_lane_backoff_does_not_block_write_lane_after_launch_failure() {
         let dir = tempdir().unwrap();
         let mut read_client = AgentClient::new(
             dir.path()
@@ -8334,8 +8403,101 @@ mod tests {
             .to_string();
 
         assert!(first.contains("failed to launch agent"));
+        assert!(second.contains("failed to launch agent"));
+        assert!(!second.contains("remote unavailable; retry after"));
+    }
+
+    #[test]
+    fn write_lane_backoff_blocks_subsequent_write_lane_attempts() {
+        let dir = tempdir().unwrap();
+        let read_client = AgentClient::new(
+            dir.path()
+                .join("missing-agent")
+                .to_string_lossy()
+                .to_string(),
+            None,
+            dir.path().to_path_buf(),
+            Duration::from_secs(30),
+            1,
+            AgentInterrupt::default(),
+        );
+        let mut write_client = read_client.clone_for_lane(AgentInterrupt::default());
+
+        let first = write_client
+            .request(Request::Hello {
+                client_version: "test".to_string(),
+                protocol_version: PROTOCOL_VERSION,
+            })
+            .unwrap_err()
+            .to_string();
+        let second = write_client
+            .request(Request::Hello {
+                client_version: "test".to_string(),
+                protocol_version: PROTOCOL_VERSION,
+            })
+            .unwrap_err()
+            .to_string();
+
+        assert!(first.contains("failed to launch agent"));
         assert!(second.contains("remote unavailable; retry after"));
         assert!(second.contains("failed to launch agent"));
+    }
+
+    #[test]
+    fn shared_remote_health_reports_write_lane_error() {
+        let dir = tempdir().unwrap();
+        let read_client = AgentClient::new(
+            dir.path()
+                .join("missing-agent")
+                .to_string_lossy()
+                .to_string(),
+            None,
+            dir.path().to_path_buf(),
+            Duration::from_secs(30),
+            1,
+            AgentInterrupt::default(),
+        );
+        let mut write_client = read_client.clone_for_lane(AgentInterrupt::default());
+
+        let error = write_client
+            .request(Request::Hello {
+                client_version: "test".to_string(),
+                protocol_version: PROTOCOL_VERSION,
+            })
+            .unwrap_err()
+            .to_string();
+        let health = read_client.remote_health();
+
+        assert!(error.contains("failed to launch agent"));
+        assert_eq!(health.state, RemoteHealthState::Unavailable);
+        assert!(health
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("failed to launch agent"));
+    }
+
+    #[test]
+    fn shared_remote_health_reports_latest_lane_error() {
+        let dir = tempdir().unwrap();
+        let mut read_client = AgentClient::new(
+            dir.path().join("agent").to_string_lossy().to_string(),
+            None,
+            dir.path().to_path_buf(),
+            Duration::from_secs(30),
+            1,
+            AgentInterrupt::default(),
+        );
+        let mut write_client = read_client.clone_for_lane(AgentInterrupt::default());
+
+        let _ = write_client.mark_remote_unavailable("write lane failed first");
+        thread::sleep(Duration::from_millis(1));
+        let _ = read_client.mark_remote_unavailable("read lane failed second");
+
+        let health = write_client.remote_health();
+
+        assert_eq!(health.state, RemoteHealthState::Unavailable);
+        assert_eq!(health.error.as_deref(), Some("read lane failed second"));
     }
 
     #[cfg(unix)]

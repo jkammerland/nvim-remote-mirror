@@ -155,7 +155,8 @@ cancel.
 Remote reads and writes use separate sidecar lanes with separate agent sessions;
 unrelated opens, grep, validation, and probes can continue while save/flush work
 is in flight, while reads that could conflict with pending writes stay ordered
-on the write lane.
+on the write lane. Read/background lane backoff does not immediately block
+write-lane save replay, and status still reports the latest lane error.
 background_mirror controls the idle mirror builder; set it false and use
 :RemoteMirrorStart manually on especially fragile links. Each background tick
 scans metadata, hydrates a tiny clean-file batch, then validates a tiny
