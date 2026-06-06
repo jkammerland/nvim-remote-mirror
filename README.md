@@ -43,6 +43,11 @@ Completion criteria:
   JSON-line RPC. Neovim is the only client today.
 - `lua/nvim_remote_mirror`: Neovim client facade.
 
+Today the Neovim facade launches one stdio sidecar process per editor session;
+the reusable boundary is the sidecar JSON command/notification protocol plus
+durable workspace state. A long-lived socket listener can be added as a thin
+process-lifetime wrapper around that protocol without changing the mirror model.
+
 This first implementation covers:
 
 - SSH or local agent launch.
@@ -142,7 +147,8 @@ Override them from Lua:
 ```lua
 require("nvim_remote_mirror").setup({
   sidecar = "/path/to/nrm-sidecar",
-  agent = "/path/to/nrm-agent",
+  agent = "/path/to/local/nrm-agent",
+  remote_agent = "nrm-agent",
   request_timeout_ms = 30000,
   ssh_connect_timeout_seconds = 10,
   find_limit = 200,
@@ -178,6 +184,10 @@ require("nvim_remote_mirror").setup({
   background_mirror_max_total_bytes = 512 * 1024,
 })
 ```
+
+For `ssh://` targets, `remote_agent` is executed on the remote host. The local
+`agent` path is used only for local targets, so a checkout-local
+`target/debug/nrm-agent` is not accidentally sent to SSH hosts.
 
 ## LSP Proxy
 

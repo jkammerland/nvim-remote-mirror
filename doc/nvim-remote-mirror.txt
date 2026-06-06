@@ -18,6 +18,10 @@ operating from a durable checksum-verified local mirror. Hydrate missing and
 related content in bounded batches, run source-adjacent tools such as LSP near
 the remote tree, preserve saves through snapshots and checksum compare-and-swap
 retries, and keep SSH behind a transport-neutral sidecar/agent boundary.
+Today the Neovim facade launches one stdio sidecar process per editor session;
+the reusable boundary is the sidecar JSON command/notification protocol plus
+durable workspace state. A long-lived socket listener can be added as a thin
+process-lifetime wrapper around that protocol without changing the mirror model.
 
 ==============================================================================
 COMMANDS                                      *nvim-remote-mirror-commands*
@@ -113,7 +117,8 @@ CONFIGURATION                                  *nvim-remote-mirror-config*
 >
   require("nvim_remote_mirror").setup({
     sidecar = "/path/to/nrm-sidecar",
-    agent = "/path/to/nrm-agent",
+    agent = "/path/to/local/nrm-agent",
+    remote_agent = "nrm-agent",
     state_dir = "/path/to/state",
     find_limit = 200,
     grep_limit = 200,
@@ -150,6 +155,10 @@ CONFIGURATION                                  *nvim-remote-mirror-config*
     background_mirror_max_total_bytes = 512 * 1024,
   })
 <
+
+For ssh:// targets, remote_agent is executed on the remote host. The local agent
+path is used only for local targets, so a checkout-local target/debug/nrm-agent
+is not accidentally sent to SSH hosts.
 
 request_timeout_ms bounds both sidecar/agent work and pending Neovim-side
 callbacks waiting for sidecar JSON replies.

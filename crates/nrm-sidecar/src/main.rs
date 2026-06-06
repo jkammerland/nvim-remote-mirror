@@ -2364,7 +2364,7 @@ impl Mirror {
             io::copy(&mut source, &mut part)?;
             part.sync_all()?;
         }
-        fs::rename(&part_path, &entry.local_path)?;
+        rename_durable(&part_path, &entry.local_path)?;
         Ok(())
     }
 
@@ -4403,7 +4403,7 @@ impl Sidecar {
             let install = self.prepare_hydration_target(&file.path, &local_path, &file.hash)?;
             let local_hash = match install {
                 HydrationInstall::ReplaceWithPart => {
-                    fs::rename(&part_path, &local_path)?;
+                    rename_durable(&part_path, &local_path)?;
                     local_hash
                 }
                 HydrationInstall::AdoptExisting { local_hash } => {
@@ -5238,7 +5238,7 @@ impl Sidecar {
             let install = self.prepare_hydration_target(path, &local_path, &remote_hash)?;
             let local_hash = match install {
                 HydrationInstall::ReplaceWithPart => {
-                    fs::rename(&part_path, &local_path)?;
+                    rename_durable(&part_path, &local_path)?;
                     local_hash
                 }
                 HydrationInstall::AdoptExisting { local_hash } => {
@@ -6301,8 +6301,7 @@ fn write_durable_file(path: &Path, content: &[u8]) -> Result<()> {
             file.write_all(content)?;
             file.sync_all()?;
         }
-        fs::rename(&tmp, path)?;
-        sync_parent_dir(path)?;
+        rename_durable(&tmp, path)?;
         Ok(())
     })();
 
@@ -6310,6 +6309,12 @@ fn write_durable_file(path: &Path, content: &[u8]) -> Result<()> {
         let _ = fs::remove_file(&tmp);
     }
     install
+}
+
+fn rename_durable(from: &Path, to: &Path) -> Result<()> {
+    fs::rename(from, to)?;
+    sync_parent_dir(to)?;
+    Ok(())
 }
 
 fn sync_parent_dir(path: &Path) -> Result<()> {

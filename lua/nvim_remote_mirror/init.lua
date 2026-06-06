@@ -21,6 +21,7 @@ end
 M.config = {
   sidecar = executable_or_default("nrm-sidecar"),
   agent = executable_or_default("nrm-agent"),
+  remote_agent = "nrm-agent",
   state_dir = nil,
   find_limit = 200,
   grep_limit = 200,
@@ -221,12 +222,16 @@ if vim.g.nvim_remote_mirror_test then
 end
 
 local function sidecar_args(target)
+  local agent = M.config.agent
+  if target.ssh then
+    agent = optional_string(M.config.remote_agent) or "nrm-agent"
+  end
   local args = {
     "serve",
     "--remote-root",
     target.remote_root,
     "--agent",
-    M.config.agent,
+    agent,
   }
   if target.ssh then
     table.insert(args, "--ssh")
@@ -241,6 +246,10 @@ local function sidecar_args(target)
   table.insert(args, "--ssh-connect-timeout-seconds")
   table.insert(args, tostring(M.config.ssh_connect_timeout_seconds))
   return args
+end
+
+if vim.g.nvim_remote_mirror_test then
+  M._test_sidecar_args = sidecar_args
 end
 
 local function fail_pending(client, message)
@@ -1728,11 +1737,9 @@ function M.grep(query)
       return
     end
 
-    if #(result.hits or {}) > 0 then
-      set_grep_quickfix(query, result, "RemoteGrep cache", function()
-        return is_current() and not remote_applied
-      end)
-    end
+    set_grep_quickfix(query, result, "RemoteGrep cache", function()
+      return is_current() and not remote_applied
+    end)
   end)
 end
 
