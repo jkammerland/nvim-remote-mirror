@@ -11,12 +11,13 @@ CONTENTS                                      *nvim-remote-mirror-contents*
 ==============================================================================
 GOAL                                            *nvim-remote-mirror-goal*
 
-Keep cached navigation, opening, status, provisional search, and editing
-responsive over slow, unstable, or offline SSH links by operating from a
-durable checksum-verified local mirror. Hydrate missing and related content in
-bounded batches, run source-adjacent tools such as LSP near the remote tree,
-preserve saves through snapshots and checksum compare-and-swap retries, and
-keep SSH behind a transport-neutral sidecar/agent boundary.
+Build a local-first reusable remote workspace daemon, with Neovim as the only
+client for now, that keeps cached navigation, opening, status, provisional
+search, and editing responsive over slow, unstable, or offline SSH links by
+operating from a durable checksum-verified local mirror. Hydrate missing and
+related content in bounded batches, run source-adjacent tools such as LSP near
+the remote tree, preserve saves through snapshots and checksum compare-and-swap
+retries, and keep SSH behind a transport-neutral sidecar/agent boundary.
 
 ==============================================================================
 COMMANDS                                      *nvim-remote-mirror-commands*
@@ -91,7 +92,9 @@ COMMANDS                                      *nvim-remote-mirror-commands*
 
 :RemoteStatus
     Show known, cached, indexed, dirty, and pending mirror counts plus the
-    last known remote health. This is a local fast path and does not probe SSH.
+    plugin connection state, pending reconnect or explicit disconnect state,
+    and last known remote health. This is a local fast path and does not probe
+    SSH.
 
 :RemoteDisconnect
     Stop the sidecar and agent.

@@ -6,17 +6,18 @@ searches, hashes, and writes files near the source tree.
 
 Goal statement:
 
-> Build `nvim-remote-mirror` into a local-first Neovim remote workspace system
-> that keeps cached navigation, opening, status, and provisional search
-> responsive even over slow, unstable, or offline SSH links by operating from a
-> durable checksum-verified local mirror; lazily hydrates missing or
-> intent-adjacent content in bounded prioritized batches; runs source-adjacent
-> workflows such as LSP near the remote tree with correct local/remote path
-> translation; preserves every local save through recoverable snapshots,
-> checksum compare-and-swap uploads, retry queues, and explicit conflict
-> reporting; and keeps the sidecar-agent protocol transport-neutral so SSH
-> remains the default today while QUIC/UDP over WireGuard can be added later
-> without changing Neovim-facing behavior.
+> Build `nvim-remote-mirror` into a local-first reusable remote workspace
+> daemon, with Neovim as the first and only client for now, that keeps cached
+> navigation, opening, status, and provisional search responsive even over
+> slow, unstable, or offline SSH links by operating from a durable
+> checksum-verified local mirror; lazily hydrates missing or intent-adjacent
+> content in bounded prioritized batches; runs source-adjacent workflows such
+> as LSP near the remote tree with correct local/remote path translation;
+> preserves every local save through recoverable snapshots, checksum
+> compare-and-swap uploads, retry queues, and explicit conflict reporting; and
+> keeps the sidecar-agent protocol transport-neutral so SSH remains the default
+> today while QUIC/UDP over WireGuard can be added later without changing
+> client-facing behavior.
 
 Completion criteria:
 
@@ -32,14 +33,15 @@ Completion criteria:
 - LSP and later source-adjacent tools run near the remote source while exposing
   local mirror paths to Neovim.
 - the transport boundary is narrow enough that SSH stdio can be replaced by a
-  future QUIC/UDP-over-WireGuard transport without changing plugin APIs.
+  future QUIC/UDP-over-WireGuard transport without changing client APIs.
 
 ## Current Shape
 
 - `nrm-agent`: remote binary. Serves length-prefixed binary RPC on stdio.
-- `nrm-sidecar`: local binary. Starts the agent locally or through SSH, owns the
-  local mirror and SQLite metadata, and exposes JSON-line RPC for Neovim.
-- `lua/nvim_remote_mirror`: Neovim plugin facade.
+- `nrm-sidecar`: local reusable remote workspace daemon. Starts the agent
+  locally or through SSH, owns the local mirror and SQLite metadata, and exposes
+  JSON-line RPC. Neovim is the only client today.
+- `lua/nvim_remote_mirror`: Neovim client facade.
 
 This first implementation covers:
 
@@ -105,7 +107,8 @@ mirror file into the durable queue.
 
 `:RemoteConnect` starts from the durable local mirror and does not block on an
 SSH agent handshake. Cached opens, cached grep, and status remain available if
-the remote is unreachable; status also reports the last known remote health
+the remote is unreachable; status reports plugin connection state, pending
+reconnect attempts or explicit disconnects, and the last known remote health
 without probing SSH. The first operation that needs the remote agent performs
 the protocol handshake and reports connection failures normally.
 Pending Neovim requests are also bounded by `request_timeout_ms`, so lost or

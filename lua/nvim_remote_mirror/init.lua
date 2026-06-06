@@ -60,6 +60,11 @@ M.reconnect_attempts = 0
 M.reconnect_generation = 0
 M.grep_generation = 0
 M.find_generation = 0
+M.connection_status = "disconnected"
+M.connection_target = nil
+M.connection_reason = nil
+M.connection_error = nil
+M.reconnect_pending = false
 M.deferred_flushes = {}
 M.background_mirror_running = false
 M.background_mirror_generation = 0
@@ -262,9 +267,16 @@ local function schedule_reconnect(target_arg, generation)
     return
   end
   if M.reconnect_attempts >= M.config.reconnect_max_attempts then
+    M.connection_status = "disconnected"
+    M.reconnect_pending = false
+    M.connection_reason = nil
+    M.connection_error = "reconnect attempts exhausted"
     notify("reconnect attempts exhausted", vim.log.levels.WARN)
     return
   end
+  M.connection_status = "reconnect_pending"
+  M.connection_target = target_arg
+  M.reconnect_pending = true
   M.reconnect_attempts = M.reconnect_attempts + 1
   local attempt = M.reconnect_attempts
   vim.defer_fn(function()
@@ -274,9 +286,15 @@ local function schedule_reconnect(target_arg, generation)
     if M.client then
       return
     end
+    M.connection_status = "reconnecting"
+    M.reconnect_pending = false
     notify("reconnecting remote session, attempt " .. tostring(attempt), vim.log.levels.WARN)
     local ok, err = pcall(M.connect, target_arg, { reconnect = true })
     if not ok then
+      M.connection_status = "reconnect_pending"
+      M.reconnect_pending = true
+      M.connection_reason = nil
+      M.connection_error = tostring(err)
       notify("reconnect failed: " .. tostring(err), vim.log.levels.ERROR)
       schedule_reconnect(target_arg, generation)
     end
@@ -362,6 +380,33 @@ local function status_remote_summary(result)
   if remote_error and result.remote_available == false then
     remote_error = remote_error:gsub("%s+", " ")
     table.insert(parts, "error=" .. remote_error:sub(1, 160))
+  end
+  return table.concat(parts, " ")
+end
+
+local function connection_summary()
+  local parts = { "connection=" .. tostring(M.connection_status or "disconnected") }
+  if M.reconnect_pending then
+    table.insert(parts, "reconnect=pending")
+  end
+  if (M.connection_status == "reconnect_pending" or M.connection_status == "reconnecting")
+    and M.config.reconnect_max_attempts
+  then
+    table.insert(
+      parts,
+      "attempts=" .. tostring(M.reconnect_attempts) .. "/" .. tostring(M.config.reconnect_max_attempts)
+    )
+  end
+  if M.connection_target then
+    table.insert(parts, "target=" .. tostring(M.connection_target))
+  end
+  if M.connection_reason then
+    local reason_text = tostring(M.connection_reason):gsub("%s+", " ")
+    table.insert(parts, "reason=" .. reason_text:sub(1, 160))
+  end
+  if M.connection_error then
+    local error_text = tostring(M.connection_error):gsub("%s+", " ")
+    table.insert(parts, "error=" .. error_text:sub(1, 160))
   end
   return table.concat(parts, " ")
 end
@@ -808,6 +853,11 @@ function M.connect(target, opts)
     M.reconnect_attempts = 0
   end
   local generation = M.reconnect_generation
+  M.connection_status = is_reconnect and "reconnecting" or "connecting"
+  M.connection_target = target_arg
+  M.connection_reason = nil
+  M.connection_error = nil
+  M.reconnect_pending = false
 
   if M.client and M.client.job_id then
     M.disconnect({ preserve_last_target = true })
@@ -845,6 +895,11 @@ function M.connect(target, opts)
       if unexpected then
         local exit_generation = M.reconnect_generation
         fail_pending(client, "sidecar exited with code " .. tostring(code))
+        M.connection_status = M.config.auto_reconnect and "reconnect_pending" or "disconnected"
+        M.connection_target = client.target_arg
+        M.connection_reason = nil
+        M.connection_error = "sidecar exited with code " .. tostring(code)
+        M.reconnect_pending = M.config.auto_reconnect == true
         notify("sidecar exited with code " .. tostring(code), vim.log.levels.ERROR)
         schedule_reconnect(client.target_arg, exit_generation)
       else
@@ -854,6 +909,10 @@ function M.connect(target, opts)
   })
 
   if client.job_id <= 0 then
+    M.connection_status = "disconnected"
+    M.connection_reason = nil
+    M.connection_error = "failed to start sidecar"
+    M.reconnect_pending = false
     error("failed to start sidecar: " .. table.concat(command, " "))
   end
 
@@ -861,10 +920,16 @@ function M.connect(target, opts)
   M.last_target = target_arg
   M.request("hello", {}, function(err, result)
     if err then
+      M.connection_error = err
       notify(err, vim.log.levels.ERROR)
       return
     end
     client.hello = result
+    M.connection_status = "connected"
+    M.connection_target = target_arg
+    M.connection_reason = nil
+    M.connection_error = nil
+    M.reconnect_pending = false
     setup_mirror_autohydrate(client)
     if is_reconnect then
       schedule_reconnect_stable_reset(client, generation)
@@ -886,6 +951,11 @@ function M.disconnect(opts)
     if not opts.preserve_last_target then
       M.reconnect_generation = M.reconnect_generation + 1
       M.reconnect_attempts = 0
+      M.connection_status = "disconnected"
+      M.connection_target = nil
+      M.connection_reason = "explicit disconnect"
+      M.connection_error = nil
+      M.reconnect_pending = false
     end
     return
   end
@@ -904,6 +974,11 @@ function M.disconnect(opts)
     M.stop_background_mirror()
     M.reconnect_generation = M.reconnect_generation + 1
     M.reconnect_attempts = 0
+    M.connection_status = "disconnected"
+    M.connection_target = nil
+    M.connection_reason = "explicit disconnect"
+    M.connection_error = nil
+    M.reconnect_pending = false
   end
 end
 
@@ -916,6 +991,11 @@ function M.reconnect()
   end
   M.reconnect_attempts = 0
   M.reconnect_generation = M.reconnect_generation + 1
+  M.connection_status = "reconnecting"
+  M.connection_target = M.last_target
+  M.connection_reason = nil
+  M.connection_error = nil
+  M.reconnect_pending = false
   M.connect(M.last_target, { reconnect = true })
 end
 
@@ -1560,6 +1640,10 @@ function M.grep(query)
 end
 
 function M.status()
+  if not M.client or not M.client.job_id then
+    notify(connection_summary(), vim.log.levels.WARN)
+    return
+  end
   M.request("status", {}, function(err, result)
     if err then
       notify(err, vim.log.levels.ERROR)
@@ -1568,7 +1652,7 @@ function M.status()
     update_remote_state(M.client, result)
     notify(
       string.format(
-        "known=%d cached=%d indexed=%d dirty=%d pending=%d failed=%d conflicts=%d stale=%d deleted=%d %s",
+        "known=%d cached=%d indexed=%d dirty=%d pending=%d failed=%d conflicts=%d stale=%d deleted=%d %s %s",
         result.known_files,
         result.cached_files,
         result.indexed_files or 0,
@@ -1578,6 +1662,7 @@ function M.status()
         result.conflicted_saves,
         result.stale_files,
         result.deleted_files,
+        connection_summary(),
         status_remote_summary(result)
       )
     )
