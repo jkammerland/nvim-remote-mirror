@@ -32,7 +32,9 @@ COMMANDS                                      *nvim-remote-mirror-commands*
     Reconnect to the last remote target, reusing the durable mirror and
     retrying queued saves after a remote probe succeeds. Remote buffers saved
     while disconnected are also replayed into the next sidecar session so their
-    local mirror files can be snapshotted.
+    local mirror files can be snapshotted. If Neovim cannot write to a closed
+    sidecar channel, the request fails immediately and reconnect handling starts
+    without waiting for request_timeout_ms.
 
 :RemoteOpen {path}
     Open a workspace-relative file from the local mirror when cached, including

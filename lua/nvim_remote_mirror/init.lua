@@ -254,7 +254,26 @@ local function send_cancel_request(client, request_id)
   pcall(vim.fn.chansend, client.job_id, payload)
 end
 
-local function schedule_reconnect(target_arg, generation)
+local schedule_reconnect
+
+local function fail_sidecar_send(client, message)
+  local generation = M.reconnect_generation
+  if M.client == client and not client.closing then
+    M.client = nil
+    clear_mirror_autohydrate()
+    M.connection_status = M.config.auto_reconnect and "reconnect_pending" or "disconnected"
+    M.connection_target = client.target_arg
+    M.connection_reason = nil
+    M.connection_error = message
+    M.reconnect_pending = M.config.auto_reconnect == true
+  end
+  fail_pending(client, message)
+  if not client.closing then
+    schedule_reconnect(client.target_arg, generation)
+  end
+end
+
+function schedule_reconnect(target_arg, generation)
   generation = generation or M.reconnect_generation
   if not M.config.auto_reconnect then
     return
@@ -1039,7 +1058,11 @@ function M.request(method, params, callback)
     method = method,
     params = params or {},
   }) .. "\n"
-  vim.fn.chansend(client.job_id, payload)
+  local ok, sent = pcall(vim.fn.chansend, client.job_id, payload)
+  if not ok or (tonumber(sent) or 0) <= 0 then
+    local reason = ok and "sidecar channel closed" or ("sidecar channel send failed: " .. tostring(sent))
+    fail_sidecar_send(client, reason)
+  end
 end
 
 function M.remote_probe(callback)

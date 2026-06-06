@@ -113,6 +113,9 @@ without probing SSH. The first operation that needs the remote agent performs
 the protocol handshake and reports connection failures normally.
 Pending Neovim requests are also bounded by `request_timeout_ms`, so lost or
 stalled sidecar replies clear their callback state instead of hanging forever.
+If Neovim cannot write to the sidecar channel because the job has already
+closed, the request fails immediately and reconnect handling starts without
+waiting for that timeout.
 When a Neovim-side timeout fires, the plugin sends a best-effort sidecar
 cancel request so remote work that has not started yet is dropped from the
 queue and no longer blocks cached reads for the same path. If the matching
