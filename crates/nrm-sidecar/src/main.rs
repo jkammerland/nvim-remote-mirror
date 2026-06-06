@@ -444,10 +444,41 @@ struct AgentLaunch {
     transport: RemoteTransport,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 struct AgentInterrupt {
-    child: Arc<Mutex<Option<Arc<Mutex<Child>>>>>,
+    current_abort: Arc<Mutex<Option<Arc<dyn AgentAbortHandle>>>>,
     shutdown_requested: Arc<AtomicBool>,
+}
+
+trait AgentAbortHandle: Send + Sync {
+    /// Abort the current lane worker. This must be idempotent, safe to call from
+    /// preemption and shutdown paths, and strong enough to unblock an in-flight
+    /// AgentSession::request for the lane.
+    fn abort(&self);
+
+    /// Wait for the aborted lane worker resource to stop or reach an aborted
+    /// state. This may be called while the AgentSession object still exists;
+    /// implementations must tolerate repeated calls and must not depend on the
+    /// session being dropped first.
+    fn wait(&self);
+}
+
+struct ProcessAgentAbort {
+    child: Arc<Mutex<Child>>,
+}
+
+impl AgentAbortHandle for ProcessAgentAbort {
+    fn abort(&self) {
+        if let Ok(mut child) = self.child.lock() {
+            kill_child_tree(&mut child);
+        }
+    }
+
+    fn wait(&self) {
+        if let Ok(mut child) = self.child.lock() {
+            let _ = child.wait();
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -465,17 +496,17 @@ impl AgentInterrupt {
         self.kill_current();
     }
 
-    fn set_child(&self, child: Arc<Mutex<Child>>) {
-        if let Ok(mut current) = self.child.lock() {
-            *current = Some(child);
+    fn set_abort_handle(&self, handle: Arc<dyn AgentAbortHandle>) {
+        if let Ok(mut current) = self.current_abort.lock() {
+            *current = Some(handle);
         }
     }
 
-    fn clear_child(&self, child: &Arc<Mutex<Child>>) {
-        if let Ok(mut current) = self.child.lock() {
+    fn clear_abort_handle(&self, handle: &Arc<dyn AgentAbortHandle>) {
+        if let Ok(mut current) = self.current_abort.lock() {
             if current
                 .as_ref()
-                .is_some_and(|current_child| Arc::ptr_eq(current_child, child))
+                .is_some_and(|current_handle| Arc::ptr_eq(current_handle, handle))
             {
                 *current = None;
             }
@@ -483,16 +514,22 @@ impl AgentInterrupt {
     }
 
     fn kill_current(&self) {
-        let child = self
-            .child
+        let handle = self
+            .current_abort
             .lock()
             .ok()
             .and_then(|current| current.as_ref().map(Arc::clone));
-        if let Some(child) = child {
-            if let Ok(mut child) = child.lock() {
-                kill_child_tree(&mut child);
-            }
+        if let Some(handle) = handle {
+            handle.abort();
         }
+    }
+
+    #[cfg(test)]
+    fn has_current_abort(&self) -> bool {
+        self.current_abort
+            .lock()
+            .map(|current| current.is_some())
+            .unwrap_or(false)
     }
 }
 
@@ -512,7 +549,7 @@ impl AgentPreempt {
 
 struct AgentWorker {
     tx: mpsc::Sender<AgentWorkerCommand>,
-    child: Arc<Mutex<Child>>,
+    abort: Arc<dyn AgentAbortHandle>,
 }
 
 trait AgentSession: Send {
@@ -832,9 +869,12 @@ impl AgentClient {
         let stdin = child.stdin.take().context("agent stdin was not piped")?;
         let stdout = child.stdout.take().context("agent stdout was not piped")?;
         let child = Arc::new(Mutex::new(child));
-        interrupt.set_child(Arc::clone(&child));
+        let abort: Arc<dyn AgentAbortHandle> = Arc::new(ProcessAgentAbort {
+            child: Arc::clone(&child),
+        });
+        interrupt.set_abort_handle(Arc::clone(&abort));
         let (tx, rx) = mpsc::channel::<AgentWorkerCommand>();
-        let worker_child = Arc::clone(&child);
+        let worker_abort = Arc::clone(&abort);
         thread::spawn(move || {
             let mut session: Box<dyn AgentSession> =
                 Box::new(FramedAgentSession::new(stdin, stdout));
@@ -844,14 +884,12 @@ impl AgentClient {
                     .unwrap_or_else(|error| AgentWorkerReply::Error(error.to_string()));
                 let _ = command.reply.send(response);
             }
-            let _ = worker_child.lock().map(|mut child| {
-                kill_child_tree(&mut child);
-                let _ = child.wait();
-            });
-            interrupt.clear_child(&worker_child);
+            worker_abort.abort();
+            worker_abort.wait();
+            interrupt.clear_abort_handle(&worker_abort);
         });
 
-        Ok(AgentWorker { tx, child })
+        Ok(AgentWorker { tx, abort })
     }
 
     fn request(&mut self, request: Request) -> Result<Response> {
@@ -1105,10 +1143,8 @@ impl AgentClient {
         self.handshake_complete = false;
         if let Some(worker) = self.worker.take() {
             drop(worker.tx);
-            if let Ok(mut child) = worker.child.lock() {
-                kill_child_tree(&mut child);
-                let _ = child.wait();
-            }
+            worker.abort.abort();
+            worker.abort.wait();
         }
     }
 }
@@ -3010,7 +3046,9 @@ fn workspace_info_value(
             "lazy_agent_handshake": true,
             "remote_agent": true,
             "lsp_proxy": true,
-            "transport_neutral_agent_frames": true
+            "transport_neutral_agent_frames": true,
+            "agent_abort_handle": true,
+            "agent_abort_scope": "lane_worker"
         },
         "remote_health": remote_health_value
     });
@@ -6321,7 +6359,24 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
     use tempfile::tempdir;
+
+    #[derive(Default)]
+    struct TestAbortHandle {
+        aborts: AtomicUsize,
+        waits: AtomicUsize,
+    }
+
+    impl AgentAbortHandle for TestAbortHandle {
+        fn abort(&self) {
+            self.aborts.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn wait(&self) {
+            self.waits.fetch_add(1, Ordering::SeqCst);
+        }
+    }
 
     fn test_meta_kind(
         path: &str,
@@ -6654,6 +6709,9 @@ mod tests {
         assert_eq!(info["remote_status"], "unchecked");
         assert_eq!(info["remote_health"]["remote_status"], "unchecked");
         assert_eq!(info["capabilities"]["server_notifications"], true);
+        assert_eq!(info["capabilities"]["transport_neutral_agent_frames"], true);
+        assert_eq!(info["capabilities"]["agent_abort_handle"], true);
+        assert_eq!(info["capabilities"]["agent_abort_scope"], "lane_worker");
         assert_eq!(
             info["commands"]
                 .as_array()
@@ -6768,6 +6826,72 @@ mod tests {
                 assert_eq!(command.remote_lane, Some("write"));
             }
         }
+    }
+
+    #[test]
+    fn agent_interrupt_uses_registered_abort_handle() {
+        let interrupt = AgentInterrupt::default();
+        let handle = Arc::new(TestAbortHandle::default());
+        let handle_trait: Arc<dyn AgentAbortHandle> = handle.clone();
+
+        interrupt.set_abort_handle(Arc::clone(&handle_trait));
+        assert!(interrupt.has_current_abort());
+
+        interrupt.kill_current();
+
+        assert_eq!(handle.aborts.load(Ordering::SeqCst), 1);
+        assert_eq!(handle.waits.load(Ordering::SeqCst), 0);
+
+        interrupt.clear_abort_handle(&handle_trait);
+        assert!(!interrupt.has_current_abort());
+    }
+
+    #[test]
+    fn agent_interrupt_keeps_replacement_when_stale_handle_clears() {
+        let interrupt = AgentInterrupt::default();
+        let stale = Arc::new(TestAbortHandle::default());
+        let current = Arc::new(TestAbortHandle::default());
+        let stale_trait: Arc<dyn AgentAbortHandle> = stale.clone();
+        let current_trait: Arc<dyn AgentAbortHandle> = current.clone();
+
+        interrupt.set_abort_handle(Arc::clone(&stale_trait));
+        interrupt.set_abort_handle(Arc::clone(&current_trait));
+        interrupt.clear_abort_handle(&stale_trait);
+
+        assert!(interrupt.has_current_abort());
+        interrupt.kill_current();
+
+        assert_eq!(stale.aborts.load(Ordering::SeqCst), 0);
+        assert_eq!(current.aborts.load(Ordering::SeqCst), 1);
+
+        interrupt.clear_abort_handle(&current_trait);
+        assert!(!interrupt.has_current_abort());
+    }
+
+    #[test]
+    fn agent_client_kill_worker_aborts_and_waits_via_handle() {
+        let handle = Arc::new(TestAbortHandle::default());
+        let handle_trait: Arc<dyn AgentAbortHandle> = handle.clone();
+        let (tx, _rx) = mpsc::channel();
+        let mut client = AgentClient::new(
+            "unused-agent".to_string(),
+            RemoteTransport::Local,
+            PathBuf::from("/unused"),
+            Duration::from_secs(1),
+            AgentInterrupt::default(),
+        );
+        client.worker = Some(AgentWorker {
+            tx,
+            abort: handle_trait,
+        });
+        client.handshake_complete = true;
+
+        client.kill_worker();
+
+        assert!(client.worker.is_none());
+        assert!(!client.handshake_complete);
+        assert_eq!(handle.aborts.load(Ordering::SeqCst), 1);
+        assert_eq!(handle.waits.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -9150,12 +9274,12 @@ mod tests {
             thread::spawn(move || sidecar.open(json!({"path": "src/main.rs"}), preempt_epoch));
 
         for _ in 0..100 {
-            if interrupt.child.lock().unwrap().is_some() {
+            if interrupt.has_current_abort() {
                 break;
             }
             thread::sleep(Duration::from_millis(10));
         }
-        assert!(interrupt.child.lock().unwrap().is_some());
+        assert!(interrupt.has_current_abort());
 
         preempt.request_preemption();
 
@@ -9196,12 +9320,12 @@ mod tests {
         let handle = thread::spawn(move || sidecar.remote_probe(preempt_epoch));
 
         for _ in 0..100 {
-            if interrupt.child.lock().unwrap().is_some() {
+            if interrupt.has_current_abort() {
                 break;
             }
             thread::sleep(Duration::from_millis(10));
         }
-        assert!(interrupt.child.lock().unwrap().is_some());
+        assert!(interrupt.has_current_abort());
 
         preempt.request_preemption();
 
@@ -9314,7 +9438,7 @@ mod tests {
         let error = client.request(Request::Shutdown).unwrap_err().to_string();
 
         assert!(error.contains("shutdown"));
-        assert!(interrupt.child.lock().unwrap().is_none());
+        assert!(!interrupt.has_current_abort());
     }
 
     #[test]
@@ -9535,12 +9659,12 @@ mod tests {
         });
 
         for _ in 0..100 {
-            if interrupt.child.lock().unwrap().is_some() {
+            if interrupt.has_current_abort() {
                 break;
             }
             thread::sleep(Duration::from_millis(10));
         }
-        assert!(interrupt.child.lock().unwrap().is_some());
+        assert!(interrupt.has_current_abort());
         interrupt.kill_current();
 
         let error = handle.join().unwrap().unwrap_err().to_string();
@@ -9582,12 +9706,12 @@ mod tests {
         });
 
         for _ in 0..100 {
-            if interrupt.child.lock().unwrap().is_some() {
+            if interrupt.has_current_abort() {
                 break;
             }
             thread::sleep(Duration::from_millis(10));
         }
-        assert!(interrupt.child.lock().unwrap().is_some());
+        assert!(interrupt.has_current_abort());
 
         preempt.request_preemption();
 

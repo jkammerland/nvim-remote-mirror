@@ -356,6 +356,10 @@ callable by the sidecar's own request rewriting path but are not listed as
 public API. Compatibility aliases such as `hello` can still be public and
 callable. Clients should ignore unknown `command_specs` fields so the daemon can
 add transport metadata without changing the Neovim-facing protocol.
+`capabilities.agent_abort_scope` is currently `lane_worker`: preemption and
+shutdown abort and replace the active serial worker for that lane, ignore late
+per-request replies from the replaced worker, and reset handshake state through
+the same lifecycle as an SSH worker restart.
 `workspace_info` is served from local state and does not start or probe SSH.
 `hello` remains a compatibility alias for the same payload.
 
@@ -415,13 +419,16 @@ Current transport state:
   `preempted` responses are normal no-op client results, and save/flush
   requests are not preempted once started.
   Agent and LSP launches share a transport command planner. Sidecar request
-  scheduling exchanges agent frames through an AgentSession abstraction;
-  stdio-backed local/SSH child processes are the current session type and still
-  own worker lifecycle, timeout, and preemption aborts. A future QUIC or UDP over
-  WireGuard session must provide reliable ordered delivery per lane, preserve
-  matching request IDs, honor today's serial request semantics unless
-  multiplexing is explicitly added, surface timeout/backoff-compatible errors,
-  and expose an abort path equivalent to restarting the current lane worker.
+  scheduling exchanges agent frames through an AgentSession abstraction and
+  interrupts active work through an abort-handle boundary. Stdio-backed
+  local/SSH child processes are the current session and abort implementation. A
+  future QUIC or UDP over WireGuard session must provide reliable ordered
+  delivery per lane, preserve matching request IDs, honor today's serial request
+  semantics unless multiplexing is explicitly added, surface
+  timeout/backoff-compatible errors, and expose an abort path equivalent to
+  restarting the current lane worker. A future non-process transport should add
+  a session factory that returns the AgentSession and AgentAbortHandle pair for a
+  lane while preserving the same `lane_worker` abort scope.
   Timed-out Neovim requests send a best-effort sidecar cancellation for queued
   remote work, clearing pending path hazards before that work reaches SSH, and
   can preempt matching active read-only/background work. Active save/flush work
