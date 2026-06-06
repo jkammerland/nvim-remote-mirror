@@ -140,6 +140,8 @@ require("nvim_remote_mirror").setup({
   find_limit = 200,
   grep_limit = 200,
   grep_remote_page_files = 512,
+  grep_remote_max_file_bytes = 512 * 1024,
+  grep_remote_max_total_bytes = 8 * 1024 * 1024,
   grep_cache_max_files = 2000,
   grep_cache_max_file_bytes = 512 * 1024,
   grep_cache_max_total_bytes = 8 * 1024 * 1024,
@@ -287,12 +289,15 @@ slow or temporarily unavailable after metadata has been scanned.
 bounded slice of already hydrated local mirror files. Cached hits are
 provisional and can populate quickfix while the remote search is still running.
 Remote grep walks the tree in deterministic pages bounded by
-`grep_remote_page_files`, so sparse or no-hit searches can refresh quickfix
-progressively instead of waiting for one full remote tree pass. Consecutive
-pages use a live agent continuation session to avoid re-walking the same remote
-prefix; the path cursor is still sent as a restart fallback if the SSH/agent
-session is lost. Each page hydrates safe result files before it is merged into
-the displayed remote result.
+`grep_remote_page_files`, `grep_remote_max_file_bytes`, and
+`grep_remote_max_total_bytes`, so sparse or no-hit searches can refresh
+quickfix progressively instead of waiting for one full remote tree pass or one
+large log/generated file. Files above the per-file cap are skipped without
+reading their contents, and the total byte cap stops the current page before it
+can monopolize the SSH worker. Consecutive pages use a live agent continuation
+session to avoid re-walking the same remote prefix; the path cursor is still
+sent as a restart fallback if the SSH/agent session is lost. Each page hydrates
+safe result files before it is merged into the displayed remote result.
 The cached search uses a persisted SQLite line index, plus byte trigrams for
 literal queries of at least three bytes, and verifies matches in Rust so
 case-sensitive literal behavior and byte-based columns stay stable. Dirty saves

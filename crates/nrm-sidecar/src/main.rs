@@ -2308,11 +2308,11 @@ impl Mirror {
         let max_file_bytes = params
             .get("max_file_bytes")
             .and_then(Value::as_u64)
-            .unwrap_or(DEFAULT_GREP_CACHE_MAX_FILE_BYTES);
+            .unwrap_or(DEFAULT_BATCH_MAX_FILE_BYTES);
         let max_total_bytes = params
             .get("max_total_bytes")
             .and_then(Value::as_u64)
-            .unwrap_or(DEFAULT_GREP_CACHE_MAX_TOTAL_BYTES);
+            .unwrap_or(DEFAULT_BATCH_MAX_TOTAL_BYTES);
         let mut hits = Vec::new();
         let mut searched_files = 0_usize;
         let mut searched_bytes = 0_u64;
@@ -3714,11 +3714,11 @@ impl Sidecar {
         let max_file_bytes = params
             .get("max_file_bytes")
             .and_then(Value::as_u64)
-            .unwrap_or(DEFAULT_BATCH_MAX_FILE_BYTES);
+            .unwrap_or(DEFAULT_GREP_CACHE_MAX_FILE_BYTES);
         let max_total_bytes = params
             .get("max_total_bytes")
             .and_then(Value::as_u64)
-            .unwrap_or(DEFAULT_BATCH_MAX_TOTAL_BYTES);
+            .unwrap_or(DEFAULT_GREP_CACHE_MAX_TOTAL_BYTES);
         let paths = self.mirror.known_prefetch_paths(limit)?;
         let requested = paths.len();
         let (hydrated, errors, truncated, preempted) = self.batch_hydrate(
@@ -3944,17 +3944,19 @@ impl Sidecar {
         let max_file_bytes = params
             .get("max_file_bytes")
             .and_then(Value::as_u64)
-            .unwrap_or(DEFAULT_BATCH_MAX_FILE_BYTES);
+            .unwrap_or(DEFAULT_GREP_CACHE_MAX_FILE_BYTES);
         let max_total_bytes = params
             .get("max_total_bytes")
             .and_then(Value::as_u64)
-            .unwrap_or(DEFAULT_BATCH_MAX_TOTAL_BYTES);
+            .unwrap_or(DEFAULT_GREP_CACHE_MAX_TOTAL_BYTES);
         let response = match self.agent.request_maybe_preemptible_since(
             Request::Grep {
                 query: query.to_string(),
                 limit,
                 after: after.clone(),
                 max_files,
+                max_file_bytes: Some(max_file_bytes),
+                max_total_bytes: Some(max_total_bytes),
                 session_id: session_id.clone(),
             },
             preempt_epoch,

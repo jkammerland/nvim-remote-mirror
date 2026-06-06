@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 
-pub const PROTOCOL_VERSION: u16 = 4;
+pub const PROTOCOL_VERSION: u16 = 5;
 pub const MAX_FRAME_LEN: usize = 64 * 1024 * 1024;
 pub const MAX_CONFLICT_CONTENT_BYTES: usize = 4 * 1024 * 1024;
 
@@ -153,6 +153,8 @@ pub enum Request {
         limit: usize,
         after: Option<String>,
         max_files: Option<usize>,
+        max_file_bytes: Option<u64>,
+        max_total_bytes: Option<u64>,
         session_id: Option<String>,
     },
     WriteFileCas {
@@ -410,6 +412,8 @@ mod tests {
                 limit: 50,
                 after: Some("src/lib.rs".to_string()),
                 max_files: Some(128),
+                max_file_bytes: Some(512 * 1024),
+                max_total_bytes: Some(8 * 1024 * 1024),
                 session_id: Some("grep-7".to_string()),
             },
         };

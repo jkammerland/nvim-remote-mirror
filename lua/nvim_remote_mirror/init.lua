@@ -25,6 +25,8 @@ M.config = {
   find_limit = 200,
   grep_limit = 200,
   grep_remote_page_files = 512,
+  grep_remote_max_file_bytes = 512 * 1024,
+  grep_remote_max_total_bytes = 8 * 1024 * 1024,
   grep_cache_max_files = 2000,
   grep_cache_max_file_bytes = 512 * 1024,
   grep_cache_max_total_bytes = 8 * 1024 * 1024,
@@ -1550,8 +1552,8 @@ function M.grep(query)
       session_id = session_id,
       max_files = grep_remote_page_files,
       hydrate = true,
-      max_file_bytes = M.config.prefetch_max_file_bytes,
-      max_total_bytes = M.config.prefetch_max_total_bytes,
+      max_file_bytes = M.config.grep_remote_max_file_bytes,
+      max_total_bytes = M.config.grep_remote_max_total_bytes,
     }, function(err, result)
       if not is_current() then
         return

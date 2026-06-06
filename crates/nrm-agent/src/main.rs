@@ -17,7 +17,27 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[cfg(test)]
 thread_local! {
     static FILE_META_CALLS: Cell<usize> = const { Cell::new(0) };
+    static FILE_CONTENT_READS: Cell<usize> = const { Cell::new(0) };
 }
+
+#[derive(Debug)]
+struct BatchTotalCapExceeded {
+    path: String,
+    file_size: u64,
+    remaining_total_bytes: u64,
+}
+
+impl std::fmt::Display for BatchTotalCapExceeded {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "batch total cap exceeded for {}: file_size={} remaining_total_bytes={}",
+            self.path, self.file_size, self.remaining_total_bytes
+        )
+    }
+}
+
+impl std::error::Error for BatchTotalCapExceeded {}
 
 struct AgentState {
     root: PathBuf,
@@ -178,14 +198,18 @@ fn handle_request(state: &mut AgentState, request: Request) -> Result<Response> 
             limit,
             after,
             max_files,
+            max_file_bytes,
+            max_total_bytes,
             session_id,
-        } => grep(
+        } => grep_with_caps(
             state,
             &query,
             limit,
             after.as_deref(),
             max_files,
             session_id.as_deref(),
+            max_file_bytes,
+            max_total_bytes,
         ),
         Request::WriteFileCas {
             path,
@@ -293,26 +317,24 @@ fn read_files(
     let mut truncated = false;
 
     for path in paths {
-        match read_file_for_batch(root, &path, max_file_bytes) {
+        let remaining_total_bytes = max_total_bytes.saturating_sub(total_bytes);
+        match read_file_for_batch(root, &path, max_file_bytes, remaining_total_bytes) {
             Ok(file) => {
                 let next_total = total_bytes.saturating_add(file.content.len() as u64);
-                if next_total > max_total_bytes {
-                    errors.push(BatchReadError {
-                        path,
-                        message: format!(
-                            "batch total cap exceeded: next_total={next_total} max_total_bytes={max_total_bytes}"
-                        ),
-                    });
-                    truncated = true;
-                    break;
-                }
                 total_bytes = next_total;
                 files.push(file);
             }
-            Err(error) => errors.push(BatchReadError {
-                path,
-                message: error.to_string(),
-            }),
+            Err(error) => {
+                let total_cap_exceeded = error.downcast_ref::<BatchTotalCapExceeded>().is_some();
+                errors.push(BatchReadError {
+                    path,
+                    message: error.to_string(),
+                });
+                if total_cap_exceeded {
+                    truncated = true;
+                    break;
+                }
+            }
         }
     }
 
@@ -354,7 +376,12 @@ fn validate_one_file(root: &Path, path: &str, include_hash: bool) -> Result<Batc
     })
 }
 
-fn read_file_for_batch(root: &Path, path: &str, max_file_bytes: u64) -> Result<BatchReadFile> {
+fn read_file_for_batch(
+    root: &Path,
+    path: &str,
+    max_file_bytes: u64,
+    remaining_total_bytes: u64,
+) -> Result<BatchReadFile> {
     let abs = resolve_remote_path(root, path)?;
     if !abs.is_file() {
         bail!("{path} is not a regular file");
@@ -367,8 +394,16 @@ fn read_file_for_batch(root: &Path, path: &str, max_file_bytes: u64) -> Result<B
             metadata.len()
         );
     }
+    if metadata.len() > remaining_total_bytes {
+        return Err(BatchTotalCapExceeded {
+            path: path.to_string(),
+            file_size: metadata.len(),
+            remaining_total_bytes,
+        }
+        .into());
+    }
 
-    let content = fs::read(&abs)?;
+    let content = read_file_bytes_with_cap(&abs, max_file_bytes.min(remaining_total_bytes))?;
     let hash = hash_bytes(&content);
     let mut meta = file_meta(root, &abs, false)?;
     meta.hash = Some(hash.clone());
@@ -380,6 +415,26 @@ fn read_file_for_batch(root: &Path, path: &str, max_file_bytes: u64) -> Result<B
     })
 }
 
+fn read_file_bytes_with_cap(path: &Path, max_bytes: u64) -> Result<Vec<u8>> {
+    #[cfg(test)]
+    FILE_CONTENT_READS.with(|reads| reads.set(reads.get() + 1));
+
+    let file = File::open(path)?;
+    let mut content = Vec::new();
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut content)?;
+    if content.len() as u64 > max_bytes {
+        bail!(
+            "{} exceeded read cap: read_at_least={} max_bytes={}",
+            path.display(),
+            content.len(),
+            max_bytes
+        );
+    }
+    Ok(content)
+}
+
+#[cfg(test)]
 fn grep(
     state: &mut AgentState,
     query: &str,
@@ -387,6 +442,21 @@ fn grep(
     after: Option<&str>,
     max_files: Option<usize>,
     session_id: Option<&str>,
+) -> Result<Response> {
+    grep_with_caps(
+        state, query, limit, after, max_files, session_id, None, None,
+    )
+}
+
+fn grep_with_caps(
+    state: &mut AgentState,
+    query: &str,
+    limit: usize,
+    after: Option<&str>,
+    max_files: Option<usize>,
+    session_id: Option<&str>,
+    max_file_bytes: Option<u64>,
+    max_total_bytes: Option<u64>,
 ) -> Result<Response> {
     if query.is_empty() || limit == 0 {
         if let Some(session_id) = session_id {
@@ -423,8 +493,12 @@ fn grep(
     let mut next_after = None;
     let mut scanned_files = 0_usize;
     let max_files = max_files.unwrap_or(usize::MAX).max(1);
+    let max_file_bytes = max_file_bytes.unwrap_or(u64::MAX);
+    let max_total_bytes = max_total_bytes.unwrap_or(u64::MAX);
+    let mut scanned_bytes = 0_u64;
     let mut exhausted = false;
     let mut hit_limit_reached = false;
+    let mut byte_limit_reached = false;
 
     while scanned_files < max_files {
         let Some(entry) = walk.next() else {
@@ -445,10 +519,32 @@ fn grep(
         }
         scanned_files += 1;
         next_after = Some(relative.clone());
+        let metadata = match fs::metadata(path) {
+            Ok(metadata) => metadata,
+            Err(_) => continue,
+        };
+        if metadata.len() > max_file_bytes {
+            byte_limit_reached = true;
+            continue;
+        }
+        let remaining_total_bytes = max_total_bytes.saturating_sub(scanned_bytes);
+        if metadata.len() > remaining_total_bytes {
+            byte_limit_reached = true;
+            break;
+        }
         if likely_binary(path)? {
             continue;
         }
-        let text = match fs::read_to_string(path) {
+        let content =
+            match read_file_bytes_with_cap(path, max_file_bytes.min(remaining_total_bytes)) {
+                Ok(content) => content,
+                Err(_) => {
+                    byte_limit_reached = true;
+                    continue;
+                }
+            };
+        scanned_bytes = scanned_bytes.saturating_add(content.len() as u64);
+        let text = match String::from_utf8(content) {
             Ok(text) => text,
             Err(_) => continue,
         };
@@ -476,7 +572,8 @@ fn grep(
         bail!("grep cursor not found");
     }
 
-    let truncated = hit_limit_reached || (!exhausted && scanned_files >= max_files);
+    let truncated =
+        hit_limit_reached || byte_limit_reached || (!exhausted && scanned_files >= max_files);
     let response_session_id = if truncated && next_after.is_some() {
         let id = active_session_id.take().unwrap_or_else(|| {
             let id = format!("grep-{}", state.next_grep_session);
@@ -1011,6 +1108,48 @@ mod tests {
     }
 
     #[test]
+    fn read_files_stops_before_reading_file_that_exceeds_remaining_total_cap() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.txt"), "1234").unwrap();
+        fs::write(root.join("b.txt"), "56789").unwrap();
+
+        FILE_CONTENT_READS.with(|reads| reads.set(0));
+        let response =
+            read_files(root, vec!["a.txt".to_string(), "b.txt".to_string()], 10, 4).unwrap();
+
+        match response {
+            Response::ReadFiles {
+                files,
+                errors,
+                truncated,
+            } => {
+                assert!(truncated);
+                assert_eq!(files.len(), 1);
+                assert_eq!(files[0].path, "a.txt");
+                assert_eq!(errors.len(), 1);
+                assert_eq!(errors[0].path, "b.txt");
+                assert!(errors[0].message.contains("remaining_total_bytes=0"));
+                assert_eq!(FILE_CONTENT_READS.with(Cell::get), 1);
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bounded_file_read_rejects_content_above_cap() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("large.txt");
+        fs::write(&path, "abcdef").unwrap();
+
+        FILE_CONTENT_READS.with(|reads| reads.set(0));
+        let error = read_file_bytes_with_cap(&path, 5).unwrap_err().to_string();
+
+        assert!(error.contains("exceeded read cap"));
+        assert_eq!(FILE_CONTENT_READS.with(Cell::get), 1);
+    }
+
+    #[test]
     fn read_file_only_hashes_final_chunk() {
         let dir = tempdir().unwrap();
         let root = dir.path();
@@ -1271,6 +1410,119 @@ mod tests {
         assert_eq!(next_after.as_deref(), Some("a.txt"));
         assert_eq!(session_id.as_deref(), Some("grep-1"));
         assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn grep_searches_file_exactly_at_byte_cap() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.txt"), "needle").unwrap();
+
+        let mut state = test_state(root);
+        FILE_CONTENT_READS.with(|reads| reads.set(0));
+        let response = grep_with_caps(
+            &mut state,
+            "needle",
+            10,
+            None,
+            Some(10),
+            None,
+            Some(6),
+            Some(6),
+        )
+        .unwrap();
+
+        let Response::Grep {
+            hits,
+            truncated,
+            scanned_files,
+            ..
+        } = response
+        else {
+            panic!("unexpected grep response");
+        };
+        assert!(!truncated);
+        assert_eq!(scanned_files, 1);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path, "a.txt");
+        assert_eq!(FILE_CONTENT_READS.with(Cell::get), 1);
+    }
+
+    #[test]
+    fn grep_skips_file_above_byte_cap_without_reading_content() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("large.txt"), "needle").unwrap();
+
+        let mut state = test_state(root);
+        FILE_CONTENT_READS.with(|reads| reads.set(0));
+        let response = grep_with_caps(
+            &mut state,
+            "needle",
+            10,
+            None,
+            Some(10),
+            None,
+            Some(5),
+            Some(1024),
+        )
+        .unwrap();
+
+        let Response::Grep {
+            hits,
+            truncated,
+            next_after,
+            session_id,
+            scanned_files,
+        } = response
+        else {
+            panic!("unexpected grep response");
+        };
+        assert!(truncated);
+        assert_eq!(scanned_files, 1);
+        assert_eq!(next_after.as_deref(), Some("large.txt"));
+        assert!(session_id.is_some());
+        assert!(hits.is_empty());
+        assert_eq!(FILE_CONTENT_READS.with(Cell::get), 0);
+    }
+
+    #[test]
+    fn grep_total_byte_cap_stops_before_reading_next_file() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.txt"), "miss").unwrap();
+        fs::write(root.join("b.txt"), "needle").unwrap();
+
+        let mut state = test_state(root);
+        FILE_CONTENT_READS.with(|reads| reads.set(0));
+        let response = grep_with_caps(
+            &mut state,
+            "needle",
+            10,
+            None,
+            Some(10),
+            None,
+            Some(10),
+            Some(4),
+        )
+        .unwrap();
+
+        let Response::Grep {
+            hits,
+            truncated,
+            next_after,
+            session_id,
+            scanned_files,
+        } = response
+        else {
+            panic!("unexpected grep response");
+        };
+        assert!(truncated);
+        assert_eq!(scanned_files, 2);
+        assert_eq!(next_after.as_deref(), Some("b.txt"));
+        assert!(session_id.is_some());
+        assert!(hits.is_empty());
+        assert_eq!(FILE_CONTENT_READS.with(Cell::get), 1);
     }
 
     #[test]

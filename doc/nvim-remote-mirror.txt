@@ -110,6 +110,8 @@ CONFIGURATION                                  *nvim-remote-mirror-config*
     find_limit = 200,
     grep_limit = 200,
     grep_remote_page_files = 512,
+    grep_remote_max_file_bytes = 512 * 1024,
+    grep_remote_max_total_bytes = 8 * 1024 * 1024,
     grep_cache_max_files = 2000,
     grep_cache_max_file_bytes = 512 * 1024,
     grep_cache_max_total_bytes = 8 * 1024 * 1024,
@@ -157,9 +159,12 @@ background_mirror controls the idle mirror builder; set it false and use
 scans metadata, hydrates a tiny clean-file batch, then validates a tiny
 oldest-check cached-file batch against the remote checksum. The metadata scan
 cursor is persisted across reconnects.
-grep_remote_page_files bounds each remote grep page by scanned files. Consecutive
-remote pages use a live agent continuation session when possible, and keep a
-path cursor as a restart fallback.
+grep_remote_page_files bounds each remote grep page by scanned files.
+grep_remote_max_file_bytes skips oversized remote files without reading their
+contents, and grep_remote_max_total_bytes stops a page before large no-hit
+searches can monopolize the SSH worker. Consecutive remote pages use a live
+agent continuation session when possible, and keep a path cursor as a restart
+fallback.
 recover_local_edits_on_connect scans hydrated local mirror files after reconnect
 and queues snapshots for changed bytes that were saved while the sidecar was
 unavailable, including crash-surviving saves that were never replayed from Lua
