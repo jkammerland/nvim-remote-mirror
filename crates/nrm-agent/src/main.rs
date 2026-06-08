@@ -9,10 +9,11 @@ use nrm_protocol::{
 #[cfg(test)]
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
+use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -64,17 +65,26 @@ struct PendingUpload {
     content_hash: String,
     size: u64,
     tmp_path: PathBuf,
+    tmp_name: OsString,
+    tmp_file: File,
+    parent: WriteParent,
     written: u64,
     _lock: WriteLock,
 }
 
 struct WriteTarget {
     abs: PathBuf,
+    parent_abs: PathBuf,
 }
 
 struct WriteLock {
     #[cfg(unix)]
     _file: File,
+}
+
+struct WriteParent {
+    #[cfg(unix)]
+    dir: File,
 }
 
 struct ActiveWriteRelease<'a> {
@@ -307,7 +317,7 @@ fn read_file(root: &Path, path: String, offset: u64, len: Option<u64>) -> Result
     let mut content = vec![0_u8; read_len as usize];
     file.read_exact(&mut content)?;
     let eof = offset + read_len >= file_len;
-    let mut meta = file_meta(root, &abs, false)?;
+    let mut meta = file_meta_for_response_path(root, &abs, &path, false)?;
     let hash = if eof {
         let hash = hash_file(&abs)?;
         meta.hash = Some(hash.clone());
@@ -423,7 +433,7 @@ fn read_file_for_batch(
 
     let content = read_file_bytes_with_cap(&abs, max_file_bytes.min(remaining_total_bytes))?;
     let hash = hash_bytes(&content);
-    let mut meta = file_meta(root, &abs, false)?;
+    let mut meta = file_meta_for_response_path(root, &abs, path, false)?;
     meta.hash = Some(hash.clone());
     Ok(BatchReadFile {
         path: path.to_string(),
@@ -703,6 +713,7 @@ fn write_file_cas_prepared(
     _lock: WriteLock,
     before_rename: impl FnOnce() -> Result<()>,
 ) -> Result<Response> {
+    let parent = open_write_parent(root, &target)?;
     let actual_hash = current_regular_file_hash(root, &path, &target.abs)?;
     if actual_hash != expected_hash {
         return Ok(Response::WriteFileCas {
@@ -722,18 +733,28 @@ fn write_file_cas_prepared(
             .unwrap_or_default()
             .as_nanos()
     ));
-    {
-        let mut file = File::create(&tmp)?;
-        file.write_all(&content)?;
-        file.sync_all()?;
+    let tmp_name = temp_file_name(&tmp)?;
+    verify_write_parent_current(root, &parent, &target)?;
+    let mut file = create_temp_file(&parent, &tmp, &tmp_name)?;
+    if let Err(error) = file.write_all(&content).and_then(|_| file.sync_all()) {
+        let _ = remove_temp_file(&parent, &tmp, &tmp_name);
+        return Err(error).with_context(|| format!("failed to write temp file {}", tmp.display()));
+    }
+    if let Err(error) = verify_temp_file_identity(&file, &tmp) {
+        let _ = remove_temp_file(&parent, &tmp, &tmp_name);
+        return Err(error);
     }
     if let Err(error) = before_rename() {
-        let _ = fs::remove_file(&tmp);
+        let _ = remove_temp_file(&parent, &tmp, &tmp_name);
+        return Err(error);
+    }
+    if let Err(error) = verify_write_parent_current(root, &parent, &target) {
+        let _ = remove_temp_file(&parent, &tmp, &tmp_name);
         return Err(error);
     }
     let actual_hash = current_regular_file_hash(root, &path, &target.abs)?;
     if actual_hash != expected_hash {
-        let _ = fs::remove_file(&tmp);
+        let _ = remove_temp_file(&parent, &tmp, &tmp_name);
         return Ok(Response::WriteFileCas {
             outcome: SaveOutcome::Conflict(save_conflict(
                 path,
@@ -743,8 +764,18 @@ fn write_file_cas_prepared(
             )),
         });
     }
-    fs::rename(&tmp, &target.abs)?;
-    sync_parent_dir(&target.abs)?;
+    if let Err(error) = verify_write_parent_current(root, &parent, &target) {
+        let _ = remove_temp_file(&parent, &tmp, &tmp_name);
+        return Err(error);
+    }
+    if let Err(error) = verify_temp_file_identity(&file, &tmp) {
+        let _ = remove_temp_file(&parent, &tmp, &tmp_name);
+        return Err(error);
+    }
+    #[cfg(not(unix))]
+    drop(file);
+    rename_temp_into_target(&parent, &tmp, &tmp_name, &target)?;
+    sync_write_parent(&parent, &target.abs)?;
     let new_hash = hash_file(&target.abs)?;
     let meta = file_meta(root, &target.abs, true)?;
 
@@ -769,6 +800,7 @@ fn begin_write_file_cas(
     let target_key = write_target_key(&state.root, &target.abs);
     ensure_no_active_write(&state.active_write_targets, &target_key, &path)?;
     let lock = acquire_write_lock(&target_key, &path)?;
+    let parent = open_write_parent(&state.root, &target)?;
     let actual_hash = current_regular_file_hash(&state.root, &path, &target.abs)?;
 
     if actual_hash != expected_hash {
@@ -791,7 +823,9 @@ fn begin_write_file_cas(
         hash_bytes(path.as_bytes())
     );
     let tmp_path = target.abs.with_extension(format!("nrm-upload-{upload_id}"));
-    File::create(&tmp_path)?;
+    let tmp_name = temp_file_name(&tmp_path)?;
+    verify_write_parent_current(&state.root, &parent, &target)?;
+    let tmp_file = create_temp_file(&parent, &tmp_path, &tmp_name)?;
     state.active_write_targets.insert(target_key.clone());
     state.uploads.insert(
         upload_id.clone(),
@@ -803,6 +837,9 @@ fn begin_write_file_cas(
             content_hash,
             size,
             tmp_path,
+            tmp_name,
+            tmp_file,
+            parent,
             written: 0,
             _lock: lock,
         },
@@ -837,9 +874,8 @@ fn write_file_chunk(
         );
     }
 
-    let mut file = fs::OpenOptions::new().write(true).open(&upload.tmp_path)?;
-    file.seek(SeekFrom::Start(offset))?;
-    file.write_all(&content)?;
+    upload.tmp_file.seek(SeekFrom::Start(offset))?;
+    upload.tmp_file.write_all(&content)?;
     upload.written = next;
 
     Ok(Response::WriteFileChunk {
@@ -853,53 +889,92 @@ fn finish_write_file_cas(state: &mut AgentState, upload_id: String) -> Result<Re
         .uploads
         .remove(&upload_id)
         .ok_or_else(|| anyhow::anyhow!("unknown upload id {upload_id}"))?;
+    let PendingUpload {
+        path,
+        target_abs,
+        target_key,
+        expected_hash,
+        content_hash,
+        size,
+        tmp_path,
+        tmp_name,
+        mut tmp_file,
+        parent,
+        written,
+        _lock: write_lock,
+    } = upload;
+    let _write_lock = write_lock;
     let root = state.root.clone();
     let _active_release = ActiveWriteRelease {
         active: &mut state.active_write_targets,
-        key: upload.target_key.clone(),
+        key: target_key,
     };
-    if upload.written != upload.size {
-        let _ = fs::remove_file(&upload.tmp_path);
+    if written != size {
+        let _ = remove_temp_file(&parent, &tmp_path, &tmp_name);
         bail!(
             "upload {upload_id} incomplete: written={} size={}",
-            upload.written,
-            upload.size
+            written,
+            size
         );
     }
 
-    let tmp_hash = hash_file(&upload.tmp_path)?;
-    if tmp_hash != upload.content_hash {
-        let _ = fs::remove_file(&upload.tmp_path);
+    if let Err(error) = tmp_file.sync_all() {
+        let _ = remove_temp_file(&parent, &tmp_path, &tmp_name);
+        return Err(error).context(format!("failed to sync upload {upload_id} temp file"));
+    }
+    let tmp_hash = match hash_open_file(&mut tmp_file) {
+        Ok(hash) => hash,
+        Err(error) => {
+            let _ = remove_temp_file(&parent, &tmp_path, &tmp_name);
+            return Err(error);
+        }
+    };
+    if tmp_hash != content_hash {
+        let _ = remove_temp_file(&parent, &tmp_path, &tmp_name);
         bail!(
             "upload {upload_id} hash mismatch: expected={} actual={tmp_hash}",
-            upload.content_hash
+            content_hash
         );
     }
+    if let Err(error) = verify_temp_file_identity(&tmp_file, &tmp_path) {
+        let _ = remove_temp_file(&parent, &tmp_path, &tmp_name);
+        return Err(error);
+    }
 
-    let actual_hash = current_regular_file_hash(&root, &upload.path, &upload.target_abs)?;
-    if actual_hash != upload.expected_hash {
-        let _ = fs::remove_file(&upload.tmp_path);
+    if let Err(error) = verify_write_parent_current_path(&root, &parent, &target_abs) {
+        let _ = remove_temp_file(&parent, &tmp_path, &tmp_name);
+        return Err(error);
+    }
+    let actual_hash = current_regular_file_hash(&root, &path, &target_abs)?;
+    if actual_hash != expected_hash {
+        let _ = remove_temp_file(&parent, &tmp_path, &tmp_name);
         return Ok(Response::FinishWriteFileCas {
             outcome: SaveOutcome::Conflict(save_conflict(
-                upload.path,
-                upload.expected_hash,
+                path,
+                expected_hash,
                 actual_hash,
-                &upload.target_abs,
+                &target_abs,
             )),
         });
     }
 
-    {
-        let file = File::open(&upload.tmp_path)?;
-        file.sync_all()?;
+    if let Err(error) = verify_write_parent_current_path(&root, &parent, &target_abs) {
+        let _ = remove_temp_file(&parent, &tmp_path, &tmp_name);
+        return Err(error);
     }
-    fs::rename(&upload.tmp_path, &upload.target_abs)?;
-    sync_parent_dir(&upload.target_abs)?;
-    let meta = file_meta(&root, &upload.target_abs, true)?;
+    if let Err(error) = verify_temp_file_identity(&tmp_file, &tmp_path) {
+        let _ = remove_temp_file(&parent, &tmp_path, &tmp_name);
+        return Err(error);
+    }
+    #[cfg(not(unix))]
+    drop(tmp_file);
+    rename_temp_into_path(&parent, &tmp_path, &tmp_name, &target_abs)?;
+    sync_write_parent(&parent, &target_abs)?;
+    let meta = file_meta(&root, &target_abs, true)?;
 
     Ok(Response::FinishWriteFileCas {
         outcome: SaveOutcome::Applied(SaveApplied {
-            path: upload.path,
+            path,
             new_hash: tmp_hash,
             size: meta.size,
             mtime_ms: meta.mtime_ms,
@@ -909,7 +984,7 @@ fn finish_write_file_cas(state: &mut AgentState, upload_id: String) -> Result<Re
 
 fn abort_write_file_cas(state: &mut AgentState, upload_id: String) -> Result<Response> {
     if let Some(upload) = state.uploads.remove(&upload_id) {
-        let _ = fs::remove_file(upload.tmp_path);
+        let _ = remove_temp_file(&upload.parent, &upload.tmp_path, &upload.tmp_name);
         state.active_write_targets.remove(&upload.target_key);
     }
     Ok(Response::AbortWriteFileCas { upload_id })
@@ -958,7 +1033,7 @@ fn existing_metadata_path(root: &Path, abs: &Path) -> Result<Option<PathBuf>> {
             ensure_path_within_root(root, &canonical)?;
             Ok(Some(abs.to_path_buf()))
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) if is_missing_path_error(&error) => Ok(None),
         Err(error) => Err(error).with_context(|| format!("failed to stat {}", abs.display())),
     }
 }
@@ -1006,7 +1081,8 @@ fn prepare_write_target(root: &Path, path: &str) -> Result<WriteTarget> {
         .with_context(|| format!("failed to resolve parent for {path}"))?;
     ensure_path_within_root(root, &canonical_parent)?;
     Ok(WriteTarget {
-        abs: canonical_parent.join(file_name),
+        abs: canonical_parent.join(&file_name),
+        parent_abs: canonical_parent,
     })
 }
 
@@ -1040,9 +1116,108 @@ fn current_regular_file_hash(root: &Path, path: &str, abs: &Path) -> Result<Opti
             ensure_path_within_root(root, &canonical)?;
             Ok(Some(hash_file(&canonical)?))
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) if is_missing_path_error(&error) => Ok(None),
         Err(error) => Err(error).with_context(|| format!("failed to stat {path}")),
     }
+}
+
+fn is_missing_path_error(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+    )
+}
+
+fn ensure_target_parent_inside_root(root: &Path, target_abs: &Path) -> Result<()> {
+    let parent = target_abs
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("remote path must have a parent directory"))?;
+    let metadata = fs::metadata(parent)
+        .with_context(|| format!("failed to stat parent {}", parent.display()))?;
+    if !metadata.is_dir() {
+        bail!("remote path parent {} is not a directory", parent.display());
+    }
+    let canonical_parent = parent
+        .canonicalize()
+        .with_context(|| format!("failed to resolve parent {}", parent.display()))?;
+    ensure_path_within_root(root, &canonical_parent)
+}
+
+fn open_write_parent(root: &Path, target: &WriteTarget) -> Result<WriteParent> {
+    ensure_target_parent_inside_root(root, &target.abs)?;
+    #[cfg(unix)]
+    {
+        let dir = open_parent_dir(&target.parent_abs)?;
+        verify_parent_dir_identity(&dir, &target.parent_abs)?;
+        Ok(WriteParent { dir })
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(WriteParent {})
+    }
+}
+
+#[cfg(unix)]
+fn open_parent_dir(path: &Path) -> Result<File> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .context("parent path contains a NUL byte")?;
+    let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
+    // SAFETY: `path` is a valid NUL-terminated pathname.
+    let fd = unsafe { libc::open(path.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error()).context("failed to open parent directory");
+    }
+    // SAFETY: open returned an owned file descriptor on success.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+#[cfg(unix)]
+fn verify_parent_dir_identity(dir: &File, path: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let handle_metadata = dir
+        .metadata()
+        .with_context(|| format!("failed to stat open parent {}", path.display()))?;
+    let path_metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to stat parent path {}", path.display()))?;
+    if !path_metadata.is_dir() {
+        bail!("parent path {} is not a directory", path.display());
+    }
+    if handle_metadata.dev() != path_metadata.dev() || handle_metadata.ino() != path_metadata.ino()
+    {
+        bail!("parent path {} was replaced", path.display());
+    }
+    Ok(())
+}
+
+fn verify_write_parent_current(
+    root: &Path,
+    parent: &WriteParent,
+    target: &WriteTarget,
+) -> Result<()> {
+    verify_write_parent_current_path(root, parent, &target.abs)
+}
+
+fn verify_write_parent_current_path(
+    root: &Path,
+    parent: &WriteParent,
+    target_abs: &Path,
+) -> Result<()> {
+    ensure_target_parent_inside_root(root, target_abs)?;
+    #[cfg(unix)]
+    {
+        let parent_abs = target_abs
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("remote path must have a parent directory"))?;
+        verify_parent_dir_identity(&parent.dir, parent_abs)?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = parent;
+    }
+    Ok(())
 }
 
 fn ensure_path_within_root(root: &Path, path: &Path) -> Result<()> {
@@ -1081,13 +1256,13 @@ fn acquire_write_lock(target_key: &str, path: &str) -> Result<WriteLock> {
         .with_context(|| format!("failed to open write lock {}", lock_path.display()))?;
     // SAFETY: flock only uses the valid file descriptor borrowed from `file`;
     // the file is kept alive in WriteLock until the critical section ends.
-    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if result != 0 {
-        bail!(
-            "failed to lock remote write {}: {}",
-            path,
-            io::Error::last_os_error()
-        );
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::WouldBlock {
+            bail!("remote write already in progress for {path}");
+        }
+        bail!("failed to lock remote write {}: {}", path, error);
     }
     Ok(WriteLock { _file: file })
 }
@@ -1102,22 +1277,159 @@ fn resolve_remote_path(root: &Path, path: &str) -> Result<PathBuf> {
     Ok(root.join(relative))
 }
 
-fn sync_parent_dir(path: &Path) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        sync_dir(parent)
-            .with_context(|| format!("failed to sync directory {}", parent.display()))?;
+#[cfg(unix)]
+fn sync_write_parent(parent: &WriteParent, path: &Path) -> Result<()> {
+    parent
+        .dir
+        .sync_all()
+        .with_context(|| format!("failed to sync directory for {}", path.display()))
+}
+
+#[cfg(not(unix))]
+fn sync_write_parent(_parent: &WriteParent, _path: &Path) -> Result<()> {
+    Ok(())
+}
+
+fn temp_file_name(path: &Path) -> Result<OsString> {
+    path.file_name()
+        .map(OsStr::to_owned)
+        .ok_or_else(|| anyhow::anyhow!("temp path must name a file"))
+}
+
+#[cfg(unix)]
+fn c_path_name(name: &OsStr) -> Result<std::ffi::CString> {
+    use std::os::unix::ffi::OsStrExt;
+
+    std::ffi::CString::new(name.as_bytes()).context("path component contains a NUL byte")
+}
+
+#[cfg(unix)]
+fn create_temp_file(parent: &WriteParent, path: &Path, name: &OsStr) -> Result<File> {
+    let name = c_path_name(name)?;
+    let flags = libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC;
+    // SAFETY: `name` is a valid NUL-terminated path component. `parent.dir`
+    // remains open for the call and pins the directory used by openat.
+    let fd = unsafe { libc::openat(parent.dir.as_raw_fd(), name.as_ptr(), flags, 0o600) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error())
+            .with_context(|| format!("failed to create temp file {}", path.display()));
+    }
+    // SAFETY: openat returned an owned file descriptor on success.
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+#[cfg(not(unix))]
+fn create_temp_file(_parent: &WriteParent, path: &Path, _name: &OsStr) -> Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .with_context(|| format!("failed to create temp file {}", path.display()))
+}
+
+#[cfg(unix)]
+fn remove_temp_file(parent: &WriteParent, _path: &Path, name: &OsStr) -> Result<()> {
+    let name = c_path_name(name)?;
+    // SAFETY: `name` is a valid NUL-terminated path component. `parent.dir`
+    // remains open for the call and pins the directory used by unlinkat.
+    let result = unsafe { libc::unlinkat(parent.dir.as_raw_fd(), name.as_ptr(), 0) };
+    if result != 0 {
+        return Err(io::Error::last_os_error()).context("failed to remove temp file");
     }
     Ok(())
 }
 
+#[cfg(not(unix))]
+fn remove_temp_file(_parent: &WriteParent, path: &Path, _name: &OsStr) -> Result<()> {
+    fs::remove_file(path).with_context(|| format!("failed to remove temp file {}", path.display()))
+}
+
+fn rename_temp_into_target(
+    parent: &WriteParent,
+    tmp_path: &Path,
+    tmp_name: &OsStr,
+    target: &WriteTarget,
+) -> Result<()> {
+    rename_temp_into_path(parent, tmp_path, tmp_name, &target.abs)
+}
+
 #[cfg(unix)]
-fn sync_dir(path: &Path) -> Result<()> {
-    File::open(path)?.sync_all()?;
+fn rename_temp_into_path(
+    parent: &WriteParent,
+    tmp_path: &Path,
+    tmp_name: &OsStr,
+    target_abs: &Path,
+) -> Result<()> {
+    let tmp_name = c_path_name(tmp_name)?;
+    let target_name = target_abs
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("target path must name a file"))
+        .and_then(c_path_name)?;
+    // SAFETY: both names are valid NUL-terminated path components. The same
+    // pinned parent directory fd is used for source and destination.
+    let result = unsafe {
+        libc::renameat(
+            parent.dir.as_raw_fd(),
+            tmp_name.as_ptr(),
+            parent.dir.as_raw_fd(),
+            target_name.as_ptr(),
+        )
+    };
+    if result != 0 {
+        return Err(io::Error::last_os_error()).with_context(|| {
+            format!(
+                "failed to rename temp file into {} from {}",
+                target_abs.display(),
+                tmp_path.display()
+            )
+        });
+    }
     Ok(())
 }
 
 #[cfg(not(unix))]
-fn sync_dir(_path: &Path) -> Result<()> {
+fn rename_temp_into_path(
+    _parent: &WriteParent,
+    tmp_path: &Path,
+    _tmp_name: &OsStr,
+    target_abs: &Path,
+) -> Result<()> {
+    fs::rename(tmp_path, target_abs).with_context(|| {
+        format!(
+            "failed to rename temp file into {} from {}",
+            target_abs.display(),
+            tmp_path.display()
+        )
+    })
+}
+
+#[cfg(unix)]
+fn verify_temp_file_identity(file: &File, path: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let handle_metadata = file
+        .metadata()
+        .with_context(|| format!("failed to stat open temp file {}", path.display()))?;
+    let path_metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to stat temp path {}", path.display()))?;
+    if !path_metadata.is_file() {
+        bail!("temp path {} is not a regular file", path.display());
+    }
+    if handle_metadata.dev() != path_metadata.dev() || handle_metadata.ino() != path_metadata.ino()
+    {
+        bail!("temp path {} was replaced during upload", path.display());
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn verify_temp_file_identity(_file: &File, path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to stat temp path {}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!("temp path {} is not a regular file", path.display());
+    }
     Ok(())
 }
 
@@ -1167,6 +1479,17 @@ fn file_meta(root: &Path, path: &Path, include_hash: bool) -> Result<FileMeta> {
     })
 }
 
+fn file_meta_for_response_path(
+    root: &Path,
+    path: &Path,
+    response_path: &str,
+    include_hash: bool,
+) -> Result<FileMeta> {
+    let mut meta = file_meta(root, path, include_hash)?;
+    meta.path = response_path.to_string();
+    Ok(meta)
+}
+
 fn relative_path(root: &Path, path: &Path) -> Result<String> {
     let relative = path.strip_prefix(root)?;
     Ok(relative.to_string_lossy().replace('\\', "/"))
@@ -1174,6 +1497,11 @@ fn relative_path(root: &Path, path: &Path) -> Result<String> {
 
 fn hash_file(path: &Path) -> Result<String> {
     let mut file = File::open(path)?;
+    hash_open_file(&mut file)
+}
+
+fn hash_open_file(file: &mut File) -> Result<String> {
+    file.seek(SeekFrom::Start(0))?;
     let mut hasher = blake3::Hasher::new();
     let mut buffer = [0_u8; 64 * 1024];
     loop {
@@ -1183,6 +1511,7 @@ fn hash_file(path: &Path) -> Result<String> {
         }
         hasher.update(&buffer[..read]);
     }
+    file.seek(SeekFrom::Start(0))?;
     Ok(hasher.finalize().to_hex().to_string())
 }
 
@@ -1304,6 +1633,109 @@ mod tests {
         .to_string();
 
         assert!(error.contains("resolves outside remote root"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stat_and_validate_reject_symlink_parent_escape() {
+        let dir = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        fs::write(outside.path().join("secret.txt"), "secret").unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("link")).unwrap();
+        let mut state = test_state(dir.path());
+
+        let stat_error = handle_request(
+            &mut state,
+            Request::Stat {
+                path: "link/secret.txt".to_string(),
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(stat_error.contains("resolves outside remote root"));
+
+        let response =
+            validate_files(dir.path(), vec!["link/secret.txt".to_string()], true).unwrap();
+        match response {
+            Response::ValidateFiles { files, errors } => {
+                assert!(files.is_empty());
+                assert_eq!(errors.len(), 1);
+                assert!(errors[0].message.contains("resolves outside remote root"));
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn metadata_apis_treat_nested_path_under_file_as_missing() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("dir"), "not a directory").unwrap();
+        let mut state = test_state(root);
+
+        let stat = handle_request(
+            &mut state,
+            Request::Stat {
+                path: "dir/file.txt".to_string(),
+            },
+        )
+        .unwrap();
+        match stat {
+            Response::Stat { meta } => assert!(meta.is_none()),
+            other => panic!("unexpected response: {other:?}"),
+        }
+
+        let checksum = handle_request(
+            &mut state,
+            Request::Checksum {
+                path: "dir/file.txt".to_string(),
+            },
+        )
+        .unwrap();
+        match checksum {
+            Response::Checksum { hash, .. } => assert!(hash.is_none()),
+            other => panic!("unexpected response: {other:?}"),
+        }
+
+        let validate = validate_files(root, vec!["dir/file.txt".to_string()], true).unwrap();
+        match validate {
+            Response::ValidateFiles { files, errors } => {
+                assert!(errors.is_empty());
+                assert_eq!(files.len(), 1);
+                assert!(files[0].meta.is_none());
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reads_preserve_requested_path_under_in_root_symlink_parent() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir(root.join("real")).unwrap();
+        fs::write(root.join("real/a.txt"), "content").unwrap();
+        std::os::unix::fs::symlink(root.join("real"), root.join("link")).unwrap();
+
+        let response = read_file(root, "link/a.txt".to_string(), 0, None).unwrap();
+        match response {
+            Response::ReadFile { path, meta, .. } => {
+                assert_eq!(path, "link/a.txt");
+                assert_eq!(meta.path, "link/a.txt");
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+
+        let response = read_files(root, vec!["link/a.txt".to_string()], 1024, 1024).unwrap();
+        match response {
+            Response::ReadFiles { files, errors, .. } => {
+                assert!(errors.is_empty());
+                assert_eq!(files.len(), 1);
+                assert_eq!(files[0].path, "link/a.txt");
+                assert_eq!(files[0].meta.path, "link/a.txt");
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
     }
 
     #[test]
@@ -1997,6 +2429,7 @@ mod tests {
             } => started.upload_id,
             other => panic!("unexpected begin response: {other:?}"),
         };
+        let tmp_path = state.uploads.get(&upload_id).unwrap().tmp_path.clone();
 
         write_file_chunk(&mut state, upload_id.clone(), 0, content).unwrap();
         fs::write(root.join("large.bin"), "external").unwrap();
@@ -2019,6 +2452,8 @@ mod tests {
             "external"
         );
         assert!(state.uploads.is_empty());
+        assert!(state.active_write_targets.is_empty());
+        assert!(!tmp_path.exists());
     }
 
     #[cfg(unix)]
@@ -2061,6 +2496,50 @@ mod tests {
         assert!(error.contains("write already in progress"));
         assert_eq!(state.uploads.len(), 1);
         abort_write_file_cas(&mut state, upload_id).unwrap();
+        assert!(state.uploads.is_empty());
+        assert!(state.active_write_targets.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn chunked_write_does_not_follow_replaced_upload_temp_symlink() {
+        let dir = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let victim = outside.path().join("victim.txt");
+        fs::write(root.join("large.bin"), "old").unwrap();
+        fs::write(&victim, "victim").unwrap();
+        let old_hash = hash_file(&root.join("large.bin")).unwrap();
+        let content = b"new-content".to_vec();
+        let mut state = test_state(&root);
+
+        let begin = begin_write_file_cas(
+            &mut state,
+            "large.bin".to_string(),
+            Some(old_hash),
+            hash_bytes(&content),
+            content.len() as u64,
+        )
+        .unwrap();
+        let upload_id = match begin {
+            Response::BeginWriteFileCas {
+                outcome: WriteStartOutcome::Started(started),
+            } => started.upload_id,
+            other => panic!("unexpected begin response: {other:?}"),
+        };
+        let tmp_path = state.uploads.get(&upload_id).unwrap().tmp_path.clone();
+        fs::remove_file(&tmp_path).unwrap();
+        std::os::unix::fs::symlink(&victim, &tmp_path).unwrap();
+
+        write_file_chunk(&mut state, upload_id.clone(), 0, content).unwrap();
+        assert_eq!(fs::read_to_string(&victim).unwrap(), "victim");
+
+        let error = finish_write_file_cas(&mut state, upload_id)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not a regular file") || error.contains("was replaced"));
+        assert_eq!(fs::read_to_string(root.join("large.bin")).unwrap(), "old");
+        assert!(!tmp_path.exists());
         assert!(state.uploads.is_empty());
         assert!(state.active_write_targets.is_empty());
     }
