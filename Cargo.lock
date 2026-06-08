@@ -438,6 +438,7 @@ dependencies = [
  "blake3",
  "clap",
  "ignore",
+ "libc",
  "nrm-protocol",
  "serde",
  "tempfile",

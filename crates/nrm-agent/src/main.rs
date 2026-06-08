@@ -8,9 +8,11 @@ use nrm_protocol::{
 };
 #[cfg(test)]
 use std::cell::Cell;
-use std::collections::HashMap;
-use std::fs::{self, File};
+use std::collections::{HashMap, HashSet};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -42,6 +44,7 @@ impl std::error::Error for BatchTotalCapExceeded {}
 struct AgentState {
     root: PathBuf,
     uploads: HashMap<String, PendingUpload>,
+    active_write_targets: HashSet<String>,
     grep_sessions: HashMap<String, GrepSession>,
     next_grep_session: u64,
 }
@@ -55,11 +58,34 @@ const MAX_GREP_SESSIONS: usize = 8;
 
 struct PendingUpload {
     path: String,
+    target_abs: PathBuf,
+    target_key: String,
     expected_hash: Option<String>,
     content_hash: String,
     size: u64,
     tmp_path: PathBuf,
     written: u64,
+    _lock: WriteLock,
+}
+
+struct WriteTarget {
+    abs: PathBuf,
+}
+
+struct WriteLock {
+    #[cfg(unix)]
+    _file: File,
+}
+
+struct ActiveWriteRelease<'a> {
+    active: &'a mut HashSet<String>,
+    key: String,
+}
+
+impl Drop for ActiveWriteRelease<'_> {
+    fn drop(&mut self) {
+        self.active.remove(&self.key);
+    }
 }
 
 #[derive(Debug, Parser)]
@@ -91,6 +117,7 @@ fn serve(root: PathBuf) -> Result<()> {
     let mut state = AgentState {
         root,
         uploads: HashMap::new(),
+        active_write_targets: HashSet::new(),
         grep_sessions: HashMap::new(),
         next_grep_session: 1,
     };
@@ -166,8 +193,9 @@ fn handle_request(state: &mut AgentState, request: Request) -> Result<Response> 
         Request::Scan { limit, after } => scan(&state.root, limit, after.as_deref()),
         Request::Stat { path } => {
             let abs = resolve_remote_path(&state.root, &path)?;
+            let meta_path = existing_metadata_path(&state.root, &abs)?;
             Ok(Response::Stat {
-                meta: if abs.exists() {
+                meta: if let Some(abs) = meta_path {
                     Some(file_meta(&state.root, &abs, false)?)
                 } else {
                     None
@@ -176,11 +204,7 @@ fn handle_request(state: &mut AgentState, request: Request) -> Result<Response> 
         }
         Request::Checksum { path } => {
             let abs = resolve_remote_path(&state.root, &path)?;
-            let hash = if abs.is_file() {
-                Some(hash_file(&abs)?)
-            } else {
-                None
-            };
+            let hash = current_regular_file_hash(&state.root, &path, &abs)?;
             Ok(Response::Checksum { path, hash })
         }
         Request::ValidateFiles {
@@ -215,7 +239,7 @@ fn handle_request(state: &mut AgentState, request: Request) -> Result<Response> 
             path,
             expected_hash,
             content,
-        } => write_file_cas(&state.root, path, expected_hash, content),
+        } => write_file_cas_state(state, path, expected_hash, content),
         Request::BeginWriteFileCas {
             path,
             expected_hash,
@@ -270,10 +294,7 @@ fn scan(root: &Path, limit: usize, after: Option<&str>) -> Result<Response> {
 }
 
 fn read_file(root: &Path, path: String, offset: u64, len: Option<u64>) -> Result<Response> {
-    let abs = resolve_remote_path(root, &path)?;
-    if !abs.is_file() {
-        bail!("{path} is not a regular file");
-    }
+    let abs = resolve_existing_content_path(root, &path)?;
 
     let mut file = File::open(&abs)?;
     let file_len = file.metadata()?.len();
@@ -364,12 +385,12 @@ fn validate_files(root: &Path, paths: Vec<String>, include_hash: bool) -> Result
 
 fn validate_one_file(root: &Path, path: &str, include_hash: bool) -> Result<BatchValidateFile> {
     let abs = resolve_remote_path(root, path)?;
-    if !abs.exists() {
+    let Some(abs) = existing_metadata_path(root, &abs)? else {
         return Ok(BatchValidateFile {
             path: path.to_string(),
             meta: None,
         });
-    }
+    };
     Ok(BatchValidateFile {
         path: path.to_string(),
         meta: Some(file_meta(root, &abs, include_hash)?),
@@ -382,10 +403,7 @@ fn read_file_for_batch(
     max_file_bytes: u64,
     remaining_total_bytes: u64,
 ) -> Result<BatchReadFile> {
-    let abs = resolve_remote_path(root, path)?;
-    if !abs.is_file() {
-        bail!("{path} is not a regular file");
-    }
+    let abs = resolve_existing_content_path(root, path)?;
 
     let metadata = fs::metadata(&abs)?;
     if metadata.len() > max_file_bytes {
@@ -506,20 +524,26 @@ fn grep_with_caps(
             break;
         };
         let entry = entry?;
-        let path = entry.path();
-        if !path.is_file() {
+        let Some(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_file() {
             continue;
         }
-        let relative = relative_path(&state.root, path)?;
+        let relative = relative_path(&state.root, entry.path())?;
         if !after_seen {
             if after == Some(relative.as_str()) {
                 after_seen = true;
             }
             continue;
         }
+        let path = match resolve_existing_content_path(&state.root, &relative) {
+            Ok(path) => path,
+            Err(_) => continue,
+        };
         scanned_files += 1;
         next_after = Some(relative.clone());
-        let metadata = match fs::metadata(path) {
+        let metadata = match fs::metadata(&path) {
             Ok(metadata) => metadata,
             Err(_) => continue,
         };
@@ -532,11 +556,11 @@ fn grep_with_caps(
             byte_limit_reached = true;
             break;
         }
-        if likely_binary(path)? {
+        if likely_binary(&path)? {
             continue;
         }
         let content =
-            match read_file_bytes_with_cap(path, max_file_bytes.min(remaining_total_bytes)) {
+            match read_file_bytes_with_cap(&path, max_file_bytes.min(remaining_total_bytes)) {
                 Ok(content) => content,
                 Err(_) => {
                     byte_limit_reached = true;
@@ -617,29 +641,81 @@ fn grep_walk(root: &Path) -> Walk {
         .build()
 }
 
+#[cfg(test)]
 fn write_file_cas(
     root: &Path,
     path: String,
     expected_hash: Option<String>,
     content: Vec<u8>,
 ) -> Result<Response> {
-    let abs = resolve_remote_path(root, &path)?;
-    let actual_hash = if abs.exists() && abs.is_file() {
-        Some(hash_file(&abs)?)
-    } else {
-        None
-    };
+    write_file_cas_inner(root, path, expected_hash, content, || Ok(()))
+}
 
+fn write_file_cas_state(
+    state: &mut AgentState,
+    path: String,
+    expected_hash: Option<String>,
+    content: Vec<u8>,
+) -> Result<Response> {
+    let target = prepare_write_target(&state.root, &path)?;
+    let target_key = write_target_key(&state.root, &target.abs);
+    ensure_no_active_write(&state.active_write_targets, &target_key, &path)?;
+    let lock = acquire_write_lock(&target_key, &path)?;
+    write_file_cas_prepared(
+        &state.root,
+        path,
+        expected_hash,
+        content,
+        target,
+        lock,
+        || Ok(()),
+    )
+}
+
+#[cfg(test)]
+fn write_file_cas_inner(
+    root: &Path,
+    path: String,
+    expected_hash: Option<String>,
+    content: Vec<u8>,
+    before_rename: impl FnOnce() -> Result<()>,
+) -> Result<Response> {
+    let target = prepare_write_target(root, &path)?;
+    let target_key = write_target_key(root, &target.abs);
+    let lock = acquire_write_lock(&target_key, &path)?;
+    write_file_cas_prepared(
+        root,
+        path,
+        expected_hash,
+        content,
+        target,
+        lock,
+        before_rename,
+    )
+}
+
+fn write_file_cas_prepared(
+    root: &Path,
+    path: String,
+    expected_hash: Option<String>,
+    content: Vec<u8>,
+    target: WriteTarget,
+    _lock: WriteLock,
+    before_rename: impl FnOnce() -> Result<()>,
+) -> Result<Response> {
+    let actual_hash = current_regular_file_hash(root, &path, &target.abs)?;
     if actual_hash != expected_hash {
         return Ok(Response::WriteFileCas {
-            outcome: SaveOutcome::Conflict(save_conflict(path, expected_hash, actual_hash, &abs)),
+            outcome: SaveOutcome::Conflict(save_conflict(
+                path,
+                expected_hash,
+                actual_hash,
+                &target.abs,
+            )),
         });
     }
 
-    if let Some(parent) = abs.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let tmp = abs.with_extension(format!(
+    let tmp = target.abs.with_extension(format!(
         "nrm-tmp-{}",
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -651,10 +727,26 @@ fn write_file_cas(
         file.write_all(&content)?;
         file.sync_all()?;
     }
-    fs::rename(&tmp, &abs)?;
-    sync_parent_dir(&abs)?;
-    let new_hash = hash_file(&abs)?;
-    let meta = file_meta(root, &abs, true)?;
+    if let Err(error) = before_rename() {
+        let _ = fs::remove_file(&tmp);
+        return Err(error);
+    }
+    let actual_hash = current_regular_file_hash(root, &path, &target.abs)?;
+    if actual_hash != expected_hash {
+        let _ = fs::remove_file(&tmp);
+        return Ok(Response::WriteFileCas {
+            outcome: SaveOutcome::Conflict(save_conflict(
+                path,
+                expected_hash,
+                actual_hash,
+                &target.abs,
+            )),
+        });
+    }
+    fs::rename(&tmp, &target.abs)?;
+    sync_parent_dir(&target.abs)?;
+    let new_hash = hash_file(&target.abs)?;
+    let meta = file_meta(root, &target.abs, true)?;
 
     Ok(Response::WriteFileCas {
         outcome: SaveOutcome::Applied(SaveApplied {
@@ -673,12 +765,11 @@ fn begin_write_file_cas(
     content_hash: String,
     size: u64,
 ) -> Result<Response> {
-    let abs = resolve_remote_path(&state.root, &path)?;
-    let actual_hash = if abs.exists() && abs.is_file() {
-        Some(hash_file(&abs)?)
-    } else {
-        None
-    };
+    let target = prepare_write_target(&state.root, &path)?;
+    let target_key = write_target_key(&state.root, &target.abs);
+    ensure_no_active_write(&state.active_write_targets, &target_key, &path)?;
+    let lock = acquire_write_lock(&target_key, &path)?;
+    let actual_hash = current_regular_file_hash(&state.root, &path, &target.abs)?;
 
     if actual_hash != expected_hash {
         return Ok(Response::BeginWriteFileCas {
@@ -686,14 +777,11 @@ fn begin_write_file_cas(
                 path,
                 expected_hash,
                 actual_hash,
-                &abs,
+                &target.abs,
             )),
         });
     }
 
-    if let Some(parent) = abs.parent() {
-        fs::create_dir_all(parent)?;
-    }
     let upload_id = format!(
         "{}-{}",
         SystemTime::now()
@@ -702,17 +790,21 @@ fn begin_write_file_cas(
             .as_nanos(),
         hash_bytes(path.as_bytes())
     );
-    let tmp_path = abs.with_extension(format!("nrm-upload-{upload_id}"));
+    let tmp_path = target.abs.with_extension(format!("nrm-upload-{upload_id}"));
     File::create(&tmp_path)?;
+    state.active_write_targets.insert(target_key.clone());
     state.uploads.insert(
         upload_id.clone(),
         PendingUpload {
             path,
+            target_abs: target.abs,
+            target_key,
             expected_hash,
             content_hash,
             size,
             tmp_path,
             written: 0,
+            _lock: lock,
         },
     );
 
@@ -761,6 +853,11 @@ fn finish_write_file_cas(state: &mut AgentState, upload_id: String) -> Result<Re
         .uploads
         .remove(&upload_id)
         .ok_or_else(|| anyhow::anyhow!("unknown upload id {upload_id}"))?;
+    let root = state.root.clone();
+    let _active_release = ActiveWriteRelease {
+        active: &mut state.active_write_targets,
+        key: upload.target_key.clone(),
+    };
     if upload.written != upload.size {
         let _ = fs::remove_file(&upload.tmp_path);
         bail!(
@@ -779,12 +876,7 @@ fn finish_write_file_cas(state: &mut AgentState, upload_id: String) -> Result<Re
         );
     }
 
-    let abs = resolve_remote_path(&state.root, &upload.path)?;
-    let actual_hash = if abs.exists() && abs.is_file() {
-        Some(hash_file(&abs)?)
-    } else {
-        None
-    };
+    let actual_hash = current_regular_file_hash(&root, &upload.path, &upload.target_abs)?;
     if actual_hash != upload.expected_hash {
         let _ = fs::remove_file(&upload.tmp_path);
         return Ok(Response::FinishWriteFileCas {
@@ -792,21 +884,18 @@ fn finish_write_file_cas(state: &mut AgentState, upload_id: String) -> Result<Re
                 upload.path,
                 upload.expected_hash,
                 actual_hash,
-                &abs,
+                &upload.target_abs,
             )),
         });
     }
 
-    if let Some(parent) = abs.parent() {
-        fs::create_dir_all(parent)?;
-    }
     {
         let file = File::open(&upload.tmp_path)?;
         file.sync_all()?;
     }
-    fs::rename(&upload.tmp_path, &abs)?;
-    sync_parent_dir(&abs)?;
-    let meta = file_meta(&state.root, &abs, true)?;
+    fs::rename(&upload.tmp_path, &upload.target_abs)?;
+    sync_parent_dir(&upload.target_abs)?;
+    let meta = file_meta(&root, &upload.target_abs, true)?;
 
     Ok(Response::FinishWriteFileCas {
         outcome: SaveOutcome::Applied(SaveApplied {
@@ -821,6 +910,7 @@ fn finish_write_file_cas(state: &mut AgentState, upload_id: String) -> Result<Re
 fn abort_write_file_cas(state: &mut AgentState, upload_id: String) -> Result<Response> {
     if let Some(upload) = state.uploads.remove(&upload_id) {
         let _ = fs::remove_file(upload.tmp_path);
+        state.active_write_targets.remove(&upload.target_key);
     }
     Ok(Response::AbortWriteFileCas { upload_id })
 }
@@ -843,21 +933,168 @@ fn save_conflict(
 }
 
 fn remote_conflict_content(abs: &Path) -> (Vec<u8>, bool, Option<u64>) {
-    if !abs.is_file() {
+    let Ok(metadata) = fs::symlink_metadata(abs) else {
+        return (Vec::new(), false, None);
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
         return (Vec::new(), false, None);
     }
-    let remote_size = fs::metadata(abs).ok().map(|metadata| metadata.len());
-    let max_bytes = remote_size
-        .unwrap_or(MAX_CONFLICT_CONTENT_BYTES as u64)
-        .min(MAX_CONFLICT_CONTENT_BYTES as u64);
+    let remote_size = metadata.len();
+    let max_bytes = remote_size.min(MAX_CONFLICT_CONTENT_BYTES as u64);
     let mut remote_content = Vec::new();
     if let Ok(file) = File::open(abs) {
         let _ = file.take(max_bytes).read_to_end(&mut remote_content);
     }
-    let remote_content_truncated = remote_size
-        .map(|size| size > remote_content.len() as u64)
-        .unwrap_or(false);
-    (remote_content, remote_content_truncated, remote_size)
+    let remote_content_truncated = remote_size > remote_content.len() as u64;
+    (remote_content, remote_content_truncated, Some(remote_size))
+}
+
+fn existing_metadata_path(root: &Path, abs: &Path) -> Result<Option<PathBuf>> {
+    match fs::symlink_metadata(abs) {
+        Ok(_) => {
+            let canonical = abs
+                .canonicalize()
+                .with_context(|| format!("failed to resolve {}", abs.display()))?;
+            ensure_path_within_root(root, &canonical)?;
+            Ok(Some(abs.to_path_buf()))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("failed to stat {}", abs.display())),
+    }
+}
+
+fn resolve_existing_content_path(root: &Path, path: &str) -> Result<PathBuf> {
+    let abs = resolve_remote_path(root, path)?;
+    let metadata = fs::symlink_metadata(&abs).with_context(|| format!("failed to stat {path}"))?;
+    if metadata.file_type().is_symlink() {
+        bail!("{path} is a symlink; content operations do not follow symlinks");
+    }
+    if !metadata.is_file() {
+        bail!("{path} is not a regular file");
+    }
+    let canonical = abs
+        .canonicalize()
+        .with_context(|| format!("failed to resolve {path}"))?;
+    ensure_path_within_root(root, &canonical)?;
+    Ok(canonical)
+}
+
+fn prepare_write_target(root: &Path, path: &str) -> Result<WriteTarget> {
+    let abs = resolve_remote_path(root, path)?;
+    let file_name = abs
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("remote path must name a file"))?
+        .to_owned();
+
+    match fs::symlink_metadata(&abs) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            bail!("{path} is a symlink; remote saves do not replace symlinks");
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to stat {path}"));
+        }
+    }
+
+    let parent = abs
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("remote path must have a parent directory"))?;
+    ensure_write_parent_inside_root(root, parent)?;
+    let canonical_parent = parent
+        .canonicalize()
+        .with_context(|| format!("failed to resolve parent for {path}"))?;
+    ensure_path_within_root(root, &canonical_parent)?;
+    Ok(WriteTarget {
+        abs: canonical_parent.join(file_name),
+    })
+}
+
+fn ensure_write_parent_inside_root(root: &Path, parent: &Path) -> Result<()> {
+    let mut ancestor = parent;
+    while !ancestor.exists() {
+        ancestor = ancestor
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("remote path parent is outside the workspace"))?;
+    }
+    let canonical_ancestor = ancestor
+        .canonicalize()
+        .with_context(|| format!("failed to resolve {}", ancestor.display()))?;
+    ensure_path_within_root(root, &canonical_ancestor)?;
+    fs::create_dir_all(parent)?;
+    Ok(())
+}
+
+fn current_regular_file_hash(root: &Path, path: &str, abs: &Path) -> Result<Option<String>> {
+    match fs::symlink_metadata(abs) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                bail!("{path} is a symlink; content operations do not follow symlinks");
+            }
+            if !metadata.is_file() {
+                return Ok(None);
+            }
+            let canonical = abs
+                .canonicalize()
+                .with_context(|| format!("failed to resolve {path}"))?;
+            ensure_path_within_root(root, &canonical)?;
+            Ok(Some(hash_file(&canonical)?))
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("failed to stat {path}")),
+    }
+}
+
+fn ensure_path_within_root(root: &Path, path: &Path) -> Result<()> {
+    if path == root || path.starts_with(root) {
+        return Ok(());
+    }
+    bail!(
+        "{} resolves outside remote root {}",
+        path.display(),
+        root.display()
+    )
+}
+
+fn write_target_key(root: &Path, target_abs: &Path) -> String {
+    hash_bytes(format!("{}:{}", root.display(), target_abs.display()).as_bytes())
+}
+
+fn ensure_no_active_write(active: &HashSet<String>, target_key: &str, path: &str) -> Result<()> {
+    if active.contains(target_key) {
+        bail!("remote write already in progress for {path}");
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn acquire_write_lock(target_key: &str, path: &str) -> Result<WriteLock> {
+    let lock_root = std::env::temp_dir().join("nrm-agent-locks");
+    fs::create_dir_all(&lock_root)?;
+    let lock_path = lock_root.join(format!("{target_key}.lock"));
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .with_context(|| format!("failed to open write lock {}", lock_path.display()))?;
+    // SAFETY: flock only uses the valid file descriptor borrowed from `file`;
+    // the file is kept alive in WriteLock until the critical section ends.
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    if result != 0 {
+        bail!(
+            "failed to lock remote write {}: {}",
+            path,
+            io::Error::last_os_error()
+        );
+    }
+    Ok(WriteLock { _file: file })
+}
+
+#[cfg(not(unix))]
+fn acquire_write_lock(_target_key: &str, _path: &str) -> Result<WriteLock> {
+    Ok(WriteLock {})
 }
 
 fn resolve_remote_path(root: &Path, path: &str) -> Result<PathBuf> {
@@ -980,6 +1217,7 @@ mod tests {
         AgentState {
             root: root.to_path_buf(),
             uploads: HashMap::new(),
+            active_write_targets: HashSet::new(),
             grep_sessions: HashMap::new(),
             next_grep_session: 1,
         }
@@ -989,6 +1227,83 @@ mod tests {
     fn rejects_path_traversal() {
         assert!(normalize_relative_path("../secret").is_err());
         assert!(normalize_relative_path("/secret").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_file_rejects_symlink_parent_escape() {
+        let dir = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        fs::create_dir_all(outside.path().join("repo")).unwrap();
+        fs::write(outside.path().join("repo/secret.txt"), "secret").unwrap();
+        std::os::unix::fs::symlink(outside.path().join("repo"), dir.path().join("link")).unwrap();
+
+        let error = read_file(dir.path(), "link/secret.txt".to_string(), 0, None)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("resolves outside remote root"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn write_cas_rejects_symlink_parent_escape() {
+        let dir = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("link")).unwrap();
+
+        let error = write_file_cas(
+            dir.path(),
+            "link/new.txt".to_string(),
+            None,
+            b"secret".to_vec(),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("resolves outside remote root"));
+        assert!(!outside.path().join("new.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn content_operations_reject_final_symlinks() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("real.txt"), "real").unwrap();
+        std::os::unix::fs::symlink(root.join("real.txt"), root.join("link.txt")).unwrap();
+
+        let read_error = read_file(root, "link.txt".to_string(), 0, None)
+            .unwrap_err()
+            .to_string();
+        assert!(read_error.contains("is a symlink"));
+
+        let write_error = write_file_cas(root, "link.txt".to_string(), None, b"new".to_vec())
+            .unwrap_err()
+            .to_string();
+        assert!(write_error.contains("is a symlink"));
+        assert_eq!(fs::read_to_string(root.join("real.txt")).unwrap(), "real");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checksum_rejects_symlink_parent_escape() {
+        let dir = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        fs::write(outside.path().join("secret.txt"), "secret").unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("link")).unwrap();
+        let mut state = test_state(dir.path());
+
+        let error = handle_request(
+            &mut state,
+            Request::Checksum {
+                path: "link/secret.txt".to_string(),
+            },
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("resolves outside remote root"));
     }
 
     #[test]
@@ -1018,6 +1333,41 @@ mod tests {
             other => panic!("unexpected response: {other:?}"),
         }
         assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "one");
+    }
+
+    #[test]
+    fn write_cas_rechecks_hash_before_rename() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("a.txt"), "one").unwrap();
+        let old_hash = hash_file(&root.join("a.txt")).unwrap();
+        let external_hash = hash_bytes(b"external");
+
+        let response = write_file_cas_inner(
+            root,
+            "a.txt".to_string(),
+            Some(old_hash),
+            b"two".to_vec(),
+            || {
+                fs::write(root.join("a.txt"), "external")?;
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        match response {
+            Response::WriteFileCas {
+                outcome: SaveOutcome::Conflict(conflict),
+            } => {
+                assert_eq!(
+                    conflict.actual_hash.as_deref(),
+                    Some(external_hash.as_str())
+                );
+                assert_eq!(conflict.remote_content, b"external");
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+        assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "external");
     }
 
     #[test]
@@ -1620,6 +1970,99 @@ mod tests {
             other => panic!("unexpected finish response: {other:?}"),
         }
         assert_eq!(fs::read(root.join("large.bin")).unwrap(), content);
+    }
+
+    #[test]
+    fn chunked_write_cas_conflicts_when_remote_changes_after_begin() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        fs::write(root.join("large.bin"), "old").unwrap();
+        let old_hash = hash_file(&root.join("large.bin")).unwrap();
+        let content = b"new-content".to_vec();
+        let content_hash = hash_bytes(&content);
+        let external_hash = hash_bytes(b"external");
+        let mut state = test_state(&root);
+
+        let begin = begin_write_file_cas(
+            &mut state,
+            "large.bin".to_string(),
+            Some(old_hash),
+            content_hash,
+            content.len() as u64,
+        )
+        .unwrap();
+        let upload_id = match begin {
+            Response::BeginWriteFileCas {
+                outcome: WriteStartOutcome::Started(started),
+            } => started.upload_id,
+            other => panic!("unexpected begin response: {other:?}"),
+        };
+
+        write_file_chunk(&mut state, upload_id.clone(), 0, content).unwrap();
+        fs::write(root.join("large.bin"), "external").unwrap();
+        let finish = finish_write_file_cas(&mut state, upload_id).unwrap();
+
+        match finish {
+            Response::FinishWriteFileCas {
+                outcome: SaveOutcome::Conflict(conflict),
+            } => {
+                assert_eq!(
+                    conflict.actual_hash.as_deref(),
+                    Some(external_hash.as_str())
+                );
+                assert_eq!(conflict.remote_content, b"external");
+            }
+            other => panic!("unexpected finish response: {other:?}"),
+        }
+        assert_eq!(
+            fs::read_to_string(root.join("large.bin")).unwrap(),
+            "external"
+        );
+        assert!(state.uploads.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn chunked_write_tracks_active_target_by_canonical_path() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        fs::create_dir(root.join("real")).unwrap();
+        fs::write(root.join("real/a.txt"), "old").unwrap();
+        std::os::unix::fs::symlink(root.join("real"), root.join("link")).unwrap();
+        let old_hash = hash_file(&root.join("real/a.txt")).unwrap();
+        let content = b"new-content".to_vec();
+        let mut state = test_state(&root);
+
+        let begin = begin_write_file_cas(
+            &mut state,
+            "link/a.txt".to_string(),
+            Some(old_hash.clone()),
+            hash_bytes(&content),
+            content.len() as u64,
+        )
+        .unwrap();
+        let upload_id = match begin {
+            Response::BeginWriteFileCas {
+                outcome: WriteStartOutcome::Started(started),
+            } => started.upload_id,
+            other => panic!("unexpected begin response: {other:?}"),
+        };
+
+        let error = begin_write_file_cas(
+            &mut state,
+            "real/a.txt".to_string(),
+            Some(old_hash),
+            hash_bytes(b"other"),
+            5,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("write already in progress"));
+        assert_eq!(state.uploads.len(), 1);
+        abort_write_file_cas(&mut state, upload_id).unwrap();
+        assert!(state.uploads.is_empty());
+        assert!(state.active_write_targets.is_empty());
     }
 
     #[test]

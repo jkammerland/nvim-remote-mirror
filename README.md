@@ -253,9 +253,13 @@ instead of flushing the same relative path into the wrong workspace; it replays
 when the original workspace is active again.
 
 Saves up to 4 MiB use one RPC request. Larger saves stream through a 1 MiB
-chunked compare-and-swap upload: the agent checks the remote base hash before
-accepting chunks, verifies the uploaded content hash, rechecks the remote base
-hash, then renames the temp file into place.
+chunked upload. On Unix, the agent takes a cooperative write lock keyed by the
+canonical target for nrm writers. It checks the remote base hash, writes and
+verifies a temp file, rechecks the base hash in the install path before rename,
+then renames the temp file into place. Non-Unix builds still rely on the hash
+recheck without the advisory lock. Non-cooperating writers on the remote host
+can still race at the filesystem boundary, so remote-side tools should avoid
+editing the same file while queued saves are replaying.
 If a compare-and-swap conflict occurs, the local save snapshot stays preserved
 as local truth. Small remote conflict copies are stored completely under
 `conflicts/`; large remote conflict copies are capped to a protocol-bounded

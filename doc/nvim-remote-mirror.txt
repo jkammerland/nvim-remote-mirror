@@ -84,6 +84,11 @@ COMMANDS                                      *nvim-remote-mirror-commands*
     sidecar is connected, the path is marked for replay after reconnect. Buffers are
     tagged with the workspace that opened them; if another target is active,
     the save is deferred until the original workspace is reconnected.
+    On Unix, the remote agent uses a cooperative write lock keyed by the
+    canonical target for nrm writers, then rechecks the remote base hash in the
+    install path before rename. Non-Unix builds still rely on the hash recheck
+    without the advisory lock. Non-cooperating remote writers can still race at
+    the filesystem boundary.
     Automatic BufWritePost flushing uses the actual write target, so
     :write {mirror_path} can adopt an unnamed buffer. New mirror-root paths saved
     during reconnect are deferred when they map to the last known workspace
