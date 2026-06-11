@@ -565,6 +565,10 @@ local function save_queue_level(counts)
   return vim.log.levels.INFO
 end
 
+function M.format_save_queue_entry(entry)
+  return save_queue_entry_text(entry or {})
+end
+
 update_remote_state = function(client, result)
   if not client or not client.hello or not result then
     return
@@ -638,6 +642,42 @@ local function connection_summary()
     table.insert(parts, "error=" .. error_text:sub(1, 160))
   end
   return table.concat(parts, " ")
+end
+
+function M.connection_state()
+  local client = M.client
+  local hello = client and client.hello or {}
+  return {
+    status = M.connection_status or "disconnected",
+    target = M.connection_target,
+    reason = M.connection_reason,
+    error = M.connection_error,
+    reconnect_pending = M.reconnect_pending == true,
+    reconnect_attempts = M.reconnect_attempts,
+    reconnect_max_attempts = M.config.reconnect_max_attempts,
+    has_client = client ~= nil and client.job_id ~= nil,
+    last_target = M.last_target,
+    transport = client and client.transport or nil,
+    workspace_key = optional_string(hello.workspace_key),
+    remote_root = optional_string(hello.remote_root),
+    mirror_root = optional_string(hello.mirror_root),
+    files_root = optional_string(hello.files_root),
+    remote_status = optional_string(hello.remote_status),
+    remote_checked = hello.remote_checked,
+    remote_available = hello.remote_available,
+    remote_error = optional_string(hello.remote_error),
+    retry_after_ms = hello.retry_after_ms,
+  }
+end
+
+local function decorate_status_result(result)
+  result = result or {}
+  result.connection = M.connection_state()
+  result.connected = result.connection.has_client == true
+  result.connection_summary = connection_summary()
+  result.remote_summary = status_remote_summary(result)
+  result.background_scan_summary = background_scan_summary(result)
+  return result
 end
 
 local function client_identity(client)
@@ -1330,6 +1370,34 @@ function M.request(method, params, callback)
   end
 end
 
+local function request_async(method, params, callback)
+  callback = callback or function() end
+  local ok, err = pcall(M.request, method, params or {}, callback)
+  if not ok then
+    callback(tostring(err), nil)
+  end
+end
+
+function M.status_async(callback)
+  callback = callback or function() end
+  if not M.client or not M.client.job_id then
+    callback(nil, decorate_status_result({}))
+    return
+  end
+
+  local client = M.client
+  request_async("status", {}, function(err, result)
+    if err then
+      callback(err, decorate_status_result({}))
+      return
+    end
+    if M.client == client then
+      update_remote_state(client, result)
+    end
+    callback(nil, decorate_status_result(result or {}))
+  end)
+end
+
 function M.remote_probe(callback)
   local client = M.client
   if not client or not client.job_id then
@@ -1666,6 +1734,7 @@ function M.scan(limit)
 end
 
 local function find_label(hit)
+  hit = hit or {}
   local labels = {}
   if hit.cached then
     table.insert(labels, "cached")
@@ -1679,7 +1748,24 @@ local function find_label(hit)
   if validation_state and validation_state ~= "valid" and validation_state ~= "unknown" then
     table.insert(labels, validation_state)
   end
-  return hit.path .. " [" .. table.concat(labels, ",") .. "]"
+  local path = optional_string(hit.path) or optional_string(hit.local_path) or "<unknown>"
+  return path .. " [" .. table.concat(labels, ",") .. "]"
+end
+
+function M.format_find_hit(hit)
+  return find_label(hit or {})
+end
+
+function M.find_paths_async(query, opts, callback)
+  if type(opts) == "function" then
+    callback = opts
+    opts = {}
+  end
+  opts = opts or {}
+  request_async("find_paths", {
+    query = query or "",
+    limit = opts.limit or M.config.find_limit,
+  }, callback)
 end
 
 function M.find(query, opts)
@@ -2057,6 +2143,20 @@ function M.save_queue(opts)
       notify(message, save_queue_level(counts))
     end)
   end)
+end
+
+function M.save_queue_async(opts, callback)
+  if type(opts) == "function" then
+    callback = opts
+    opts = {}
+  end
+  opts = opts or {}
+
+  local params = {}
+  if opts.limit then
+    params.limit = opts.limit
+  end
+  request_async("save_queue", params, callback)
 end
 
 function M.flush_queue(opts)

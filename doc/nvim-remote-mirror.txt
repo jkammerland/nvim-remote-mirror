@@ -4,9 +4,10 @@
 CONTENTS                                      *nvim-remote-mirror-contents*
 
 1. Goal                                      |nvim-remote-mirror-goal|
-2. Commands                                  |nvim-remote-mirror-commands|
-3. Configuration                             |nvim-remote-mirror-config|
-4. LSP                                       |nvim-remote-mirror-lsp|
+2. UI                                        |nvim-remote-mirror-ui|
+3. Commands                                  |nvim-remote-mirror-commands|
+4. Configuration                             |nvim-remote-mirror-config|
+5. LSP                                       |nvim-remote-mirror-lsp|
 
 ==============================================================================
 GOAL                                            *nvim-remote-mirror-goal*
@@ -22,6 +23,35 @@ By default the Neovim facade launches one stdio sidecar process per editor
 session. For a reusable endpoint, set connection = "socket"; Neovim will connect
 to a Unix-domain sidecar listener or start one with the same JSON
 command/notification protocol and durable workspace state.
+
+==============================================================================
+UI                                                *nvim-remote-mirror-ui*
+
+:RemoteWorkspace
+    Open the remote workspace dashboard. The dashboard shows connection state,
+    remote health, mirror counts, background scan state, and save queue counts.
+
+:RemoteConnectUI
+    Prompt for a local path or ssh://host/absolute/path target and connect.
+
+:RemoteFiles
+    Prompt for a path query, show known mirror paths with vim.ui.select(), and
+    open the selected remote path.
+
+:RemoteGrepUI
+    Prompt for grep text and run :RemoteGrep.
+
+:RemoteQueue
+    Show queued saves with actions to open local copies, snapshots, conflict
+    copies, diff conflicts, retry queued saves, or refresh the queue.
+
+:RemoteConflicts
+    Show only conflict entries from the save queue.
+
+Dashboard keys:
+    c connect        o open path      f find files     g grep
+    s save queue     C conflicts      r refresh        R reconnect
+    d disconnect     q/x close
 
 ==============================================================================
 COMMANDS                                      *nvim-remote-mirror-commands*

@@ -4,6 +4,31 @@ end
 vim.g.loaded_nvim_remote_mirror = true
 
 local nrm = require("nvim_remote_mirror")
+local ui = require("nvim_remote_mirror.ui")
+
+vim.api.nvim_create_user_command("RemoteWorkspace", function()
+  ui.workspace()
+end, {})
+
+vim.api.nvim_create_user_command("RemoteConnectUI", function()
+  ui.connect()
+end, {})
+
+vim.api.nvim_create_user_command("RemoteFiles", function()
+  ui.files()
+end, {})
+
+vim.api.nvim_create_user_command("RemoteGrepUI", function()
+  ui.grep()
+end, {})
+
+vim.api.nvim_create_user_command("RemoteQueue", function()
+  ui.queue()
+end, {})
+
+vim.api.nvim_create_user_command("RemoteConflicts", function()
+  ui.conflicts()
+end, {})
 
 vim.api.nvim_create_user_command("RemoteConnect", function(opts)
   nrm.connect(opts.args)
