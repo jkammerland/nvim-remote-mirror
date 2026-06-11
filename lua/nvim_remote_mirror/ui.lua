@@ -123,7 +123,7 @@ local function ensure_window()
   end
 
   local width = math.min(math.max(vim.o.columns - 4, 40), 90)
-  local height = math.min(math.max(vim.o.lines - 6, 16), 26)
+  local height = math.min(math.max(vim.o.lines - 6, 18), 34)
   state.win = vim.api.nvim_open_win(state.buf, true, {
     relative = "editor",
     width = width,
@@ -196,10 +196,12 @@ function M.connect()
 end
 
 function M.open()
-  prompt("Remote path: ", vim.fn.expand("<cfile>"), function(path)
+  local default = vim.bo.filetype == "nrm-dashboard" and "" or vim.fn.expand("<cfile>")
+  prompt("Remote path: ", default, function(path)
     if path == "" then
       return
     end
+    close()
     local ok, err = pcall(nrm.open, path)
     if not ok then
       notify(tostring(err), vim.log.levels.ERROR)
@@ -225,6 +227,7 @@ local function select_find_hit(query, result)
     if not hit then
       return
     end
+    close()
     nrm.open(hit.path)
   end)
 end
@@ -242,10 +245,12 @@ function M.files()
 end
 
 function M.grep()
-  prompt("Remote grep: ", vim.fn.expand("<cword>"), function(query)
+  local default = vim.bo.filetype == "nrm-dashboard" and "" or vim.fn.expand("<cword>")
+  prompt("Remote grep: ", default, function(query)
     if query == "" then
       return
     end
+    close()
     local ok, err = pcall(nrm.grep, query)
     if not ok then
       notify(tostring(err), vim.log.levels.ERROR)
@@ -262,6 +267,7 @@ local function edit_path(path)
     notify("path is not available: " .. tostring(path), vim.log.levels.WARN)
     return
   end
+  close()
   vim.cmd.edit(vim.fn.fnameescape(path))
 end
 
@@ -270,6 +276,7 @@ local function diff_paths(left, right)
     notify("both files must exist to open a diff", vim.log.levels.WARN)
     return
   end
+  close()
   vim.cmd("tabnew " .. vim.fn.fnameescape(left))
   vim.cmd("vertical diffsplit " .. vim.fn.fnameescape(right))
 end
