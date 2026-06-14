@@ -4,10 +4,12 @@
 CONTENTS                                      *nvim-remote-mirror-contents*
 
 1. Goal                                      |nvim-remote-mirror-goal|
-2. UI                                        |nvim-remote-mirror-ui|
-3. Commands                                  |nvim-remote-mirror-commands|
-4. Configuration                             |nvim-remote-mirror-config|
-5. LSP                                       |nvim-remote-mirror-lsp|
+2. Install                                   |nvim-remote-mirror-install|
+3. UI                                        |nvim-remote-mirror-ui|
+4. Commands                                  |nvim-remote-mirror-commands|
+5. Configuration                             |nvim-remote-mirror-config|
+6. Limits                                    |nvim-remote-mirror-limits|
+7. LSP                                       |nvim-remote-mirror-lsp|
 
 ==============================================================================
 GOAL                                            *nvim-remote-mirror-goal*
@@ -25,11 +27,55 @@ to a Unix-domain sidecar listener or start one with the same JSON
 command/notification protocol and durable workspace state.
 
 ==============================================================================
+INSTALL                                      *nvim-remote-mirror-install*
+
+Requirements:
+    - Neovim 0.10+, with Neovim 0.11+ preferred.
+    - Rust toolchain on the local machine.
+    - SSH access for ssh://host/path targets.
+    - nrm-agent installed and executable on each remote host.
+
+Build the binaries from the checkout:
+>
+  cargo build --release
+<
+
+Install nrm-agent on each remote host:
+>
+  scp target/release/nrm-agent myhost:~/.local/bin/nrm-agent
+  ssh myhost 'chmod +x ~/.local/bin/nrm-agent'
+<
+
+Non-interactive SSH may not load ~/.profile or shell rc files. If this fails:
+>
+  ssh myhost 'command -v nrm-agent'
+<
+set remote_agent to an absolute remote path such as
+/home/me/.local/bin/nrm-agent.
+
+Minimal lazy.nvim checkout config:
+>
+  {
+    dir = vim.fn.expand("~/repos/nvim-remote-mirror"),
+    name = "nvim-remote-mirror",
+    config = function()
+      require("nvim_remote_mirror").setup({
+        sidecar = vim.fn.expand("~/repos/nvim-remote-mirror/target/release/nrm-sidecar"),
+        agent = vim.fn.expand("~/repos/nvim-remote-mirror/target/release/nrm-agent"),
+        remote_agent = "/home/me/.local/bin/nrm-agent",
+        connection = "socket",
+      })
+    end,
+  }
+<
+
+==============================================================================
 UI                                                *nvim-remote-mirror-ui*
 
 :RemoteWorkspace
     Open the remote workspace dashboard. The dashboard shows connection state,
-    remote health, mirror counts, background scan state, and save queue counts.
+    remote health, mirror root, files root, mirror counts, background scan
+    state, and save queue counts.
 
 :RemoteConnectUI
     Prompt for a local path or ssh://host/absolute/path target and connect.
@@ -50,8 +96,8 @@ UI                                                *nvim-remote-mirror-ui*
 
 Dashboard keys:
     c connect        o open path      f find files     g grep
-    s save queue     C conflicts      r refresh        R reconnect
-    d disconnect     q/x close
+    z cwd            s save queue     C conflicts      r refresh
+    d disconnect     R reconnect      q/x close
 
 ==============================================================================
 COMMANDS                                      *nvim-remote-mirror-commands*
@@ -88,6 +134,11 @@ COMMANDS                                      *nvim-remote-mirror-commands*
     Force remote rehydration for clean cached files. Dirty cached files are not
     overwritten; if the local file is missing, the latest queued save snapshot
     is restored instead.
+
+:RemoteScan [limit]
+    Scan remote metadata into the local mirror index. This populates known
+    paths for navigation without hydrating every file. Omit limit to use the
+    sidecar default.
 
 :RemoteFind [query]
     Search known mirror paths locally and fill quickfix with mirror-local
@@ -207,12 +258,18 @@ CONFIGURATION                                  *nvim-remote-mirror-config*
 For ssh:// targets, remote_agent is executed on the remote host. The local agent
 path is used only for local targets, so a checkout-local target/debug/nrm-agent
 is not accidentally sent to SSH hosts.
+Non-interactive SSH may not load the same PATH as an interactive login shell.
+If ssh host 'command -v nrm-agent' fails, set remote_agent to an absolute
+remote path.
 Set connection = "socket" to connect through a reusable Unix-domain sidecar
 listener. If socket_path is unset, the plugin derives a stable path under
 socket_dir, state_dir/sockets, or the system temp directory from the target and
 daemon-affecting config. The listener is detached from Neovim and currently
 serves one active client session at a time; :RemoteDisconnect closes the client
 session but leaves the listener available for the next editor.
+When state_dir is unset, durable mirror state uses the platform state directory,
+typically ~/.local/state/nvim-remote-mirror on Linux. Use :RemoteWorkspace to
+inspect the active mirror root and files root before cleaning mirror data.
 
 request_timeout_ms bounds both sidecar/agent work and pending Neovim-side
 callbacks waiting for sidecar JSON replies.
@@ -296,6 +353,24 @@ Workspace state keys preserve the legacy identity material: local for local
 workspaces and the bare SSH target string for SSH workspaces. This keeps
 existing mirrors stable, including the historical collision with an SSH target
 named local. Future non-SSH transports should use namespaced identity material.
+
+==============================================================================
+LIMITS                                        *nvim-remote-mirror-limits*
+
+This is dogfooding software. The local mirror, SSH workspaces, background
+metadata scan, find, grep, save queue, conflicts, socket sidecar mode, and basic
+LSP proxy are implemented. Remote terminals, DAP, git adapters, and general
+plugin remoting are not built yet.
+
+Local plugins operate on hydrated mirror files. Local grep or file pickers can
+only see what is already known or present in the mirror; use :RemoteScan,
+:RemoteFind, :RemoteFiles, and :RemoteGrep for sidecar-backed discovery.
+
+Saving a new file under the mirror files root adopts that path and queues it
+for remote creation. After :RemoteCd, cwd-based plugins may write generated
+files under the mirror root. Until ignore policy is configurable, keep plugin
+caches, temp files, tags, and build outputs outside the mirror root unless they
+should exist remotely.
 
 ==============================================================================
 LSP                                                *nvim-remote-mirror-lsp*

@@ -36,6 +36,7 @@ local function main()
   assert_eq(nrm.current_workspace(), nil)
   assert_eq(nrm.files_root(), nil)
   assert_eq(nrm.remote_root(), nil)
+  assert_eq(nrm.mirror_root(), nil)
   assert_eq(nrm.local_path("src/main.rs"), nil)
   assert_eq(nrm.remote_path(root .. "/files/src/main.rs"), nil)
   local ok, err = pcall(nrm.cd)
@@ -64,9 +65,11 @@ local function main()
   assert_eq(workspace.target, "ssh://host/repo")
   assert_eq(workspace.transport, "socket")
   assert_eq(workspace.remote_root, "/remote/repo")
+  assert_eq(workspace.mirror_root, root)
   assert_eq(workspace.files_root, root .. "/files")
   assert_eq(nrm.files_root(), root .. "/files")
   assert_eq(nrm.remote_root(), "/remote/repo")
+  assert_eq(nrm.mirror_root(), root)
 
   assert_eq(nrm.local_path("src/main.rs"), root .. "/files/src/main.rs")
   assert_eq(nrm.local_path("src/./main.rs"), root .. "/files/src/main.rs")
@@ -88,9 +91,24 @@ local function main()
   assert_eq(nrm.is_remote_buffer(buf), true)
   assert_eq(nrm.remote_path(buf), "src/main.rs")
 
+  local connected_client = nrm.client
+  nrm.client = nil
+  assert_eq(nrm.remote_path(buf), nil)
+  nrm.client = connected_client
+
   vim.b[buf].nrm_workspace_key = "workspace-b"
   assert_eq(nrm.remote_path(buf), nil)
   vim.b[buf].nrm_workspace_key = "workspace-a"
+  assert_eq(nrm.remote_path(buf), "src/main.rs")
+
+  vim.b[buf].nrm_target_arg = "ssh://other/repo"
+  assert_eq(nrm.remote_path(buf), nil)
+  vim.b[buf].nrm_target_arg = "ssh://host/repo"
+  assert_eq(nrm.remote_path(buf), "src/main.rs")
+
+  vim.b[buf].nrm_files_root = root .. "/other-files"
+  assert_eq(nrm.remote_path(buf), nil)
+  vim.b[buf].nrm_files_root = root .. "/files"
   assert_eq(nrm.remote_path(buf), "src/main.rs")
 
   local pending = vim.api.nvim_create_buf(true, false)
@@ -103,6 +121,9 @@ local function main()
   assert_eq(nrm.is_remote_buffer(plain), false)
   assert_eq(nrm.remote_path(plain), nil)
 
+  vim.cmd("runtime plugin/nvim_remote_mirror.lua")
+  assert_eq(vim.fn.exists(":RemoteCd"), 2)
+
   local cd_root = nrm.cd()
   assert_eq(cd_root, root .. "/files")
   assert_eq(vim.fn.getcwd(), root .. "/files")
@@ -110,6 +131,18 @@ local function main()
     return #notifications > 0
   end)
   assert_contains(notifications[#notifications], "remote cwd: " .. root .. "/files")
+
+  vim.cmd("tcd " .. vim.fn.fnameescape(old_cwd))
+  local original_tab = vim.api.nvim_get_current_tabpage()
+  vim.cmd("tabnew")
+  vim.cmd("RemoteCd")
+  assert_eq(vim.fn.getcwd(), root .. "/files")
+  vim.cmd("tabprevious")
+  assert_eq(vim.api.nvim_get_current_tabpage(), original_tab)
+  assert_eq(vim.fn.getcwd(), old_cwd)
+  vim.cmd("tabnext")
+  assert_eq(vim.fn.getcwd(), root .. "/files")
+  vim.cmd("tabclose")
 
   nrm.client.hello.files_root = root .. "/missing"
   ok, err = pcall(nrm.cd)

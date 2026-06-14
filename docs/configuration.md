@@ -18,7 +18,9 @@ require("nvim_remote_mirror").setup({
 | `remote_agent` | `nrm-agent` | Command executed on SSH hosts |
 
 For `ssh://` targets, `remote_agent` is used on the remote host. The local
-`agent` path is not copied to the remote.
+`agent` path is not copied to the remote. Non-interactive SSH may not load the
+same PATH as your login shell; if `ssh host 'command -v nrm-agent'` fails, set
+`remote_agent` to an absolute remote path such as `/home/me/.local/bin/nrm-agent`.
 
 ## Transport
 
@@ -27,9 +29,16 @@ For `ssh://` targets, `remote_agent` is used on the remote host. The local
 | `connection` | `stdio` | Use `socket` for reusable daemon mode |
 | `socket_path` | `nil` | Explicit Unix socket path |
 | `socket_dir` | `nil` | Directory for derived socket paths |
+| `state_dir` | `nil` | Durable mirror state root |
 | `daemon_start_timeout_ms` | `1000` | Wait for socket daemon startup |
 | `request_timeout_ms` | `30000` | Neovim request timeout |
 | `ssh_connect_timeout_seconds` | `10` | SSH connect timeout |
+
+When `state_dir` is unset, sidecar state uses the platform state directory.
+On a normal Linux Neovim install this is typically
+`~/.local/state/nvim-remote-mirror`. Use `:RemoteWorkspace` to inspect the
+active mirror root and files root before cleaning or scripting against mirror
+files.
 
 ## Search and Mirror Limits
 

@@ -729,6 +729,11 @@ function M.remote_root()
   return workspace and workspace.remote_root or nil
 end
 
+function M.mirror_root()
+  local workspace = M.current_workspace()
+  return workspace and workspace.mirror_root or nil
+end
+
 function M.is_remote_buffer(bufnr)
   bufnr = bufnr or vim.api.nvim_get_current_buf()
   if not vim.api.nvim_buf_is_valid(bufnr) then

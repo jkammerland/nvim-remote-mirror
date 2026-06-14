@@ -47,6 +47,15 @@ scp target/release/nrm-agent myhost:~/.local/bin/nrm-agent
 ssh myhost 'chmod +x ~/.local/bin/nrm-agent'
 ```
 
+Non-interactive SSH often skips shell startup files. If this fails:
+
+```sh
+ssh myhost 'command -v nrm-agent'
+```
+
+set `remote_agent` to an absolute remote path such as
+`/home/me/.local/bin/nrm-agent`.
+
 Add the plugin from a local checkout:
 
 ```lua
@@ -110,6 +119,7 @@ Dashboard keys:
 | `o` | Open remote path |
 | `f` | Find file |
 | `g` | Grep |
+| `z` | Set current tab cwd to the mirror files root |
 | `s` | Save queue |
 | `C` | Conflicts |
 | `r` | Refresh dashboard |
@@ -145,6 +155,7 @@ Dashboard keys:
 | Option | Default | Use |
 | --- | --- | --- |
 | `connection` | `"stdio"` | Set to `"socket"` for reusable sidecar mode |
+| `state_dir` | `nil` | Durable mirror state root; default is Neovim state data |
 | `remote_agent` | `"nrm-agent"` | Remote command run over SSH |
 | `request_timeout_ms` | `30000` | Neovim-to-sidecar request timeout |
 | `ssh_connect_timeout_seconds` | `10` | SSH connection timeout |
@@ -154,6 +165,10 @@ Dashboard keys:
 | `background_mirror` | `true` | Gradually scan, hydrate, and validate in idle batches |
 
 See [docs/configuration.md](docs/configuration.md) for the larger option list.
+
+Mirror files live under the sidecar state directory, typically below
+`~/.local/state/nvim-remote-mirror` on Linux when `state_dir` is unset. Open
+`:RemoteWorkspace` to inspect the active mirror root and files root.
 
 ## Troubleshooting
 

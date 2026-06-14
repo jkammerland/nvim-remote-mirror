@@ -102,6 +102,14 @@ local function main()
     if method == "save_queue" then
       assert_eq(params.limit, 2)
       callback(nil, {
+        total = 3,
+        limit = 2,
+        truncated = true,
+        counts = {
+          pending = 1,
+          failed = 0,
+          conflict = 1,
+        },
         entries = {
           {
             queue_id = 9,
@@ -131,7 +139,10 @@ local function main()
   local lines = ui._format_dashboard_lines(status)
   assert_line_contains(lines, "Connection")
   assert_line_contains(lines, "Mirror")
+  assert_line_contains(lines, "Mirror Root")
+  assert_line_contains(lines, "/mirror/workspace")
   assert_line_contains(lines, "Save Queue")
+  assert_line_contains(lines, "z cwd")
   assert_line_contains(lines, "src/main.rs")
 
   local find_result = nil
@@ -148,6 +159,11 @@ local function main()
     queue_result = result
   end)
   assert_contains(nrm.format_save_queue_entry(queue_result.entries[1]), "[conflict] #9 src/lib.rs")
+  local queue_prompt = ui._queue_prompt({}, queue_result, #queue_result.entries)
+  assert_contains(queue_prompt, "showing=1")
+  assert_contains(queue_prompt, "total=3")
+  assert_contains(queue_prompt, "conflicts=1")
+  assert_contains(queue_prompt, "truncated_at=2")
 
   local actions = ui._queue_actions(queue_result.entries[1])
   assert_eq(#actions >= 4, true)

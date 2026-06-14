@@ -57,6 +57,11 @@ local function format_dashboard_lines(status, err)
     table.insert(lines, "Status request failed: " .. tostring(err))
   end
 
+  add_section(lines, "Actions")
+  table.insert(lines, "  c connect    o open       f files      g grep")
+  table.insert(lines, "  z cwd        s saves      C conflicts  r refresh")
+  table.insert(lines, "  d disconnect R reconnect  q close      x close")
+
   add_section(lines, "Connection")
   add_line(lines, "State", connection.status)
   add_line(lines, "Target", connection.target or connection.last_target)
@@ -68,6 +73,7 @@ local function format_dashboard_lines(status, err)
   add_line(lines, "Error", status.remote_error or connection.remote_error or connection.error or connection.reason)
 
   add_section(lines, "Mirror")
+  add_line(lines, "Mirror Root", connection.mirror_root)
   add_line(lines, "Files Root", connection.files_root)
   add_line(lines, "Known", number_value(status.known_files))
   add_line(lines, "Cached", number_value(status.cached_files))
@@ -81,11 +87,6 @@ local function format_dashboard_lines(status, err)
   add_line(lines, "Pending", number_value(status.pending_saves))
   add_line(lines, "Failed", number_value(status.failed_saves))
   add_line(lines, "Conflicts", number_value(status.conflicted_saves))
-
-  add_section(lines, "Actions")
-  table.insert(lines, "  c connect    o open       f files      g grep")
-  table.insert(lines, "  s saves      C conflicts  r refresh    d disconnect")
-  table.insert(lines, "  R reconnect  q close      x close")
 
   return lines
 end
@@ -147,6 +148,14 @@ local function ensure_window()
   map(state.buf, "o", M.open, "Remote mirror: open")
   map(state.buf, "f", M.files, "Remote mirror: files")
   map(state.buf, "g", M.grep, "Remote mirror: grep")
+  map(state.buf, "z", function()
+    local ok, err = pcall(nrm.cd)
+    if not ok then
+      notify(tostring(err), vim.log.levels.ERROR)
+      return
+    end
+    M.refresh_workspace()
+  end, "Remote mirror: cwd")
   map(state.buf, "d", function()
     nrm.disconnect()
     M.refresh_workspace()
@@ -345,6 +354,25 @@ local function select_queue_action(entry, opts)
   end)
 end
 
+local function queue_prompt(opts, result, shown_count)
+  opts = opts or {}
+  result = result or {}
+  local counts = result.counts or {}
+  local total = tonumber(result.total) or shown_count or #(result.entries or {})
+  local parts = {
+    opts.conflicts_only and "Remote conflicts" or "Remote save queue",
+    "showing=" .. tostring(shown_count or #(result.entries or {})),
+    "total=" .. tostring(total),
+    "pending=" .. tostring(tonumber(counts.pending) or 0),
+    "failed=" .. tostring(tonumber(counts.failed) or 0),
+    "conflicts=" .. tostring(tonumber(counts.conflict) or 0),
+  }
+  if result.truncated then
+    table.insert(parts, "truncated_at=" .. tostring(result.limit or shown_count or #(result.entries or {})))
+  end
+  return table.concat(parts, " ")
+end
+
 function M.queue(opts)
   opts = opts or {}
   nrm.save_queue_async({ limit = opts.limit or 100 }, function(err, result)
@@ -360,8 +388,14 @@ function M.queue(opts)
       notify(message)
       return
     end
+    if result and result.truncated then
+      notify(
+        "save queue truncated at " .. tostring(result.limit or #entries) .. " of " .. tostring(result.total or #entries),
+        vim.log.levels.WARN
+      )
+    end
     vim.ui.select(entries, {
-      prompt = opts.conflicts_only and "Remote conflicts" or "Remote save queue",
+      prompt = queue_prompt(opts, result, #entries),
       format_item = function(entry)
         return nrm.format_save_queue_entry(entry)
       end,
@@ -379,5 +413,6 @@ end
 
 M._format_dashboard_lines = format_dashboard_lines
 M._queue_actions = queue_actions
+M._queue_prompt = queue_prompt
 
 return M
