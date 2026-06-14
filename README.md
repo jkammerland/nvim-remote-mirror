@@ -85,6 +85,12 @@ Connect to a remote workspace:
 :RemoteConnect ssh://myhost/home/me/project
 ```
 
+For cwd-based local plugins, switch the current tab to the mirror files root:
+
+```vim
+:RemoteCd
+```
+
 Use the UI commands for normal work:
 
 | Command | Purpose |
@@ -118,8 +124,10 @@ Dashboard keys:
 | `:RemoteConnect [target]` | Connect to local path or `ssh://host/absolute/path` |
 | `:RemoteDisconnect` | Close the current client session |
 | `:RemoteReconnect` | Reconnect to the last target |
+| `:RemoteCd` | Set the current tab cwd to the mirror files root |
 | `:RemoteOpen {path}` | Open a workspace-relative file |
 | `:RemoteOpen! {path}` | Force remote rehydrate for clean cached files |
+| `:RemoteScan [limit]` | Scan remote metadata into the local mirror index |
 | `:RemoteFind [query]` | Put known remote paths in quickfix |
 | `:RemoteGrep {query}` | Search remote and cached mirror files |
 | `:RemotePrefetch {path...}` | Hydrate files into the mirror |
@@ -165,6 +173,7 @@ See [docs/configuration.md](docs/configuration.md) for the larger option list.
 | --- | --- |
 | [docs/design.md](docs/design.md) | Goal, architecture, and next milestones |
 | [docs/configuration.md](docs/configuration.md) | Configuration options |
+| [docs/plugin-compatibility.md](docs/plugin-compatibility.md) | How normal plugins should interact with mirror paths |
 | [docs/save-recovery.md](docs/save-recovery.md) | Save queue and conflict behavior |
 | [docs/protocol.md](docs/protocol.md) | Sidecar and agent protocol notes |
 | [doc/nvim-remote-mirror.txt](doc/nvim-remote-mirror.txt) | Vim help |

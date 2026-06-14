@@ -71,6 +71,11 @@ COMMANDS                                      *nvim-remote-mirror-commands*
     sidecar channel, the request fails immediately and reconnect handling starts
     without waiting for request_timeout_ms.
 
+:RemoteCd
+    Set the current tab's working directory to the active workspace's local
+    mirror files root. This is useful for cwd-based local plugins that should
+    operate on the mirrored project tree.
+
 :RemoteOpen {path}
     Open a workspace-relative file from the local mirror when cached, including
     dirty, stale, or deleted mirror entries. Hydrate it from the remote when no

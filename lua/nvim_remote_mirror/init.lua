@@ -156,6 +156,33 @@ local function mirror_relative_path(client, local_path)
   return files_root_relative_path(hello and hello.files_root, local_path)
 end
 
+local function files_root_local_path(files_root, relative_path)
+  relative_path = optional_string(relative_path)
+  files_root = optional_string(files_root)
+  if not relative_path or not files_root then
+    return nil
+  end
+  if relative_path:sub(1, 1) == "/" or relative_path:find("^%a:[/\\]") then
+    return nil
+  end
+  local normalized_relative = relative_path:gsub("\\", "/")
+  if normalized_relative == "." then
+    return nil
+  end
+  for segment in normalized_relative:gmatch("[^/]+") do
+    if segment == ".." then
+      return nil
+    end
+  end
+  local root = normalize_local_path(files_root):gsub("/+$", "")
+  local path = normalize_local_path(vim.fs.joinpath(root, relative_path))
+  local prefix = root .. "/"
+  if path ~= root and path:sub(1, #prefix) ~= prefix then
+    return nil
+  end
+  return path
+end
+
 local function close_timer(timer)
   if timer and not timer:is_closing() then
     timer:stop()
@@ -668,6 +695,108 @@ function M.connection_state()
     remote_error = optional_string(hello.remote_error),
     retry_after_ms = hello.retry_after_ms,
   }
+end
+
+function M.current_workspace()
+  local client = M.client
+  if not client or not client.job_id or not client.hello then
+    return nil
+  end
+  local hello = client.hello
+  return {
+    workspace_key = optional_string(hello.workspace_key),
+    target = M.connection_target or optional_string(client.target_arg),
+    target_arg = optional_string(client.target_arg),
+    transport = optional_string(client.transport),
+    remote_root = optional_string(hello.remote_root),
+    mirror_root = optional_string(hello.mirror_root),
+    files_root = optional_string(hello.files_root),
+    remote_status = optional_string(hello.remote_status),
+    remote_checked = hello.remote_checked,
+    remote_available = hello.remote_available,
+    remote_error = optional_string(hello.remote_error),
+    retry_after_ms = hello.retry_after_ms,
+  }
+end
+
+function M.files_root()
+  local workspace = M.current_workspace()
+  return workspace and workspace.files_root or nil
+end
+
+function M.remote_root()
+  local workspace = M.current_workspace()
+  return workspace and workspace.remote_root or nil
+end
+
+function M.is_remote_buffer(bufnr)
+  bufnr = bufnr or vim.api.nvim_get_current_buf()
+  if not vim.api.nvim_buf_is_valid(bufnr) then
+    return false
+  end
+  return optional_string(vim.b[bufnr].nrm_remote_path) ~= nil
+    or optional_string(vim.b[bufnr].nrm_hydrate_path) ~= nil
+    or optional_string(vim.b[bufnr].nrm_workspace_key) ~= nil
+    or optional_string(vim.b[bufnr].nrm_target_arg) ~= nil
+    or optional_string(vim.b[bufnr].nrm_files_root) ~= nil
+end
+
+function M.remote_path(bufnr_or_local_path)
+  if type(bufnr_or_local_path) == "number" then
+    if not vim.api.nvim_buf_is_valid(bufnr_or_local_path) then
+      return nil
+    end
+    local path = optional_string(vim.b[bufnr_or_local_path].nrm_remote_path)
+    if not path then
+      return nil
+    end
+    local workspace = M.current_workspace()
+    if not workspace then
+      return nil
+    end
+    local workspace_key = optional_string(vim.b[bufnr_or_local_path].nrm_workspace_key)
+    if workspace_key and workspace.workspace_key and workspace_key ~= workspace.workspace_key then
+      return nil
+    end
+    local target_arg = optional_string(vim.b[bufnr_or_local_path].nrm_target_arg)
+    if target_arg and workspace.target_arg and target_arg ~= workspace.target_arg then
+      return nil
+    end
+    local files_root = optional_string(vim.b[bufnr_or_local_path].nrm_files_root)
+    if files_root and workspace.files_root then
+      local buffer_root = normalize_local_path(files_root):gsub("/+$", "")
+      local current_root = normalize_local_path(workspace.files_root):gsub("/+$", "")
+      if buffer_root ~= current_root then
+        return nil
+      end
+    end
+    return path
+  end
+
+  local local_path = optional_string(bufnr_or_local_path)
+  if not local_path then
+    local bufnr = vim.api.nvim_get_current_buf()
+    return M.remote_path(bufnr)
+  end
+  return files_root_relative_path(M.files_root(), local_path)
+end
+
+function M.local_path(remote_path)
+  return files_root_local_path(M.files_root(), remote_path)
+end
+
+function M.cd()
+  local root = M.files_root()
+  if not root then
+    error("not connected; run :RemoteConnect first")
+  end
+  local stat = uv.fs_stat(root)
+  if not stat or stat.type ~= "directory" then
+    error("remote mirror files root is not available: " .. root)
+  end
+  vim.cmd("tcd " .. vim.fn.fnameescape(root))
+  notify("remote cwd: " .. root)
+  return root
 end
 
 local function decorate_status_result(result)

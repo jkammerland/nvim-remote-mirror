@@ -68,6 +68,7 @@ local function format_dashboard_lines(status, err)
   add_line(lines, "Error", status.remote_error or connection.remote_error or connection.error or connection.reason)
 
   add_section(lines, "Mirror")
+  add_line(lines, "Files Root", connection.files_root)
   add_line(lines, "Known", number_value(status.known_files))
   add_line(lines, "Cached", number_value(status.cached_files))
   add_line(lines, "Indexed", number_value(status.indexed_files))

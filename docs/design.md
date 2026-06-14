@@ -45,7 +45,8 @@ changing Neovim commands.
 ## Next Milestones
 
 1. Polish the dashboard and queue workflows.
-2. Add optional Telescope integration for file and grep pickers.
-3. Add conflict diff/resolve commands with explicit accept/retry actions.
-4. Expand remote LSP dogfooding and status reporting.
-5. Add transport abstraction tests before any non-SSH transport work.
+2. Harden plugin compatibility through mirror path/root semantics.
+3. Add provider adapters for file and grep pickers where mirror files are not enough.
+4. Add conflict diff/resolve commands with explicit accept/retry actions.
+5. Expand remote LSP dogfooding and status reporting.
+6. Add transport abstraction tests before any non-SSH transport work.

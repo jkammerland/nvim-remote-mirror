@@ -45,6 +45,10 @@ vim.api.nvim_create_user_command("RemoteReconnect", function()
   nrm.reconnect()
 end, {})
 
+vim.api.nvim_create_user_command("RemoteCd", function()
+  nrm.cd()
+end, {})
+
 vim.api.nvim_create_user_command("RemoteOpen", function(opts)
   nrm.open(opts.args, { force = opts.bang })
 end, {
