@@ -144,6 +144,7 @@ Dashboard keys:
 | `:RemoteStatus` | Print a status summary |
 | `:RemoteSaveQueue [limit]` | Put queued saves in quickfix |
 | `:RemoteFlush` | Flush current remote buffer |
+| `:RemoteAdopt [path]` | Explicitly create or take over a new mirror-root path |
 | `:RemoteFlushQueue` | Retry queued saves |
 | `:RemoteValidate [path]` | Compare cached file metadata with remote hash |
 | `:RemoteRefresh [path...]` | Validate cached files in batches |
@@ -162,6 +163,7 @@ Dashboard keys:
 | `find_limit` | `200` | Max file picker results |
 | `grep_limit` | `200` | Max grep results |
 | `open_prefetch_related` | `false` | Prefetch nearby known files after open |
+| `adoption_policy` | `"tracked_or_explicit"` | Require `:RemoteAdopt` for untracked mirror files |
 | `background_mirror` | `true` | Gradually scan, hydrate, and validate in idle batches |
 
 See [docs/configuration.md](docs/configuration.md) for the larger option list.
@@ -180,7 +182,27 @@ Mirror files live under the sidecar state directory, typically below
 | Opens are stale | Use `:RemoteValidate` or `:RemoteOpen! path` |
 | Saves are queued | Open `:RemoteQueue`, then retry with `:RemoteFlushQueue` |
 | Save conflict | Open `:RemoteConflicts` and inspect local vs remote copy |
+| New mirror file did not upload | Use `:RemoteAdopt` or set `adoption_policy = "auto"` |
 | UI feels empty | Run `:RemoteScan` or leave background mirror enabled |
+
+## Development Checks
+
+```sh
+just check
+cargo bench --workspace --no-run --locked
+scripts/perf_smoke.sh --small
+NRM_PERF_LARGE=1 scripts/perf_smoke.sh --large
+```
+
+`just check` runs Rust fmt, clippy, Rust tests, Lua syntax checks, headless
+Neovim tests, and whitespace checks. The Criterion benchmarks cover protocol
+frames and agent scan/grep paths; run them without `--no-run` for manual
+before/after measurements. The small perf smoke runs in CI; the large mode is
+intended for local before/after timing on bigger synthetic workspaces.
+
+Set `NRM_TRACE=1` when starting the sidecar to emit JSON trace events for
+request queueing, agent round trips, preemption, truncation, and remote backoff
+to stderr.
 
 ## More Docs
 

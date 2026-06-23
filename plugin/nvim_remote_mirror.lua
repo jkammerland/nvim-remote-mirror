@@ -96,6 +96,14 @@ vim.api.nvim_create_user_command("RemoteFlush", function()
   nrm.flush_buffer(0)
 end, {})
 
+vim.api.nvim_create_user_command("RemoteAdopt", function(opts)
+  local path = opts.args ~= "" and opts.args or nil
+  nrm.adopt(path)
+end, {
+  nargs = "?",
+  complete = "file",
+})
+
 vim.api.nvim_create_user_command("RemoteFlushQueue", function()
   nrm.flush_queue()
 end, {})

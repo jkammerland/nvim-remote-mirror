@@ -120,6 +120,50 @@ local function main()
   assert_eq(count_method("flush"), 1)
   assert_eq(calls[#calls].method, "flush")
   assert_eq(calls[#calls].params.path, "src/ok.rs")
+
+  local no_eol_path = files_root .. "/src/no-eol.rs"
+  local no_eol_buf = edit_path(no_eol_path)
+  vim.fn.writefile({ "fn no_eol() {}" }, no_eol_path, "b")
+  open_callbacks["src/no-eol.rs"](nil, {
+    path = "src/no-eol.rs",
+    local_path = no_eol_path,
+    hash = "no-eol-hash",
+  })
+  vim.wait(100, function()
+    return vim.b[no_eol_buf].nrm_remote_path == "src/no-eol.rs"
+  end)
+  assert_eq(vim.api.nvim_buf_get_lines(no_eol_buf, 0, -1, false)[1], "fn no_eol() {}")
+  assert_eq(vim.api.nvim_get_option_value("endofline", { buf = no_eol_buf }), false)
+
+  local empty_path = files_root .. "/src/empty.rs"
+  local empty_buf = edit_path(empty_path)
+  vim.fn.writefile({}, empty_path, "b")
+  open_callbacks["src/empty.rs"](nil, {
+    path = "src/empty.rs",
+    local_path = empty_path,
+    hash = "empty-hash",
+  })
+  vim.wait(100, function()
+    return vim.b[empty_buf].nrm_remote_path == "src/empty.rs"
+  end)
+  assert_eq(#vim.api.nvim_buf_get_lines(empty_buf, 0, -1, false), 1)
+  assert_eq(vim.api.nvim_buf_get_lines(empty_buf, 0, -1, false)[1], "")
+
+  local binary_path = files_root .. "/src/binary.bin"
+  local binary_buf = edit_path(binary_path)
+  local binary_file = assert(io.open(binary_path, "wb"))
+  binary_file:write("a\000b")
+  binary_file:close()
+  open_callbacks["src/binary.bin"](nil, {
+    path = "src/binary.bin",
+    local_path = binary_path,
+    hash = "binary-hash",
+  })
+  vim.wait(100, function()
+    return vim.b[binary_buf].nrm_hydrate_failed == true
+  end)
+  assert_eq(vim.b[binary_buf].nrm_remote_path, nil)
+  assert_eq(vim.api.nvim_get_option_value("modifiable", { buf = binary_buf }), false)
 end
 
 local ok, err = xpcall(main, debug.traceback)

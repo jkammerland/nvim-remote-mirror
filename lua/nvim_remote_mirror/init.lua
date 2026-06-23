@@ -43,6 +43,7 @@ M.config = {
   open_prefetch_related = false,
   open_prefetch_related_limit = 16,
   auto_hydrate_mirror_buffers = true,
+  adoption_policy = "tracked_or_explicit",
   auto_reconnect = true,
   reconnect_delay_ms = 1000,
   reconnect_max_attempts = 3,
@@ -95,6 +96,10 @@ local function optional_string(value)
     return value
   end
   return nil
+end
+
+local function auto_adoption_enabled()
+  return M.config.adoption_policy == "auto"
 end
 
 local function normalize_local_root(path)
@@ -977,7 +982,7 @@ local function adopt_mirror_buffer_for_save(bufnr, identity, relative_path)
   vim.b[bufnr].nrm_flush_pending = has_deferred_flush(relative_path, identity)
 end
 
-local function mark_deferred_flush(bufnr, path, reason, identity)
+local function mark_deferred_flush(bufnr, path, reason, identity, adopt)
   if not path or path == "" then
     return false
   end
@@ -992,10 +997,12 @@ local function mark_deferred_flush(bufnr, path, reason, identity)
       workspace_key = identity and identity.workspace_key or nil,
       target_arg = identity and identity.target_arg or nil,
       files_root = identity and identity.files_root or nil,
+      adopt = adopt == true,
       bufnrs = {},
     }
     M.deferred_flushes[key] = item
   end
+  item.adopt = item.adopt or adopt == true
   item.reason = reason
   item.updated_at = os.time()
   if bufnr and vim.api.nvim_buf_is_valid(bufnr) then
@@ -1570,17 +1577,62 @@ end
 
 local prefetch_related
 
-local function apply_mirror_file_to_buffer(bufnr, local_path, result, client)
-  local ok, lines = pcall(vim.fn.readfile, local_path, "b")
+local function blob_to_text(blob)
+  if type(blob) == "string" then
+    if blob:find("\000", 1, true) then
+      return nil, "binary"
+    end
+    return blob, nil
+  end
+  local ok, bytes = pcall(vim.fn.blob2list, blob)
   if not ok then
-    notify("failed to read local mirror file " .. local_path .. ": " .. tostring(lines), vim.log.levels.ERROR)
+    return nil, tostring(bytes)
+  end
+  local chunks = {}
+  for index, byte in ipairs(bytes) do
+    if byte == 0 then
+      return nil, "binary"
+    end
+    chunks[index] = string.char(byte)
+  end
+  return table.concat(chunks), nil
+end
+
+local function text_to_buffer_lines(text)
+  if text == "" then
+    return { "" }, false
+  end
+  local has_final_newline = text:sub(-1) == "\n"
+  local lines = vim.split(text, "\n", { plain = true })
+  if has_final_newline then
+    table.remove(lines, #lines)
+  end
+  if #lines == 0 then
+    lines = { "" }
+  end
+  return lines, has_final_newline
+end
+
+local function apply_mirror_file_to_buffer(bufnr, local_path, result, client)
+  local ok, blob = pcall(vim.fn.readblob, local_path)
+  if not ok then
+    notify("failed to read local mirror file " .. local_path .. ": " .. tostring(blob), vim.log.levels.ERROR)
     return false
   end
+  local text, read_error = blob_to_text(blob)
   if not vim.api.nvim_buf_is_valid(bufnr) then
     return false
   end
+  if read_error == "binary" then
+    set_buffer_hydrate_failed(bufnr, result and result.path or vim.fn.fnamemodify(local_path, ":t"))
+    notify("binary mirror file is not supported for buffer hydration: " .. local_path, vim.log.levels.ERROR)
+    return false
+  end
+  local lines, has_final_newline = text_to_buffer_lines(text)
   set_buffer_editable(bufnr, true)
   vim.api.nvim_buf_set_lines(bufnr, 0, -1, false, lines)
+  pcall(vim.api.nvim_set_option_value, "fixendofline", false, { buf = bufnr })
+  pcall(vim.api.nvim_set_option_value, "endofline", has_final_newline, { buf = bufnr })
   vim.api.nvim_set_option_value("modified", false, { buf = bufnr })
   if result then
     set_remote_buffer_identity(bufnr, client or M.client, result)
@@ -1759,7 +1811,7 @@ local function flush_remote_path(path, opts)
   local identity = opts.identity or buffer_identity(bufnr) or client_identity(M.client)
   if not M.client or not identity_matches_client(identity, M.client) then
     local reason = M.client and "workspace mismatch" or "disconnected"
-    local is_new = mark_deferred_flush(bufnr, path, reason, identity)
+    local is_new = mark_deferred_flush(bufnr, path, reason, identity, opts.adopt == true)
     if is_new then
       local suffix = reason == "workspace mismatch" and " until its workspace is reconnected"
         or " until reconnect"
@@ -1768,9 +1820,10 @@ local function flush_remote_path(path, opts)
     return
   end
 
-  M.request("flush", { path = path }, function(err, result)
+  local method = opts.adopt == true and "adopt" or "flush"
+  M.request(method, { path = path }, function(err, result)
     if err then
-      mark_deferred_flush(bufnr, path, err, identity)
+      mark_deferred_flush(bufnr, path, err, identity, opts.adopt == true)
       notify("remote save deferred for " .. path .. ": " .. err, vim.log.levels.WARN)
       return
     end
@@ -1832,24 +1885,53 @@ function M.flush_buffer(bufnr, opts)
   local client = M.client
   local write_path = optional_string(opts.local_path) or vim.api.nvim_buf_get_name(bufnr)
   local adopt_identity = nil
+  local explicit_adopt = opts.adopt == true
   if not path and client then
-    path = mirror_relative_path(client, write_path)
-    adopt_identity = client_identity(client)
+    local candidate = mirror_relative_path(client, write_path)
+    if candidate and (explicit_adopt or auto_adoption_enabled()) then
+      path = candidate
+      adopt_identity = client_identity(client)
+    elseif candidate then
+      notify("remote save skipped for untracked mirror file " .. candidate .. "; use :RemoteAdopt", vim.log.levels.WARN)
+      return
+    end
   end
   if not path then
     adopt_identity = buffer_identity_value or M.last_workspace_identity
-    path = identity_relative_path(adopt_identity, write_path)
+    local candidate = identity_relative_path(adopt_identity, write_path)
+    if candidate and (explicit_adopt or auto_adoption_enabled()) then
+      path = candidate
+    elseif candidate then
+      notify("remote save skipped for untracked mirror file " .. candidate .. "; use :RemoteAdopt", vim.log.levels.WARN)
+      return
+    end
   end
   if path and not optional_string(vim.b[bufnr].nrm_remote_path) then
     adopt_mirror_buffer_for_save(bufnr, adopt_identity, path)
   end
-  flush_remote_path(path, { bufnr = bufnr, identity = buffer_identity(bufnr) or adopt_identity })
+  flush_remote_path(path, {
+    bufnr = bufnr,
+    identity = buffer_identity(bufnr) or adopt_identity,
+    adopt = explicit_adopt,
+  })
+end
+
+function M.adopt(local_path)
+  local bufnr = vim.api.nvim_get_current_buf()
+  local path = optional_string(local_path)
+  if not path then
+    path = vim.api.nvim_buf_get_name(bufnr)
+  end
+  if not path or path == "" then
+    error("adopt requires a mirror file path or a named buffer")
+  end
+  M.flush_buffer(bufnr, { local_path = path, adopt = true })
 end
 
 function M.flush_deferred()
   local items = deferred_flush_items(M.client)
   for _, item in ipairs(items) do
-    flush_remote_path(item.path, { deferred = true, identity = item })
+    flush_remote_path(item.path, { deferred = true, identity = item, adopt = item.adopt == true })
   end
   return #items
 end
@@ -2211,6 +2293,9 @@ function M.save_queue(opts)
   if opts.limit then
     params.limit = opts.limit
   end
+  if opts.state then
+    params.state = opts.state
+  end
 
   M.request("save_queue", params, function(err, result)
     if not is_current() then
@@ -2290,6 +2375,9 @@ function M.save_queue_async(opts, callback)
   if opts.limit then
     params.limit = opts.limit
   end
+  if opts.state then
+    params.state = opts.state
+  end
   request_async("save_queue", params, callback)
 end
 
@@ -2361,7 +2449,7 @@ function M.recover_local_edits(opts)
 end
 
 function M.validate(path)
-  path = path or vim.b.nrm_remote_path
+  path = path or M.remote_path(0)
   if not path or path == "" then
     error("validate requires a remote path or a remote buffer")
   end

@@ -367,6 +367,9 @@ local function queue_prompt(opts, result, shown_count)
     "failed=" .. tostring(tonumber(counts.failed) or 0),
     "conflicts=" .. tostring(tonumber(counts.conflict) or 0),
   }
+  if (tonumber(counts.unreplayable) or 0) > 0 then
+    table.insert(parts, "unreplayable=" .. tostring(tonumber(counts.unreplayable) or 0))
+  end
   if result.truncated then
     table.insert(parts, "truncated_at=" .. tostring(result.limit or shown_count or #(result.entries or {})))
   end
@@ -375,14 +378,15 @@ end
 
 function M.queue(opts)
   opts = opts or {}
-  nrm.save_queue_async({ limit = opts.limit or 100 }, function(err, result)
+  nrm.save_queue_async({
+    limit = opts.limit or 100,
+    state = opts.conflicts_only and "conflict" or nil,
+  }, function(err, result)
     if err then
       notify(err, vim.log.levels.ERROR)
       return
     end
-    local entries = vim.tbl_filter(function(entry)
-      return not opts.conflicts_only or entry.state == "conflict"
-    end, result and result.entries or {})
+    local entries = result and result.entries or {}
     if #entries == 0 then
       local message = opts.conflicts_only and "save queue has no conflicts" or "save queue is empty"
       notify(message)

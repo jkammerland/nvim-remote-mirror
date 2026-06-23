@@ -56,6 +56,17 @@ files.
 | `prefetch_max_file_bytes` | `4 MiB` |
 | `prefetch_max_total_bytes` | `16 MiB` |
 
+## Save Adoption
+
+| Option | Default | Notes |
+| --- | --- | --- |
+| `adoption_policy` | `tracked_or_explicit` | `tracked_or_explicit` only saves buffers that were opened by nrm or explicitly adopted with `:RemoteAdopt`; `auto` restores legacy mirror-root auto-adoption |
+
+The default avoids accidentally creating remote files when another plugin writes
+cache, scratch, or generated files under the mirror files root. Use
+`:RemoteAdopt [path]` for intentional new remote files or recreating a remote
+file that validation marked deleted.
+
 ## Reconnect and Recovery
 
 | Option | Default | Notes |

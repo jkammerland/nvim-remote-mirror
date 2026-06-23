@@ -52,17 +52,16 @@ root. This makes cwd-based plugins behave like they are inside the project:
 
 ## Write Adoption Caveat
 
-Saving a new file under the mirror files root adopts that file as a
-workspace-relative remote path and queues it for remote creation. After
-`:RemoteCd`, cwd-based plugins are more likely to write under that root. That
-makes file explorers and normal editing useful, but it can surprise plugins
-that write generated files, temp files, caches, tags, formatter scratch files,
-or build outputs inside the project tree.
+By default, saving a new file under the mirror files root does not create it
+remotely. Use `:RemoteAdopt [path]` when the file should become a
+workspace-relative remote path. Setting `adoption_policy = "auto"` restores the
+legacy behavior where mirror-root files are adopted automatically.
 
-Until ignore/adoption policy is configurable, keep plugin caches and temporary
-output outside the mirror files root unless the files should exist remotely.
-Good examples are `$XDG_CACHE_HOME`, `/tmp`, plugin-specific state directories,
-or an explicit remote-intended generated directory.
+After `:RemoteCd`, cwd-based plugins are more likely to write under the mirror
+files root. Keep plugin caches and temporary output outside that root unless the
+files should exist remotely. Good examples are `$XDG_CACHE_HOME`, `/tmp`,
+plugin-specific state directories, or an explicit remote-intended generated
+directory.
 
 ## Adapter Rule
 

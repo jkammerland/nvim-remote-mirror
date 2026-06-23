@@ -167,6 +167,33 @@ local function main()
 
   local actions = ui._queue_actions(queue_result.entries[1])
   assert_eq(#actions >= 4, true)
+
+  local conflict_select_prompt = nil
+  vim.ui.select = function(items, opts)
+    assert_eq(#items, 1)
+    conflict_select_prompt = opts.prompt
+  end
+  nrm.request = function(method, params, callback)
+    assert_eq(method, "save_queue")
+    assert_eq(params.limit, 100)
+    assert_eq(params.state, "conflict")
+    callback(nil, {
+      total = 1,
+      limit = 100,
+      truncated = false,
+      counts = { pending = 0, failed = 0, conflict = 1 },
+      entries = {
+        {
+          queue_id = 10,
+          path = "src/conflict.rs",
+          state = "conflict",
+          remote_conflict_path = "/mirror/workspace/conflicts/src-conflict.remote",
+        },
+      },
+    })
+  end
+  ui.conflicts()
+  assert_contains(conflict_select_prompt, "Remote conflicts")
 end
 
 local ok, err = xpcall(main, debug.traceback)

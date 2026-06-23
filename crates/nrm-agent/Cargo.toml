@@ -15,4 +15,9 @@ serde.workspace = true
 walkdir.workspace = true
 
 [dev-dependencies]
+criterion.workspace = true
 tempfile.workspace = true
+
+[[bench]]
+name = "agent_cli"
+harness = false

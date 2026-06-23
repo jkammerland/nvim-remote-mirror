@@ -111,6 +111,23 @@ local function main()
   vim.b[buf].nrm_files_root = root .. "/files"
   assert_eq(nrm.remote_path(buf), "src/main.rs")
 
+  local validate_calls = {}
+  nrm.request = function(method, params, callback)
+    table.insert(validate_calls, { method = method, params = params })
+    callback(nil, { path = params.path, status = "valid" })
+  end
+  vim.api.nvim_set_current_buf(buf)
+  vim.b[buf].nrm_workspace_key = "workspace-b"
+  ok, err = pcall(nrm.validate)
+  assert_eq(ok, false)
+  assert_contains(err, "validate requires")
+  assert_eq(#validate_calls, 0)
+  vim.b[buf].nrm_workspace_key = "workspace-a"
+  ok, err = pcall(nrm.validate)
+  assert_eq(ok, true, err)
+  assert_eq(validate_calls[1].method, "validate")
+  assert_eq(validate_calls[1].params.path, "src/main.rs")
+
   local pending = vim.api.nvim_create_buf(true, false)
   vim.b[pending].nrm_hydrate_path = "src/pending.rs"
   vim.b[pending].nrm_files_root = root .. "/files"

@@ -4,7 +4,8 @@ use ignore::{Walk, WalkBuilder};
 use nrm_protocol::{
     read_frame, write_frame, BatchReadError, BatchReadFile, BatchValidateFile, CapabilitySet,
     FileMeta, Request, Response, RpcError, RpcMessage, SaveApplied, SaveConflict, SaveOutcome,
-    SearchHit, WriteStartOutcome, WriteStarted, MAX_CONFLICT_CONTENT_BYTES, PROTOCOL_VERSION,
+    SearchHit, WriteStartOutcome, WriteStarted, MAX_CONFLICT_CONTENT_BYTES, MAX_FRAME_LEN,
+    PROTOCOL_VERSION,
 };
 #[cfg(test)]
 use std::cell::Cell;
@@ -15,7 +16,18 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::{Component, Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+const AGENT_READ_RESPONSE_MAX_BYTES: u64 = (MAX_FRAME_LEN - (1024 * 1024)) as u64;
+const AGENT_BATCH_TOTAL_MAX_BYTES: u64 = AGENT_READ_RESPONSE_MAX_BYTES;
+const AGENT_GREP_HARD_MAX_FILES: usize = 50_000;
+const AGENT_GREP_HARD_MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
+const AGENT_GREP_HARD_MAX_TOTAL_BYTES: u64 = 32 * 1024 * 1024;
+const AGENT_GREP_HARD_MAX_HIT_TEXT_BYTES: usize = 4 * 1024 * 1024;
+const AGENT_GREP_HARD_MAX_LINE_BYTES: usize = 64 * 1024;
+const MAX_ACTIVE_UPLOADS: usize = 8;
+const MAX_ACTIVE_UPLOAD_BYTES: u64 = 512 * 1024 * 1024;
+const UPLOAD_TTL: Duration = Duration::from_secs(10 * 60);
 
 #[cfg(test)]
 thread_local! {
@@ -55,6 +67,13 @@ struct GrepSession {
     walk: Walk,
 }
 
+#[derive(Clone, Copy, Default)]
+struct GrepCaps {
+    max_files: Option<usize>,
+    max_file_bytes: Option<u64>,
+    max_total_bytes: Option<u64>,
+}
+
 const MAX_GREP_SESSIONS: usize = 8;
 
 struct PendingUpload {
@@ -69,6 +88,7 @@ struct PendingUpload {
     tmp_file: File,
     parent: WriteParent,
     written: u64,
+    created_at: Instant,
     _lock: WriteLock,
 }
 
@@ -80,6 +100,11 @@ struct WriteTarget {
 struct WriteLock {
     #[cfg(unix)]
     _file: File,
+}
+
+struct OpenedContentFile {
+    file: File,
+    metadata: fs::Metadata,
 }
 
 struct WriteParent {
@@ -240,10 +265,12 @@ fn handle_request(state: &mut AgentState, request: Request) -> Result<Response> 
             &query,
             limit,
             after.as_deref(),
-            max_files,
             session_id.as_deref(),
-            max_file_bytes,
-            max_total_bytes,
+            GrepCaps {
+                max_files,
+                max_file_bytes,
+                max_total_bytes,
+            },
         ),
         Request::WriteFileCas {
             path,
@@ -304,22 +331,23 @@ fn scan(root: &Path, limit: usize, after: Option<&str>) -> Result<Response> {
 }
 
 fn read_file(root: &Path, path: String, offset: u64, len: Option<u64>) -> Result<Response> {
-    let abs = resolve_existing_content_path(root, &path)?;
-
-    let mut file = File::open(&abs)?;
-    let file_len = file.metadata()?.len();
+    let mut opened = open_existing_content_file(root, &path)?;
+    let file_len = opened.metadata.len();
     if offset > file_len {
         bail!("offset {offset} exceeds file length {file_len}");
     }
-    file.seek(SeekFrom::Start(offset))?;
+    opened.file.seek(SeekFrom::Start(offset))?;
 
     let read_len = len.unwrap_or(file_len - offset).min(file_len - offset);
+    if read_len > AGENT_READ_RESPONSE_MAX_BYTES {
+        bail!("read length {read_len} exceeds agent response cap {AGENT_READ_RESPONSE_MAX_BYTES}");
+    }
     let mut content = vec![0_u8; read_len as usize];
-    file.read_exact(&mut content)?;
+    opened.file.read_exact(&mut content)?;
     let eof = offset + read_len >= file_len;
-    let mut meta = file_meta_for_response_path(root, &abs, &path, false)?;
+    let mut meta = file_meta_from_metadata(path.clone(), &opened.metadata, None);
     let hash = if eof {
-        let hash = hash_file(&abs)?;
+        let hash = hash_open_file(&mut opened.file)?;
         meta.hash = Some(hash.clone());
         hash
     } else {
@@ -346,6 +374,8 @@ fn read_files(
     let mut errors = Vec::new();
     let mut total_bytes = 0_u64;
     let mut truncated = false;
+    let max_file_bytes = max_file_bytes.min(AGENT_READ_RESPONSE_MAX_BYTES);
+    let max_total_bytes = max_total_bytes.min(AGENT_BATCH_TOTAL_MAX_BYTES);
 
     for path in paths {
         let remaining_total_bytes = max_total_bytes.saturating_sub(total_bytes);
@@ -401,6 +431,19 @@ fn validate_one_file(root: &Path, path: &str, include_hash: bool) -> Result<Batc
             meta: None,
         });
     };
+    let metadata = fs::symlink_metadata(&abs)?;
+    if include_hash && metadata.is_file() {
+        let mut opened = open_existing_content_file(root, path)?;
+        let hash = hash_open_file(&mut opened.file)?;
+        return Ok(BatchValidateFile {
+            path: path.to_string(),
+            meta: Some(file_meta_from_metadata(
+                path.to_string(),
+                &opened.metadata,
+                Some(hash),
+            )),
+        });
+    }
     Ok(BatchValidateFile {
         path: path.to_string(),
         meta: Some(file_meta(root, &abs, include_hash)?),
@@ -413,27 +456,30 @@ fn read_file_for_batch(
     max_file_bytes: u64,
     remaining_total_bytes: u64,
 ) -> Result<BatchReadFile> {
-    let abs = resolve_existing_content_path(root, path)?;
+    let mut opened = open_existing_content_file(root, path)?;
 
-    let metadata = fs::metadata(&abs)?;
-    if metadata.len() > max_file_bytes {
+    if opened.metadata.len() > max_file_bytes {
         bail!(
             "{path} is {} bytes, above batch max_file_bytes={max_file_bytes}",
-            metadata.len()
+            opened.metadata.len()
         );
     }
-    if metadata.len() > remaining_total_bytes {
+    if opened.metadata.len() > remaining_total_bytes {
         return Err(BatchTotalCapExceeded {
             path: path.to_string(),
-            file_size: metadata.len(),
+            file_size: opened.metadata.len(),
             remaining_total_bytes,
         }
         .into());
     }
 
-    let content = read_file_bytes_with_cap(&abs, max_file_bytes.min(remaining_total_bytes))?;
+    let content = read_open_file_bytes_with_cap(
+        &mut opened.file,
+        path,
+        max_file_bytes.min(remaining_total_bytes),
+    )?;
     let hash = hash_bytes(&content);
-    let mut meta = file_meta_for_response_path(root, &abs, path, false)?;
+    let mut meta = file_meta_from_metadata(path.to_string(), &opened.metadata, None);
     meta.hash = Some(hash.clone());
     Ok(BatchReadFile {
         path: path.to_string(),
@@ -443,18 +489,37 @@ fn read_file_for_batch(
     })
 }
 
+#[cfg(test)]
 fn read_file_bytes_with_cap(path: &Path, max_bytes: u64) -> Result<Vec<u8>> {
     #[cfg(test)]
     FILE_CONTENT_READS.with(|reads| reads.set(reads.get() + 1));
 
+    let max_bytes = max_bytes.min(AGENT_READ_RESPONSE_MAX_BYTES);
     let file = File::open(path)?;
+    read_reader_bytes_with_cap(file, &path.display().to_string(), max_bytes)
+}
+
+fn read_open_file_bytes_with_cap(file: &mut File, label: &str, max_bytes: u64) -> Result<Vec<u8>> {
+    #[cfg(test)]
+    FILE_CONTENT_READS.with(|reads| reads.set(reads.get() + 1));
+
+    let max_bytes = max_bytes.min(AGENT_READ_RESPONSE_MAX_BYTES);
+    file.seek(SeekFrom::Start(0))?;
+    let content =
+        read_reader_bytes_with_cap(file.take(max_bytes.saturating_add(1)), label, max_bytes)?;
+    file.seek(SeekFrom::Start(0))?;
+    Ok(content)
+}
+
+fn read_reader_bytes_with_cap<R: Read>(reader: R, label: &str, max_bytes: u64) -> Result<Vec<u8>> {
     let mut content = Vec::new();
-    file.take(max_bytes.saturating_add(1))
+    reader
+        .take(max_bytes.saturating_add(1))
         .read_to_end(&mut content)?;
     if content.len() as u64 > max_bytes {
         bail!(
             "{} exceeded read cap: read_at_least={} max_bytes={}",
-            path.display(),
+            label,
             content.len(),
             max_bytes
         );
@@ -472,7 +537,15 @@ fn grep(
     session_id: Option<&str>,
 ) -> Result<Response> {
     grep_with_caps(
-        state, query, limit, after, max_files, session_id, None, None,
+        state,
+        query,
+        limit,
+        after,
+        session_id,
+        GrepCaps {
+            max_files,
+            ..GrepCaps::default()
+        },
     )
 }
 
@@ -481,10 +554,8 @@ fn grep_with_caps(
     query: &str,
     limit: usize,
     after: Option<&str>,
-    max_files: Option<usize>,
     session_id: Option<&str>,
-    max_file_bytes: Option<u64>,
-    max_total_bytes: Option<u64>,
+    caps: GrepCaps,
 ) -> Result<Response> {
     if query.is_empty() || limit == 0 {
         if let Some(session_id) = session_id {
@@ -520,10 +591,20 @@ fn grep_with_caps(
     let mut hits = Vec::new();
     let mut next_after = None;
     let mut scanned_files = 0_usize;
-    let max_files = max_files.unwrap_or(usize::MAX).max(1);
-    let max_file_bytes = max_file_bytes.unwrap_or(u64::MAX);
-    let max_total_bytes = max_total_bytes.unwrap_or(u64::MAX);
+    let max_files = caps
+        .max_files
+        .unwrap_or(AGENT_GREP_HARD_MAX_FILES)
+        .clamp(1, AGENT_GREP_HARD_MAX_FILES);
+    let max_file_bytes = caps
+        .max_file_bytes
+        .unwrap_or(AGENT_GREP_HARD_MAX_FILE_BYTES)
+        .min(AGENT_GREP_HARD_MAX_FILE_BYTES);
+    let max_total_bytes = caps
+        .max_total_bytes
+        .unwrap_or(AGENT_GREP_HARD_MAX_TOTAL_BYTES)
+        .min(AGENT_GREP_HARD_MAX_TOTAL_BYTES);
     let mut scanned_bytes = 0_u64;
+    let mut hit_text_bytes = 0_usize;
     let mut exhausted = false;
     let mut hit_limit_reached = false;
     let mut byte_limit_reached = false;
@@ -547,43 +628,52 @@ fn grep_with_caps(
             }
             continue;
         }
-        let path = match resolve_existing_content_path(&state.root, &relative) {
-            Ok(path) => path,
+        let mut opened = match open_existing_content_file(&state.root, &relative) {
+            Ok(opened) => opened,
             Err(_) => continue,
         };
         scanned_files += 1;
         next_after = Some(relative.clone());
-        let metadata = match fs::metadata(&path) {
-            Ok(metadata) => metadata,
-            Err(_) => continue,
-        };
-        if metadata.len() > max_file_bytes {
+        if opened.metadata.len() > max_file_bytes {
             byte_limit_reached = true;
             continue;
         }
         let remaining_total_bytes = max_total_bytes.saturating_sub(scanned_bytes);
-        if metadata.len() > remaining_total_bytes {
+        if opened.metadata.len() > remaining_total_bytes {
             byte_limit_reached = true;
             break;
         }
-        if likely_binary(&path)? {
+        if likely_binary_open_file(&mut opened.file)? {
             continue;
         }
-        let content =
-            match read_file_bytes_with_cap(&path, max_file_bytes.min(remaining_total_bytes)) {
-                Ok(content) => content,
-                Err(_) => {
-                    byte_limit_reached = true;
-                    continue;
-                }
-            };
+        let content = match read_open_file_bytes_with_cap(
+            &mut opened.file,
+            &relative,
+            max_file_bytes.min(remaining_total_bytes),
+        ) {
+            Ok(content) => content,
+            Err(_) => {
+                byte_limit_reached = true;
+                continue;
+            }
+        };
         scanned_bytes = scanned_bytes.saturating_add(content.len() as u64);
         let text = match String::from_utf8(content) {
             Ok(text) => text,
             Err(_) => continue,
         };
         for (line_idx, line) in text.lines().enumerate() {
+            if line.len() > AGENT_GREP_HARD_MAX_LINE_BYTES {
+                byte_limit_reached = true;
+                continue;
+            }
             if let Some(byte_idx) = line.find(query) {
+                let next_hit_text_bytes = hit_text_bytes.saturating_add(line.len());
+                if next_hit_text_bytes > AGENT_GREP_HARD_MAX_HIT_TEXT_BYTES {
+                    byte_limit_reached = true;
+                    break;
+                }
+                hit_text_bytes = next_hit_text_bytes;
                 hits.push(SearchHit {
                     path: relative.clone(),
                     line: line_idx as u64 + 1,
@@ -796,6 +886,8 @@ fn begin_write_file_cas(
     content_hash: String,
     size: u64,
 ) -> Result<Response> {
+    cleanup_expired_uploads(state);
+    enforce_upload_limits(state, size)?;
     let target = prepare_write_target(&state.root, &path)?;
     let target_key = write_target_key(&state.root, &target.abs);
     ensure_no_active_write(&state.active_write_targets, &target_key, &path)?;
@@ -841,6 +933,7 @@ fn begin_write_file_cas(
             tmp_file,
             parent,
             written: 0,
+            created_at: Instant::now(),
             _lock: lock,
         },
     );
@@ -856,6 +949,7 @@ fn write_file_chunk(
     offset: u64,
     content: Vec<u8>,
 ) -> Result<Response> {
+    cleanup_expired_uploads(state);
     let upload = state
         .uploads
         .get_mut(&upload_id)
@@ -885,6 +979,7 @@ fn write_file_chunk(
 }
 
 fn finish_write_file_cas(state: &mut AgentState, upload_id: String) -> Result<Response> {
+    cleanup_expired_uploads(state);
     let upload = state
         .uploads
         .remove(&upload_id)
@@ -901,6 +996,7 @@ fn finish_write_file_cas(state: &mut AgentState, upload_id: String) -> Result<Re
         mut tmp_file,
         parent,
         written,
+        created_at: _,
         _lock: write_lock,
     } = upload;
     let _write_lock = write_lock;
@@ -983,11 +1079,48 @@ fn finish_write_file_cas(state: &mut AgentState, upload_id: String) -> Result<Re
 }
 
 fn abort_write_file_cas(state: &mut AgentState, upload_id: String) -> Result<Response> {
+    cleanup_expired_uploads(state);
     if let Some(upload) = state.uploads.remove(&upload_id) {
         let _ = remove_temp_file(&upload.parent, &upload.tmp_path, &upload.tmp_name);
         state.active_write_targets.remove(&upload.target_key);
     }
     Ok(Response::AbortWriteFileCas { upload_id })
+}
+
+fn cleanup_expired_uploads(state: &mut AgentState) {
+    let now = Instant::now();
+    let expired = state
+        .uploads
+        .iter()
+        .filter(|(_, upload)| {
+            now.saturating_duration_since(upload.created_at)
+                .gt(&UPLOAD_TTL)
+        })
+        .map(|(upload_id, _)| upload_id.clone())
+        .collect::<Vec<_>>();
+    for upload_id in expired {
+        if let Some(upload) = state.uploads.remove(&upload_id) {
+            let _ = remove_temp_file(&upload.parent, &upload.tmp_path, &upload.tmp_name);
+            state.active_write_targets.remove(&upload.target_key);
+        }
+    }
+}
+
+fn enforce_upload_limits(state: &AgentState, new_size: u64) -> Result<()> {
+    if state.uploads.len() >= MAX_ACTIVE_UPLOADS {
+        bail!("too many active uploads: max={MAX_ACTIVE_UPLOADS}");
+    }
+    let active_bytes = state
+        .uploads
+        .values()
+        .fold(0_u64, |sum, upload| sum.saturating_add(upload.size));
+    let next_bytes = active_bytes.saturating_add(new_size);
+    if next_bytes > MAX_ACTIVE_UPLOAD_BYTES {
+        bail!(
+            "active upload bytes would exceed limit: next={next_bytes} max={MAX_ACTIVE_UPLOAD_BYTES}"
+        );
+    }
+    Ok(())
 }
 
 fn save_conflict(
@@ -1038,6 +1171,56 @@ fn existing_metadata_path(root: &Path, abs: &Path) -> Result<Option<PathBuf>> {
     }
 }
 
+#[cfg(unix)]
+fn open_existing_content_file(root: &Path, path: &str) -> Result<OpenedContentFile> {
+    let relative = normalize_relative_path(path)?;
+    let abs = root.join(relative);
+    let file_name = abs
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("remote path must name a file"))?
+        .to_owned();
+    let parent = abs
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("remote path must have a parent directory"))?;
+    let canonical_parent = parent
+        .canonicalize()
+        .with_context(|| format!("failed to resolve parent for {path}"))?;
+    ensure_path_within_root(root, &canonical_parent)?;
+    let parent_dir = open_parent_dir(&canonical_parent)?;
+    verify_parent_dir_identity(&parent_dir, &canonical_parent)?;
+    let name = c_path_name(&file_name)?;
+    let flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+    // SAFETY: `name` is a valid NUL-terminated path component, and
+    // `parent_dir` pins the directory used by openat.
+    let fd = unsafe { libc::openat(parent_dir.as_raw_fd(), name.as_ptr(), flags) };
+    if fd < 0 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ELOOP) {
+            bail!("{path} is a symlink; content operations do not follow symlinks");
+        }
+        return Err(error).with_context(|| format!("failed to open {path}"));
+    }
+    // SAFETY: openat returned an owned descriptor on success.
+    let file = unsafe { File::from_raw_fd(fd) };
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("failed to stat open file {path}"))?;
+    if !metadata.is_file() {
+        bail!("{path} is not a regular file");
+    }
+    verify_parent_dir_identity(&parent_dir, &canonical_parent)?;
+    Ok(OpenedContentFile { file, metadata })
+}
+
+#[cfg(not(unix))]
+fn open_existing_content_file(root: &Path, path: &str) -> Result<OpenedContentFile> {
+    let abs = resolve_existing_content_path(root, path)?;
+    let file = File::open(&abs)?;
+    let metadata = file.metadata()?;
+    Ok(OpenedContentFile { file, metadata })
+}
+
+#[cfg(not(unix))]
 fn resolve_existing_content_path(root: &Path, path: &str) -> Result<PathBuf> {
     let abs = resolve_remote_path(root, path)?;
     let metadata = fs::symlink_metadata(&abs).with_context(|| format!("failed to stat {path}"))?;
@@ -1110,11 +1293,8 @@ fn current_regular_file_hash(root: &Path, path: &str, abs: &Path) -> Result<Opti
             if !metadata.is_file() {
                 return Ok(None);
             }
-            let canonical = abs
-                .canonicalize()
-                .with_context(|| format!("failed to resolve {path}"))?;
-            ensure_path_within_root(root, &canonical)?;
-            Ok(Some(hash_file(&canonical)?))
+            let mut opened = open_existing_content_file(root, path)?;
+            Ok(Some(hash_open_file(&mut opened.file)?))
         }
         Err(error) if is_missing_path_error(&error) => Ok(None),
         Err(error) => Err(error).with_context(|| format!("failed to stat {path}")),
@@ -1463,8 +1643,20 @@ fn file_meta(root: &Path, path: &Path, include_hash: bool) -> Result<FileMeta> {
     } else {
         None
     };
-    Ok(FileMeta {
-        path: relative_path(root, path)?,
+    Ok(file_meta_from_metadata(
+        relative_path(root, path)?,
+        &metadata,
+        hash,
+    ))
+}
+
+fn file_meta_from_metadata(
+    path: String,
+    metadata: &fs::Metadata,
+    hash: Option<String>,
+) -> FileMeta {
+    FileMeta {
+        path,
         size: metadata.len(),
         mtime_ms: metadata
             .modified()
@@ -1472,22 +1664,11 @@ fn file_meta(root: &Path, path: &Path, include_hash: bool) -> Result<FileMeta> {
             .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
             .map(|duration| duration.as_millis() as i64)
             .unwrap_or(0),
-        mode: platform_mode(&metadata),
+        mode: platform_mode(metadata),
         is_dir: metadata.is_dir(),
         is_symlink: metadata.file_type().is_symlink(),
         hash,
-    })
-}
-
-fn file_meta_for_response_path(
-    root: &Path,
-    path: &Path,
-    response_path: &str,
-    include_hash: bool,
-) -> Result<FileMeta> {
-    let mut meta = file_meta(root, path, include_hash)?;
-    meta.path = response_path.to_string();
-    Ok(meta)
+    }
 }
 
 fn relative_path(root: &Path, path: &Path) -> Result<String> {
@@ -1519,10 +1700,11 @@ fn hash_bytes(bytes: &[u8]) -> String {
     blake3::hash(bytes).to_hex().to_string()
 }
 
-fn likely_binary(path: &Path) -> Result<bool> {
-    let mut file = File::open(path)?;
+fn likely_binary_open_file(file: &mut File) -> Result<bool> {
+    file.seek(SeekFrom::Start(0))?;
     let mut buffer = [0_u8; 1024];
     let read = file.read(&mut buffer)?;
+    file.seek(SeekFrom::Start(0))?;
     Ok(buffer[..read].contains(&0))
 }
 
@@ -2207,10 +2389,12 @@ mod tests {
             "needle",
             10,
             None,
-            Some(10),
             None,
-            Some(6),
-            Some(6),
+            GrepCaps {
+                max_files: Some(10),
+                max_file_bytes: Some(6),
+                max_total_bytes: Some(6),
+            },
         )
         .unwrap();
 
@@ -2243,10 +2427,12 @@ mod tests {
             "needle",
             10,
             None,
-            Some(10),
             None,
-            Some(5),
-            Some(1024),
+            GrepCaps {
+                max_files: Some(10),
+                max_file_bytes: Some(5),
+                max_total_bytes: Some(1024),
+            },
         )
         .unwrap();
 
@@ -2282,10 +2468,12 @@ mod tests {
             "needle",
             10,
             None,
-            Some(10),
             None,
-            Some(10),
-            Some(4),
+            GrepCaps {
+                max_files: Some(10),
+                max_file_bytes: Some(10),
+                max_total_bytes: Some(4),
+            },
         )
         .unwrap();
 
@@ -2305,6 +2493,38 @@ mod tests {
         assert!(session_id.is_some());
         assert!(hits.is_empty());
         assert_eq!(FILE_CONTENT_READS.with(Cell::get), 1);
+    }
+
+    #[test]
+    fn grep_skips_huge_matching_line_and_reports_truncation() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let huge_line = format!("needle{}", "x".repeat(AGENT_GREP_HARD_MAX_LINE_BYTES));
+        fs::write(root.join("huge.txt"), huge_line).unwrap();
+        let mut state = test_state(root);
+
+        let response = grep_with_caps(
+            &mut state,
+            "needle",
+            10,
+            None,
+            None,
+            GrepCaps {
+                max_files: Some(10),
+                max_file_bytes: Some(AGENT_GREP_HARD_MAX_FILE_BYTES),
+                max_total_bytes: Some(AGENT_GREP_HARD_MAX_TOTAL_BYTES),
+            },
+        )
+        .unwrap();
+
+        let Response::Grep {
+            hits, truncated, ..
+        } = response
+        else {
+            panic!("unexpected grep response");
+        };
+        assert!(truncated);
+        assert!(hits.is_empty());
     }
 
     #[test]
@@ -2572,5 +2792,78 @@ mod tests {
             other => panic!("unexpected begin response: {other:?}"),
         }
         assert!(state.uploads.is_empty());
+    }
+
+    #[test]
+    fn chunked_uploads_enforce_active_count_limit() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let mut state = test_state(&root);
+        for index in 0..MAX_ACTIVE_UPLOADS {
+            let path = format!("file-{index}.bin");
+            let response =
+                begin_write_file_cas(&mut state, path, None, hash_bytes(b"x"), 1).unwrap();
+            assert!(matches!(
+                response,
+                Response::BeginWriteFileCas {
+                    outcome: WriteStartOutcome::Started(_)
+                }
+            ));
+        }
+
+        let error = begin_write_file_cas(
+            &mut state,
+            "too-many.bin".to_string(),
+            None,
+            hash_bytes(b"x"),
+            1,
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("too many active uploads"));
+    }
+
+    #[test]
+    fn abandoned_chunked_upload_ttl_releases_lock_and_temp_state() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().to_path_buf();
+        let mut state = test_state(&root);
+        let begin = begin_write_file_cas(
+            &mut state,
+            "old.bin".to_string(),
+            None,
+            hash_bytes(b"old"),
+            3,
+        )
+        .unwrap();
+        let upload_id = match begin {
+            Response::BeginWriteFileCas {
+                outcome: WriteStartOutcome::Started(started),
+            } => started.upload_id,
+            other => panic!("unexpected begin response: {other:?}"),
+        };
+        let tmp_path = state.uploads.get(&upload_id).unwrap().tmp_path.clone();
+        state.uploads.get_mut(&upload_id).unwrap().created_at =
+            Instant::now() - UPLOAD_TTL - Duration::from_secs(1);
+
+        let next = begin_write_file_cas(
+            &mut state,
+            "new.bin".to_string(),
+            None,
+            hash_bytes(b"new"),
+            3,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            next,
+            Response::BeginWriteFileCas {
+                outcome: WriteStartOutcome::Started(_)
+            }
+        ));
+        assert!(!state.uploads.contains_key(&upload_id));
+        assert!(!tmp_path.exists());
+        assert_eq!(state.active_write_targets.len(), 1);
     }
 }

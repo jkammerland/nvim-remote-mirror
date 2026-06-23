@@ -19,6 +19,7 @@ upload. This is the safety model for slow or unstable links.
 | `pending` | Waiting for upload |
 | `failed` | Upload failed but can be retried |
 | `conflict` | Remote changed before upload |
+| `unreplayable` | Queue row is missing the durable snapshot needed for replay |
 
 Use `:RemoteQueue` for a picker UI or `:RemoteSaveQueue` for quickfix.
 
@@ -33,7 +34,24 @@ A conflict keeps both sides:
 | Remote conflict copy | Remote bytes that blocked upload |
 
 Use `:RemoteConflicts` to open or diff the available copies. After resolving
-manually, save the chosen buffer and retry with `:RemoteFlushQueue`.
+manually, save the chosen buffer and retry with `:RemoteFlushQueue`. The next
+resolved save compares against the remote hash that caused the conflict, not an
+older base hash from the original save attempt.
+
+`:RemoteConflicts` asks the sidecar for conflict rows directly, so large pending
+queues do not hide later conflict entries.
+
+## New Remote Files
+
+By default, untracked mirror-root files are not uploaded automatically. Use
+`:RemoteAdopt [path]` to intentionally create a new remote file or recreate a
+file that validation marked deleted. Set `adoption_policy = "auto"` only when
+legacy mirror-root auto-adoption is desired.
+
+When the sidecar is connected but the remote is unavailable, `:RemoteAdopt`
+stores the saved bytes in the durable queue before retrying remote upload. If
+Neovim has no sidecar connection at all, the plugin can only defer the adoption
+in memory until reconnect; save or adopt again after restart if needed.
 
 ## Disconnected Saves
 

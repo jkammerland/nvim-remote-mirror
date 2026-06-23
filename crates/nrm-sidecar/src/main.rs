@@ -8,7 +8,7 @@ use nrm_protocol::{
 use rusqlite::Row;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -22,7 +22,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
-    mpsc, Arc, Condvar, Mutex,
+    mpsc, Arc, Condvar, Mutex, OnceLock,
 };
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -40,6 +40,7 @@ const REMOTE_UNAVAILABLE_BACKOFF_BASE_MS: u64 = 2_000;
 const REMOTE_UNAVAILABLE_BACKOFF_MAX_MS: u64 = 60_000;
 const MAX_SAVE_PAYLOAD_BYTES: u64 = (MAX_FRAME_LEN - (1024 * 1024)) as u64;
 const SAVE_INLINE_MAX_BYTES: u64 = 4 * 1024 * 1024;
+const FAST_FLUSH_SNAPSHOT_MAX_BYTES: u64 = 1024 * 1024;
 const REMOTE_INTERACTIVE_QUEUE_CAPACITY: usize = 128;
 const REMOTE_BACKGROUND_QUEUE_CAPACITY: usize = 128;
 const BACKGROUND_SCAN_CURSOR_KEY: &str = "background_scan_cursor";
@@ -66,6 +67,7 @@ const SIDECAR_COMMAND_SPECS: &[SidecarCommandSpec] = &[
     SidecarCommandSpec::public("grep", "hybrid", Some("read_or_write"), false, false, true),
     SidecarCommandSpec::public("grep_cache", "local", None, false, true, false),
     SidecarCommandSpec::public("recover_local_edits", "local", None, false, false, false),
+    SidecarCommandSpec::public("adopt", "hybrid", Some("write"), true, false, false),
     SidecarCommandSpec::public("flush", "hybrid", Some("write"), true, false, false),
     SidecarCommandSpec::internal("flush_queued", "remote", Some("write"), true, false, false),
     SidecarCommandSpec::public("flush_queue", "remote", Some("write"), true, false, false),
@@ -300,7 +302,20 @@ enum SaveAttempt {
     Queued {
         path: String,
         reason: String,
+        remote_failure: bool,
     },
+}
+
+impl SaveAttempt {
+    fn should_stop_queue_replay(&self) -> bool {
+        matches!(
+            self,
+            SaveAttempt::Queued {
+                remote_failure: true,
+                ..
+            }
+        )
+    }
 }
 
 enum HydrationMode {
@@ -614,7 +629,8 @@ struct AgentWorkerCommand {
 #[derive(Debug)]
 enum AgentWorkerReply {
     Response(Response),
-    Error(String),
+    Error(RpcError),
+    TransportError(String),
 }
 
 #[derive(Debug)]
@@ -729,6 +745,15 @@ struct AgentClient {
 enum AgentBackoffLane {
     Read,
     Write,
+}
+
+impl AgentBackoffLane {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+        }
+    }
 }
 
 #[derive(Debug, Default, Clone)]
@@ -901,7 +926,7 @@ impl AgentClient {
             while let Ok(command) = rx.recv() {
                 let response = session
                     .request(command.id, command.request)
-                    .unwrap_or_else(|error| AgentWorkerReply::Error(error.to_string()));
+                    .unwrap_or_else(|error| AgentWorkerReply::TransportError(error.to_string()));
                 let _ = command.reply.send(response);
             }
             worker_abort.abort();
@@ -965,6 +990,18 @@ impl AgentClient {
         if let Ok(mut backoff) = self.remote_backoff.lock() {
             backoff.mark_unavailable(self.backoff_lane, error.clone());
         }
+        let retry_after_ms = self
+            .remote_backoff()
+            .map(|(remaining_ms, _)| remaining_ms)
+            .unwrap_or(0);
+        trace_event(
+            "remote_backoff",
+            json!({
+                "lane": self.backoff_lane.label(),
+                "retry_after_ms": retry_after_ms,
+                "error": error.as_str()
+            }),
+        );
         anyhow!(error)
     }
 
@@ -1064,6 +1101,8 @@ impl AgentClient {
         }
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1).max(1);
+        let method = agent_request_name(&request);
+        let started = Instant::now();
         let (reply, reply_rx) = mpsc::channel();
         for attempt in 0..2 {
             let tx = match self.ensure_worker() {
@@ -1087,7 +1126,20 @@ impl AgentClient {
             }
         }
 
-        self.wait_for_reply(id, reply_rx, preemptible, preempt_epoch)
+        let outcome = self.wait_for_reply(id, reply_rx, preemptible, preempt_epoch);
+        trace_event(
+            "agent_request",
+            json!({
+                "agent_request_id": id,
+                "method": method,
+                "lane": self.backoff_lane.label(),
+                "agent_rtt_ms": duration_ms(started.elapsed()),
+                "ok": outcome.is_ok(),
+                "preempted": matches!(&outcome, Ok(AgentRequestOutcome::Preempted)),
+                "error": outcome.as_ref().err().map(ToString::to_string)
+            }),
+        );
+        outcome
     }
 
     fn wait_for_reply(
@@ -1134,7 +1186,13 @@ impl AgentClient {
         match reply {
             AgentWorkerReply::Response(Response::Error { message }) => Err(anyhow!(message)),
             AgentWorkerReply::Response(response) => Ok(AgentRequestOutcome::Response(response)),
-            AgentWorkerReply::Error(message) => {
+            AgentWorkerReply::Error(error) if error.retryable => {
+                self.worker = None;
+                self.handshake_complete = false;
+                Err(self.mark_remote_unavailable(format_rpc_error(error)))
+            }
+            AgentWorkerReply::Error(error) => Err(anyhow!(format_rpc_error(error))),
+            AgentWorkerReply::TransportError(message) => {
                 self.worker = None;
                 self.handshake_complete = false;
                 Err(self.mark_remote_unavailable(message))
@@ -1202,6 +1260,25 @@ fn kill_child_tree(child: &mut Child) {
     let _ = child.kill();
 }
 
+fn agent_request_name(request: &Request) -> &'static str {
+    match request {
+        Request::Hello { .. } => "hello",
+        Request::Scan { .. } => "scan",
+        Request::Stat { .. } => "stat",
+        Request::Checksum { .. } => "checksum",
+        Request::ValidateFiles { .. } => "validate_files",
+        Request::ReadFile { .. } => "read_file",
+        Request::ReadFiles { .. } => "read_files",
+        Request::Grep { .. } => "grep",
+        Request::WriteFileCas { .. } => "write_file_cas",
+        Request::BeginWriteFileCas { .. } => "begin_write_file_cas",
+        Request::WriteFileChunk { .. } => "write_file_chunk",
+        Request::FinishWriteFileCas { .. } => "finish_write_file_cas",
+        Request::AbortWriteFileCas { .. } => "abort_write_file_cas",
+        Request::Shutdown => "shutdown",
+    }
+}
+
 fn send_agent_frame<W: Write, R: Read>(
     stdin: &mut W,
     stdout: &mut BufReader<R>,
@@ -1219,7 +1296,7 @@ fn send_agent_frame<W: Write, R: Read>(
         RpcMessage::Error {
             id: response_id,
             error,
-        } if response_id == id => Ok(AgentWorkerReply::Error(format_rpc_error(error))),
+        } if response_id == id => Ok(AgentWorkerReply::Error(error)),
         RpcMessage::Response {
             id: response_id, ..
         }
@@ -1347,6 +1424,7 @@ impl Mirror {
               attempts INTEGER NOT NULL DEFAULT 0,
               last_error TEXT,
               remote_conflict_path TEXT,
+              conflict_actual_hash TEXT,
               created_at_ms INTEGER NOT NULL,
               updated_at_ms INTEGER NOT NULL
             );
@@ -1394,6 +1472,7 @@ impl Mirror {
         self.add_missing_column("save_queue", "attempts", "INTEGER NOT NULL DEFAULT 0")?;
         self.add_missing_column("save_queue", "last_error", "TEXT")?;
         self.add_missing_column("save_queue", "remote_conflict_path", "TEXT")?;
+        self.add_missing_column("save_queue", "conflict_actual_hash", "TEXT")?;
         Ok(())
     }
 
@@ -1518,6 +1597,15 @@ impl Mirror {
             ],
         )?;
         Ok(())
+    }
+
+    fn upsert_metadata_batch(&self, entries: &[FileMeta], state: &str) -> Result<()> {
+        self.immediate_transaction(|| {
+            for entry in entries {
+                self.upsert_metadata(entry, state)?;
+            }
+            Ok(())
+        })
     }
 
     fn record_hydrated(&self, meta: &FileMeta, remote_hash: &str, local_hash: &str) -> Result<()> {
@@ -1692,6 +1780,7 @@ impl Mirror {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn replace_search_index_rows(
         &self,
         relative_path: &str,
@@ -1785,7 +1874,7 @@ impl Mirror {
         query: &str,
         remaining: usize,
     ) -> Result<(Vec<Value>, bool)> {
-        if query.as_bytes().len() >= SEARCH_TRIGRAM_BYTES {
+        if query.len() >= SEARCH_TRIGRAM_BYTES {
             if let Some(gram) = self.rarest_query_trigram(&entry.relative_path, query)? {
                 return self.indexed_grep_hits_for_gram(entry, query, remaining, &gram);
             }
@@ -2008,10 +2097,38 @@ impl Mirror {
     }
 
     fn enqueue_local_save(&self, relative_path: &str) -> Result<SaveQueueEntry> {
+        self.enqueue_local_save_inner(relative_path, false)
+    }
+
+    fn enqueue_adopted_local_save(&self, relative_path: &str) -> Result<SaveQueueEntry> {
+        self.enqueue_local_save_inner(relative_path, true)
+    }
+
+    fn enqueue_local_save_inner(
+        &self,
+        relative_path: &str,
+        allow_adopt_or_recreate: bool,
+    ) -> Result<SaveQueueEntry> {
         let relative_path = normalize_relative_path(relative_path)?
             .to_string_lossy()
             .replace('\\', "/");
         let entry = self.get(&relative_path)?;
+        if entry.is_none() && !allow_adopt_or_recreate {
+            bail!(
+                "{} is not tracked in the mirror; use RemoteAdopt to create it remotely",
+                relative_path
+            );
+        }
+        if let Some(entry) = entry.as_ref() {
+            let requires_explicit_recreate = entry.validation_state == "deleted"
+                || (entry.validation_state == "conflict" && entry.remote_hash.is_none());
+            if requires_explicit_recreate && !allow_adopt_or_recreate {
+                bail!(
+                    "{} was deleted remotely; use RemoteAdopt to recreate it",
+                    relative_path
+                );
+            }
+        }
         let local_path = entry
             .as_ref()
             .map(|entry| entry.local_path.clone())
@@ -2020,14 +2137,14 @@ impl Mirror {
             format!("failed to read local mirror file {}", local_path.display())
         })?;
         let local_hash = hash_bytes(&content);
-        self.enqueue_save(
-            &relative_path,
-            &local_hash,
-            entry
-                .as_ref()
-                .and_then(|entry| entry.remote_hash.as_deref()),
-            &content,
-        )
+        let expected_hash = entry.as_ref().and_then(|entry| {
+            if allow_adopt_or_recreate && entry.validation_state == "deleted" {
+                None
+            } else {
+                entry.remote_hash.as_deref()
+            }
+        });
+        self.enqueue_save(&relative_path, &local_hash, expected_hash, &content)
     }
 
     fn sync_cached_file_integrity(&self, entry: &MirrorEntry) -> Result<(MirrorEntry, bool)> {
@@ -2081,7 +2198,7 @@ impl Mirror {
     }
 
     fn recover_local_edits(&self, limit: usize, after: Option<&str>) -> Result<Value> {
-        let limit = limit.max(1).min(100_000);
+        let limit = limit.clamp(1, 100_000);
         let db_limit = limit.saturating_add(1).min(i64::MAX as usize) as i64;
         let after = after.unwrap_or("");
         let mut entries = {
@@ -2235,6 +2352,15 @@ impl Mirror {
 
     fn save_queue(&self, params: &Value) -> Result<Value> {
         let limit = optional_positive_usize_param(params, "limit").unwrap_or(256);
+        let state_filter = optional_string_param(params, "state")
+            .map(str::to_string)
+            .filter(|state| !state.is_empty());
+        if let Some(state) = state_filter.as_deref() {
+            match state {
+                "pending" | "failed" | "conflict" | "unreplayable" => {}
+                other => bail!("unsupported save queue state filter `{other}`"),
+            }
+        }
         let db_limit = if limit >= i64::MAX as usize {
             i64::MAX
         } else {
@@ -2242,16 +2368,27 @@ impl Mirror {
         };
         let mut statement = self.db.prepare(
             "
+            WITH visible_queue AS (
+              SELECT id, relative_path, expected_hash, local_hash, snapshot_path,
+                     CASE
+                       WHEN state IN ('pending', 'failed') AND snapshot_path IS NULL THEN 'unreplayable'
+                       ELSE state
+                     END AS visible_state,
+                     attempts, last_error, remote_conflict_path, conflict_actual_hash,
+                     created_at_ms, updated_at_ms
+              FROM save_queue
+              WHERE state IN ('pending', 'failed', 'conflict')
+            )
             SELECT id, relative_path, expected_hash, local_hash, snapshot_path,
-                   state, attempts, last_error, remote_conflict_path,
+                   visible_state, attempts, last_error, remote_conflict_path, conflict_actual_hash,
                    created_at_ms, updated_at_ms
-            FROM save_queue
-            WHERE state IN ('pending', 'failed', 'conflict')
+            FROM visible_queue
+            WHERE (?2 IS NULL OR visible_state = ?2)
             ORDER BY id ASC
             LIMIT ?1
             ",
         )?;
-        let mut rows = statement.query(params![db_limit])?;
+        let mut rows = statement.query(params![db_limit, state_filter.as_deref()])?;
         let mut entries = Vec::new();
         let mut truncated = false;
         while let Some(row) = rows.next()? {
@@ -2277,29 +2414,49 @@ impl Mirror {
                 "attempts": row.get::<_, i64>(6)?,
                 "last_error": row.get::<_, Option<String>>(7)?,
                 "remote_conflict_path": remote_conflict_path,
+                "conflict_actual_hash": row.get::<_, Option<String>>(9)?,
                 "local_path": local_path,
-                "created_at_ms": row.get::<_, i64>(9)?,
-                "updated_at_ms": row.get::<_, i64>(10)?,
+                "created_at_ms": row.get::<_, i64>(10)?,
+                "updated_at_ms": row.get::<_, i64>(11)?,
             }));
         }
 
         let total: i64 = self.db.query_row(
-            "SELECT COUNT(*) FROM save_queue WHERE state IN ('pending', 'failed', 'conflict')",
-            [],
+            "
+            WITH visible_queue AS (
+              SELECT CASE
+                       WHEN state IN ('pending', 'failed') AND snapshot_path IS NULL THEN 'unreplayable'
+                       ELSE state
+                     END AS visible_state
+              FROM save_queue
+              WHERE state IN ('pending', 'failed', 'conflict')
+            )
+            SELECT COUNT(*) FROM visible_queue
+            WHERE (?1 IS NULL OR visible_state = ?1)
+            ",
+            params![state_filter.as_deref()],
             |row| row.get(0),
         )?;
         let pending: i64 = self.db.query_row(
-            "SELECT COUNT(*) FROM save_queue WHERE state='pending'",
+            "SELECT COUNT(*) FROM save_queue WHERE state='pending' AND snapshot_path IS NOT NULL",
             [],
             |row| row.get(0),
         )?;
         let failed: i64 = self.db.query_row(
-            "SELECT COUNT(*) FROM save_queue WHERE state='failed'",
+            "SELECT COUNT(*) FROM save_queue WHERE state='failed' AND snapshot_path IS NOT NULL",
             [],
             |row| row.get(0),
         )?;
         let conflict: i64 = self.db.query_row(
             "SELECT COUNT(*) FROM save_queue WHERE state='conflict'",
+            [],
+            |row| row.get(0),
+        )?;
+        let unreplayable: i64 = self.db.query_row(
+            "
+            SELECT COUNT(*) FROM save_queue
+            WHERE state IN ('pending', 'failed') AND snapshot_path IS NULL
+            ",
             [],
             |row| row.get(0),
         )?;
@@ -2312,7 +2469,8 @@ impl Mirror {
             "counts": {
                 "pending": pending,
                 "failed": failed,
-                "conflict": conflict
+                "conflict": conflict,
+                "unreplayable": unreplayable
             }
         }))
     }
@@ -2516,6 +2674,7 @@ impl Mirror {
         &self,
         queue_id: i64,
         relative_path: &str,
+        actual_hash: Option<&str>,
         remote_content: &[u8],
         remote_content_truncated: bool,
         message: &str,
@@ -2538,20 +2697,28 @@ impl Mirror {
                   attempts=attempts+1,
                   last_error=?2,
                   remote_conflict_path=?3,
-                  updated_at_ms=?4
+                  conflict_actual_hash=?4,
+                  updated_at_ms=?5
                 WHERE id=?1
                 ",
-                params![queue_id, message, path.to_string_lossy(), now_ms()],
+                params![
+                    queue_id,
+                    message,
+                    path.to_string_lossy(),
+                    actual_hash,
+                    now_ms()
+                ],
             )?;
             self.db.execute(
                 "
                 UPDATE files SET
+                  remote_hash=?2,
                   validation_state='conflict',
-                  last_error=?2,
-                  updated_at_ms=?3
+                  last_error=?3,
+                  updated_at_ms=?4
                 WHERE relative_path=?1
                 ",
-                params![relative_path, message, now_ms()],
+                params![relative_path, actual_hash, message, now_ms()],
             )?;
             Ok(())
         })?;
@@ -2976,6 +3143,7 @@ impl Mirror {
         Ok(paths)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn push_related_prefetch_bucket(
         &self,
         paths: &mut Vec<String>,
@@ -3153,6 +3321,7 @@ struct RemoteWork {
     priority: RemotePriority,
     lane: RemoteLane,
     write_hazard_registered: bool,
+    enqueued_at: Instant,
 }
 
 struct StartedRemoteWork {
@@ -3195,6 +3364,15 @@ impl RemoteLane {
         if request_is_write_lane(request) {
             return Self::Write;
         }
+        if request.method == "grep"
+            && request
+                .params
+                .get("session_id")
+                .and_then(Value::as_str)
+                .is_some()
+        {
+            return Self::Read;
+        }
         let interest = RequestInterest::for_request(request);
         if pending_writes.conflicts_with_interest(&interest) {
             Self::Write
@@ -3223,7 +3401,7 @@ impl RemotePreempts {
 fn request_is_write_lane(request: &ClientRequest) -> bool {
     matches!(
         request.method.as_str(),
-        "recover_local_edits" | "flush" | "flush_queued" | "flush_queue"
+        "recover_local_edits" | "adopt" | "flush" | "flush_queued" | "flush_queue"
     )
 }
 
@@ -3582,7 +3760,7 @@ impl PendingHazard {
                     .and_then(Value::as_bool)
                     .unwrap_or(true),
             },
-            "flush" | "flush_queued" => {
+            "adopt" | "flush" | "flush_queued" => {
                 path_hazard(request.params.get("path").and_then(Value::as_str))
             }
             "recover_local_edits" if request_background_flag(request) => Self::default(),
@@ -3802,10 +3980,21 @@ impl FastState {
         }
     }
 
-    fn prepare_flush(&self, request: &ClientRequest) -> Result<ClientRequest> {
+    fn prepare_flush(&self, request: &ClientRequest, adopt: bool) -> Result<ClientRequest> {
         let path = required_string(&request.params, "path")?;
         let mirror = Mirror::open_root(self.mirror_root.clone())?;
-        let queued = mirror.enqueue_local_save(path)?;
+        let local_path = mirror.local_path(path)?;
+        if fs::metadata(&local_path)
+            .map(|metadata| metadata.len() > FAST_FLUSH_SNAPSHOT_MAX_BYTES)
+            .unwrap_or(false)
+        {
+            return Ok(request.clone());
+        }
+        let queued = if adopt {
+            mirror.enqueue_adopted_local_save(path)?
+        } else {
+            mirror.enqueue_local_save(path)?
+        };
         Ok(ClientRequest {
             id: request.id,
             method: "flush_queued".to_string(),
@@ -3883,6 +4072,7 @@ impl Sidecar {
             "grep" => self.grep(params, preempt_epoch),
             "grep_cache" => self.mirror.grep_cache(&params),
             "recover_local_edits" => self.recover_local_edits(params),
+            "adopt" => self.adopt(params),
             "flush" => self.flush(params),
             "flush_queued" => self.flush_queued(params),
             "flush_queue" => self.flush_queue(params),
@@ -4032,9 +4222,7 @@ impl Sidecar {
         match response {
             Response::Scan { entries, truncated } => {
                 let next_after = entries.last().map(|entry| entry.path.clone());
-                for entry in &entries {
-                    self.mirror.upsert_metadata(entry, "metadata")?;
-                }
+                self.mirror.upsert_metadata_batch(&entries, "metadata")?;
                 self.record_scan_progress(resume, truncated, next_after.as_deref())?;
                 Ok(json!({
                     "entries": entries,
@@ -4522,7 +4710,7 @@ impl Sidecar {
             .and_then(Value::as_bool)
             .unwrap_or(true);
         let after = optional_string_param(&params, "after")
-            .map(|value| normalize_relative_path(value))
+            .map(normalize_relative_path)
             .transpose()?
             .map(|value| value.to_string_lossy().replace('\\', "/"));
         let session_id = optional_string_param(&params, "session_id").map(ToOwned::to_owned);
@@ -4664,6 +4852,12 @@ impl Sidecar {
         Ok(values)
     }
 
+    fn adopt(&mut self, params: Value) -> Result<Value> {
+        let path = required_string(&params, "path")?;
+        let queued = self.mirror.enqueue_adopted_local_save(path)?;
+        Self::save_attempt_to_json(self.apply_save_entry(queued)?)
+    }
+
     fn flush(&mut self, params: Value) -> Result<Value> {
         let path = required_string(&params, "path")?;
         let queued = self.mirror.enqueue_local_save(path)?;
@@ -4673,7 +4867,7 @@ impl Sidecar {
     fn recover_local_edits(&mut self, params: Value) -> Result<Value> {
         let limit = optional_positive_usize_param(&params, "limit").unwrap_or(256);
         let after = optional_string_param(&params, "after")
-            .map(|value| normalize_relative_path(value))
+            .map(normalize_relative_path)
             .transpose()?
             .map(|value| value.to_string_lossy().replace('\\', "/"));
         self.mirror.recover_local_edits(limit, after.as_deref())
@@ -4705,7 +4899,12 @@ impl Sidecar {
         let entries = self.mirror.pending_save_entries(limit)?;
         let mut attempts = Vec::new();
         for entry in entries {
-            attempts.push(Self::save_attempt_to_json(self.apply_save_entry(entry)?)?);
+            let attempt = self.apply_save_entry(entry)?;
+            let stop = attempt.should_stop_queue_replay();
+            attempts.push(Self::save_attempt_to_json(attempt)?);
+            if stop {
+                break;
+            }
         }
         Ok(attempts)
     }
@@ -4723,6 +4922,7 @@ impl Sidecar {
                 return Ok(SaveAttempt::Queued {
                     path: entry.relative_path,
                     reason,
+                    remote_failure: false,
                 });
             }
         };
@@ -4738,6 +4938,7 @@ impl Sidecar {
                 return Ok(SaveAttempt::Queued {
                     path: entry.relative_path,
                     reason,
+                    remote_failure: false,
                 });
             }
         };
@@ -4751,6 +4952,7 @@ impl Sidecar {
             return Ok(SaveAttempt::Queued {
                 path: entry.relative_path,
                 reason,
+                remote_failure: false,
             });
         }
         if save_should_use_chunked_upload(snapshot_size) {
@@ -4769,6 +4971,7 @@ impl Sidecar {
                 return Ok(SaveAttempt::Queued {
                     path: entry.relative_path,
                     reason,
+                    remote_failure: false,
                 });
             }
         };
@@ -4794,6 +4997,7 @@ impl Sidecar {
                 return Ok(SaveAttempt::Queued {
                     path: entry.relative_path,
                     reason,
+                    remote_failure: true,
                 });
             }
         };
@@ -4823,6 +5027,7 @@ impl Sidecar {
                 return Ok(SaveAttempt::Queued {
                     path: entry.relative_path,
                     reason,
+                    remote_failure: true,
                 });
             }
         };
@@ -4849,6 +5054,7 @@ impl Sidecar {
             return Ok(SaveAttempt::Queued {
                 path: entry.relative_path,
                 reason,
+                remote_failure: true,
             });
         }
 
@@ -4864,6 +5070,7 @@ impl Sidecar {
                 return Ok(SaveAttempt::Queued {
                     path: entry.relative_path,
                     reason,
+                    remote_failure: true,
                 });
             }
         };
@@ -4961,6 +5168,7 @@ impl Sidecar {
                 let conflict_path = self.mirror.record_save_conflict(
                     entry.id,
                     &conflict.path,
+                    conflict.actual_hash.as_deref(),
                     &conflict.remote_content,
                     conflict.remote_content_truncated,
                     &message,
@@ -5004,10 +5212,15 @@ impl Sidecar {
                 "remote_size": remote_size,
                 "remote_content_bytes": remote_content_bytes
             }),
-            SaveAttempt::Queued { path, reason } => json!({
+            SaveAttempt::Queued {
+                path,
+                reason,
+                remote_failure,
+            } => json!({
                 "status": "queued",
                 "path": path,
-                "reason": reason
+                "reason": reason,
+                "remote_failure": remote_failure
             }),
         })
     }
@@ -5504,6 +5717,7 @@ struct ServerSessionExit {
     shutdown_listener: bool,
 }
 
+#[allow(clippy::too_many_arguments, clippy::redundant_closure_call)]
 fn run_server_session<R>(
     remote_root: PathBuf,
     transport: RemoteTransport,
@@ -5675,8 +5889,9 @@ where
                 continue;
             }
 
-            if request.method == "flush" {
-                request = match fast_state.prepare_flush(&request) {
+            if matches!(request.method.as_str(), "flush" | "adopt") {
+                let adopt = request.method == "adopt";
+                request = match fast_state.prepare_flush(&request, adopt) {
                     Ok(request) => request,
                     Err(error) => {
                         send_client_response(
@@ -5711,12 +5926,15 @@ where
                         }
                     }
                     let priority = RemotePriority::for_request(&request);
+                    let request_id = request.id;
+                    let request_method = request.method.clone();
                     let work = RemoteWork {
                         request,
                         hazard,
                         priority,
                         lane,
                         write_hazard_registered,
+                        enqueued_at: Instant::now(),
                     };
                     let queue = match lane {
                         RemoteLane::Read => &read_queue,
@@ -5726,10 +5944,29 @@ where
                         .then_some(remote_preempts.for_lane(lane));
                     match queue.try_push(work, preempt) {
                         Ok(canceled) => {
+                            trace_event(
+                                "request_queued",
+                                json!({
+                                    "request_id": request_id,
+                                    "method": request_method,
+                                    "lane": lane.label(),
+                                    "priority": priority.label(),
+                                    "preempted": !canceled.is_empty()
+                                }),
+                            );
                             clear_pending_work_refs(&pending_remote, &pending_writes, &canceled);
                             send_preempted_responses(&response_tx, canceled);
                         }
                         Err(work) => {
+                            trace_event(
+                                "request_queue_full",
+                                json!({
+                                    "request_id": work.request.id,
+                                    "method": work.request.method.as_str(),
+                                    "lane": work.lane.label(),
+                                    "priority": work.priority.label()
+                                }),
+                            );
                             clear_pending_work(&pending_remote, &pending_writes, &work);
                             let response = if work.request.method == "flush_queued" {
                                 result_to_client_response(
@@ -5860,6 +6097,7 @@ fn join_writer(handle: thread::JoinHandle<Result<()>>, name: &str) -> Result<()>
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_remote_worker(
     mut sidecar: Sidecar,
     queue: Arc<RemoteQueue>,
@@ -5875,6 +6113,10 @@ fn spawn_remote_worker(
             let preempt_epoch = started.preempt_epoch;
             let work = started.work;
             let request_id = work.request.id;
+            let queue_wait_ms = duration_ms(work.enqueued_at.elapsed());
+            let method = work.request.method.clone();
+            let lane = work.lane;
+            let priority = work.priority;
             active.set(&work);
             if interrupt.is_shutdown_requested() {
                 clear_pending_work(&pending_remote, &pending_writes, &work);
@@ -5898,6 +6140,26 @@ fn spawn_remote_worker(
                 write_hazard_registered,
             );
             active.clear(request_id);
+            trace_event(
+                "request_finished",
+                json!({
+                    "request_id": request_id,
+                    "method": method,
+                    "lane": lane.label(),
+                    "priority": priority.label(),
+                    "queue_wait_ms": queue_wait_ms,
+                    "ok": response.ok,
+                    "preempted": response.result.as_ref()
+                        .and_then(|result| result.get("preempted"))
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    "truncated": response.result.as_ref()
+                        .and_then(|result| result.get("truncated"))
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    "error": response.error.as_deref()
+                }),
+            );
             send_client_response(&response_tx, response);
             send_client_notification(&response_tx, sidecar.remote_health_notification());
             if should_shutdown || interrupt.is_shutdown_requested() {
@@ -6644,6 +6906,32 @@ fn now_ms() -> i64 {
         .as_millis() as i64
 }
 
+fn duration_ms(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+fn trace_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("NRM_TRACE")
+            .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+            .unwrap_or(false)
+    })
+}
+
+fn trace_event(event: &str, fields: Value) {
+    if !trace_enabled() {
+        return;
+    }
+    let mut object = match fields {
+        Value::Object(object) => object,
+        _ => Map::new(),
+    };
+    object.insert("event".to_string(), json!(event));
+    object.insert("at_ms".to_string(), json!(now_ms()));
+    eprintln!("{}", Value::Object(object));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6789,6 +7077,54 @@ mod tests {
     }
 
     #[test]
+    fn non_retryable_agent_rpc_error_does_not_poison_remote_backoff() {
+        let dir = tempdir().unwrap();
+        let mut client = AgentClient::new(
+            "missing-agent".to_string(),
+            RemoteTransport::Local,
+            dir.path().to_path_buf(),
+            Duration::from_millis(100),
+            AgentInterrupt::default(),
+        );
+
+        let error = client
+            .handle_worker_reply(AgentWorkerReply::Error(RpcError {
+                code: nrm_protocol::RpcErrorCode::Agent,
+                message: "missing file".to_string(),
+                retryable: false,
+            }))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("missing file"));
+        assert!(client.remote_backoff().is_none());
+    }
+
+    #[test]
+    fn retryable_agent_rpc_error_sets_remote_backoff() {
+        let dir = tempdir().unwrap();
+        let mut client = AgentClient::new(
+            "missing-agent".to_string(),
+            RemoteTransport::Local,
+            dir.path().to_path_buf(),
+            Duration::from_millis(100),
+            AgentInterrupt::default(),
+        );
+
+        let error = client
+            .handle_worker_reply(AgentWorkerReply::Error(RpcError {
+                code: nrm_protocol::RpcErrorCode::Agent,
+                message: "transport reset".to_string(),
+                retryable: true,
+            }))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("transport reset"));
+        assert!(client.remote_backoff().is_some());
+    }
+
+    #[test]
     fn client_response_send_applies_backpressure_instead_of_dropping() {
         let (tx, rx) = mpsc::sync_channel(1);
         let first = ClientResponse {
@@ -6873,8 +7209,10 @@ mod tests {
 
     #[test]
     fn save_upload_inline_threshold_stays_below_protocol_limit() {
-        assert!(SAVE_UPLOAD_CHUNK_BYTES as u64 <= SAVE_INLINE_MAX_BYTES);
-        assert!(SAVE_INLINE_MAX_BYTES < MAX_SAVE_PAYLOAD_BYTES);
+        const {
+            assert!(SAVE_UPLOAD_CHUNK_BYTES as u64 <= SAVE_INLINE_MAX_BYTES);
+            assert!(SAVE_INLINE_MAX_BYTES < MAX_SAVE_PAYLOAD_BYTES);
+        }
         assert!(save_should_use_chunked_upload(MAX_SAVE_PAYLOAD_BYTES + 1));
     }
 
@@ -7003,46 +7341,31 @@ mod tests {
         assert_eq!(info["capabilities"]["agent_abort_handle"], true);
         assert_eq!(info["capabilities"]["agent_abort_scope"], "lane_worker");
         assert_eq!(info["capabilities"]["sidecar_socket_listener"], cfg!(unix));
-        assert_eq!(
-            info["commands"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|method| method.as_str() == Some("open")),
-            true
-        );
-        assert_eq!(
-            info["commands"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|method| method.as_str() == Some("flush_queued")),
-            true
-        );
-        assert_eq!(
-            info["public_commands"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|method| method.as_str() == Some("flush")),
-            true
-        );
-        assert_eq!(
-            info["public_commands"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|method| method.as_str() == Some("flush_queued")),
-            false
-        );
-        assert_eq!(
-            info["internal_commands"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|method| method.as_str() == Some("flush_queued")),
-            true
-        );
+        assert!(info["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|method| method.as_str() == Some("open")));
+        assert!(info["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|method| method.as_str() == Some("flush_queued")));
+        assert!(info["public_commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|method| method.as_str() == Some("flush")));
+        assert!(!info["public_commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|method| method.as_str() == Some("flush_queued")));
+        assert!(info["internal_commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|method| method.as_str() == Some("flush_queued")));
         let command_specs = info["command_specs"].as_array().unwrap();
         let flush_queued = command_specs
             .iter()
@@ -7066,33 +7389,24 @@ mod tests {
         assert_eq!(cancel["visibility"], "public");
         assert_eq!(cancel["execution"], "control");
         assert_eq!(info["capabilities"]["command_metadata"], true);
-        assert_eq!(
-            info["notifications"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|method| method.as_str() == Some("workspace/remote_health")),
-            true
-        );
+        assert!(info["notifications"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|method| method.as_str() == Some("workspace/remote_health")));
     }
 
     struct FailingRequestReader;
 
     impl Read for FailingRequestReader {
         fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
-            Err(io::Error::new(
-                io::ErrorKind::Other,
-                "request stream failed",
-            ))
+            Err(io::Error::other("request stream failed"))
         }
     }
 
     impl BufRead for FailingRequestReader {
         fn fill_buf(&mut self) -> io::Result<&[u8]> {
-            Err(io::Error::new(
-                io::ErrorKind::Other,
-                "request stream failed",
-            ))
+            Err(io::Error::other("request stream failed"))
         }
 
         fn consume(&mut self, _amt: usize) {}
@@ -7219,7 +7533,7 @@ mod tests {
             &agent,
             format!(
                 "#!/bin/sh\n: > {}\nsleep 30\n",
-                shell_quote(&marker.to_string_lossy())
+                shell_quote(marker.to_string_lossy())
             ),
         )
         .unwrap();
@@ -7335,7 +7649,7 @@ mod tests {
             &agent,
             format!(
                 "#!/bin/sh\n: > {}\nsleep 30\n",
-                shell_quote(&marker.to_string_lossy())
+                shell_quote(marker.to_string_lossy())
             ),
         )
         .unwrap();
@@ -8114,11 +8428,46 @@ mod tests {
         assert_eq!(fs::read(conflict_path).unwrap(), b"remote prefix");
         let entry = sidecar.mirror.get("a.txt").unwrap().unwrap();
         assert_eq!(entry.validation_state, "conflict");
+        assert_eq!(entry.remote_hash.as_deref(), Some("remote"));
         assert!(entry
             .last_error
             .as_deref()
             .unwrap()
             .contains("saved first 13 of 10000 remote bytes"));
+    }
+
+    #[test]
+    fn conflict_actual_hash_becomes_next_resolved_save_base() {
+        let dir = tempdir().unwrap();
+        let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
+        let local_path = record_hydrated_content(&mirror, "a.txt", b"base");
+        let dirty_hash = hash_bytes(b"dirty");
+        let queued = mirror
+            .enqueue_save("a.txt", &dirty_hash, Some("base"), b"dirty")
+            .unwrap();
+        let sidecar = test_sidecar(mirror);
+        sidecar
+            .record_save_outcome(
+                &queued,
+                SaveOutcome::Conflict(nrm_protocol::SaveConflict {
+                    path: "a.txt".to_string(),
+                    expected_hash: Some("base".to_string()),
+                    actual_hash: Some("remote-after-conflict".to_string()),
+                    remote_content: b"remote".to_vec(),
+                    remote_content_truncated: false,
+                    remote_size: Some(6),
+                }),
+            )
+            .unwrap();
+        fs::write(&local_path, b"resolved").unwrap();
+
+        let resolved = sidecar.mirror.enqueue_local_save("a.txt").unwrap();
+
+        assert_eq!(
+            resolved.expected_hash.as_deref(),
+            Some("remote-after-conflict")
+        );
+        assert_eq!(resolved.local_hash, hash_bytes(b"resolved"));
     }
 
     #[test]
@@ -8196,7 +8545,24 @@ mod tests {
     }
 
     #[test]
-    fn enqueue_local_save_creates_unknown_mirror_entry() {
+    fn enqueue_local_save_rejects_unknown_mirror_entry() {
+        let dir = tempdir().unwrap();
+        let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
+        let local_path = mirror.local_path("src/new.rs").unwrap();
+        fs::create_dir_all(local_path.parent().unwrap()).unwrap();
+        fs::write(&local_path, b"new file").unwrap();
+
+        let error = mirror
+            .enqueue_local_save("src/new.rs")
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("RemoteAdopt"));
+        assert_eq!(mirror.pending_save_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn enqueue_adopted_local_save_creates_unknown_mirror_entry() {
         let dir = tempdir().unwrap();
         let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
         let local_path = mirror.local_path("src/new.rs").unwrap();
@@ -8204,7 +8570,7 @@ mod tests {
         fs::write(&local_path, b"new file").unwrap();
         let expected_hash = hash_bytes(b"new file");
 
-        let queued = mirror.enqueue_local_save("src/new.rs").unwrap();
+        let queued = mirror.enqueue_adopted_local_save("src/new.rs").unwrap();
 
         assert_eq!(queued.relative_path, "src/new.rs");
         assert_eq!(queued.expected_hash, None);
@@ -8226,7 +8592,7 @@ mod tests {
         fs::create_dir_all(local_path.parent().unwrap()).unwrap();
         fs::write(&local_path, b"new file").unwrap();
         let hash = hash_bytes(b"new file");
-        let queued = mirror.enqueue_local_save("src/new.rs").unwrap();
+        let queued = mirror.enqueue_adopted_local_save("src/new.rs").unwrap();
         let before = mirror
             .find_paths(&json!({"query": "src/new", "limit": 10}))
             .unwrap();
@@ -8248,7 +8614,7 @@ mod tests {
     }
 
     #[test]
-    fn flush_unknown_local_file_preserves_snapshot_when_remote_unavailable() {
+    fn flush_unknown_local_file_requires_adopt() {
         let state_dir = tempdir().unwrap();
         let remote_dir = tempdir().unwrap();
         let remote_root = remote_dir.path().join("repo");
@@ -8269,7 +8635,41 @@ mod tests {
         fs::create_dir_all(local_path.parent().unwrap()).unwrap();
         fs::write(&local_path, b"new file").unwrap();
 
-        let result = sidecar.flush(json!({"path": "src/new.rs"})).unwrap();
+        let error = sidecar
+            .flush(json!({"path": "src/new.rs"}))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("RemoteAdopt"));
+        assert_eq!(
+            sidecar.mirror.pending_save_entries(Some(1)).unwrap().len(),
+            0
+        );
+    }
+
+    #[test]
+    fn adopt_unknown_local_file_preserves_snapshot_when_remote_unavailable() {
+        let state_dir = tempdir().unwrap();
+        let remote_dir = tempdir().unwrap();
+        let remote_root = remote_dir.path().join("repo");
+        let mut sidecar = Sidecar::new(
+            remote_root,
+            RemoteTransport::Local,
+            state_dir
+                .path()
+                .join("missing-agent")
+                .to_string_lossy()
+                .to_string(),
+            Some(state_dir.path().to_path_buf()),
+            1,
+            AgentInterrupt::default(),
+        )
+        .unwrap();
+        let local_path = sidecar.mirror.local_path("src/new.rs").unwrap();
+        fs::create_dir_all(local_path.parent().unwrap()).unwrap();
+        fs::write(&local_path, b"new file").unwrap();
+
+        let result = sidecar.adopt(json!({"path": "src/new.rs"})).unwrap();
 
         assert_eq!(result["status"], "queued");
         assert_eq!(result["path"], "src/new.rs");
@@ -8303,7 +8703,14 @@ mod tests {
             .mark_save_failed(queued_b.id, "b.txt", "ssh connect failed")
             .unwrap();
         let conflict_path = mirror
-            .record_save_conflict(queued_c.id, "c.txt", b"remote c", false, "remote changed")
+            .record_save_conflict(
+                queued_c.id,
+                "c.txt",
+                Some("remote-c"),
+                b"remote c",
+                false,
+                "remote changed",
+            )
             .unwrap();
 
         let result = mirror.save_queue(&json!({"limit": 2})).unwrap();
@@ -8614,6 +9021,28 @@ mod tests {
         let entry = sidecar.mirror.get("a.txt").unwrap().unwrap();
         assert_eq!(entry.validation_state, "deleted");
         assert_eq!(entry.remote_hash.as_deref(), Some(local_hash.as_str()));
+    }
+
+    #[test]
+    fn deleted_remote_file_requires_explicit_adopt_to_recreate() {
+        let dir = tempdir().unwrap();
+        let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
+        let local_path = record_hydrated_content(&mirror, "a.txt", b"base");
+        let base_hash = hash_bytes(b"base");
+        mirror
+            .record_validation("a.txt", "deleted", None, Some("remote deleted"))
+            .unwrap();
+        fs::write(&local_path, b"recreated").unwrap();
+
+        let error = mirror.enqueue_local_save("a.txt").unwrap_err().to_string();
+        let recreated = mirror.enqueue_adopted_local_save("a.txt").unwrap();
+
+        assert!(error.contains("RemoteAdopt"));
+        assert_eq!(recreated.expected_hash, None);
+        assert_eq!(recreated.local_hash, hash_bytes(b"recreated"));
+        let entry = mirror.get("a.txt").unwrap().unwrap();
+        assert_eq!(entry.remote_hash.as_deref(), Some(base_hash.as_str()));
+        assert!(entry.dirty);
     }
 
     #[test]
@@ -9140,7 +9569,7 @@ mod tests {
             method: "flush".to_string(),
             params: json!({"path": "src/main.rs"}),
         };
-        let prepared = fast.prepare_flush(&request).unwrap();
+        let prepared = fast.prepare_flush(&request, false).unwrap();
         let reopened = Mirror::open_root(mirror_root).unwrap();
         let entries = reopened.pending_save_entries(Some(10)).unwrap();
 
@@ -9265,6 +9694,7 @@ mod tests {
             priority,
             lane,
             write_hazard_registered,
+            enqueued_at: Instant::now(),
         }
     }
 
@@ -9629,6 +10059,7 @@ mod tests {
                     priority: RemotePriority::Interactive,
                     lane: RemoteLane::Read,
                     write_hazard_registered: false,
+                    enqueued_at: Instant::now(),
                 },
                 None,
             )

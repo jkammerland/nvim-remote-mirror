@@ -29,7 +29,7 @@ end
 local calls = {}
 nrm.request = function(method, params, callback)
   table.insert(calls, { method = method, params = params })
-  if method == "flush" then
+  if method == "flush" or method == "adopt" then
     callback(nil, {
       status = "applied",
       path = params.path,
@@ -86,7 +86,13 @@ local function main()
 
   nrm.flush_buffer(new_buf)
 
-  assert_eq(calls[#calls].method, "flush")
+  assert_eq(calls[#calls].params.path, "src/main.rs", "untracked mirror files should not auto-save by default")
+  assert_eq(vim.b[new_buf].nrm_remote_path, nil)
+
+  vim.api.nvim_set_current_buf(new_buf)
+  nrm.adopt()
+
+  assert_eq(calls[#calls].method, "adopt")
   assert_eq(calls[#calls].params.path, "src/new.rs")
   assert_eq(vim.b[new_buf].nrm_remote_path, "src/new.rs")
 
@@ -95,9 +101,10 @@ local function main()
   local write_buf = vim.api.nvim_create_buf(true, false)
   nrm.client = fake_client("workspace-write", "ssh://write.example/repo", files_root)
 
-  nrm.flush_buffer(write_buf, { local_path = write_target })
+  vim.api.nvim_set_current_buf(write_buf)
+  nrm.adopt(write_target)
 
-  assert_eq(calls[#calls].method, "flush")
+  assert_eq(calls[#calls].method, "adopt")
   assert_eq(calls[#calls].params.path, "src/write-target.rs")
   assert_eq(vim.b[write_buf].nrm_remote_path, "src/write-target.rs")
 
@@ -113,7 +120,8 @@ local function main()
   }
   local call_count = #calls
 
-  nrm.flush_buffer(offline_buf)
+  vim.api.nvim_set_current_buf(offline_buf)
+  nrm.adopt()
 
   assert_eq(#calls, call_count, "disconnected new save must not call sidecar immediately")
   assert_eq(vim.b[offline_buf].nrm_remote_path, "src/offline.rs")
@@ -122,7 +130,7 @@ local function main()
 
   nrm.client = fake_client("workspace-offline", "ssh://offline.example/repo", files_root)
   assert_eq(nrm.flush_deferred(), 1)
-  assert_eq(calls[#calls].method, "flush")
+  assert_eq(calls[#calls].method, "adopt")
   assert_eq(calls[#calls].params.path, "src/offline.rs")
 end
 

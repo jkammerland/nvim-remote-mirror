@@ -92,7 +92,8 @@ UI                                                *nvim-remote-mirror-ui*
     copies, diff conflicts, retry queued saves, or refresh the queue.
 
 :RemoteConflicts
-    Show only conflict entries from the save queue.
+    Show only conflict entries from the save queue. The query is filtered by
+    the sidecar, so large pending queues do not hide later conflict entries.
 
 Dashboard keys:
     c connect        o open path      f find files     g grep
@@ -167,18 +168,23 @@ COMMANDS                                      *nvim-remote-mirror-commands*
 :RemoteFlush
     Flush the current remote buffer to the remote workspace using checksum
     compare-and-swap. Saves above 4 MiB are uploaded in 1 MiB chunks. If no
-    sidecar is connected, the path is marked for replay after reconnect. Buffers are
-    tagged with the workspace that opened them; if another target is active,
+    sidecar is connected, the path is marked for replay after reconnect. Buffers
+    are tagged with the workspace that opened them; if another target is active,
     the save is deferred until the original workspace is reconnected.
     On Unix, the remote agent uses a cooperative write lock keyed by the
     canonical target for nrm writers, then rechecks the remote base hash in the
     install path before rename. Non-Unix builds still rely on the hash recheck
     without the advisory lock. Non-cooperating remote writers can still race at
     the filesystem boundary.
-    Automatic BufWritePost flushing uses the actual write target, so
-    :write {mirror_path} can adopt an unnamed buffer. New mirror-root paths saved
-    during reconnect are deferred when they map to the last known workspace
-    mirror root.
+    Automatic BufWritePost flushing uses the actual write target, but untracked
+    mirror-root paths are skipped by default. Use :RemoteAdopt for intentional
+    new remote files, or set adoption_policy="auto" for legacy auto-adoption.
+
+:RemoteAdopt [path]
+    Explicitly create or take over a mirror-root path as a workspace-relative
+    remote file. Use this for intentional new remote files or recreating a file
+    that validation marked deleted. If the sidecar is connected but the remote
+    is unavailable, the sidecar snapshots the bytes into the durable queue.
 
 :RemoteFlushQueue
     Retry queued or previously failed remote saves and report applied, still
@@ -235,6 +241,7 @@ CONFIGURATION                                  *nvim-remote-mirror-config*
     open_prefetch_related = false,
     open_prefetch_related_limit = 16,
     auto_hydrate_mirror_buffers = true,
+    adoption_policy = "tracked_or_explicit",
     auto_reconnect = true,
     reconnect_delay_ms = 1000,
     reconnect_max_attempts = 3,
@@ -308,11 +315,10 @@ open_batch_max_file_bytes controls how large a direct uncached open may be
 before it falls back from one-request batch read hydration to chunked reads.
 auto_hydrate_mirror_buffers makes LSP jumps into missing local mirror files call
 the sidecar open path and hydrate the corresponding remote file. Pending or
-failed hydrations are read-only and are not flushed as remote saves. If the user
-creates or saves a new file under the mirror root, the plugin adopts the
-mirror-relative path and the sidecar snapshots it into the durable save queue
-with no expected remote hash, so replay creates the remote file only if it is
-still absent.
+failed hydrations are read-only and are not flushed as remote saves.
+adoption_policy defaults to "tracked_or_explicit", so new mirror-root files need
+:RemoteAdopt before they are queued for remote creation. Set it to "auto" only
+when mirror-root writes should be adopted as remote files automatically.
 
 Agent and LSP launch commands share a sidecar transport planner. Local targets
 spawn binaries directly; SSH targets use configured connection options and a
