@@ -36,7 +36,7 @@ changing Neovim commands.
 
 | Limit | Direction |
 | --- | --- |
-| One active client per socket sidecar | Add multi-client coordination later |
+| One active client per socket sidecar | `workspace_info` reports `client_mode = "single_writer"`; add multi-client coordination later |
 | No streaming UI | Add incremental picker updates after API settles |
 | Basic LSP proxy only | Harden path translation and server lifecycle |
 | No terminal or DAP remoting | Keep behind the same sidecar boundary |
@@ -50,3 +50,6 @@ changing Neovim commands.
 4. Add conflict diff/resolve commands with explicit accept/retry actions.
 5. Expand remote LSP dogfooding and status reporting.
 6. Add transport abstraction tests before any non-SSH transport work.
+
+See [architecture-user-stories.md](architecture-user-stories.md) for the
+reviewed user stories behind the current architecture hardening work.

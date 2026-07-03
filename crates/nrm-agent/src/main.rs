@@ -1740,6 +1740,24 @@ mod tests {
         assert!(normalize_relative_path("/secret").is_err());
     }
 
+    #[test]
+    fn hello_rejects_incompatible_protocol_version() {
+        let dir = tempdir().unwrap();
+        let mut state = test_state(dir.path());
+
+        let error = handle_request(
+            &mut state,
+            Request::Hello {
+                client_version: "test".to_string(),
+                protocol_version: PROTOCOL_VERSION + 1,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("protocol version mismatch"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn read_file_rejects_symlink_parent_escape() {

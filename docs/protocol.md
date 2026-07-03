@@ -47,3 +47,11 @@ Future transports must preserve:
 | Timeout-compatible errors | Preserve reconnect/backoff behavior |
 | Abort support | Replace active read/background work when preempted |
 | Same agent command model | Avoid changing Neovim-facing APIs |
+
+## Compatibility
+
+`Request::Hello` is the sidecar-agent compatibility gate. Incompatible
+sidecar/agent protocol versions must fail with a clear protocol version mismatch
+message. The sidecar reports that failure as `remote_status = "unavailable"` in
+`remote_probe`, `workspace_info`, and `workspace/remote_health` notifications so
+Neovim can keep serving local mirror operations while the remote agent is fixed.

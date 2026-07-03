@@ -34,6 +34,11 @@ same PATH as your login shell; if `ssh host 'command -v nrm-agent'` fails, set
 | `request_timeout_ms` | `30000` | Neovim request timeout |
 | `ssh_connect_timeout_seconds` | `10` | SSH connect timeout |
 
+Socket listener sessions are single-writer and sequential today. The sidecar
+reports this through `workspace_info.client_mode = "single_writer"` and
+`workspace_info.client_policy`; a disconnected client leaves the listener
+available for the next editor session.
+
 When `state_dir` is unset, sidecar state uses the platform state directory.
 On a normal Linux Neovim install this is typically
 `~/.local/state/nvim-remote-mirror`. Use `:RemoteWorkspace` to inspect the

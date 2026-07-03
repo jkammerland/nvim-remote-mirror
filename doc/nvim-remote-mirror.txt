@@ -273,7 +273,10 @@ listener. If socket_path is unset, the plugin derives a stable path under
 socket_dir, state_dir/sockets, or the system temp directory from the target and
 daemon-affecting config. The listener is detached from Neovim and currently
 serves one active client session at a time; :RemoteDisconnect closes the client
-session but leaves the listener available for the next editor.
+session but leaves the listener available for the next editor. The sidecar
+reports this as workspace_info.client_mode = "single_writer" with a
+workspace_info.client_policy object so future clients can distinguish this
+sequential policy from future multi-client modes.
 When state_dir is unset, durable mirror state uses the platform state directory,
 typically ~/.local/state/nvim-remote-mirror on Linux. Use :RemoteWorkspace to
 inspect the active mirror root and files root before cleaning mirror data.

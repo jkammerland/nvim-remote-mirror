@@ -1,5 +1,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
+mod lsp_rewrite;
+use lsp_rewrite::rewrite_lsp_body;
 use nrm_protocol::{
     read_frame, write_frame, BatchReadFile, BatchValidateFile, FileMeta, Request, RequestId,
     Response, RpcError, RpcMessage, SaveOutcome, WriteStartOutcome, MAX_FRAME_LEN,
@@ -3241,6 +3243,12 @@ fn workspace_info_value(
         "mirror_root": mirror_root.to_string_lossy(),
         "files_root": files_root.to_string_lossy(),
         "transport": transport.to_value(),
+        "client_mode": "single_writer",
+        "client_policy": {
+            "mode": "single_writer",
+            "concurrency": "sequential",
+            "write_owner": "current_session"
+        },
         "commands": sidecar_commands(),
         "public_commands": sidecar_commands_by_visibility("public"),
         "internal_commands": sidecar_commands_by_visibility("internal"),
@@ -3260,7 +3268,8 @@ fn workspace_info_value(
             "transport_neutral_agent_frames": true,
             "agent_abort_handle": true,
             "agent_abort_scope": "lane_worker",
-            "sidecar_socket_listener": cfg!(unix)
+            "sidecar_socket_listener": cfg!(unix),
+            "single_writer_sessions": true
         },
         "remote_health": remote_health_value
     });
@@ -4163,26 +4172,30 @@ impl Sidecar {
                 "protocol_version": protocol_version,
                 "capabilities": capabilities
             }),
-            Ok(AgentRequestOutcome::Response(other)) => json!({
-                "remote_status": "unavailable",
-                "remote_checked": true,
-                "remote_available": false,
-                "remote_error": format!("unexpected hello response from agent: {other:?}")
-            }),
+            Ok(AgentRequestOutcome::Response(other)) => self.remote_probe_unavailable(format!(
+                "unexpected hello response from agent: {other:?}"
+            )),
             Ok(AgentRequestOutcome::Preempted) => json!({
                 "remote_status": "unchecked",
                 "remote_checked": false,
                 "remote_available": false,
                 "preempted": true
             }),
-            Err(error) => json!({
-                "remote_status": "unavailable",
-                "remote_checked": true,
-                "remote_available": false,
-                "retry_after_ms": self.agent.remote_backoff().map(|(remaining, _)| remaining).unwrap_or(0),
-                "remote_error": error.to_string()
-            }),
+            Err(error) => self.remote_probe_unavailable(error.to_string()),
         }
+    }
+
+    fn remote_probe_unavailable(&mut self, error: String) -> Value {
+        if self.agent.remote_backoff().is_none() {
+            let _ = self.agent.mark_remote_unavailable(error.clone());
+        }
+        json!({
+            "remote_status": "unavailable",
+            "remote_checked": true,
+            "remote_available": false,
+            "retry_after_ms": self.agent.remote_backoff().map(|(remaining, _)| remaining).unwrap_or(0),
+            "remote_error": error
+        })
     }
 
     fn scan(&mut self, params: Value, preempt_epoch: u64) -> Result<Value> {
@@ -6592,124 +6605,6 @@ fn write_lsp_message<W: Write>(writer: &mut W, body: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn rewrite_lsp_body(body: &[u8], from_prefix: &str, to_prefix: &str) -> Result<Vec<u8>> {
-    let mut value: Value = serde_json::from_slice(body)?;
-    rewrite_lsp_json(&mut value, None, from_prefix, to_prefix);
-    Ok(serde_json::to_vec(&value)?)
-}
-
-fn rewrite_lsp_json(value: &mut Value, key: Option<&str>, from_prefix: &str, to_prefix: &str) {
-    match value {
-        Value::String(text) => {
-            if let Some(rewritten) = rewrite_lsp_uri(text, from_prefix, to_prefix) {
-                *text = rewritten;
-            } else if key.map(is_lsp_path_key).unwrap_or(false) {
-                if let Some(rewritten) = rewrite_lsp_path(text, from_prefix, to_prefix) {
-                    *text = rewritten;
-                }
-            }
-        }
-        Value::Array(values) => {
-            for value in values {
-                rewrite_lsp_json(value, key, from_prefix, to_prefix);
-            }
-        }
-        Value::Object(map) => {
-            let entries = std::mem::take(map);
-            for (entry_key, mut entry_value) in entries {
-                rewrite_lsp_json(&mut entry_value, Some(&entry_key), from_prefix, to_prefix);
-                map.insert(
-                    rewrite_lsp_object_key(&entry_key, from_prefix, to_prefix),
-                    entry_value,
-                );
-            }
-        }
-        _ => {}
-    }
-}
-
-fn rewrite_lsp_object_key(key: &str, from_prefix: &str, to_prefix: &str) -> String {
-    rewrite_lsp_uri(key, from_prefix, to_prefix)
-        .or_else(|| rewrite_lsp_path(key, from_prefix, to_prefix))
-        .unwrap_or_else(|| key.to_string())
-}
-
-fn rewrite_lsp_uri(text: &str, from_prefix: &str, to_prefix: &str) -> Option<String> {
-    for (from_uri, to_uri) in path_to_file_uri_prefix_pairs(from_prefix, to_prefix) {
-        if let Some(suffix) = strip_prefix_with_boundary(text, &from_uri, &['/', '?', '#']) {
-            return Some(format!("{to_uri}{suffix}"));
-        }
-    }
-    None
-}
-
-fn rewrite_lsp_path(text: &str, from_prefix: &str, to_prefix: &str) -> Option<String> {
-    strip_prefix_with_boundary(text, from_prefix, &['/', '\\'])
-        .map(|suffix| format!("{to_prefix}{suffix}"))
-}
-
-fn strip_prefix_with_boundary<'a>(
-    text: &'a str,
-    prefix: &str,
-    boundaries: &[char],
-) -> Option<&'a str> {
-    let suffix = text.strip_prefix(prefix)?;
-    if suffix
-        .chars()
-        .next()
-        .map(|ch| boundaries.contains(&ch))
-        .unwrap_or(true)
-    {
-        Some(suffix)
-    } else {
-        None
-    }
-}
-
-fn is_lsp_path_key(key: &str) -> bool {
-    let key = key.to_ascii_lowercase();
-    key == "path"
-        || key == "file"
-        || key == "filename"
-        || key == "directory"
-        || key == "dir"
-        || key == "cwd"
-        || key.ends_with("path")
-        || key.ends_with("filepath")
-        || key.ends_with("file_path")
-        || key.ends_with("filename")
-        || key.ends_with("file_name")
-        || key.ends_with("directory")
-}
-
-fn path_to_file_uri_prefix_pairs(from_prefix: &str, to_prefix: &str) -> Vec<(String, String)> {
-    let mut pairs = vec![(
-        format!("file://{}", from_prefix),
-        format!("file://{}", to_prefix),
-    )];
-    let encoded = (
-        format!("file://{}", percent_encode_uri_path(from_prefix)),
-        format!("file://{}", percent_encode_uri_path(to_prefix)),
-    );
-    if encoded != pairs[0] {
-        pairs.insert(0, encoded);
-    }
-    pairs
-}
-
-fn percent_encode_uri_path(path: &str) -> String {
-    let mut encoded = String::new();
-    for byte in path.as_bytes() {
-        match *byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b':' | b'-' | b'_' | b'.' | b'~' => {
-                encoded.push(*byte as char)
-            }
-            other => encoded.push_str(&format!("%{other:02X}")),
-        }
-    }
-    encoded
-}
-
 fn required_string<'a>(params: &'a Value, key: &str) -> Result<&'a str> {
     params
         .get(key)
@@ -6992,6 +6887,21 @@ mod tests {
             workspace_key: "test".to_string(),
             remote_health: Arc::new(Mutex::new(RemoteHealth::default())),
         }
+    }
+
+    fn test_sidecar_with_agent_reply(mirror: Mirror, reply: AgentWorkerReply) -> Sidecar {
+        let mut sidecar = test_sidecar(mirror);
+        let (tx, rx) = mpsc::channel::<AgentWorkerCommand>();
+        thread::spawn(move || {
+            if let Ok(command) = rx.recv() {
+                let _ = command.reply.send(reply);
+            }
+        });
+        sidecar.agent.worker = Some(AgentWorker {
+            tx,
+            abort: Arc::new(TestAbortHandle::default()),
+        });
+        sidecar
     }
 
     fn record_hydrated_content(mirror: &Mirror, path: &str, content: &[u8]) -> PathBuf {
@@ -7302,6 +7212,42 @@ mod tests {
     }
 
     #[test]
+    fn remote_probe_records_protocol_mismatch_as_unavailable_health() {
+        let state_dir = tempdir().unwrap();
+        let mirror = Mirror::open(Some(state_dir.path().to_path_buf()), "test").unwrap();
+        let mut sidecar = test_sidecar_with_agent_reply(
+            mirror,
+            AgentWorkerReply::Error(RpcError {
+                code: nrm_protocol::RpcErrorCode::Agent,
+                message: format!(
+                    "protocol version mismatch: client={} agent={}",
+                    PROTOCOL_VERSION + 1,
+                    PROTOCOL_VERSION
+                ),
+                retryable: false,
+            }),
+        );
+
+        let probe = sidecar.handle("remote_probe", json!({}), 0).unwrap();
+        assert_eq!(probe["remote_status"], "unavailable");
+        assert_eq!(probe["remote_checked"], true);
+        assert_eq!(probe["remote_available"], false);
+        assert!(probe["retry_after_ms"].as_u64().unwrap() > 0);
+        assert!(probe["remote_error"]
+            .as_str()
+            .unwrap()
+            .contains("protocol version mismatch"));
+
+        let info = sidecar.handle("workspace_info", json!({}), 0).unwrap();
+        assert_eq!(info["remote_status"], "unavailable");
+        assert_eq!(info["remote_health"]["remote_status"], "unavailable");
+        assert!(info["remote_error"]
+            .as_str()
+            .unwrap()
+            .contains("protocol version mismatch"));
+    }
+
+    #[test]
     fn workspace_info_reports_daemon_capabilities_without_agent_handshake() {
         let state_dir = tempdir().unwrap();
         let remote_dir = tempdir().unwrap();
@@ -7334,6 +7280,10 @@ mod tests {
         assert_eq!(info["transport"]["agent_io"], "stdio");
         assert_eq!(info["transport"]["target"], "host");
         assert_eq!(info["transport"]["ssh_connect_timeout_seconds"], 7);
+        assert_eq!(info["client_mode"], "single_writer");
+        assert_eq!(info["client_policy"]["mode"], "single_writer");
+        assert_eq!(info["client_policy"]["concurrency"], "sequential");
+        assert_eq!(info["client_policy"]["write_owner"], "current_session");
         assert_eq!(info["remote_status"], "unchecked");
         assert_eq!(info["remote_health"]["remote_status"], "unchecked");
         assert_eq!(info["capabilities"]["server_notifications"], true);
@@ -7341,6 +7291,7 @@ mod tests {
         assert_eq!(info["capabilities"]["agent_abort_handle"], true);
         assert_eq!(info["capabilities"]["agent_abort_scope"], "lane_worker");
         assert_eq!(info["capabilities"]["sidecar_socket_listener"], cfg!(unix));
+        assert_eq!(info["capabilities"]["single_writer_sessions"], true);
         assert!(info["commands"]
             .as_array()
             .unwrap()
@@ -9998,6 +9949,39 @@ mod tests {
     }
 
     #[test]
+    fn interactive_open_preempts_conflicting_background_prefetch() {
+        let queue = RemoteQueue::new(8, 8);
+        let preempt = AgentPreempt::default();
+        queue
+            .try_push(
+                test_remote_work_from_request(test_client_request(
+                    1,
+                    "prefetch",
+                    json!({"paths": ["src/main.rs"]}),
+                )),
+                None,
+            )
+            .unwrap();
+
+        let canceled = queue
+            .try_push(
+                test_remote_work_from_request(test_client_request(
+                    2,
+                    "open",
+                    json!({"path": "src/main.rs"}),
+                )),
+                Some(&preempt),
+            )
+            .unwrap();
+
+        assert_eq!(preempt.epoch(), 1);
+        assert_eq!(canceled.len(), 1);
+        assert_eq!(canceled[0].request.id, 1);
+        assert_eq!(queue.pop().unwrap().request.id, 2);
+        queue.shutdown_and_drain();
+    }
+
+    #[test]
     fn remote_queue_pop_started_captures_preemption_epoch_under_lock() {
         let queue = RemoteQueue::new(8, 8);
         let preempt = AgentPreempt::default();
@@ -10194,7 +10178,7 @@ mod tests {
 
     #[test]
     fn rewrites_lsp_workspace_edit_uri_keys() {
-        let body = br#"{"result":{"changes":{"file:///remote/repo/src/lib.rs":[{"newText":"x"}]},"documentChanges":[{"textDocument":{"uri":"file:///remote/repo/src/main.rs"}}]}}"#;
+        let body = br#"{"result":{"changes":{"file:///remote/repo/src/lib.rs":[{"newText":"x"}]},"documentChanges":[{"textDocument":{"uri":"file:///remote/repo/src/main.rs"}},{"kind":"rename","oldUri":"file:///remote/repo/src/old.rs","newUri":"file:///remote/repo/src/new.rs"}]}}"#;
         let rewritten = rewrite_lsp_body(body, "/remote/repo", "/local/mirror").unwrap();
         let value: Value = serde_json::from_slice(&rewritten).unwrap();
 
@@ -10205,6 +10189,26 @@ mod tests {
         assert_eq!(
             value["result"]["documentChanges"][0]["textDocument"]["uri"],
             "file:///local/mirror/src/main.rs"
+        );
+        assert_eq!(
+            value["result"]["documentChanges"][1]["oldUri"],
+            "file:///local/mirror/src/old.rs"
+        );
+        assert_eq!(
+            value["result"]["documentChanges"][1]["newUri"],
+            "file:///local/mirror/src/new.rs"
+        );
+    }
+
+    #[test]
+    fn rewrites_lsp_location_target_uri() {
+        let body = br#"{"result":[{"targetUri":"file:///remote/repo/src/lib.rs","targetRange":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}},"originSelectionRange":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}}}]}"#;
+        let rewritten = rewrite_lsp_body(body, "/remote/repo", "/local/mirror").unwrap();
+        let value: Value = serde_json::from_slice(&rewritten).unwrap();
+
+        assert_eq!(
+            value["result"][0]["targetUri"],
+            "file:///local/mirror/src/lib.rs"
         );
     }
 
@@ -10233,6 +10237,20 @@ mod tests {
             "file:///local/mirror-other/src/main.rs"
         );
         assert_eq!(value["params"]["rootPath"], "/local/mirror-other");
+        assert_eq!(value["params"]["path"], "/remote/repo/src/main.rs");
+    }
+
+    #[test]
+    fn lsp_rewrite_does_not_touch_non_path_keys_with_plain_paths() {
+        let body = br#"{"params":{"message":"/local/mirror/src/main.rs failed","profile":"/local/mirror/src/profile","path":"/local/mirror/src/main.rs"}}"#;
+        let rewritten = rewrite_lsp_body(body, "/local/mirror", "/remote/repo").unwrap();
+        let value: Value = serde_json::from_slice(&rewritten).unwrap();
+
+        assert_eq!(
+            value["params"]["message"],
+            "/local/mirror/src/main.rs failed"
+        );
+        assert_eq!(value["params"]["profile"], "/local/mirror/src/profile");
         assert_eq!(value["params"]["path"], "/remote/repo/src/main.rs");
     }
 
