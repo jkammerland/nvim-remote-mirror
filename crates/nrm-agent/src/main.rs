@@ -807,12 +807,7 @@ fn write_file_cas_prepared(
     let actual_hash = current_regular_file_hash(root, &path, &target.abs)?;
     if actual_hash != expected_hash {
         return Ok(Response::WriteFileCas {
-            outcome: SaveOutcome::Conflict(save_conflict(
-                path,
-                expected_hash,
-                actual_hash,
-                &target.abs,
-            )),
+            outcome: SaveOutcome::Conflict(save_conflict(root, path, expected_hash, actual_hash)),
         });
     }
 
@@ -846,12 +841,7 @@ fn write_file_cas_prepared(
     if actual_hash != expected_hash {
         let _ = remove_temp_file(&parent, &tmp, &tmp_name);
         return Ok(Response::WriteFileCas {
-            outcome: SaveOutcome::Conflict(save_conflict(
-                path,
-                expected_hash,
-                actual_hash,
-                &target.abs,
-            )),
+            outcome: SaveOutcome::Conflict(save_conflict(root, path, expected_hash, actual_hash)),
         });
     }
     if let Err(error) = verify_write_parent_current(root, &parent, &target) {
@@ -898,10 +888,10 @@ fn begin_write_file_cas(
     if actual_hash != expected_hash {
         return Ok(Response::BeginWriteFileCas {
             outcome: WriteStartOutcome::Conflict(save_conflict(
+                &state.root,
                 path,
                 expected_hash,
                 actual_hash,
-                &target.abs,
             )),
         });
     }
@@ -1045,12 +1035,7 @@ fn finish_write_file_cas(state: &mut AgentState, upload_id: String) -> Result<Re
     if actual_hash != expected_hash {
         let _ = remove_temp_file(&parent, &tmp_path, &tmp_name);
         return Ok(Response::FinishWriteFileCas {
-            outcome: SaveOutcome::Conflict(save_conflict(
-                path,
-                expected_hash,
-                actual_hash,
-                &target_abs,
-            )),
+            outcome: SaveOutcome::Conflict(save_conflict(&root, path, expected_hash, actual_hash)),
         });
     }
 
@@ -1124,12 +1109,13 @@ fn enforce_upload_limits(state: &AgentState, new_size: u64) -> Result<()> {
 }
 
 fn save_conflict(
+    root: &Path,
     path: String,
     expected_hash: Option<String>,
     actual_hash: Option<String>,
-    abs: &Path,
 ) -> SaveConflict {
-    let (remote_content, remote_content_truncated, remote_size) = remote_conflict_content(abs);
+    let (remote_content, remote_content_truncated, remote_size) =
+        remote_conflict_content(root, &path);
     SaveConflict {
         path,
         expected_hash,
@@ -1140,21 +1126,27 @@ fn save_conflict(
     }
 }
 
-fn remote_conflict_content(abs: &Path) -> (Vec<u8>, bool, Option<u64>) {
-    let Ok(metadata) = fs::symlink_metadata(abs) else {
+fn remote_conflict_content(root: &Path, path: &str) -> (Vec<u8>, bool, Option<u64>) {
+    let Ok(mut opened) = open_existing_content_file(root, path) else {
         return (Vec::new(), false, None);
     };
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return (Vec::new(), false, None);
-    }
-    let remote_size = metadata.len();
+    let remote_size = opened.metadata.len();
     let max_bytes = remote_size.min(MAX_CONFLICT_CONTENT_BYTES as u64);
-    let mut remote_content = Vec::new();
-    if let Ok(file) = File::open(abs) {
-        let _ = file.take(max_bytes).read_to_end(&mut remote_content);
-    }
+    let remote_content =
+        read_open_file_prefix(&mut opened.file, max_bytes).unwrap_or_else(|_| Vec::new());
     let remote_content_truncated = remote_size > remote_content.len() as u64;
     (remote_content, remote_content_truncated, Some(remote_size))
+}
+
+fn read_open_file_prefix(file: &mut File, max_bytes: u64) -> io::Result<Vec<u8>> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut content = Vec::new();
+    {
+        let mut reader = (&mut *file).take(max_bytes);
+        reader.read_to_end(&mut content)?;
+    }
+    file.seek(SeekFrom::Start(0))?;
+    Ok(content)
 }
 
 fn existing_metadata_path(root: &Path, abs: &Path) -> Result<Option<PathBuf>> {
@@ -1812,6 +1804,26 @@ mod tests {
             .to_string();
         assert!(write_error.contains("is a symlink"));
         assert_eq!(fs::read_to_string(root.join("real.txt")).unwrap(), "real");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn conflict_capture_rejects_final_symlink_content() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("real.txt"), "remote secret").unwrap();
+        std::os::unix::fs::symlink(root.join("real.txt"), root.join("link.txt")).unwrap();
+
+        let conflict = save_conflict(
+            root,
+            "link.txt".to_string(),
+            Some("expected".to_string()),
+            Some("actual".to_string()),
+        );
+
+        assert!(conflict.remote_content.is_empty());
+        assert_eq!(conflict.remote_size, None);
+        assert!(!conflict.remote_content_truncated);
     }
 
     #[cfg(unix)]

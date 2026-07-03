@@ -108,6 +108,22 @@ local function main()
   assert_eq(calls[#calls].params.path, "src/write-target.rs")
   assert_eq(vim.b[write_buf].nrm_remote_path, "src/write-target.rs")
 
+  local explicit_target = files_root .. "/src/explicit-target.rs"
+  vim.fn.writefile({ "explicit target" }, explicit_target)
+  local tracked_buf = vim.api.nvim_create_buf(true, false)
+  vim.api.nvim_buf_set_name(tracked_buf, files_root .. "/src/current.rs")
+  vim.b[tracked_buf].nrm_remote_path = "src/current.rs"
+  vim.b[tracked_buf].nrm_workspace_key = "workspace-write"
+  vim.b[tracked_buf].nrm_target_arg = "ssh://write.example/repo"
+  vim.b[tracked_buf].nrm_files_root = files_root
+
+  vim.api.nvim_set_current_buf(tracked_buf)
+  nrm.adopt(explicit_target)
+
+  assert_eq(calls[#calls].method, "adopt")
+  assert_eq(calls[#calls].params.path, "src/explicit-target.rs")
+  assert_eq(vim.b[tracked_buf].nrm_remote_path, "src/current.rs")
+
   local offline_path = files_root .. "/src/offline.rs"
   vim.fn.writefile({ "offline" }, offline_path)
   local offline_buf = vim.api.nvim_create_buf(true, false)

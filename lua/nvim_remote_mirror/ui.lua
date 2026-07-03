@@ -86,6 +86,7 @@ local function format_dashboard_lines(status, err)
   add_section(lines, "Save Queue")
   add_line(lines, "Pending", number_value(status.pending_saves))
   add_line(lines, "Failed", number_value(status.failed_saves))
+  add_line(lines, "Unreplayable", number_value(status.unreplayable_saves))
   add_line(lines, "Conflicts", number_value(status.conflicted_saves))
 
   return lines
@@ -211,11 +212,12 @@ function M.open()
     if path == "" then
       return
     end
-    close()
     local ok, err = pcall(nrm.open, path)
     if not ok then
       notify(tostring(err), vim.log.levels.ERROR)
+      return
     end
+    close()
   end)
 end
 
@@ -237,8 +239,12 @@ local function select_find_hit(query, result)
     if not hit then
       return
     end
+    local ok, err = pcall(nrm.open, hit.path)
+    if not ok then
+      notify(tostring(err), vim.log.levels.ERROR)
+      return
+    end
     close()
-    nrm.open(hit.path)
   end)
 end
 
@@ -260,11 +266,12 @@ function M.grep()
     if query == "" then
       return
     end
-    close()
     local ok, err = pcall(nrm.grep, query)
     if not ok then
       notify(tostring(err), vim.log.levels.ERROR)
+      return
     end
+    close()
   end)
 end
 

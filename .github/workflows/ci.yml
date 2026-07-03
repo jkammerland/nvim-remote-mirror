@@ -18,6 +18,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y lua5.1 neovim
+      - name: Check Neovim version
+        run: nvim --headless --clean +'lua local v = vim.version(); if v.major == 0 and v.minor < 10 then error(string.format("nvim-remote-mirror requires Neovim 0.10+, got %d.%d.%d", v.major, v.minor, v.patch or 0)) end; if vim.fn.exists("*readblob") ~= 1 then error("nvim-remote-mirror requires readblob()") end' +qa
       - name: Rust format
         run: cargo fmt --all --check
       - name: Rust clippy

@@ -38,9 +38,7 @@ fn rewrite_lsp_json(value: &mut Value, key: Option<&str>, from_prefix: &str, to_
 }
 
 fn rewrite_lsp_object_key(key: &str, from_prefix: &str, to_prefix: &str) -> String {
-    rewrite_lsp_uri(key, from_prefix, to_prefix)
-        .or_else(|| rewrite_lsp_path(key, from_prefix, to_prefix))
-        .unwrap_or_else(|| key.to_string())
+    rewrite_lsp_uri(key, from_prefix, to_prefix).unwrap_or_else(|| key.to_string())
 }
 
 fn rewrite_lsp_uri(text: &str, from_prefix: &str, to_prefix: &str) -> Option<String> {

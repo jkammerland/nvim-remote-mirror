@@ -2302,7 +2302,7 @@ impl Mirror {
             .query_row(
                 "
                 SELECT local_hash FROM save_queue
-                WHERE relative_path=?1 AND state IN ('pending', 'failed')
+                WHERE relative_path=?1 AND state IN ('pending', 'failed') AND snapshot_path IS NOT NULL
                 ORDER BY id DESC LIMIT 1
                 ",
                 params![relative_path],
@@ -2570,7 +2570,7 @@ impl Mirror {
             .query_row(
                 "
                 SELECT COUNT(*) FROM save_queue
-                WHERE relative_path=?1 AND state IN ('pending', 'failed')
+                WHERE relative_path=?1 AND state IN ('pending', 'failed') AND snapshot_path IS NOT NULL
                 ",
                 params![relative_path],
                 |row| row.get(0),
@@ -2747,12 +2747,20 @@ impl Mirror {
                     row.get(0)
                 })?;
         let pending: i64 = self.db.query_row(
-            "SELECT COUNT(*) FROM save_queue WHERE state='pending'",
+            "SELECT COUNT(*) FROM save_queue WHERE state='pending' AND snapshot_path IS NOT NULL",
             [],
             |row| row.get(0),
         )?;
         let failed: i64 = self.db.query_row(
-            "SELECT COUNT(*) FROM save_queue WHERE state='failed'",
+            "SELECT COUNT(*) FROM save_queue WHERE state='failed' AND snapshot_path IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        let unreplayable: i64 = self.db.query_row(
+            "
+            SELECT COUNT(*) FROM save_queue
+            WHERE state IN ('pending', 'failed') AND snapshot_path IS NULL
+            ",
             [],
             |row| row.get(0),
         )?;
@@ -2788,6 +2796,7 @@ impl Mirror {
             "dirty_files": dirty,
             "pending_saves": pending,
             "failed_saves": failed,
+            "unreplayable_saves": unreplayable,
             "conflicted_saves": conflicted,
             "stale_files": stale,
             "deleted_files": deleted,
@@ -6917,6 +6926,31 @@ mod tests {
         local_path
     }
 
+    fn insert_unreplayable_save(
+        mirror: &Mirror,
+        path: &str,
+        expected_hash: Option<&str>,
+        local_hash: &str,
+        state: &str,
+    ) -> i64 {
+        assert!(matches!(state, "pending" | "failed"));
+        let now = now_ms();
+        mirror
+            .db
+            .execute(
+                "
+                INSERT INTO save_queue (
+                  relative_path, expected_hash, local_hash, snapshot_path, state,
+                  attempts, created_at_ms, updated_at_ms
+                )
+                VALUES (?1, ?2, ?3, NULL, ?4, 0, ?5, ?5)
+                ",
+                params![path, expected_hash, local_hash, state, now],
+            )
+            .unwrap();
+        mirror.db.last_insert_rowid()
+    }
+
     fn slot_backoff_window_ms(slot: &RemoteBackoffSlot) -> u64 {
         slot.unavailable_until
             .unwrap()
@@ -8278,6 +8312,77 @@ mod tests {
         assert!(!entry.dirty);
         assert_eq!(entry.remote_hash.as_deref(), Some(second_hash.as_str()));
         assert_eq!(entry.local_hash.as_deref(), Some(second_hash.as_str()));
+    }
+
+    #[test]
+    fn unreplayable_save_rows_do_not_chain_new_snapshots() {
+        let dir = tempdir().unwrap();
+        let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
+        let local_path = record_hydrated_content(&mirror, "a.txt", b"base");
+        let base_hash = hash_bytes(b"base");
+        let lost_hash = hash_bytes(b"lost local edit");
+        insert_unreplayable_save(
+            &mirror,
+            "a.txt",
+            Some(base_hash.as_str()),
+            &lost_hash,
+            "pending",
+        );
+        fs::write(&local_path, b"resolved").unwrap();
+
+        let queued = mirror.enqueue_local_save("a.txt").unwrap();
+
+        assert_eq!(queued.expected_hash.as_deref(), Some(base_hash.as_str()));
+        assert_ne!(queued.expected_hash.as_deref(), Some(lost_hash.as_str()));
+    }
+
+    #[test]
+    fn applied_save_ignores_unreplayable_rows_when_cleaning_dirty_state() {
+        let dir = tempdir().unwrap();
+        let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
+        record_hydrated_content(&mirror, "a.txt", b"base");
+        let base_hash = hash_bytes(b"base");
+        let lost_hash = hash_bytes(b"lost local edit");
+        insert_unreplayable_save(
+            &mirror,
+            "a.txt",
+            Some(base_hash.as_str()),
+            &lost_hash,
+            "pending",
+        );
+        let resolved_hash = hash_bytes(b"resolved");
+        let queued = mirror
+            .enqueue_save(
+                "a.txt",
+                &resolved_hash,
+                Some(base_hash.as_str()),
+                b"resolved",
+            )
+            .unwrap();
+
+        mirror
+            .mark_save_applied(queued.id, "a.txt", &resolved_hash, 8, 42)
+            .unwrap();
+
+        assert_eq!(mirror.pending_save_count().unwrap(), 0);
+        let entry = mirror.get("a.txt").unwrap().unwrap();
+        assert!(!entry.dirty);
+        assert_eq!(entry.remote_hash.as_deref(), Some(resolved_hash.as_str()));
+        assert_eq!(entry.local_hash.as_deref(), Some(resolved_hash.as_str()));
+        assert_eq!(entry.validation_state, "valid");
+
+        let status = mirror.status().unwrap();
+        assert_eq!(status["pending_saves"], 0);
+        assert_eq!(status["failed_saves"], 0);
+        assert_eq!(status["unreplayable_saves"], 1);
+
+        let queue = mirror
+            .save_queue(&json!({"state": "unreplayable"}))
+            .unwrap();
+        assert_eq!(queue["total"], 1);
+        assert_eq!(queue["counts"]["pending"], 0);
+        assert_eq!(queue["counts"]["unreplayable"], 1);
+        assert_eq!(queue["entries"][0]["state"], "unreplayable");
     }
 
     #[test]
@@ -10198,6 +10303,17 @@ mod tests {
             value["result"]["documentChanges"][1]["newUri"],
             "file:///local/mirror/src/new.rs"
         );
+    }
+
+    #[test]
+    fn lsp_rewrite_does_not_rewrite_plain_path_object_keys() {
+        let body = br#"{"result":{"metadata":{"/remote/repo/src/lib.rs":{"kind":"opaque"}}}}"#;
+        let rewritten = rewrite_lsp_body(body, "/remote/repo", "/local/mirror").unwrap();
+        let value: Value = serde_json::from_slice(&rewritten).unwrap();
+        let metadata = value["result"]["metadata"].as_object().unwrap();
+
+        assert!(metadata.contains_key("/remote/repo/src/lib.rs"));
+        assert!(!metadata.contains_key("/local/mirror/src/lib.rs"));
     }
 
     #[test]

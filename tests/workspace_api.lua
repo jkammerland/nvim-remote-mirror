@@ -79,9 +79,13 @@ local function main()
   assert_eq(nrm.local_path("a/../../outside.rs"), nil)
   assert_eq(nrm.local_path("."), nil)
   assert_eq(nrm.local_path("/tmp/outside.rs"), nil)
+  assert_eq(nrm.local_path([[\outside.rs]]), nil)
+  assert_eq(nrm.local_path([[\\outside.rs]]), nil)
+  assert_eq(nrm.local_path([[\\server\share\file.rs]]), nil)
   assert_eq(nrm.remote_path(root .. "/files/src/main.rs"), "src/main.rs")
   assert_eq(nrm.remote_path(root .. "/files/src/../README.md"), "README.md")
   assert_eq(nrm.remote_path(root .. "/other/main.rs"), nil)
+  assert_eq(nrm.remote_path(root .. [[/files/\outside.rs]]), nil)
 
   local buf = vim.api.nvim_create_buf(true, false)
   vim.b[buf].nrm_remote_path = "src/main.rs"

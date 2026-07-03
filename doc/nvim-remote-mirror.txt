@@ -375,11 +375,12 @@ Local plugins operate on hydrated mirror files. Local grep or file pickers can
 only see what is already known or present in the mirror; use :RemoteScan,
 :RemoteFind, :RemoteFiles, and :RemoteGrep for sidecar-backed discovery.
 
-Saving a new file under the mirror files root adopts that path and queues it
-for remote creation. After :RemoteCd, cwd-based plugins may write generated
-files under the mirror root. Until ignore policy is configurable, keep plugin
-caches, temp files, tags, and build outputs outside the mirror root unless they
-should exist remotely.
+Saving a new file under the mirror files root does not create it remotely by
+default. Use :RemoteAdopt {path} for files that should exist remotely, or set
+adoption_policy = 'auto' if new mirror-root files should be adopted on write.
+After :RemoteCd, cwd-based plugins may write generated files under the mirror
+root. Until ignore policy is configurable, keep plugin caches, temp files, tags,
+and build outputs outside the mirror root unless they should exist remotely.
 
 ==============================================================================
 LSP                                                *nvim-remote-mirror-lsp*

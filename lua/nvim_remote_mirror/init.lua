@@ -153,7 +153,11 @@ local function files_root_relative_path(files_root, local_path)
   if path:sub(1, #prefix) ~= prefix then
     return nil
   end
-  return path:sub(#prefix + 1)
+  local relative = path:sub(#prefix + 1)
+  if relative == "" or relative:sub(1, 1) == "/" then
+    return nil
+  end
+  return relative
 end
 
 local function mirror_relative_path(client, local_path)
@@ -171,6 +175,9 @@ local function files_root_local_path(files_root, relative_path)
     return nil
   end
   local normalized_relative = relative_path:gsub("\\", "/")
+  if normalized_relative:sub(1, 1) == "/" or normalized_relative:find("^%a:/") then
+    return nil
+  end
   if normalized_relative == "." then
     return nil
   end
@@ -180,7 +187,7 @@ local function files_root_local_path(files_root, relative_path)
     end
   end
   local root = normalize_local_path(files_root):gsub("/+$", "")
-  local path = normalize_local_path(vim.fs.joinpath(root, relative_path))
+  local path = normalize_local_path(vim.fs.joinpath(root, normalized_relative))
   local prefix = root .. "/"
   if path ~= root and path:sub(1, #prefix) ~= prefix then
     return nil
@@ -1877,15 +1884,19 @@ function M.flush_buffer(bufnr, opts)
     )
     return
   end
-  local path = optional_string(vim.b[bufnr].nrm_remote_path)
   local buffer_identity_value = buffer_identity(bufnr)
   if not identity_has_scope(buffer_identity_value) then
     buffer_identity_value = nil
   end
   local client = M.client
-  local write_path = optional_string(opts.local_path) or vim.api.nvim_buf_get_name(bufnr)
-  local adopt_identity = nil
+  local explicit_local_path = optional_string(opts.local_path)
+  local write_path = explicit_local_path or vim.api.nvim_buf_get_name(bufnr)
   local explicit_adopt = opts.adopt == true
+  local path = optional_string(vim.b[bufnr].nrm_remote_path)
+  if explicit_adopt and explicit_local_path then
+    path = nil
+  end
+  local adopt_identity = nil
   if not path and client then
     local candidate = mirror_relative_path(client, write_path)
     if candidate and (explicit_adopt or auto_adoption_enabled()) then
@@ -1911,7 +1922,7 @@ function M.flush_buffer(bufnr, opts)
   end
   flush_remote_path(path, {
     bufnr = bufnr,
-    identity = buffer_identity(bufnr) or adopt_identity,
+    identity = adopt_identity or buffer_identity(bufnr),
     adopt = explicit_adopt,
   })
 end
@@ -2262,13 +2273,14 @@ function M.status()
     local scan_summary = background_scan_summary(result)
     notify(
       string.format(
-        "known=%d cached=%d indexed=%d dirty=%d pending=%d failed=%d conflicts=%d stale=%d deleted=%d %s %s%s",
+        "known=%d cached=%d indexed=%d dirty=%d pending=%d failed=%d unreplayable=%d conflicts=%d stale=%d deleted=%d %s %s%s",
         result.known_files,
         result.cached_files,
         result.indexed_files or 0,
         result.dirty_files,
         result.pending_saves,
         result.failed_saves,
+        result.unreplayable_saves or 0,
         result.conflicted_saves,
         result.stale_files,
         result.deleted_files,

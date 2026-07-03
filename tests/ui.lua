@@ -30,6 +30,20 @@ local function assert_line_contains(lines, needle)
   error("expected dashboard lines to contain " .. vim.inspect(needle) .. ":\n" .. table.concat(lines, "\n"))
 end
 
+local function assert_dashboard_visible(message)
+  vim.wait(100, function()
+    return vim.bo.filetype == "nrm-dashboard"
+  end)
+  assert_eq(vim.bo.filetype, "nrm-dashboard", message)
+end
+
+local function assert_dashboard_closed(message)
+  vim.wait(100, function()
+    return vim.bo.filetype ~= "nrm-dashboard"
+  end)
+  assert_eq(vim.bo.filetype == "nrm-dashboard", false, message)
+end
+
 local function fake_client()
   return {
     job_id = 1,
@@ -194,6 +208,54 @@ local function main()
   end
   ui.conflicts()
   assert_contains(conflict_select_prompt, "Remote conflicts")
+
+  local original_input = vim.ui.input
+  local original_open = nrm.open
+  local original_grep = nrm.grep
+  nrm.client = nil
+  nrm.connection_status = "disconnected"
+
+  vim.ui.input = function(_, callback)
+    callback("README.md")
+  end
+  nrm.open = function()
+    error("not connected; run :RemoteConnect first")
+  end
+  ui.workspace()
+  assert_dashboard_visible("workspace dashboard should open before failed open")
+  ui.open()
+  assert_dashboard_visible("failed open should keep dashboard visible")
+
+  local opened_path = nil
+  nrm.open = function(path)
+    opened_path = path
+  end
+  ui.open()
+  assert_eq(opened_path, "README.md")
+  assert_dashboard_closed("successful open should close dashboard")
+
+  vim.ui.input = function(_, callback)
+    callback("needle")
+  end
+  nrm.grep = function()
+    error("not connected; run :RemoteConnect first")
+  end
+  ui.workspace()
+  assert_dashboard_visible("workspace dashboard should open before failed grep")
+  ui.grep()
+  assert_dashboard_visible("failed grep should keep dashboard visible")
+
+  local grep_query = nil
+  nrm.grep = function(query)
+    grep_query = query
+  end
+  ui.grep()
+  assert_eq(grep_query, "needle")
+  assert_dashboard_closed("successful grep should close dashboard")
+
+  vim.ui.input = original_input
+  nrm.open = original_open
+  nrm.grep = original_grep
 end
 
 local ok, err = xpcall(main, debug.traceback)
