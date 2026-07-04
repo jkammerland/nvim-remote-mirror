@@ -1262,6 +1262,8 @@ impl Drop for AgentClient {
 
 #[cfg(unix)]
 fn configure_agent_process(command: &mut Command) {
+    // SAFETY: `pre_exec` only calls the async-signal-safe `setpgid` syscall
+    // before exec so the spawned agent owns a process group we can terminate.
     unsafe {
         command.pre_exec(|| {
             if libc::setpgid(0, 0) == 0 {
@@ -1281,6 +1283,9 @@ fn kill_child_tree(child: &mut Child) {
     {
         let pid = child.id() as libc::pid_t;
         if pid > 0 {
+            // SAFETY: a negative pid targets the process group created for
+            // this child by `configure_agent_process`; errors are ignored
+            // because child teardown falls back to killing the direct child.
             let _ = unsafe { libc::kill(-pid, libc::SIGKILL) };
         }
     }

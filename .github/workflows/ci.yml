@@ -23,13 +23,15 @@ jobs:
       - name: Rust format
         run: cargo fmt --all --check
       - name: Rust clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings -D clippy::undocumented_unsafe_blocks
       - name: Rust tests
         run: cargo test --workspace --locked
       - name: Lua syntax
-        run: luac -p lua/nvim_remote_mirror/init.lua lua/nvim_remote_mirror/ui.lua plugin/nvim_remote_mirror.lua tests/*.lua
+        run: git ls-files -z '*.lua' | xargs -0 luac5.1 -p
       - name: Headless Neovim tests
-        run: for test in tests/*.lua; do nvim --headless -u NONE -l "$test"; done
+        run: find tests -maxdepth 1 -name '*.lua' -print0 | sort -z | while IFS= read -r -d '' test; do nvim --headless -u NONE -l "$test"; done
+      - name: Shell syntax
+        run: bash -n scripts/*.sh
       - name: Whitespace
         run: git diff --check
       - name: Perf smoke

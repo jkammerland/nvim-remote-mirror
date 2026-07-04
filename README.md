@@ -223,16 +223,23 @@ Mirror files live under the sidecar state directory, typically below
 
 ```sh
 just check
+just ci
+just lint-extra
+just audit
 cargo bench --workspace --no-run --locked
 scripts/perf_smoke.sh --small
 NRM_PERF_LARGE=1 scripts/perf_smoke.sh --large
 ```
 
 `just check` runs Rust fmt, clippy, Rust tests, Lua syntax checks, headless
-Neovim tests, and whitespace checks. The Criterion benchmarks cover protocol
-frames and agent scan/grep paths; run them without `--no-run` for manual
-before/after measurements. The small perf smoke runs in CI; the large mode is
-intended for local before/after timing on bigger synthetic workspaces.
+Neovim tests, Bash syntax checks, and whitespace checks. The Criterion
+benchmarks cover protocol frames and agent scan/grep paths; run them without
+`--no-run` for manual before/after measurements. The small perf smoke runs in
+CI and through `just ci`; the large mode is intended for local before/after
+timing on bigger synthetic workspaces.
+`just lint-extra`, `just audit`, and `just miri-protocol` are optional local
+quality gates for release or riskier changes; see
+[docs/quality-gates.md](docs/quality-gates.md).
 
 Set `NRM_TRACE=1` when starting the sidecar to emit JSON trace events for
 request queueing, agent round trips, preemption, truncation, and remote backoff
@@ -248,4 +255,5 @@ to stderr.
 | [docs/plugin-compatibility.md](docs/plugin-compatibility.md) | How normal plugins should interact with mirror paths |
 | [docs/save-recovery.md](docs/save-recovery.md) | Save queue and conflict behavior |
 | [docs/protocol.md](docs/protocol.md) | Sidecar and agent protocol notes |
+| [docs/quality-gates.md](docs/quality-gates.md) | Required and optional checks for local and release validation |
 | [doc/nvim-remote-mirror.txt](doc/nvim-remote-mirror.txt) | Vim help |

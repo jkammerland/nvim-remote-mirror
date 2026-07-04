@@ -282,6 +282,8 @@ performance checks that make failures diagnosable before data is at risk.
   missing agent, missing snapshot, and remote reboot.
 - Define performance budgets for scan, find, grep, open, save replay, and
   background mirror.
+- Document required and optional quality gates, including Lua lint/format,
+  dependency audit, and narrow Miri coverage for protocol parsing.
 - Package release docs for local binary build and remote agent install.
 - Decide the v1 support matrix explicitly. The default is Ubuntu CI plus manual
   local/SSH dogfood; macOS and Windows CI remain post-v1 unless promoted.
@@ -305,6 +307,10 @@ performance checks that make failures diagnosable before data is at risk.
 **Tests:**
 
 - `just check`
+- `just ci`
+- `just lint-extra`
+- `just audit`
+- `just miri-protocol`
 - `scripts/perf_smoke.sh --small`
 - `cargo bench --workspace --no-run --locked`
 - Add `tests/health.lua` for healthcheck command behavior once implemented.
