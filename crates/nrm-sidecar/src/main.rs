@@ -11080,6 +11080,97 @@ mod tests {
     }
 
     #[test]
+    fn lsp_rewrite_does_not_rewrite_file_uri_prose() {
+        let body = br#"{"params":{"message":"file:///remote/repo/src/lib.rs failed","detail":"file:///remote/repo/src/lib.rs:3:1","textDocument":{"uri":"file:///remote/repo/src/lib.rs"}}}"#;
+        let rewritten = rewrite_lsp_body(body, "/remote/repo", "/local/mirror").unwrap();
+        let value: Value = serde_json::from_slice(&rewritten).unwrap();
+
+        assert_eq!(
+            value["params"]["message"],
+            "file:///remote/repo/src/lib.rs failed"
+        );
+        assert_eq!(
+            value["params"]["detail"],
+            "file:///remote/repo/src/lib.rs:3:1"
+        );
+        assert_eq!(
+            value["params"]["textDocument"]["uri"],
+            "file:///local/mirror/src/lib.rs"
+        );
+    }
+
+    #[test]
+    fn lsp_rewrite_preserves_file_localhost_uri() {
+        let body = br#"{"params":{"textDocument":{"uri":"file://localhost/remote/repo/src/lib.rs"},"path":"/remote/repo/src/lib.rs"}}"#;
+        let rewritten = rewrite_lsp_body(body, "/remote/repo", "/local/mirror").unwrap();
+        let value: Value = serde_json::from_slice(&rewritten).unwrap();
+
+        assert_eq!(
+            value["params"]["textDocument"]["uri"],
+            "file://localhost/remote/repo/src/lib.rs"
+        );
+        assert_eq!(value["params"]["path"], "/local/mirror/src/lib.rs");
+    }
+
+    #[test]
+    fn lsp_rewrite_preserves_uri_query_and_fragment() {
+        let body =
+            br#"{"params":{"textDocument":{"uri":"file:///remote/repo/src/lib.rs?version=1#L4"}}}"#;
+        let rewritten = rewrite_lsp_body(body, "/remote/repo", "/local/mirror").unwrap();
+        let value: Value = serde_json::from_slice(&rewritten).unwrap();
+
+        assert_eq!(
+            value["params"]["textDocument"]["uri"],
+            "file:///local/mirror/src/lib.rs?version=1#L4"
+        );
+    }
+
+    #[test]
+    fn lsp_rewrite_does_not_drop_colliding_workspace_edit_keys() {
+        let body = br#"{"result":{"changes":{"file:///remote/repo/src/lib.rs":[{"newText":"remote"}],"file:///local/mirror/src/lib.rs":[{"newText":"local"}]}}}"#;
+        let rewritten = rewrite_lsp_body(body, "/remote/repo", "/local/mirror").unwrap();
+        let value: Value = serde_json::from_slice(&rewritten).unwrap();
+        let changes = value["result"]["changes"].as_object().unwrap();
+        let edits = changes["file:///local/mirror/src/lib.rs"]
+            .as_array()
+            .unwrap();
+
+        assert!(!changes.contains_key("file:///remote/repo/src/lib.rs"));
+        assert_eq!(edits.len(), 2);
+        assert!(edits.iter().any(|edit| edit["newText"] == "remote"));
+        assert!(edits.iter().any(|edit| edit["newText"] == "local"));
+    }
+
+    #[test]
+    fn rewrites_lsp_publish_diagnostics_related_information() {
+        let body = br#"{"method":"textDocument/publishDiagnostics","params":{"uri":"file:///remote/repo/src/lib.rs","diagnostics":[{"relatedInformation":[{"location":{"uri":"file:///remote/repo/src/dep.rs"}}]}]}}"#;
+        let rewritten = rewrite_lsp_body(body, "/remote/repo", "/local/mirror").unwrap();
+        let value: Value = serde_json::from_slice(&rewritten).unwrap();
+
+        assert_eq!(value["params"]["uri"], "file:///local/mirror/src/lib.rs");
+        assert_eq!(
+            value["params"]["diagnostics"][0]["relatedInformation"][0]["location"]["uri"],
+            "file:///local/mirror/src/dep.rs"
+        );
+    }
+
+    #[test]
+    fn rewrites_lsp_code_action_edits() {
+        let body = br#"{"result":[{"edit":{"changes":{"file:///remote/repo/src/lib.rs":[{"newText":"x"}]},"documentChanges":[{"kind":"create","uri":"file:///remote/repo/src/new.rs"}]}}]}"#;
+        let rewritten = rewrite_lsp_body(body, "/remote/repo", "/local/mirror").unwrap();
+        let value: Value = serde_json::from_slice(&rewritten).unwrap();
+
+        assert!(value["result"][0]["edit"]["changes"]
+            .as_object()
+            .unwrap()
+            .contains_key("file:///local/mirror/src/lib.rs"));
+        assert_eq!(
+            value["result"][0]["edit"]["documentChanges"][0]["uri"],
+            "file:///local/mirror/src/new.rs"
+        );
+    }
+
+    #[test]
     fn agent_local_transport_launches_agent_directly() {
         let plan = RemoteTransport::from_ssh(None, 10)
             .agent_plan("nrm-agent", Path::new("/tmp/repo with spaces"));

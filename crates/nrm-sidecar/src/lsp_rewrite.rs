@@ -10,8 +10,10 @@ pub(crate) fn rewrite_lsp_body(body: &[u8], from_prefix: &str, to_prefix: &str) 
 fn rewrite_lsp_json(value: &mut Value, key: Option<&str>, from_prefix: &str, to_prefix: &str) {
     match value {
         Value::String(text) => {
-            if let Some(rewritten) = rewrite_lsp_uri(text, from_prefix, to_prefix) {
-                *text = rewritten;
+            if key.map(is_lsp_uri_key).unwrap_or(false) {
+                if let Some(rewritten) = rewrite_lsp_uri(text, from_prefix, to_prefix) {
+                    *text = rewritten;
+                }
             } else if key.map(is_lsp_path_key).unwrap_or(false) {
                 if let Some(rewritten) = rewrite_lsp_path(text, from_prefix, to_prefix) {
                     *text = rewritten;
@@ -27,10 +29,28 @@ fn rewrite_lsp_json(value: &mut Value, key: Option<&str>, from_prefix: &str, to_
             let entries = std::mem::take(map);
             for (entry_key, mut entry_value) in entries {
                 rewrite_lsp_json(&mut entry_value, Some(&entry_key), from_prefix, to_prefix);
-                map.insert(
-                    rewrite_lsp_object_key(&entry_key, from_prefix, to_prefix),
-                    entry_value,
-                );
+                let rewritten_key = rewrite_lsp_object_key(&entry_key, from_prefix, to_prefix);
+                if let Some(existing) = map.get_mut(&rewritten_key) {
+                    merge_lsp_collision(existing, entry_value);
+                } else {
+                    map.insert(rewritten_key, entry_value);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn merge_lsp_collision(existing: &mut Value, incoming: Value) {
+    match (existing, incoming) {
+        (Value::Array(existing), Value::Array(mut incoming)) => existing.append(&mut incoming),
+        (Value::Object(existing), Value::Object(incoming)) => {
+            for (key, value) in incoming {
+                if let Some(existing_value) = existing.get_mut(&key) {
+                    merge_lsp_collision(existing_value, value);
+                } else {
+                    existing.insert(key, value);
+                }
             }
         }
         _ => {}
@@ -42,6 +62,9 @@ fn rewrite_lsp_object_key(key: &str, from_prefix: &str, to_prefix: &str) -> Stri
 }
 
 fn rewrite_lsp_uri(text: &str, from_prefix: &str, to_prefix: &str) -> Option<String> {
+    if text.chars().any(char::is_whitespace) {
+        return None;
+    }
     for (from_uri, to_uri) in path_to_file_uri_prefix_pairs(from_prefix, to_prefix) {
         if let Some(suffix) = strip_prefix_with_boundary(text, &from_uri, &['/', '?', '#']) {
             return Some(format!("{to_uri}{suffix}"));
@@ -87,6 +110,11 @@ fn is_lsp_path_key(key: &str) -> bool {
         || key.ends_with("filename")
         || key.ends_with("file_name")
         || key.ends_with("directory")
+}
+
+fn is_lsp_uri_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    key == "uri" || key.ends_with("uri")
 }
 
 fn path_to_file_uri_prefix_pairs(from_prefix: &str, to_prefix: &str) -> Vec<(String, String)> {
