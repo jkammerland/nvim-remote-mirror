@@ -20,6 +20,7 @@ but it is not a polished replacement for SSHFS or VS Code Remote yet.
 | Save queue and conflicts | Working |
 | Socket sidecar mode | Working, one active Neovim client |
 | Remote LSP proxy | Basic |
+| Remote git status/diff/blame | Basic |
 | Terminals, DAP, plugin remoting | Not built |
 | Non-SSH transports | Not built |
 
@@ -143,6 +144,9 @@ Dashboard keys:
 | `:RemoteGrep {query}` | Search remote and cached mirror files |
 | `:RemotePrefetch {path...}` | Hydrate files into the mirror |
 | `:RemoteStatus` | Print a status summary |
+| `:RemoteGitStatus [path...]` | Put remote git status entries in quickfix |
+| `:RemoteGitDiff [path]` | Open a remote git diff scratch buffer |
+| `:RemoteGitBlame [path]` | Put remote git blame output in quickfix |
 | `:RemoteLspStart {cmd...}` | Start a simple remote LSP command |
 | `:RemoteLspStop` | Stop active remote LSP clients for the current workspace |
 | `:RemoteLspRestart [cmd...]` | Restart the last or provided remote LSP command |
@@ -169,6 +173,7 @@ Dashboard keys:
 | `ssh_connect_timeout_seconds` | `10` | SSH connection timeout |
 | `find_limit` | `200` | Max file picker results |
 | `grep_limit` | `200` | Max grep results |
+| `git_output_max_bytes` | `1048576` | Max stdout/stderr captured for each remote git command |
 | `open_prefetch_related` | `false` | Prefetch nearby known files after open |
 | `adoption_policy` | `"tracked_or_explicit"` | Require `:RemoteAdopt` for untracked mirror files |
 | `background_mirror` | `true` | Gradually scan, hydrate, and validate in idle batches |

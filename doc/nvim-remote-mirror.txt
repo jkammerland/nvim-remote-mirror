@@ -222,6 +222,19 @@ COMMANDS                                      *nvim-remote-mirror-commands*
     background metadata scan state, LSP summary, and last known remote health.
     This is a local fast path and does not probe SSH.
 
+:RemoteGitStatus [path...]
+    Run remote `git status --porcelain=v1 -z --branch --untracked-files=all`
+    through the agent and put changed paths in quickfix. Optional paths are
+    workspace-relative or mirror-local paths.
+
+:RemoteGitDiff [path]
+    Run remote `git diff` for the current remote buffer or given path and open
+    the result in a nofile diff scratch buffer.
+
+:RemoteGitBlame [path]
+    Run remote `git blame` for the current remote buffer or given path and put
+    blame lines in quickfix.
+
 :RemoteLspStart {cmd...}
     Start a simple remote LSP command for the active workspace. For complex
     server configs, prefer start_lsp() from Lua.
@@ -261,6 +274,7 @@ CONFIGURATION                                  *nvim-remote-mirror-config*
     grep_cache_max_files = 2000,
     grep_cache_max_file_bytes = 512 * 1024,
     grep_cache_max_total_bytes = 8 * 1024 * 1024,
+    git_output_max_bytes = 1024 * 1024,
     request_timeout_ms = 30000,
     ssh_connect_timeout_seconds = 10,
     open_batch_max_file_bytes = 4 * 1024 * 1024,
@@ -426,8 +440,9 @@ LIMITS                                        *nvim-remote-mirror-limits*
 
 This is dogfooding software. The local mirror, SSH workspaces, background
 metadata scan, find, grep, save queue, conflicts, socket sidecar mode, and basic
-LSP proxy are implemented. Remote terminals, DAP, git adapters, and general
-plugin remoting are not built yet.
+LSP proxy are implemented. Remote git status/diff/blame primitives are
+implemented. Remote terminals, DAP, full git adapters, and general plugin
+remoting are not built yet.
 
 Local plugins operate on hydrated mirror files. Local grep or file pickers can
 only see what is already known or present in the mirror; use :RemoteScan,

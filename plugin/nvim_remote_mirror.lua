@@ -146,6 +146,27 @@ vim.api.nvim_create_user_command("RemoteStatus", function()
   nrm.status()
 end, {})
 
+vim.api.nvim_create_user_command("RemoteGitStatus", function(opts)
+  nrm.git_status({ paths = opts.fargs })
+end, {
+  nargs = "*",
+  complete = "file",
+})
+
+vim.api.nvim_create_user_command("RemoteGitDiff", function(opts)
+  nrm.git_diff(opts.fargs[1])
+end, {
+  nargs = "?",
+  complete = "file",
+})
+
+vim.api.nvim_create_user_command("RemoteGitBlame", function(opts)
+  nrm.git_blame(opts.fargs[1])
+end, {
+  nargs = "?",
+  complete = "file",
+})
+
 vim.api.nvim_create_user_command("RemoteLspStart", function(opts)
   local command = vim.split(opts.args, "%s+", { trimempty = true })
   nrm.start_lsp(command)

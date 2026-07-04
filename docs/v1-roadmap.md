@@ -239,6 +239,9 @@ for whether tools run locally on mirror files or remotely through the sidecar.
 ```vim
 :RemoteCd
 :RemoteStatus
+:RemoteGitStatus
+:RemoteGitDiff
+:RemoteGitBlame
 " Local formatters may operate on hydrated mirror buffers.
 " Remote git operations should go through nrm-provided commands.
 ```
@@ -248,6 +251,10 @@ for whether tools run locally on mirror files or remotely through the sidecar.
 - Docs name supported and unsupported plugin classes.
 - Git status/diff/blame can be obtained without local repo checkout semantics.
 - Formatting a remote buffer does not bypass save queue safety.
+
+**Status:** Started. Sidecar-backed `:RemoteGitStatus`, `:RemoteGitDiff`, and
+`:RemoteGitBlame` are implemented as bounded remote agent commands. Full
+git-plugin adapters remain future work.
 
 **Tests:**
 

@@ -38,6 +38,7 @@ const DEFAULT_GREP_CACHE_MAX_FILE_BYTES: u64 = 512 * 1024;
 const DEFAULT_GREP_CACHE_MAX_TOTAL_BYTES: u64 = 8 * 1024 * 1024;
 const SEARCH_INDEX_MAX_FILE_BYTES: u64 = DEFAULT_BATCH_MAX_FILE_BYTES;
 const SEARCH_TRIGRAM_BYTES: usize = 3;
+const DEFAULT_GIT_OUTPUT_MAX_BYTES: u64 = 1024 * 1024;
 const REMOTE_UNAVAILABLE_BACKOFF_BASE_MS: u64 = 2_000;
 const REMOTE_UNAVAILABLE_BACKOFF_MAX_MS: u64 = 60_000;
 const LSP_PROXY_EXIT_GRACE_MS: u64 = 500;
@@ -69,6 +70,9 @@ const SIDECAR_COMMAND_SPECS: &[SidecarCommandSpec] = &[
     ),
     SidecarCommandSpec::public("grep", "hybrid", Some("read_or_write"), false, false, true),
     SidecarCommandSpec::public("grep_cache", "local", None, false, true, false),
+    SidecarCommandSpec::public("git_status", "remote", Some("read"), false, false, true),
+    SidecarCommandSpec::public("git_diff", "remote", Some("read"), false, false, true),
+    SidecarCommandSpec::public("git_blame", "remote", Some("read"), false, false, true),
     SidecarCommandSpec::public("recover_local_edits", "local", None, false, false, false),
     SidecarCommandSpec::public("adopt", "hybrid", Some("write"), true, false, false),
     SidecarCommandSpec::public("flush", "hybrid", Some("write"), true, false, false),
@@ -1293,6 +1297,9 @@ fn agent_request_name(request: &Request) -> &'static str {
         Request::ReadFile { .. } => "read_file",
         Request::ReadFiles { .. } => "read_files",
         Request::Grep { .. } => "grep",
+        Request::GitStatus { .. } => "git_status",
+        Request::GitDiff { .. } => "git_diff",
+        Request::GitBlame { .. } => "git_blame",
         Request::WriteFileCas { .. } => "write_file_cas",
         Request::BeginWriteFileCas { .. } => "begin_write_file_cas",
         Request::WriteFileChunk { .. } => "write_file_chunk",
@@ -3544,6 +3551,7 @@ fn workspace_info_value(
             "lazy_agent_handshake": true,
             "remote_agent": true,
             "lsp_proxy": true,
+            "remote_git": true,
             "transport_neutral_agent_frames": true,
             "agent_abort_handle": true,
             "agent_abort_scope": "lane_worker",
@@ -4116,6 +4124,13 @@ impl RequestInterest {
                     .and_then(Value::as_bool)
                     .unwrap_or(true),
             },
+            "git_status" | "git_diff" => Self {
+                exact_paths: Vec::new(),
+                unknown_content: true,
+            },
+            "git_blame" => {
+                request_path_interest(request.params.get("path").and_then(Value::as_str))
+            }
             _ => Self::default(),
         }
     }
@@ -4369,6 +4384,9 @@ impl Sidecar {
             "prefetch_related" => self.prefetch_related(params, preempt_epoch),
             "grep" => self.grep(params, preempt_epoch),
             "grep_cache" => self.mirror.grep_cache(&params),
+            "git_status" => self.git_status(params, preempt_epoch),
+            "git_diff" => self.git_diff(params, preempt_epoch),
+            "git_blame" => self.git_blame(params, preempt_epoch),
             "recover_local_edits" => self.recover_local_edits(params),
             "adopt" => self.adopt(params),
             "flush" => self.flush(params),
@@ -5103,6 +5121,76 @@ impl Sidecar {
                 }))
             }
             other => bail!("unexpected grep response: {other:?}"),
+        }
+    }
+
+    fn git_status(&mut self, params: Value, preempt_epoch: u64) -> Result<Value> {
+        let paths = normalized_paths_param(&params, "paths")?;
+        self.remote_git_request(
+            Request::GitStatus {
+                paths,
+                max_output_bytes: git_output_max_bytes(&params),
+            },
+            preempt_epoch,
+        )
+    }
+
+    fn git_diff(&mut self, params: Value, preempt_epoch: u64) -> Result<Value> {
+        let path = optional_string_param(&params, "path")
+            .map(normalize_relative_path)
+            .transpose()?
+            .map(|value| value.to_string_lossy().replace('\\', "/"));
+        let cached = params
+            .get("cached")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        self.remote_git_request(
+            Request::GitDiff {
+                path,
+                cached,
+                max_output_bytes: git_output_max_bytes(&params),
+            },
+            preempt_epoch,
+        )
+    }
+
+    fn git_blame(&mut self, params: Value, preempt_epoch: u64) -> Result<Value> {
+        let path = normalize_relative_path(required_string(&params, "path")?)?
+            .to_string_lossy()
+            .replace('\\', "/");
+        self.remote_git_request(
+            Request::GitBlame {
+                path,
+                max_output_bytes: git_output_max_bytes(&params),
+            },
+            preempt_epoch,
+        )
+    }
+
+    fn remote_git_request(&mut self, request: Request, preempt_epoch: u64) -> Result<Value> {
+        let response = match self
+            .agent
+            .request_maybe_preemptible_since(request, preempt_epoch)?
+        {
+            AgentRequestOutcome::Response(response) => response,
+            AgentRequestOutcome::Preempted => {
+                return Ok(json!({
+                    "stdout": "",
+                    "stderr": "",
+                    "status_code": Value::Null,
+                    "truncated": true,
+                    "preempted": true
+                }));
+            }
+        };
+        match response {
+            Response::Git { output } => Ok(json!({
+                "stdout": output.stdout,
+                "stderr": output.stderr,
+                "status_code": output.status_code,
+                "truncated": output.truncated
+            })),
+            other => bail!("unexpected git response: {other:?}"),
         }
     }
 
@@ -6647,6 +6735,9 @@ fn active_request_is_preemptible(active: &ActiveRemoteWork) -> bool {
             | "prefetch_related"
             | "refresh"
             | "remote_probe"
+            | "git_status"
+            | "git_diff"
+            | "git_blame"
     )
 }
 
@@ -7068,6 +7159,31 @@ fn optional_positive_usize_param(params: &Value, key: &str) -> Option<usize> {
     })
 }
 
+fn git_output_max_bytes(params: &Value) -> u64 {
+    params
+        .get("max_output_bytes")
+        .and_then(Value::as_u64)
+        .unwrap_or(DEFAULT_GIT_OUTPUT_MAX_BYTES)
+}
+
+fn normalized_paths_param(params: &Value, key: &str) -> Result<Vec<String>> {
+    let Some(values) = params.get(key).and_then(Value::as_array) else {
+        return Ok(Vec::new());
+    };
+    let mut paths = Vec::new();
+    for value in values {
+        let path = value
+            .as_str()
+            .ok_or_else(|| anyhow!("params.{key} must contain strings"))?;
+        paths.push(
+            normalize_relative_path(path)?
+                .to_string_lossy()
+                .replace('\\', "/"),
+        );
+    }
+    Ok(paths)
+}
+
 fn normalize_relative_path(path: &str) -> Result<PathBuf> {
     let path = Path::new(path);
     if path.is_absolute() {
@@ -7365,6 +7481,38 @@ mod tests {
                 });
                 let _ = command.reply.send(reply);
             }
+        });
+        sidecar.agent.worker = Some(AgentWorker {
+            tx,
+            abort: Arc::new(TestAbortHandle::default()),
+        });
+        sidecar
+    }
+
+    fn test_sidecar_with_git_request<F>(
+        mirror: Mirror,
+        assert_request: F,
+        response: Response,
+    ) -> Sidecar
+    where
+        F: FnOnce(Request) + Send + 'static,
+    {
+        let mut sidecar = test_sidecar(mirror);
+        let (tx, rx) = mpsc::channel::<AgentWorkerCommand>();
+        thread::spawn(move || {
+            let hello = rx.recv().expect("expected hello request");
+            assert!(matches!(hello.request, Request::Hello { .. }));
+            let _ = hello
+                .reply
+                .send(AgentWorkerReply::Response(Response::Hello {
+                    agent_version: "test-agent".to_string(),
+                    protocol_version: PROTOCOL_VERSION,
+                    capabilities: nrm_protocol::CapabilitySet::v1_agent(),
+                }));
+
+            let command = rx.recv().expect("expected git request");
+            assert_request(command.request);
+            let _ = command.reply.send(AgentWorkerReply::Response(response));
         });
         sidecar.agent.worker = Some(AgentWorker {
             tx,
@@ -8250,6 +8398,109 @@ mod tests {
                 assert_eq!(command.remote_lane, Some("write"));
             }
         }
+    }
+
+    #[test]
+    fn sidecar_git_diff_maps_json_params_to_agent_request() {
+        let dir = tempdir().unwrap();
+        let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
+        let mut sidecar = test_sidecar_with_git_request(
+            mirror,
+            |request| match request {
+                Request::GitDiff {
+                    path,
+                    cached,
+                    max_output_bytes,
+                } => {
+                    assert_eq!(path.as_deref(), Some("src/main.rs"));
+                    assert!(cached);
+                    assert_eq!(max_output_bytes, 7);
+                }
+                other => panic!("unexpected request: {other:?}"),
+            },
+            Response::Git {
+                output: nrm_protocol::GitCommandOutput {
+                    stdout: "diff".to_string(),
+                    stderr: String::new(),
+                    status_code: Some(0),
+                    truncated: false,
+                },
+            },
+        );
+
+        let result = sidecar
+            .handle(
+                "git_diff",
+                json!({"path": "src/./main.rs", "cached": true, "max_output_bytes": 7}),
+                0,
+            )
+            .unwrap();
+
+        assert_eq!(result["stdout"], "diff");
+        assert_eq!(result["status_code"], 0);
+        assert_eq!(result["truncated"], false);
+    }
+
+    #[test]
+    fn sidecar_git_status_maps_path_filters() {
+        let dir = tempdir().unwrap();
+        let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
+        let mut sidecar = test_sidecar_with_git_request(
+            mirror,
+            |request| match request {
+                Request::GitStatus {
+                    paths,
+                    max_output_bytes,
+                } => {
+                    assert_eq!(
+                        paths,
+                        vec!["src/main.rs".to_string(), "README.md".to_string()]
+                    );
+                    assert_eq!(max_output_bytes, DEFAULT_GIT_OUTPUT_MAX_BYTES);
+                }
+                other => panic!("unexpected request: {other:?}"),
+            },
+            Response::Git {
+                output: nrm_protocol::GitCommandOutput {
+                    stdout: " M src/main.rs\n".to_string(),
+                    stderr: String::new(),
+                    status_code: Some(0),
+                    truncated: false,
+                },
+            },
+        );
+
+        let result = sidecar
+            .handle(
+                "git_status",
+                json!({"paths": ["src/./main.rs", "README.md"]}),
+                0,
+            )
+            .unwrap();
+
+        assert!(result["stdout"].as_str().unwrap().contains("src/main.rs"));
+    }
+
+    #[test]
+    fn sidecar_git_rejects_bad_paths_before_agent_request() {
+        let dir = tempdir().unwrap();
+        let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
+        let mut sidecar = test_sidecar(mirror);
+
+        let status = sidecar
+            .handle("git_status", json!({"paths": ["../outside"]}), 0)
+            .unwrap_err()
+            .to_string();
+        assert!(status.contains("path must not contain '..'"), "{status}");
+
+        let blame = sidecar
+            .handle("git_blame", json!({"path": "/outside"}), 0)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            blame.contains("paths must be workspace-relative"),
+            "{blame}"
+        );
     }
 
     #[test]
@@ -10600,6 +10851,35 @@ mod tests {
             read: AgentPreempt::default(),
             write: AgentPreempt::default(),
         }
+    }
+
+    #[test]
+    fn git_reads_route_around_pending_write_hazards() {
+        let mut pending_writes = PendingRemote::default();
+        pending_writes.register(&PendingHazard::for_request(&test_client_request(
+            1,
+            "flush",
+            json!({"path": "src/main.rs"}),
+        )));
+
+        let same_path_diff = test_client_request(2, "git_diff", json!({"path": "src/main.rs"}));
+        assert_eq!(
+            RemoteLane::for_request(&same_path_diff, &pending_writes),
+            RemoteLane::Write
+        );
+
+        let unrelated_status =
+            test_client_request(3, "git_status", json!({"paths": ["src/lib.rs"]}));
+        assert_eq!(
+            RemoteLane::for_request(&unrelated_status, &pending_writes),
+            RemoteLane::Write
+        );
+
+        let broad_status = test_client_request(4, "git_status", json!({}));
+        assert_eq!(
+            RemoteLane::for_request(&broad_status, &pending_writes),
+            RemoteLane::Write
+        );
     }
 
     #[test]

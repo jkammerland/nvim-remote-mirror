@@ -35,6 +35,7 @@ M.config = {
   grep_cache_max_files = 2000,
   grep_cache_max_file_bytes = 512 * 1024,
   grep_cache_max_total_bytes = 8 * 1024 * 1024,
+  git_output_max_bytes = 1024 * 1024,
   request_timeout_ms = 30000,
   ssh_connect_timeout_seconds = 10,
   open_batch_max_file_bytes = 4 * 1024 * 1024,
@@ -73,6 +74,9 @@ M.reconnect_attempts = 0
 M.reconnect_generation = 0
 M.grep_generation = 0
 M.find_generation = 0
+M.git_status_generation = 0
+M.git_diff_generation = 0
+M.git_blame_generation = 0
 M.save_queue_generation = 0
 M.connection_status = "disconnected"
 M.connection_target = nil
@@ -2490,6 +2494,392 @@ function M.grep(query)
 
     set_grep_quickfix(query, result, "RemoteGrep cache", function()
       return is_current() and not remote_applied
+    end)
+  end)
+end
+
+local function text_lines(text)
+  text = tostring(text or ""):gsub("\r\n", "\n")
+  if text == "" then
+    return {}
+  end
+  local lines = vim.split(text, "\n", { plain = true })
+  if lines[#lines] == "" then
+    table.remove(lines, #lines)
+  end
+  return lines
+end
+
+local function normalize_git_path_arg(path, use_current, label)
+  if not M.current_workspace() then
+    error("not connected; run :RemoteConnect first")
+  end
+  if path == nil or path == "" then
+    if use_current then
+      local current = M.remote_path(0)
+      if current then
+        return current
+      end
+      error(label .. " requires a remote buffer or path")
+    end
+    return nil
+  end
+  if type(path) ~= "string" then
+    error(label .. " path must be a string")
+  end
+
+  if path:sub(1, 1) == "/" or path:sub(1, 1) == "\\" or path:match("^%a:[/\\]") then
+    local from_local = M.remote_path(path)
+    if from_local then
+      return from_local
+    end
+    error(label .. " path is outside the current remote mirror")
+  end
+  local local_path = M.local_path(path)
+  if not local_path then
+    error(label .. " path must be workspace-relative and stay inside the workspace")
+  end
+  local relative = M.remote_path(local_path)
+  if not relative then
+    error(label .. " path must be workspace-relative and stay inside the workspace")
+  end
+  return relative
+end
+
+local function normalize_git_paths(paths, label)
+  local normalized = {}
+  for _, path in ipairs(paths or {}) do
+    local remote_path = normalize_git_path_arg(path, false, label)
+    if remote_path then
+      table.insert(normalized, remote_path)
+    end
+  end
+  return normalized
+end
+
+local function git_unquote_path(path)
+  if path:sub(1, 1) ~= '"' then
+    return path
+  end
+  if path:sub(-1) == '"' then
+    path = path:sub(2, -2)
+  else
+    path = path:sub(2)
+  end
+  local out = {}
+  local index = 1
+  while index <= #path do
+    local char = path:sub(index, index)
+    if char ~= "\\" then
+      table.insert(out, char)
+      index = index + 1
+    else
+      local next_char = path:sub(index + 1, index + 1)
+      if next_char == "\\" or next_char == '"' then
+        table.insert(out, next_char)
+        index = index + 2
+      elseif next_char == "t" then
+        table.insert(out, "\t")
+        index = index + 2
+      elseif next_char == "n" then
+        table.insert(out, "\n")
+        index = index + 2
+      elseif next_char == "r" then
+        table.insert(out, "\r")
+        index = index + 2
+      elseif next_char:match("[0-7]") then
+        local octal = path:sub(index + 1, index + 3):match("^[0-7]+") or next_char
+        table.insert(out, string.char(tonumber(octal, 8)))
+        index = index + 1 + #octal
+      elseif next_char ~= "" then
+        table.insert(out, next_char)
+        index = index + 2
+      else
+        index = index + 1
+      end
+    end
+  end
+  return table.concat(out)
+end
+
+local function git_status_records(stdout)
+  stdout = tostring(stdout or "")
+  if stdout:find("\0", 1, true) then
+    local records = {}
+    local start = 1
+    while start <= #stdout do
+      local stop = stdout:find("\0", start, true)
+      if not stop then
+        table.insert(records, stdout:sub(start))
+        break
+      end
+      if stop > start then
+        table.insert(records, stdout:sub(start, stop - 1))
+      end
+      start = stop + 1
+    end
+    return records, true
+  end
+  return text_lines(stdout), false
+end
+
+local function git_status_items(result)
+  local items = {}
+  local records, raw_paths = git_status_records(result and result.stdout or "")
+  local index = 1
+  while index <= #records do
+    local line = records[index]
+    if line:sub(1, 2) ~= "##" and line ~= "" then
+      local path = line:sub(4)
+      local renamed = path:match(".+ %-> (.+)$")
+      if renamed then
+        path = renamed
+      end
+      if not raw_paths then
+        path = git_unquote_path(path)
+      end
+      local local_path = M.local_path(path)
+      if local_path then
+        table.insert(items, {
+          filename = local_path,
+          lnum = 1,
+          col = 1,
+          text = line,
+        })
+      end
+      local status = line:sub(1, 1)
+      if raw_paths and (status == "R" or status == "C") then
+        index = index + 1
+      end
+    end
+    index = index + 1
+  end
+  return items
+end
+
+local function git_command_failed(result)
+  return result
+    and result.truncated ~= true
+    and result.status_code ~= nil
+    and tonumber(result.status_code) ~= 0
+end
+
+local function git_error_text(result, fallback)
+  local stderr = optional_string(result and result.stderr)
+  if stderr then
+    return stderr:gsub("%s+$", "")
+  end
+  local stdout = optional_string(result and result.stdout)
+  if stdout then
+    return stdout:gsub("%s+$", "")
+  end
+  return fallback
+end
+
+local function open_git_scratch(name, filetype, text, should_apply)
+  vim.schedule(function()
+    if should_apply and not should_apply() then
+      return
+    end
+    local buf = vim.api.nvim_create_buf(true, true)
+    vim.bo[buf].buftype = "nofile"
+    vim.bo[buf].bufhidden = "wipe"
+    vim.bo[buf].swapfile = false
+    vim.bo[buf].filetype = filetype
+    pcall(vim.api.nvim_buf_set_name, buf, name)
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, text_lines(text))
+    vim.api.nvim_set_current_buf(buf)
+  end)
+end
+
+function M.git_status_async(opts, callback)
+  if type(opts) == "function" then
+    callback = opts
+    opts = {}
+  end
+  opts = opts or {}
+  if opts.paths == nil and opts[1] ~= nil then
+    opts = { paths = opts }
+  end
+  callback = callback or function() end
+  request_async("git_status", {
+    paths = normalize_git_paths(opts.paths or {}, "git status"),
+    max_output_bytes = opts.max_output_bytes or M.config.git_output_max_bytes,
+  }, callback)
+end
+
+function M.git_status(opts)
+  M.git_status_generation = M.git_status_generation + 1
+  local generation = M.git_status_generation
+  local client = M.client
+  local function is_current()
+    return generation == M.git_status_generation and M.client == client
+  end
+
+  M.git_status_async(opts or {}, function(err, result)
+    if not is_current() then
+      return
+    end
+    if err then
+      notify(err, vim.log.levels.ERROR)
+      return
+    end
+    if result and result.preempted then
+      return
+    end
+    if git_command_failed(result) then
+      notify(git_error_text(result, "remote git status failed"), vim.log.levels.ERROR)
+      return
+    end
+    local items = git_status_items(result or {})
+    vim.schedule(function()
+      if not is_current() then
+        return
+      end
+      vim.fn.setqflist({}, " ", { title = "RemoteGitStatus", items = items })
+      if #items > 0 then
+        vim.cmd.copen()
+      else
+        notify("remote git status clean")
+      end
+      if result and result.truncated then
+        notify("remote git status output truncated", vim.log.levels.WARN)
+      end
+    end)
+  end)
+end
+
+function M.git_diff_async(path, opts, callback)
+  if type(path) == "table" then
+    if type(opts) == "function" then
+      callback = opts
+    end
+    opts = path
+    path = opts.path
+  elseif type(opts) == "function" then
+    callback = opts
+    opts = {}
+  end
+  opts = opts or {}
+  callback = callback or function() end
+  local remote_path = normalize_git_path_arg(path, true, "git diff")
+  request_async("git_diff", {
+    path = remote_path,
+    cached = opts.cached == true,
+    max_output_bytes = opts.max_output_bytes or M.config.git_output_max_bytes,
+  }, function(err, result)
+    if result then
+      result.path = remote_path
+    end
+    callback(err, result)
+  end)
+end
+
+function M.git_diff(path, opts)
+  M.git_diff_generation = M.git_diff_generation + 1
+  local generation = M.git_diff_generation
+  local client = M.client
+  local function is_current()
+    return generation == M.git_diff_generation and M.client == client
+  end
+
+  M.git_diff_async(path, opts or {}, function(err, result)
+    if not is_current() then
+      return
+    end
+    if err then
+      notify(err, vim.log.levels.ERROR)
+      return
+    end
+    if result and result.preempted then
+      return
+    end
+    if git_command_failed(result) then
+      notify(git_error_text(result, "remote git diff failed"), vim.log.levels.ERROR)
+      return
+    end
+    if not optional_string(result and result.stdout) then
+      notify("remote git diff is empty")
+      return
+    end
+    open_git_scratch("nrm://git-diff/" .. tostring(result.path), "diff", result.stdout, is_current)
+    if result.truncated then
+      notify("remote git diff output truncated", vim.log.levels.WARN)
+    end
+  end)
+end
+
+function M.git_blame_async(path, opts, callback)
+  if type(path) == "table" then
+    if type(opts) == "function" then
+      callback = opts
+    end
+    opts = path
+    path = opts.path
+  elseif type(opts) == "function" then
+    callback = opts
+    opts = {}
+  end
+  opts = opts or {}
+  callback = callback or function() end
+  local remote_path = normalize_git_path_arg(path, true, "git blame")
+  request_async("git_blame", {
+    path = remote_path,
+    max_output_bytes = opts.max_output_bytes or M.config.git_output_max_bytes,
+  }, function(err, result)
+    if result then
+      result.path = remote_path
+    end
+    callback(err, result)
+  end)
+end
+
+function M.git_blame(path, opts)
+  M.git_blame_generation = M.git_blame_generation + 1
+  local generation = M.git_blame_generation
+  local client = M.client
+  local function is_current()
+    return generation == M.git_blame_generation and M.client == client
+  end
+
+  M.git_blame_async(path, opts or {}, function(err, result)
+    if not is_current() then
+      return
+    end
+    if err then
+      notify(err, vim.log.levels.ERROR)
+      return
+    end
+    if result and result.preempted then
+      return
+    end
+    if git_command_failed(result) then
+      notify(git_error_text(result, "remote git blame failed"), vim.log.levels.ERROR)
+      return
+    end
+    local local_path = M.local_path(result.path)
+    local items = {}
+    for index, line in ipairs(text_lines(result.stdout)) do
+      table.insert(items, {
+        filename = local_path,
+        lnum = index,
+        col = 1,
+        text = line,
+      })
+    end
+    vim.schedule(function()
+      if not is_current() then
+        return
+      end
+      vim.fn.setqflist({}, " ", { title = "RemoteGitBlame " .. tostring(result.path), items = items })
+      if #items > 0 then
+        vim.cmd.copen()
+      else
+        notify("remote git blame is empty")
+      end
+      if result.truncated then
+        notify("remote git blame output truncated", vim.log.levels.WARN)
+      end
     end)
   end)
 end

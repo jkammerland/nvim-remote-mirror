@@ -38,6 +38,21 @@ The sidecar sends framed binary RPC to `nrm-agent`. Each request has an ID and
 each response carries the same ID. Current SSH transport runs the agent process
 over stdio.
 
+Current agent protocol version: `6`.
+
+Remote git primitives are agent RPCs, not local mirror operations:
+
+| Request | Behavior |
+| --- | --- |
+| `GitStatus { paths, max_output_bytes }` | Runs remote `git status --porcelain=v1 -z --branch --untracked-files=all` with optional workspace-relative pathspecs |
+| `GitDiff { path, cached, max_output_bytes }` | Runs remote `git diff --no-color --no-ext-diff [--cached] -- [path]` |
+| `GitBlame { path, max_output_bytes }` | Runs remote `git blame -- path` |
+
+All git responses use `Response::Git { output }` with bounded stdout/stderr,
+an optional process status code, and a truncation flag. The agent invokes `git`
+with explicit argv, disables the pager/color, and validates user paths as
+workspace-relative before passing them after `--`.
+
 Future transports must preserve:
 
 | Requirement | Reason |

@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 
-pub const PROTOCOL_VERSION: u16 = 5;
+pub const PROTOCOL_VERSION: u16 = 6;
 pub const MAX_FRAME_LEN: usize = 64 * 1024 * 1024;
 pub const MAX_CONFLICT_CONTENT_BYTES: usize = 4 * 1024 * 1024;
 
@@ -22,6 +22,7 @@ pub struct CapabilitySet {
     pub cancellation: bool,
     pub streaming: bool,
     pub multiplexing: bool,
+    pub git: bool,
 }
 
 impl CapabilitySet {
@@ -40,6 +41,7 @@ impl CapabilitySet {
             cancellation: false,
             streaming: false,
             multiplexing: false,
+            git: true,
         }
     }
 }
@@ -61,6 +63,14 @@ pub struct SearchHit {
     pub line: u64,
     pub column: u64,
     pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GitCommandOutput {
+    pub stdout: String,
+    pub stderr: String,
+    pub status_code: Option<i32>,
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -157,6 +167,19 @@ pub enum Request {
         max_total_bytes: Option<u64>,
         session_id: Option<String>,
     },
+    GitStatus {
+        paths: Vec<String>,
+        max_output_bytes: u64,
+    },
+    GitDiff {
+        path: Option<String>,
+        cached: bool,
+        max_output_bytes: u64,
+    },
+    GitBlame {
+        path: String,
+        max_output_bytes: u64,
+    },
     WriteFileCas {
         path: String,
         expected_hash: Option<String>,
@@ -226,6 +249,9 @@ pub enum Response {
         next_after: Option<String>,
         session_id: Option<String>,
         scanned_files: usize,
+    },
+    Git {
+        output: GitCommandOutput,
     },
     WriteFileCas {
         outcome: SaveOutcome,
@@ -444,6 +470,56 @@ mod tests {
         let mut bytes = Vec::new();
         write_frame(&mut bytes, &response).unwrap();
 
+        let decoded: RpcMessage = read_frame(&mut Cursor::new(bytes)).unwrap();
+        assert_eq!(decoded, response);
+    }
+
+    #[test]
+    fn round_trips_git_requests_and_response() {
+        let requests = [
+            RpcMessage::Request {
+                id: 21,
+                request: Request::GitStatus {
+                    paths: vec!["src/lib.rs".to_string()],
+                    max_output_bytes: 1024,
+                },
+            },
+            RpcMessage::Request {
+                id: 22,
+                request: Request::GitDiff {
+                    path: Some("src/lib.rs".to_string()),
+                    cached: false,
+                    max_output_bytes: 2048,
+                },
+            },
+            RpcMessage::Request {
+                id: 23,
+                request: Request::GitBlame {
+                    path: "src/lib.rs".to_string(),
+                    max_output_bytes: 4096,
+                },
+            },
+        ];
+        for message in requests {
+            let mut bytes = Vec::new();
+            write_frame(&mut bytes, &message).unwrap();
+            let decoded: RpcMessage = read_frame(&mut Cursor::new(bytes)).unwrap();
+            assert_eq!(decoded, message);
+        }
+
+        let response = RpcMessage::Response {
+            id: 24,
+            response: Response::Git {
+                output: GitCommandOutput {
+                    stdout: " M src/lib.rs\n".to_string(),
+                    stderr: String::new(),
+                    status_code: Some(0),
+                    truncated: false,
+                },
+            },
+        };
+        let mut bytes = Vec::new();
+        write_frame(&mut bytes, &response).unwrap();
         let decoded: RpcMessage = read_frame(&mut Cursor::new(bytes)).unwrap();
         assert_eq!(decoded, response);
     }

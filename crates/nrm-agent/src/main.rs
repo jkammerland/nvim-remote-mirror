@@ -3,9 +3,9 @@ use clap::{Parser, Subcommand};
 use ignore::{Walk, WalkBuilder};
 use nrm_protocol::{
     read_frame, write_frame, BatchReadError, BatchReadFile, BatchValidateFile, CapabilitySet,
-    FileMeta, Request, Response, RpcError, RpcMessage, SaveApplied, SaveConflict, SaveOutcome,
-    SearchHit, WriteStartOutcome, WriteStarted, MAX_CONFLICT_CONTENT_BYTES, MAX_FRAME_LEN,
-    PROTOCOL_VERSION,
+    FileMeta, GitCommandOutput, Request, Response, RpcError, RpcMessage, SaveApplied, SaveConflict,
+    SaveOutcome, SearchHit, WriteStartOutcome, WriteStarted, MAX_CONFLICT_CONTENT_BYTES,
+    MAX_FRAME_LEN, PROTOCOL_VERSION,
 };
 #[cfg(test)]
 use std::cell::Cell;
@@ -16,6 +16,12 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::{Component, Path, PathBuf};
+use std::process::{Command as ProcessCommand, Stdio};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
+use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const AGENT_READ_RESPONSE_MAX_BYTES: u64 = (MAX_FRAME_LEN - (1024 * 1024)) as u64;
@@ -25,6 +31,7 @@ const AGENT_GREP_HARD_MAX_FILE_BYTES: u64 = 4 * 1024 * 1024;
 const AGENT_GREP_HARD_MAX_TOTAL_BYTES: u64 = 32 * 1024 * 1024;
 const AGENT_GREP_HARD_MAX_HIT_TEXT_BYTES: usize = 4 * 1024 * 1024;
 const AGENT_GREP_HARD_MAX_LINE_BYTES: usize = 64 * 1024;
+const AGENT_GIT_OUTPUT_MAX_BYTES: u64 = 1024 * 1024;
 const MAX_ACTIVE_UPLOADS: usize = 8;
 const MAX_ACTIVE_UPLOAD_BYTES: u64 = 512 * 1024 * 1024;
 const UPLOAD_TTL: Duration = Duration::from_secs(10 * 60);
@@ -272,6 +279,19 @@ fn handle_request(state: &mut AgentState, request: Request) -> Result<Response> 
                 max_total_bytes,
             },
         ),
+        Request::GitStatus {
+            paths,
+            max_output_bytes,
+        } => git_status(&state.root, paths, max_output_bytes),
+        Request::GitDiff {
+            path,
+            cached,
+            max_output_bytes,
+        } => git_diff(&state.root, path, cached, max_output_bytes),
+        Request::GitBlame {
+            path,
+            max_output_bytes,
+        } => git_blame(&state.root, path, max_output_bytes),
         Request::WriteFileCas {
             path,
             expected_hash,
@@ -448,6 +468,268 @@ fn validate_one_file(root: &Path, path: &str, include_hash: bool) -> Result<Batc
         path: path.to_string(),
         meta: Some(file_meta(root, &abs, include_hash)?),
     })
+}
+
+fn git_status(root: &Path, paths: Vec<String>, max_output_bytes: u64) -> Result<Response> {
+    let mut args = vec![
+        OsString::from("status"),
+        OsString::from("--porcelain=v1"),
+        OsString::from("-z"),
+        OsString::from("--branch"),
+        OsString::from("--untracked-files=all"),
+    ];
+    args.push(OsString::from("--"));
+    if !paths.is_empty() {
+        for path in paths {
+            args.push(normalize_relative_path(&path)?.into_os_string());
+        }
+    } else {
+        args.push(OsString::from("."));
+    }
+    let prefix = git_worktree_prefix(root);
+    let response = run_git(root, args, max_output_bytes)?;
+    Ok(match response {
+        Response::Git { mut output } => {
+            if output.status_code == Some(0) {
+                output.stdout = rebase_git_status_stdout(&output.stdout, prefix.as_deref());
+            }
+            Response::Git { output }
+        }
+        other => other,
+    })
+}
+
+fn git_diff(
+    root: &Path,
+    path: Option<String>,
+    cached: bool,
+    max_output_bytes: u64,
+) -> Result<Response> {
+    let mut args = vec![
+        OsString::from("diff"),
+        OsString::from("--no-color"),
+        OsString::from("--no-ext-diff"),
+        OsString::from("--no-textconv"),
+        OsString::from("--relative"),
+    ];
+    if cached {
+        args.push(OsString::from("--cached"));
+    }
+    args.push(OsString::from("--"));
+    if let Some(path) = path {
+        args.push(normalize_relative_path(&path)?.into_os_string());
+    }
+    run_git(root, args, max_output_bytes)
+}
+
+fn git_blame(root: &Path, path: String, max_output_bytes: u64) -> Result<Response> {
+    let path = normalize_relative_path(&path)?;
+    run_git(
+        root,
+        vec![
+            OsString::from("blame"),
+            OsString::from("--no-textconv"),
+            OsString::from("--"),
+            path.into_os_string(),
+        ],
+        max_output_bytes,
+    )
+}
+
+fn run_git(root: &Path, args: Vec<OsString>, max_output_bytes: u64) -> Result<Response> {
+    let max_output_bytes = max_output_bytes
+        .min(AGENT_GIT_OUTPUT_MAX_BYTES)
+        .min(usize::MAX as u64) as usize;
+    let mut command = git_command(root);
+    let mut child = command.args(args).spawn().context("failed to launch git")?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("git stdout was not piped"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("git stderr was not piped"))?;
+    let cap_reached = Arc::new(AtomicBool::new(false));
+    let stdout_reader = read_limited_pipe(stdout, max_output_bytes, Arc::clone(&cap_reached));
+    let stderr_reader = read_limited_pipe(stderr, max_output_bytes, Arc::clone(&cap_reached));
+    let status = loop {
+        if let Some(status) = child.try_wait().context("failed to poll git")? {
+            break status;
+        }
+        if cap_reached.load(Ordering::SeqCst) {
+            let _ = child.kill();
+            break child.wait().context("failed to wait for killed git")?;
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    let (stdout, stdout_truncated) = join_limited_pipe(stdout_reader, "stdout")?;
+    let (stderr, stderr_truncated) = join_limited_pipe(stderr_reader, "stderr")?;
+
+    Ok(Response::Git {
+        output: GitCommandOutput {
+            stdout: String::from_utf8_lossy(&stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&stderr).into_owned(),
+            status_code: status.code(),
+            truncated: stdout_truncated || stderr_truncated,
+        },
+    })
+}
+
+fn git_command(root: &Path) -> ProcessCommand {
+    let mut command = ProcessCommand::new("git");
+    command
+        .current_dir(root)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_LITERAL_PATHSPECS", "1")
+        .env("GIT_PAGER", "cat")
+        .env("NO_COLOR", "1")
+        .arg("-c")
+        .arg("color.ui=false")
+        .arg("-c")
+        .arg("core.fsmonitor=false")
+        .arg("-c")
+        .arg("diff.external=")
+        .arg("-c")
+        .arg("diff.trustExitCode=false")
+        .arg("--no-pager")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    command
+}
+
+fn git_worktree_prefix(root: &Path) -> Option<String> {
+    let mut command = git_command(root);
+    let output = command
+        .arg("rev-parse")
+        .arg("--show-prefix")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let prefix = String::from_utf8_lossy(&output.stdout)
+        .trim_end_matches(['\r', '\n'])
+        .to_string();
+    (!prefix.is_empty()).then_some(prefix)
+}
+
+fn read_limited_pipe<R>(
+    reader: R,
+    max_bytes: usize,
+    cap_reached: Arc<AtomicBool>,
+) -> thread::JoinHandle<io::Result<(Vec<u8>, bool)>>
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut reader = reader;
+        let mut bytes = Vec::new();
+        let mut truncated = false;
+        let mut buffer = [0_u8; 8192];
+        loop {
+            let read = reader.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            let remaining = max_bytes.saturating_sub(bytes.len());
+            if remaining == 0 {
+                truncated = true;
+                cap_reached.store(true, Ordering::SeqCst);
+                continue;
+            }
+            let keep = read.min(remaining);
+            bytes.extend_from_slice(&buffer[..keep]);
+            if keep < read {
+                truncated = true;
+                cap_reached.store(true, Ordering::SeqCst);
+            }
+        }
+        Ok((bytes, truncated))
+    })
+}
+
+fn join_limited_pipe(
+    handle: thread::JoinHandle<io::Result<(Vec<u8>, bool)>>,
+    name: &str,
+) -> Result<(Vec<u8>, bool)> {
+    handle
+        .join()
+        .map_err(|_| anyhow::anyhow!("git {name} reader panicked"))?
+        .with_context(|| format!("failed to read git {name}"))
+}
+
+fn rebase_git_status_stdout(stdout: &str, prefix: Option<&str>) -> String {
+    let Some(prefix) = prefix.filter(|value| !value.is_empty()) else {
+        return stdout.to_string();
+    };
+    if stdout.as_bytes().contains(&0) {
+        return rebase_git_status_nul_stdout(stdout, prefix);
+    }
+    let mut rebased = String::new();
+    for line in stdout.lines() {
+        if line.starts_with("##") {
+            rebased.push_str(line);
+            rebased.push('\n');
+            continue;
+        }
+        if line.len() < 4 {
+            continue;
+        }
+        let status = &line[..3];
+        let path = &line[3..];
+        if let Some((old, new)) = path.split_once(" -> ") {
+            let Some(old) = old.strip_prefix(prefix) else {
+                continue;
+            };
+            let Some(new) = new.strip_prefix(prefix) else {
+                continue;
+            };
+            rebased.push_str(status);
+            rebased.push_str(old);
+            rebased.push_str(" -> ");
+            rebased.push_str(new);
+            rebased.push('\n');
+            continue;
+        }
+        let Some(path) = path.strip_prefix(prefix) else {
+            continue;
+        };
+        rebased.push_str(status);
+        rebased.push_str(path);
+        rebased.push('\n');
+    }
+    rebased
+}
+
+fn rebase_git_status_nul_stdout(stdout: &str, prefix: &str) -> String {
+    let mut rebased = String::new();
+    let mut records = stdout.split('\0').filter(|record| !record.is_empty());
+    while let Some(record) = records.next() {
+        if record.starts_with("##") {
+            rebased.push_str(record);
+            rebased.push('\0');
+            continue;
+        }
+        if record.len() < 4 {
+            continue;
+        }
+        let status = &record[..3];
+        let path = &record[3..];
+        let Some(path) = path.strip_prefix(prefix) else {
+            continue;
+        };
+        rebased.push_str(status);
+        rebased.push_str(path);
+        rebased.push('\0');
+        if status.starts_with('R') || status.starts_with('C') {
+            let _old_path = records.next();
+        }
+    }
+    rebased
 }
 
 fn read_file_for_batch(
@@ -1726,10 +2008,220 @@ mod tests {
         }
     }
 
+    fn run_git_test_command(root: &Path, args: &[&str]) {
+        let output = ProcessCommand::new("git")
+            .current_dir(root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {:?} failed\nstdout:\n{}\nstderr:\n{}",
+            args,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn init_git_repo(root: &Path) {
+        run_git_test_command(root, &["init", "-q"]);
+        run_git_test_command(root, &["config", "user.email", "test@example.invalid"]);
+        run_git_test_command(root, &["config", "user.name", "Test User"]);
+        fs::write(root.join("tracked.txt"), "base\n").unwrap();
+        run_git_test_command(root, &["add", "tracked.txt"]);
+        run_git_test_command(root, &["commit", "-q", "-m", "base"]);
+    }
+
+    fn git_output(response: Response) -> GitCommandOutput {
+        match response {
+            Response::Git { output } => output,
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
     #[test]
     fn rejects_path_traversal() {
         assert!(normalize_relative_path("../secret").is_err());
         assert!(normalize_relative_path("/secret").is_err());
+    }
+
+    #[test]
+    fn git_status_reports_modified_and_untracked_files() {
+        let dir = tempdir().unwrap();
+        init_git_repo(dir.path());
+        fs::write(dir.path().join("tracked.txt"), "changed\n").unwrap();
+        fs::write(dir.path().join("new.txt"), "new\n").unwrap();
+
+        let output = git_output(git_status(dir.path(), Vec::new(), 4096).unwrap());
+
+        assert_eq!(output.status_code, Some(0));
+        assert!(!output.truncated);
+        assert!(
+            output.stdout.contains(" M tracked.txt"),
+            "{}",
+            output.stdout
+        );
+        assert!(output.stdout.contains("?? new.txt"), "{}", output.stdout);
+    }
+
+    #[test]
+    fn git_status_filters_workspace_relative_paths() {
+        let dir = tempdir().unwrap();
+        init_git_repo(dir.path());
+        fs::write(dir.path().join("tracked.txt"), "changed\n").unwrap();
+        fs::write(dir.path().join("new.txt"), "new\n").unwrap();
+
+        let output =
+            git_output(git_status(dir.path(), vec!["tracked.txt".to_string()], 4096).unwrap());
+
+        assert_eq!(output.status_code, Some(0));
+        assert!(
+            output.stdout.contains(" M tracked.txt"),
+            "{}",
+            output.stdout
+        );
+        assert!(!output.stdout.contains("new.txt"), "{}", output.stdout);
+    }
+
+    #[test]
+    fn git_status_treats_pathspecs_as_literals() {
+        let dir = tempdir().unwrap();
+        run_git_test_command(dir.path(), &["init", "-q"]);
+        run_git_test_command(
+            dir.path(),
+            &["config", "user.email", "test@example.invalid"],
+        );
+        run_git_test_command(dir.path(), &["config", "user.name", "Test User"]);
+        fs::write(dir.path().join("literal*.txt"), "base\n").unwrap();
+        fs::write(dir.path().join("literal-a.txt"), "base\n").unwrap();
+        run_git_test_command(dir.path(), &["add", "."]);
+        run_git_test_command(dir.path(), &["commit", "-q", "-m", "base"]);
+        fs::write(dir.path().join("literal*.txt"), "changed\n").unwrap();
+        fs::write(dir.path().join("literal-a.txt"), "changed\n").unwrap();
+
+        let output =
+            git_output(git_status(dir.path(), vec!["literal*.txt".to_string()], 4096).unwrap());
+
+        assert_eq!(output.status_code, Some(0));
+        assert!(
+            output.stdout.contains(" M literal*.txt"),
+            "{}",
+            output.stdout
+        );
+        assert!(
+            !output.stdout.contains("literal-a.txt"),
+            "{}",
+            output.stdout
+        );
+    }
+
+    #[test]
+    fn git_status_rebases_subdirectory_worktree_paths() {
+        let dir = tempdir().unwrap();
+        run_git_test_command(dir.path(), &["init", "-q"]);
+        run_git_test_command(
+            dir.path(),
+            &["config", "user.email", "test@example.invalid"],
+        );
+        run_git_test_command(dir.path(), &["config", "user.name", "Test User"]);
+        fs::create_dir_all(dir.path().join("sub")).unwrap();
+        fs::create_dir_all(dir.path().join("other")).unwrap();
+        fs::write(dir.path().join("sub/a.txt"), "base\n").unwrap();
+        fs::write(dir.path().join("other/o.txt"), "base\n").unwrap();
+        run_git_test_command(dir.path(), &["add", "."]);
+        run_git_test_command(dir.path(), &["commit", "-q", "-m", "base"]);
+        fs::write(dir.path().join("sub/a.txt"), "changed\n").unwrap();
+        fs::write(dir.path().join("other/o.txt"), "changed\n").unwrap();
+
+        let output = git_output(git_status(&dir.path().join("sub"), Vec::new(), 4096).unwrap());
+
+        assert_eq!(output.status_code, Some(0));
+        assert!(output.stdout.contains(" M a.txt"), "{}", output.stdout);
+        assert!(!output.stdout.contains("sub/a.txt"), "{}", output.stdout);
+        assert!(!output.stdout.contains("other/o.txt"), "{}", output.stdout);
+    }
+
+    #[test]
+    fn git_diff_truncates_large_output() {
+        let dir = tempdir().unwrap();
+        init_git_repo(dir.path());
+        fs::write(dir.path().join("tracked.txt"), "changed\n".repeat(64)).unwrap();
+
+        let output =
+            git_output(git_diff(dir.path(), Some("tracked.txt".to_string()), false, 32).unwrap());
+
+        assert!(output.truncated);
+        assert!(output.stdout.len() <= 32);
+    }
+
+    #[test]
+    fn git_diff_uses_subdirectory_relative_headers() {
+        let dir = tempdir().unwrap();
+        run_git_test_command(dir.path(), &["init", "-q"]);
+        run_git_test_command(
+            dir.path(),
+            &["config", "user.email", "test@example.invalid"],
+        );
+        run_git_test_command(dir.path(), &["config", "user.name", "Test User"]);
+        fs::create_dir_all(dir.path().join("sub")).unwrap();
+        fs::write(dir.path().join("sub/a.txt"), "base\n").unwrap();
+        run_git_test_command(dir.path(), &["add", "."]);
+        run_git_test_command(dir.path(), &["commit", "-q", "-m", "base"]);
+        fs::write(dir.path().join("sub/a.txt"), "changed\n").unwrap();
+
+        let output = git_output(
+            git_diff(
+                &dir.path().join("sub"),
+                Some("a.txt".to_string()),
+                false,
+                4096,
+            )
+            .unwrap(),
+        );
+
+        assert_eq!(output.status_code, Some(0));
+        assert!(
+            output.stdout.contains("diff --git a/a.txt b/a.txt"),
+            "{}",
+            output.stdout
+        );
+        assert!(!output.stdout.contains("sub/a.txt"), "{}", output.stdout);
+    }
+
+    #[test]
+    fn git_blame_returns_committed_lines() {
+        let dir = tempdir().unwrap();
+        init_git_repo(dir.path());
+
+        let output = git_output(git_blame(dir.path(), "tracked.txt".to_string(), 4096).unwrap());
+
+        assert_eq!(output.status_code, Some(0));
+        assert!(!output.truncated);
+        assert!(output.stdout.contains("base"), "{}", output.stdout);
+    }
+
+    #[test]
+    fn git_commands_reject_traversal_paths() {
+        let dir = tempdir().unwrap();
+        init_git_repo(dir.path());
+
+        assert!(git_status(dir.path(), vec!["../tracked.txt".to_string()], 4096).is_err());
+        assert!(git_diff(dir.path(), Some("../tracked.txt".to_string()), false, 4096).is_err());
+        assert!(git_blame(dir.path(), "../tracked.txt".to_string(), 4096).is_err());
+    }
+
+    #[test]
+    fn git_status_reports_non_repo_error_without_panicking() {
+        let dir = tempdir().unwrap();
+
+        let output = git_output(git_status(dir.path(), Vec::new(), 4096).unwrap());
+
+        assert_ne!(output.status_code, Some(0));
+        assert!(
+            output.stderr.contains("not a git repository"),
+            "{}",
+            output.stderr
+        );
     }
 
     #[test]

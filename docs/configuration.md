@@ -57,6 +57,7 @@ files.
 | `grep_cache_max_files` | `2000` |
 | `grep_cache_max_file_bytes` | `512 KiB` |
 | `grep_cache_max_total_bytes` | `8 MiB` |
+| `git_output_max_bytes` | `1 MiB` |
 | `open_batch_max_file_bytes` | `4 MiB` |
 | `prefetch_max_file_bytes` | `4 MiB` |
 | `prefetch_max_total_bytes` | `16 MiB` |

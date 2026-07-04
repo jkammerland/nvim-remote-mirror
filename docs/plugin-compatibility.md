@@ -45,10 +45,31 @@ root. This makes cwd-based plugins behave like they are inside the project:
 | File pickers | Use mirror files or `require("nvim_remote_mirror.pickers").files()` |
 | Grep/search | Prefer sidecar-backed `:RemoteGrep` or `pickers.grep()`; local grep only sees hydrated files |
 | LSP | Run remote server through the LSP proxy with path translation |
-| Formatters/linters | Need explicit local-vs-remote tool policy |
-| Git plugins | Need a remote git adapter or sidecar git commands |
+| Formatters/linters | May edit hydrated mirror buffers locally; saves still flow through the mirror save queue |
+| Git plugins | Use `:RemoteGitStatus`, `:RemoteGitDiff`, and `:RemoteGitBlame` for remote repository state |
 | Terminals | Need remote PTY/session support |
 | DAP | Need remote debug adapter and path mapping |
+
+## Formatter, Linter, And Git Policy
+
+Formatters and linters that operate on the current buffer can run locally
+against hydrated mirror files. They must not write project caches, generated
+state, or temporary artifacts under the mirror files root unless those files
+should be adopted into the remote workspace.
+
+Git state belongs to the remote workspace, not the mirror directory. Local git
+plugins should not assume the mirror is a checkout. Use the sidecar-backed
+commands instead:
+
+| Command | Result |
+| --- | --- |
+| `:RemoteGitStatus [path...]` | Remote `git status --porcelain` entries in quickfix |
+| `:RemoteGitDiff [path]` | Remote diff in a `nofile` diff scratch buffer |
+| `:RemoteGitBlame [path]` | Remote blame output in quickfix |
+
+These commands invoke `git` beside the remote root through the agent with
+workspace-relative pathspecs and bounded output capture. They are primitives for
+daily use, not a full fugitive/gitsigns/neogit compatibility layer.
 
 ## Write Adoption Caveat
 
