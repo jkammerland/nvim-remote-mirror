@@ -89,7 +89,8 @@ UI                                                *nvim-remote-mirror-ui*
 
 :RemoteQueue
     Show queued saves with actions to open local copies, snapshots, conflict
-    copies, diff conflicts, retry queued saves, or refresh the queue.
+    copies, diff conflicts, accept local or remote conflict content, retry
+    queued saves, or refresh the queue.
 
 :RemoteConflicts
     Show only conflict entries from the save queue. The query is filtered by
@@ -189,6 +190,18 @@ COMMANDS                                      *nvim-remote-mirror-commands*
 :RemoteFlushQueue
     Retry queued or previously failed remote saves and report applied, still
     queued, conflict, and remaining counts.
+
+:RemoteAcceptLocalConflict {queue_id}
+    Resolve the latest conflict for a path by retrying its durable local save
+    snapshot against the recorded remote conflict hash. Older unresolved saves
+    for that path are superseded. The command refuses stale queue rows when
+    newer unresolved saves exist.
+
+:RemoteAcceptRemoteConflict {queue_id}
+    Resolve the latest conflict for a path by replacing the local mirror file
+    with the full saved remote conflict copy and marking older unresolved saves
+    for that path resolved. The command refuses partial remote conflict copies
+    and stale queue rows when newer unresolved saves exist.
 
 :RemoteSaveQueue [limit]
     List pending, failed, unreplayable, and conflicted saves from the local
@@ -313,7 +326,8 @@ memory. recover_local_edits_limit bounds each local scan page.
 Compare-and-swap conflicts keep the local save snapshot preserved as local
 truth. Small remote conflict copies are stored completely; large remote conflict
 copies are stored as a protocol-bounded prefix and reported with truncation
-metadata.
+metadata. Accepting a remote conflict copy is only allowed for full saved remote
+copies.
 open_batch_max_file_bytes controls how large a direct uncached open may be
 before it falls back from one-request batch read hydration to chunked reads.
 auto_hydrate_mirror_buffers makes LSP jumps into missing local mirror files call

@@ -74,6 +74,15 @@ const SIDECAR_COMMAND_SPECS: &[SidecarCommandSpec] = &[
     SidecarCommandSpec::internal("flush_queued", "remote", Some("write"), true, false, false),
     SidecarCommandSpec::public("flush_queue", "remote", Some("write"), true, false, false),
     SidecarCommandSpec::public(
+        "accept_local_conflict",
+        "remote",
+        Some("write"),
+        true,
+        false,
+        false,
+    ),
+    SidecarCommandSpec::public("accept_remote_conflict", "local", None, false, false, false),
+    SidecarCommandSpec::public(
         "validate",
         "hybrid",
         Some("read_or_write"),
@@ -271,6 +280,17 @@ struct SaveQueueEntry {
     expected_hash: Option<String>,
     local_hash: String,
     snapshot_path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+struct ConflictQueueEntry {
+    id: i64,
+    relative_path: String,
+    local_hash: String,
+    snapshot_path: Option<PathBuf>,
+    remote_conflict_path: Option<PathBuf>,
+    conflict_actual_hash: Option<String>,
+    remote_conflict_truncated: bool,
 }
 
 #[derive(Debug)]
@@ -1427,6 +1447,7 @@ impl Mirror {
               last_error TEXT,
               remote_conflict_path TEXT,
               conflict_actual_hash TEXT,
+              remote_conflict_truncated INTEGER NOT NULL DEFAULT 0,
               created_at_ms INTEGER NOT NULL,
               updated_at_ms INTEGER NOT NULL
             );
@@ -1475,6 +1496,11 @@ impl Mirror {
         self.add_missing_column("save_queue", "last_error", "TEXT")?;
         self.add_missing_column("save_queue", "remote_conflict_path", "TEXT")?;
         self.add_missing_column("save_queue", "conflict_actual_hash", "TEXT")?;
+        self.add_missing_column(
+            "save_queue",
+            "remote_conflict_truncated",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
         Ok(())
     }
 
@@ -2377,13 +2403,14 @@ impl Mirror {
                        ELSE state
                      END AS visible_state,
                      attempts, last_error, remote_conflict_path, conflict_actual_hash,
+                     remote_conflict_truncated,
                      created_at_ms, updated_at_ms
               FROM save_queue
               WHERE state IN ('pending', 'failed', 'conflict')
             )
             SELECT id, relative_path, expected_hash, local_hash, snapshot_path,
                    visible_state, attempts, last_error, remote_conflict_path, conflict_actual_hash,
-                   created_at_ms, updated_at_ms
+                   remote_conflict_truncated, created_at_ms, updated_at_ms
             FROM visible_queue
             WHERE (?2 IS NULL OR visible_state = ?2)
             ORDER BY id ASC
@@ -2400,26 +2427,37 @@ impl Mirror {
             }
 
             let relative_path: String = row.get(1)?;
+            let queue_id: i64 = row.get(0)?;
+            let expected_hash: Option<String> = row.get(2)?;
+            let local_hash: String = row.get(3)?;
             let snapshot_path: Option<String> = row.get(4)?;
+            let state: String = row.get(5)?;
+            let attempts: i64 = row.get(6)?;
+            let last_error: Option<String> = row.get(7)?;
             let remote_conflict_path: Option<String> = row.get(8)?;
+            let conflict_actual_hash: Option<String> = row.get(9)?;
+            let remote_conflict_truncated = row.get::<_, i64>(10)? != 0;
+            let created_at_ms: i64 = row.get(11)?;
+            let updated_at_ms: i64 = row.get(12)?;
             let local_path = self
                 .local_path(&relative_path)?
                 .to_string_lossy()
                 .to_string();
             entries.push(json!({
-                "queue_id": row.get::<_, i64>(0)?,
+                "queue_id": queue_id,
                 "path": relative_path,
-                "expected_hash": row.get::<_, Option<String>>(2)?,
-                "local_hash": row.get::<_, String>(3)?,
+                "expected_hash": expected_hash,
+                "local_hash": local_hash,
                 "snapshot_path": snapshot_path,
-                "state": row.get::<_, String>(5)?,
-                "attempts": row.get::<_, i64>(6)?,
-                "last_error": row.get::<_, Option<String>>(7)?,
+                "state": state,
+                "attempts": attempts,
+                "last_error": last_error,
                 "remote_conflict_path": remote_conflict_path,
-                "conflict_actual_hash": row.get::<_, Option<String>>(9)?,
+                "conflict_actual_hash": conflict_actual_hash,
+                "remote_conflict_truncated": remote_conflict_truncated,
                 "local_path": local_path,
-                "created_at_ms": row.get::<_, i64>(10)?,
-                "updated_at_ms": row.get::<_, i64>(11)?,
+                "created_at_ms": created_at_ms,
+                "updated_at_ms": updated_at_ms,
             }));
         }
 
@@ -2522,6 +2560,231 @@ impl Mirror {
             )
             .optional()?
             .ok_or_else(|| anyhow!("queued save {queue_id} is not pending or failed"))
+    }
+
+    fn conflict_queue_entry(&self, queue_id: i64) -> Result<ConflictQueueEntry> {
+        self.db
+            .query_row(
+                "
+                SELECT id, relative_path, local_hash, snapshot_path, remote_conflict_path,
+                       conflict_actual_hash, remote_conflict_truncated
+                FROM save_queue
+                WHERE id=?1 AND state='conflict'
+                ",
+                params![queue_id],
+                |row| {
+                    let snapshot_path: Option<String> = row.get(3)?;
+                    let remote_conflict_path: Option<String> = row.get(4)?;
+                    Ok(ConflictQueueEntry {
+                        id: row.get(0)?,
+                        relative_path: row.get(1)?,
+                        local_hash: row.get(2)?,
+                        snapshot_path: snapshot_path.map(PathBuf::from),
+                        remote_conflict_path: remote_conflict_path.map(PathBuf::from),
+                        conflict_actual_hash: row.get(5)?,
+                        remote_conflict_truncated: row.get::<_, i64>(6)? != 0,
+                    })
+                },
+            )
+            .optional()?
+            .ok_or_else(|| anyhow!("queued save {queue_id} is not a conflict"))
+    }
+
+    fn newer_unresolved_save_count(&self, relative_path: &str, queue_id: i64) -> Result<i64> {
+        self.db
+            .query_row(
+                "
+                SELECT COUNT(*) FROM save_queue
+                WHERE relative_path=?1
+                  AND id > ?2
+                  AND state IN ('pending', 'failed', 'conflict')
+                ",
+                params![relative_path, queue_id],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
+    fn ensure_no_newer_unresolved_save(&self, entry: &ConflictQueueEntry) -> Result<()> {
+        let newer = self.newer_unresolved_save_count(&entry.relative_path, entry.id)?;
+        if newer > 0 {
+            bail!(
+                "cannot resolve conflict #{} for {} because newer queued saves exist",
+                entry.id,
+                entry.relative_path
+            );
+        }
+        Ok(())
+    }
+
+    fn prepare_accept_local_conflict(&self, queue_id: i64) -> Result<SaveQueueEntry> {
+        let entry = self.conflict_queue_entry(queue_id)?;
+        self.ensure_no_newer_unresolved_save(&entry)?;
+        let snapshot_path = entry
+            .snapshot_path
+            .clone()
+            .ok_or_else(|| anyhow!("conflict #{} has no durable local snapshot", entry.id))?;
+        let snapshot_hash = hash_file(&snapshot_path).with_context(|| {
+            format!(
+                "failed to hash conflict snapshot {}",
+                snapshot_path.display()
+            )
+        })?;
+        if snapshot_hash != entry.local_hash {
+            bail!(
+                "conflict snapshot hash mismatch for {}: expected={} actual={snapshot_hash}",
+                entry.relative_path,
+                entry.local_hash
+            );
+        }
+        self.immediate_transaction(|| {
+            self.db.execute(
+                "
+                UPDATE save_queue SET
+                  state='superseded',
+                  last_error=?3,
+                  updated_at_ms=?4
+                WHERE relative_path=?1
+                  AND id < ?2
+                  AND state IN ('pending', 'failed', 'conflict')
+                ",
+                params![
+                    entry.relative_path.as_str(),
+                    entry.id,
+                    format!("superseded by accepted local conflict #{}", entry.id),
+                    now_ms()
+                ],
+            )?;
+            self.db.execute(
+                "
+                UPDATE save_queue SET
+                  state='pending',
+                  expected_hash=?2,
+                  last_error=NULL,
+                  remote_conflict_path=NULL,
+                  conflict_actual_hash=NULL,
+                  remote_conflict_truncated=0,
+                  updated_at_ms=?3
+                WHERE id=?1 AND state='conflict'
+                ",
+                params![entry.id, entry.conflict_actual_hash.as_deref(), now_ms()],
+            )?;
+            Ok(())
+        })?;
+        Ok(SaveQueueEntry {
+            id: entry.id,
+            relative_path: entry.relative_path,
+            expected_hash: entry.conflict_actual_hash,
+            local_hash: entry.local_hash,
+            snapshot_path,
+        })
+    }
+
+    fn accept_remote_conflict(&self, queue_id: i64) -> Result<Value> {
+        let entry = self.conflict_queue_entry(queue_id)?;
+        self.ensure_no_newer_unresolved_save(&entry)?;
+        let remote_conflict_path = entry
+            .remote_conflict_path
+            .clone()
+            .ok_or_else(|| anyhow!("conflict #{} has no saved remote copy", entry.id))?;
+        if entry.remote_conflict_truncated || conflict_copy_path_is_partial(&remote_conflict_path) {
+            bail!(
+                "cannot accept remote for conflict #{} because the saved remote copy is partial",
+                entry.id
+            );
+        }
+        let recorded_remote_hash = entry
+            .conflict_actual_hash
+            .as_deref()
+            .ok_or_else(|| anyhow!("conflict #{} has no recorded remote hash", entry.id))?;
+        let local_path = self.local_path(&entry.relative_path)?;
+        let current_local_hash = hash_file(&local_path).with_context(|| {
+            format!(
+                "failed to hash local mirror file {} before accepting remote conflict",
+                local_path.display()
+            )
+        })?;
+        if current_local_hash != entry.local_hash {
+            bail!(
+                "local mirror file changed since conflict #{} for {}; refresh the conflict before accepting remote",
+                entry.id,
+                entry.relative_path
+            );
+        }
+
+        let content = fs::read(&remote_conflict_path).with_context(|| {
+            format!(
+                "failed to read saved remote conflict copy {}",
+                remote_conflict_path.display()
+            )
+        })?;
+        let actual_hash = hash_bytes(&content);
+        if recorded_remote_hash != actual_hash {
+            bail!(
+                "saved remote conflict copy hash mismatch for {}: expected={} actual={actual_hash}",
+                entry.relative_path,
+                recorded_remote_hash
+            );
+        }
+        let remote_hash = recorded_remote_hash.to_string();
+        write_durable_file(&local_path, &content)?;
+        let size = content.len() as u64;
+        let now = now_ms();
+        self.immediate_transaction(|| {
+            self.db.execute(
+                "
+                UPDATE save_queue SET
+                  state='resolved_remote',
+                  last_error=NULL,
+                  updated_at_ms=?3
+                WHERE relative_path=?1
+                  AND id <= ?2
+                  AND state IN ('pending', 'failed', 'conflict')
+                ",
+                params![entry.relative_path.as_str(), entry.id, now],
+            )?;
+            self.db.execute(
+                "
+                INSERT INTO files (
+                  relative_path, local_path, size, mtime_ms, mode, is_dir, is_symlink,
+                  metadata_kind_known, remote_hash, local_hash, state, dirty,
+                  validated_at_ms, validation_state, last_error, updated_at_ms
+                )
+                VALUES (?1, ?2, ?3, ?4, 0, 0, 0, 1, ?5, ?5, 'hydrated', 0, ?4, 'valid', NULL, ?4)
+                ON CONFLICT(relative_path) DO UPDATE SET
+                  local_path=excluded.local_path,
+                  size=excluded.size,
+                  mtime_ms=excluded.mtime_ms,
+                  metadata_kind_known=1,
+                  is_dir=0,
+                  is_symlink=0,
+                  remote_hash=excluded.remote_hash,
+                  local_hash=excluded.local_hash,
+                  state='hydrated',
+                  dirty=0,
+                  validated_at_ms=excluded.validated_at_ms,
+                  validation_state='valid',
+                  last_error=NULL,
+                  updated_at_ms=excluded.updated_at_ms
+                ",
+                params![
+                    entry.relative_path.as_str(),
+                    local_path.to_string_lossy(),
+                    size as i64,
+                    now,
+                    remote_hash.as_str()
+                ],
+            )?;
+            Ok(())
+        })?;
+        self.replace_search_index_from_bytes(&entry.relative_path, &remote_hash, &content)?;
+        Ok(json!({
+            "status": "accepted_remote",
+            "path": entry.relative_path,
+            "hash": remote_hash,
+            "size": size,
+            "local_path": local_path.to_string_lossy()
+        }))
     }
 
     fn restore_latest_dirty_snapshot(&self, entry: &MirrorEntry) -> Result<()> {
@@ -2700,7 +2963,8 @@ impl Mirror {
                   last_error=?2,
                   remote_conflict_path=?3,
                   conflict_actual_hash=?4,
-                  updated_at_ms=?5
+                  remote_conflict_truncated=?5,
+                  updated_at_ms=?6
                 WHERE id=?1
                 ",
                 params![
@@ -2708,6 +2972,11 @@ impl Mirror {
                     message,
                     path.to_string_lossy(),
                     actual_hash,
+                    if remote_content_truncated {
+                        1_i64
+                    } else {
+                        0_i64
+                    },
                     now_ms()
                 ],
             )?;
@@ -3419,7 +3688,13 @@ impl RemotePreempts {
 fn request_is_write_lane(request: &ClientRequest) -> bool {
     matches!(
         request.method.as_str(),
-        "recover_local_edits" | "adopt" | "flush" | "flush_queued" | "flush_queue"
+        "recover_local_edits"
+            | "adopt"
+            | "flush"
+            | "flush_queued"
+            | "flush_queue"
+            | "accept_local_conflict"
+            | "accept_remote_conflict"
     )
 }
 
@@ -3781,6 +4056,10 @@ impl PendingHazard {
             "adopt" | "flush" | "flush_queued" => {
                 path_hazard(request.params.get("path").and_then(Value::as_str))
             }
+            "accept_local_conflict" | "accept_remote_conflict" => Self {
+                exact_paths: Vec::new(),
+                unknown_content_mutation: true,
+            },
             "recover_local_edits" if request_background_flag(request) => Self::default(),
             "recover_local_edits" => Self {
                 exact_paths: Vec::new(),
@@ -4094,6 +4373,8 @@ impl Sidecar {
             "flush" => self.flush(params),
             "flush_queued" => self.flush_queued(params),
             "flush_queue" => self.flush_queue(params),
+            "accept_local_conflict" => self.accept_local_conflict(params),
+            "accept_remote_conflict" => self.accept_remote_conflict(params),
             "validate" => self.validate(params, preempt_epoch),
             "refresh" => self.refresh(params, preempt_epoch),
             "shutdown" | "disconnect" => {
@@ -4915,6 +5196,17 @@ impl Sidecar {
             "attempts": attempts,
             "remaining": remaining
         }))
+    }
+
+    fn accept_local_conflict(&mut self, params: Value) -> Result<Value> {
+        let queue_id = required_i64(&params, "queue_id")?;
+        let queued = self.mirror.prepare_accept_local_conflict(queue_id)?;
+        Self::save_attempt_to_json(self.apply_save_entry(queued)?)
+    }
+
+    fn accept_remote_conflict(&mut self, params: Value) -> Result<Value> {
+        let queue_id = required_i64(&params, "queue_id")?;
+        self.mirror.accept_remote_conflict(queue_id)
     }
 
     fn replay_queued_saves(&mut self, limit: Option<usize>) -> Result<Vec<Value>> {
@@ -6621,6 +6913,13 @@ fn required_string<'a>(params: &'a Value, key: &str) -> Result<&'a str> {
         .ok_or_else(|| anyhow!("missing required string params.{key}"))
 }
 
+fn required_i64(params: &Value, key: &str) -> Result<i64> {
+    params
+        .get(key)
+        .and_then(Value::as_i64)
+        .ok_or_else(|| anyhow!("missing required integer params.{key}"))
+}
+
 fn optional_string_param<'a>(params: &'a Value, key: &str) -> Option<&'a str> {
     params
         .get(key)
@@ -6803,6 +7102,13 @@ fn hash_file(path: &Path) -> Result<String> {
     Ok(hasher.finalize().to_hex().to_string())
 }
 
+fn conflict_copy_path_is_partial(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| name.contains(".remote.partial."))
+        .unwrap_or(false)
+}
+
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -6913,6 +7219,28 @@ mod tests {
         sidecar
     }
 
+    fn test_sidecar_with_agent_replies(mirror: Mirror, replies: Vec<AgentWorkerReply>) -> Sidecar {
+        let mut sidecar = test_sidecar(mirror);
+        let (tx, rx) = mpsc::channel::<AgentWorkerCommand>();
+        thread::spawn(move || {
+            let mut replies = VecDeque::from(replies);
+            while let Ok(command) = rx.recv() {
+                let reply = replies.pop_front().unwrap_or_else(|| {
+                    AgentWorkerReply::TransportError(format!(
+                        "no test reply for {:?}",
+                        command.request
+                    ))
+                });
+                let _ = command.reply.send(reply);
+            }
+        });
+        sidecar.agent.worker = Some(AgentWorker {
+            tx,
+            abort: Arc::new(TestAbortHandle::default()),
+        });
+        sidecar
+    }
+
     fn record_hydrated_content(mirror: &Mirror, path: &str, content: &[u8]) -> PathBuf {
         let hash = hash_bytes(content);
         mirror
@@ -6949,6 +7277,17 @@ mod tests {
             )
             .unwrap();
         mirror.db.last_insert_rowid()
+    }
+
+    fn save_state(mirror: &Mirror, queue_id: i64) -> String {
+        mirror
+            .db
+            .query_row(
+                "SELECT state FROM save_queue WHERE id=?1",
+                params![queue_id],
+                |row| row.get(0),
+            )
+            .unwrap()
     }
 
     fn slot_backoff_window_ms(slot: &RemoteBackoffSlot) -> u64 {
@@ -7360,6 +7699,22 @@ mod tests {
         assert_eq!(flush_queued["execution"], "remote");
         assert_eq!(flush_queued["remote_lane"], "write");
         assert_eq!(flush_queued["mutates_remote"], true);
+        let accept_local = command_specs
+            .iter()
+            .find(|command| command["name"] == "accept_local_conflict")
+            .unwrap();
+        assert_eq!(accept_local["visibility"], "public");
+        assert_eq!(accept_local["execution"], "remote");
+        assert_eq!(accept_local["remote_lane"], "write");
+        assert_eq!(accept_local["mutates_remote"], true);
+        let accept_remote = command_specs
+            .iter()
+            .find(|command| command["name"] == "accept_remote_conflict")
+            .unwrap();
+        assert_eq!(accept_remote["visibility"], "public");
+        assert_eq!(accept_remote["execution"], "local");
+        assert_eq!(accept_remote["remote_lane"], Value::Null);
+        assert_eq!(accept_remote["mutates_remote"], false);
         let save_queue = command_specs
             .iter()
             .find(|command| command["name"] == "save_queue")
@@ -8575,6 +8930,359 @@ mod tests {
     }
 
     #[test]
+    fn accept_local_conflict_rebases_snapshot_and_supersedes_older_saves() {
+        let dir = tempdir().unwrap();
+        let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
+        record_hydrated_content(&mirror, "a.txt", b"base");
+        let first_hash = hash_bytes(b"dirty one");
+        let second_hash = hash_bytes(b"dirty two");
+        let first = mirror
+            .enqueue_save("a.txt", &first_hash, Some("base"), b"dirty one")
+            .unwrap();
+        let second = mirror
+            .enqueue_save(
+                "a.txt",
+                &second_hash,
+                Some(first_hash.as_str()),
+                b"dirty two",
+            )
+            .unwrap();
+        mirror
+            .record_save_conflict(
+                second.id,
+                "a.txt",
+                Some("remote-after-conflict"),
+                b"remote",
+                false,
+                "remote changed",
+            )
+            .unwrap();
+        let mut sidecar = test_sidecar_with_agent_replies(
+            mirror,
+            vec![
+                AgentWorkerReply::Response(Response::Hello {
+                    agent_version: "test-agent".to_string(),
+                    protocol_version: PROTOCOL_VERSION,
+                    capabilities: nrm_protocol::CapabilitySet::v1_agent(),
+                }),
+                AgentWorkerReply::Response(Response::WriteFileCas {
+                    outcome: SaveOutcome::Applied(nrm_protocol::SaveApplied {
+                        path: "a.txt".to_string(),
+                        new_hash: second_hash.clone(),
+                        size: b"dirty two".len() as u64,
+                        mtime_ms: 123,
+                    }),
+                }),
+            ],
+        );
+
+        let result = sidecar
+            .accept_local_conflict(json!({"queue_id": second.id}))
+            .unwrap();
+
+        assert_eq!(result["status"], "applied", "result={result:?}");
+        assert_eq!(save_state(&sidecar.mirror, first.id), "superseded");
+        assert_eq!(save_state(&sidecar.mirror, second.id), "applied");
+        let expected_hash: Option<String> = sidecar
+            .mirror
+            .db
+            .query_row(
+                "SELECT expected_hash FROM save_queue WHERE id=?1",
+                params![second.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(expected_hash.as_deref(), Some("remote-after-conflict"));
+        let entry = sidecar.mirror.get("a.txt").unwrap().unwrap();
+        assert!(!entry.dirty);
+        assert_eq!(entry.remote_hash.as_deref(), Some(second_hash.as_str()));
+        assert_eq!(entry.local_hash.as_deref(), Some(second_hash.as_str()));
+        assert_eq!(entry.validation_state, "valid");
+    }
+
+    #[test]
+    fn accept_local_conflict_missing_snapshot_keeps_conflict_state() {
+        let dir = tempdir().unwrap();
+        let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
+        record_hydrated_content(&mirror, "a.txt", b"base");
+        let dirty_hash = hash_bytes(b"dirty");
+        let queued = mirror
+            .enqueue_save("a.txt", &dirty_hash, Some("base"), b"dirty")
+            .unwrap();
+        mirror
+            .record_save_conflict(
+                queued.id,
+                "a.txt",
+                Some("remote-after-conflict"),
+                b"remote",
+                false,
+                "remote changed",
+            )
+            .unwrap();
+        fs::remove_file(&queued.snapshot_path).unwrap();
+
+        let error = mirror
+            .prepare_accept_local_conflict(queued.id)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("failed to hash conflict snapshot"));
+        assert_eq!(save_state(&mirror, queued.id), "conflict");
+    }
+
+    #[test]
+    fn accept_local_conflict_remote_failure_keeps_rebased_failed_row() {
+        let dir = tempdir().unwrap();
+        let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
+        record_hydrated_content(&mirror, "a.txt", b"base");
+        let dirty_hash = hash_bytes(b"dirty");
+        let queued = mirror
+            .enqueue_save("a.txt", &dirty_hash, Some("base"), b"dirty")
+            .unwrap();
+        mirror
+            .record_save_conflict(
+                queued.id,
+                "a.txt",
+                Some("remote-after-conflict"),
+                b"remote",
+                false,
+                "remote changed",
+            )
+            .unwrap();
+        let mut sidecar = test_sidecar_with_agent_replies(
+            mirror,
+            vec![
+                AgentWorkerReply::Response(Response::Hello {
+                    agent_version: "test-agent".to_string(),
+                    protocol_version: PROTOCOL_VERSION,
+                    capabilities: nrm_protocol::CapabilitySet::v1_agent(),
+                }),
+                AgentWorkerReply::TransportError("ssh unavailable".to_string()),
+            ],
+        );
+
+        let result = sidecar
+            .accept_local_conflict(json!({"queue_id": queued.id}))
+            .unwrap();
+
+        assert_eq!(result["status"], "queued");
+        assert_eq!(save_state(&sidecar.mirror, queued.id), "failed");
+        let expected_hash: Option<String> = sidecar
+            .mirror
+            .db
+            .query_row(
+                "SELECT expected_hash FROM save_queue WHERE id=?1",
+                params![queued.id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(expected_hash.as_deref(), Some("remote-after-conflict"));
+    }
+
+    #[test]
+    fn accept_remote_conflict_installs_full_copy_and_resolves_path_queue() {
+        let dir = tempdir().unwrap();
+        let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
+        let local_path = record_hydrated_content(&mirror, "a.txt", b"base");
+        let first_hash = hash_bytes(b"dirty one");
+        let second_hash = hash_bytes(b"dirty two");
+        let first = mirror
+            .enqueue_save("a.txt", &first_hash, Some("base"), b"dirty one")
+            .unwrap();
+        let second = mirror
+            .enqueue_save(
+                "a.txt",
+                &second_hash,
+                Some(first_hash.as_str()),
+                b"dirty two",
+            )
+            .unwrap();
+        let remote_hash = hash_bytes(b"remote");
+        mirror
+            .record_save_conflict(
+                second.id,
+                "a.txt",
+                Some(remote_hash.as_str()),
+                b"remote",
+                false,
+                "remote changed",
+            )
+            .unwrap();
+        fs::write(&local_path, b"dirty two").unwrap();
+        let sidecar = test_sidecar(mirror);
+
+        let result = sidecar.mirror.accept_remote_conflict(second.id).unwrap();
+
+        assert_eq!(result["status"], "accepted_remote");
+        assert_eq!(result["path"], "a.txt");
+        assert_eq!(result["hash"], remote_hash);
+        assert_eq!(fs::read(&local_path).unwrap(), b"remote");
+        assert_eq!(save_state(&sidecar.mirror, first.id), "resolved_remote");
+        assert_eq!(save_state(&sidecar.mirror, second.id), "resolved_remote");
+        assert_eq!(sidecar.mirror.save_queue(&json!({})).unwrap()["total"], 0);
+        let entry = sidecar.mirror.get("a.txt").unwrap().unwrap();
+        assert!(!entry.dirty);
+        assert_eq!(entry.remote_hash.as_deref(), Some(remote_hash.as_str()));
+        assert_eq!(entry.local_hash.as_deref(), Some(remote_hash.as_str()));
+        assert_eq!(entry.validation_state, "valid");
+    }
+
+    #[test]
+    fn accept_remote_conflict_rejects_changed_local_file() {
+        let dir = tempdir().unwrap();
+        let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
+        let local_path = record_hydrated_content(&mirror, "a.txt", b"base");
+        let dirty_hash = hash_bytes(b"dirty");
+        let queued = mirror
+            .enqueue_save("a.txt", &dirty_hash, Some("base"), b"dirty")
+            .unwrap();
+        let remote_hash = hash_bytes(b"remote");
+        mirror
+            .record_save_conflict(
+                queued.id,
+                "a.txt",
+                Some(remote_hash.as_str()),
+                b"remote",
+                false,
+                "remote changed",
+            )
+            .unwrap();
+        fs::write(&local_path, b"new unsaved local edit").unwrap();
+
+        let error = mirror
+            .accept_remote_conflict(queued.id)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("local mirror file changed"));
+        assert_eq!(save_state(&mirror, queued.id), "conflict");
+        assert_eq!(fs::read(local_path).unwrap(), b"new unsaved local edit");
+    }
+
+    #[test]
+    fn accept_remote_conflict_rejects_partial_copy() {
+        let dir = tempdir().unwrap();
+        let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
+        let local_path = record_hydrated_content(&mirror, "a.txt", b"base");
+        let dirty_hash = hash_bytes(b"dirty");
+        let queued = mirror
+            .enqueue_save("a.txt", &dirty_hash, Some("base"), b"dirty")
+            .unwrap();
+        mirror
+            .record_save_conflict(
+                queued.id,
+                "a.txt",
+                Some("remote"),
+                b"remote prefix",
+                true,
+                "remote changed",
+            )
+            .unwrap();
+        let sidecar = test_sidecar(mirror);
+
+        let error = sidecar
+            .mirror
+            .accept_remote_conflict(queued.id)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("partial"));
+        assert_eq!(save_state(&sidecar.mirror, queued.id), "conflict");
+        assert_eq!(fs::read(local_path).unwrap(), b"base");
+    }
+
+    #[test]
+    fn accept_remote_conflict_rejects_missing_remote_hash() {
+        let dir = tempdir().unwrap();
+        let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
+        let local_path = record_hydrated_content(&mirror, "a.txt", b"base");
+        let dirty_hash = hash_bytes(b"dirty");
+        let queued = mirror
+            .enqueue_save("a.txt", &dirty_hash, Some("base"), b"dirty")
+            .unwrap();
+        mirror
+            .record_save_conflict(queued.id, "a.txt", None, b"remote", false, "remote changed")
+            .unwrap();
+        fs::write(&local_path, b"dirty").unwrap();
+
+        let error = mirror
+            .accept_remote_conflict(queued.id)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("no recorded remote hash"));
+        assert_eq!(save_state(&mirror, queued.id), "conflict");
+    }
+
+    #[test]
+    fn accept_remote_conflict_rejects_conflict_copy_hash_mismatch() {
+        let dir = tempdir().unwrap();
+        let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
+        let local_path = record_hydrated_content(&mirror, "a.txt", b"base");
+        let dirty_hash = hash_bytes(b"dirty");
+        let queued = mirror
+            .enqueue_save("a.txt", &dirty_hash, Some("base"), b"dirty")
+            .unwrap();
+        mirror
+            .record_save_conflict(
+                queued.id,
+                "a.txt",
+                Some("wrong-hash"),
+                b"remote",
+                false,
+                "remote changed",
+            )
+            .unwrap();
+        fs::write(&local_path, b"dirty").unwrap();
+
+        let error = mirror
+            .accept_remote_conflict(queued.id)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("hash mismatch"));
+        assert_eq!(save_state(&mirror, queued.id), "conflict");
+    }
+
+    #[test]
+    fn accept_conflict_refuses_stale_queue_row_when_newer_save_exists() {
+        let dir = tempdir().unwrap();
+        let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
+        record_hydrated_content(&mirror, "a.txt", b"base");
+        let first_hash = hash_bytes(b"dirty one");
+        let second_hash = hash_bytes(b"dirty two");
+        let first = mirror
+            .enqueue_save("a.txt", &first_hash, Some("base"), b"dirty one")
+            .unwrap();
+        mirror
+            .record_save_conflict(
+                first.id,
+                "a.txt",
+                Some("remote-after-conflict"),
+                b"remote",
+                false,
+                "remote changed",
+            )
+            .unwrap();
+        mirror
+            .enqueue_save(
+                "a.txt",
+                &second_hash,
+                Some(first_hash.as_str()),
+                b"dirty two",
+            )
+            .unwrap();
+
+        let error = mirror
+            .prepare_accept_local_conflict(first.id)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("newer queued saves"));
+        assert_eq!(save_state(&mirror, first.id), "conflict");
+    }
+
+    #[test]
     fn pending_save_entries_respect_limit_and_report_remaining() {
         let dir = tempdir().unwrap();
         let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
@@ -8806,6 +9514,7 @@ mod tests {
             entries[2]["remote_conflict_path"].as_str().unwrap(),
             conflict_path.to_string_lossy().as_ref()
         );
+        assert_eq!(entries[2]["remote_conflict_truncated"], false);
     }
 
     #[test]

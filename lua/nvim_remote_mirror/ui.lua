@@ -351,12 +351,32 @@ local function user_queue_opts(opts)
   return result
 end
 
+local function refresh_queue_after_action(opts, generation)
+  return function(err)
+    if err or (generation and generation ~= state.queue_generation) then
+      return
+    end
+    M.queue(user_queue_opts(opts))
+  end
+end
+
+local function run_queue_action(action, queue_id, opts)
+  local generation = opts._queue_generation
+  local ok, err = pcall(action, queue_id, {
+    on_done = refresh_queue_after_action(opts, generation),
+  })
+  if not ok then
+    notify(tostring(err), vim.log.levels.ERROR)
+  end
+end
+
 local function queue_actions(entry, opts)
   opts = opts or {}
   local actions = {}
   local local_path = optional_path(entry.local_path)
   local snapshot_path = optional_path(entry.snapshot_path)
   local remote_conflict_path = optional_path(entry.remote_conflict_path)
+  local queue_id = tonumber(entry.queue_id)
   if local_path then
     table.insert(actions, {
       label = "Open local mirror file",
@@ -397,17 +417,33 @@ local function queue_actions(entry, opts)
       end,
     })
   end
+  if entry.state == "conflict" and queue_id and snapshot_path then
+    table.insert(actions, {
+      label = "Accept local saved snapshot",
+      run = function()
+        run_queue_action(nrm.accept_local_conflict, queue_id, opts)
+      end,
+    })
+  end
+  if
+    entry.state == "conflict"
+    and queue_id
+    and remote_conflict_path
+    and entry.remote_conflict_truncated ~= true
+  then
+    table.insert(actions, {
+      label = "Accept remote conflict copy",
+      run = function()
+        run_queue_action(nrm.accept_remote_conflict, queue_id, opts)
+      end,
+    })
+  end
   table.insert(actions, {
     label = "Retry queued saves",
     run = function()
       local generation = opts._queue_generation
       flush_queue_safe({
-        on_done = function(err)
-          if err or (generation and generation ~= state.queue_generation) then
-            return
-          end
-          M.queue(user_queue_opts(opts))
-        end,
+        on_done = refresh_queue_after_action(opts, generation),
       })
     end,
   })

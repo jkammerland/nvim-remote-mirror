@@ -108,6 +108,18 @@ vim.api.nvim_create_user_command("RemoteFlushQueue", function()
   nrm.flush_queue()
 end, {})
 
+vim.api.nvim_create_user_command("RemoteAcceptLocalConflict", function(opts)
+  nrm.accept_local_conflict(opts.args)
+end, {
+  nargs = 1,
+})
+
+vim.api.nvim_create_user_command("RemoteAcceptRemoteConflict", function(opts)
+  nrm.accept_remote_conflict(opts.args)
+end, {
+  nargs = 1,
+})
+
 vim.api.nvim_create_user_command("RemoteSaveQueue", function(opts)
   nrm.save_queue({ limit = tonumber(opts.args) })
 end, {

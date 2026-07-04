@@ -138,6 +138,15 @@ local function main()
     nrm.format_save_queue_entry({ state = "unreplayable", path = "lost.rs" }),
     "snapshot=missing"
   )
+  assert_contains(
+    nrm.format_save_queue_entry({
+      state = "conflict",
+      path = "partial.rs",
+      remote_conflict_path = "/tmp/partial.remote",
+      remote_conflict_truncated = true,
+    }),
+    "remote=partial"
+  )
 
   nrm.request = function(method, params, callback)
     table.insert(calls, { method = method, params = params })

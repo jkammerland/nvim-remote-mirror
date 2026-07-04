@@ -219,6 +219,7 @@ local function main()
   vim.fn.writefile({ "snapshot" }, snapshot_path)
   vim.fn.writefile({ "remote" }, remote_path)
   local conflict_actions = ui._queue_actions({
+    queue_id = 9,
     path = "src/lib.rs",
     state = "conflict",
     local_path = local_path,
@@ -227,6 +228,18 @@ local function main()
   })
   find_action(conflict_actions, "Diff saved snapshot vs remote conflict")
   find_action(conflict_actions, "Diff local mirror vs remote conflict")
+  find_action(conflict_actions, "Accept local saved snapshot")
+  find_action(conflict_actions, "Accept remote conflict copy")
+  local partial_conflict_actions = ui._queue_actions({
+    queue_id = 9,
+    path = "src/lib.rs",
+    state = "conflict",
+    snapshot_path = snapshot_path,
+    remote_conflict_path = remote_path,
+    remote_conflict_truncated = true,
+  })
+  find_action(partial_conflict_actions, "Accept local saved snapshot")
+  assert_eq(action_exists(partial_conflict_actions, "Accept remote conflict copy"), false)
 
   local null_path_actions = ui._queue_actions({
     path = "lost.rs",
@@ -267,6 +280,48 @@ local function main()
   find_action(ui._queue_actions({ path = "src/lib.rs" }, { conflicts_only = true, _queue_generation = -1 }), "Retry queued saves").run()
   assert_eq(refreshed, false)
   nrm.flush_queue = old_flush_queue
+  ui.queue = old_ui_queue
+
+  local old_accept_local_conflict = nrm.accept_local_conflict
+  local old_accept_remote_conflict = nrm.accept_remote_conflict
+  local accepted_local = nil
+  local accepted_remote = nil
+  refreshed = false
+  nrm.accept_local_conflict = function(queue_id, opts)
+    accepted_local = queue_id
+    opts.on_done(nil, { status = "applied", path = "src/lib.rs" })
+  end
+  nrm.accept_remote_conflict = function(queue_id, opts)
+    accepted_remote = queue_id
+    opts.on_done(nil, { status = "accepted_remote", path = "src/lib.rs" })
+  end
+  ui.queue = function(opts)
+    refreshed = opts.conflicts_only == true
+  end
+  local resolving_actions = ui._queue_actions({
+    queue_id = 42,
+    path = "src/lib.rs",
+    state = "conflict",
+    snapshot_path = snapshot_path,
+    remote_conflict_path = remote_path,
+  }, { conflicts_only = true })
+  find_action(resolving_actions, "Accept local saved snapshot").run()
+  assert_eq(accepted_local, 42)
+  assert_eq(refreshed, true)
+  refreshed = false
+  find_action(resolving_actions, "Accept remote conflict copy").run()
+  assert_eq(accepted_remote, 42)
+  assert_eq(refreshed, true)
+  refreshed = false
+  find_action(ui._queue_actions({
+    queue_id = 43,
+    path = "src/lib.rs",
+    state = "conflict",
+    snapshot_path = snapshot_path,
+  }, { conflicts_only = true, _queue_generation = -1 }), "Accept local saved snapshot").run()
+  assert_eq(refreshed, false)
+  nrm.accept_local_conflict = old_accept_local_conflict
+  nrm.accept_remote_conflict = old_accept_remote_conflict
   ui.queue = old_ui_queue
 
   local conflict_select_prompt = nil

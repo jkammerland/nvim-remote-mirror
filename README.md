@@ -147,6 +147,8 @@ Dashboard keys:
 | `:RemoteFlush` | Flush current remote buffer |
 | `:RemoteAdopt [path]` | Explicitly create or take over a new mirror-root path |
 | `:RemoteFlushQueue` | Retry queued saves |
+| `:RemoteAcceptLocalConflict {queue_id}` | Resolve the latest conflict by uploading its saved local snapshot |
+| `:RemoteAcceptRemoteConflict {queue_id}` | Resolve the latest conflict by discarding local queued bytes for the full saved remote copy |
 | `:RemoteValidate [path]` | Compare cached file metadata with remote hash |
 | `:RemoteRefresh [path...]` | Validate cached files in batches |
 | `:RemoteMirrorStart` | Start background mirror building |
@@ -182,7 +184,7 @@ Mirror files live under the sidecar state directory, typically below
 | Remote agent missing | Confirm `ssh myhost 'command -v nrm-agent'` |
 | Opens are stale | Use `:RemoteValidate` or `:RemoteOpen! path` |
 | Saves are queued | Open `:RemoteQueue`, then retry with `:RemoteFlushQueue` |
-| Save conflict | Open `:RemoteConflicts` and inspect local vs remote copy |
+| Save conflict | Open `:RemoteConflicts`; accept-local uploads the saved local snapshot, accept-remote is blocked for partial remote copies |
 | New mirror file did not upload | Use `:RemoteAdopt` or set `adoption_policy = "auto"` |
 | UI feels empty | Run `:RemoteScan` or leave background mirror enabled |
 

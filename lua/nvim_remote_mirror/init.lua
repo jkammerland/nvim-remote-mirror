@@ -585,6 +585,9 @@ local function save_queue_entry_text(entry)
   local remote_conflict_path = optional_string(entry.remote_conflict_path)
   if remote_conflict_path then
     table.insert(parts, "remote=" .. remote_conflict_path)
+    if entry.remote_conflict_truncated == true then
+      table.insert(parts, "remote=partial")
+    end
   end
   if state == "unreplayable" and not optional_string(entry.snapshot_path) then
     table.insert(parts, "snapshot=missing")
@@ -2419,6 +2422,70 @@ function M.flush_queue(opts)
       opts.on_done(nil, result)
     end
   end)
+end
+
+local function queue_id_param(queue_id)
+  local parsed = tonumber(queue_id)
+  if not parsed then
+    error("queue_id must be a number")
+  end
+  return math.floor(parsed)
+end
+
+local function notify_conflict_resolution_result(action, result)
+  result = result or {}
+  local status = optional_string(result.status) or "unknown"
+  local path = optional_string(result.path) or "<unknown>"
+  local level = vim.log.levels.INFO
+  local message
+  if status == "applied" then
+    message = action .. " for " .. path
+  elseif status == "accepted_remote" then
+    message = action .. " for " .. path
+  elseif status == "conflict" then
+    level = vim.log.levels.ERROR
+    message = action .. " still conflicts for " .. path
+    local remote_path = optional_string(result.remote_path)
+    if remote_path then
+      message = message .. "; remote copy=" .. remote_path
+    end
+  elseif status == "queued" then
+    level = vim.log.levels.WARN
+    message = action .. " queued for " .. path
+    local reason = optional_string(result.reason)
+    if reason then
+      message = message .. ": " .. reason
+    end
+  else
+    level = vim.log.levels.WARN
+    message = action .. " returned status=" .. status .. " for " .. path
+  end
+  notify(message, level)
+end
+
+local function accept_conflict(method, action, queue_id, opts)
+  opts = opts or {}
+  request_async(method, { queue_id = queue_id_param(queue_id) }, function(err, result)
+    if err then
+      notify(err, vim.log.levels.ERROR)
+      if opts.on_done then
+        opts.on_done(err, nil)
+      end
+      return
+    end
+    notify_conflict_resolution_result(action, result)
+    if opts.on_done then
+      opts.on_done(nil, result)
+    end
+  end)
+end
+
+function M.accept_local_conflict(queue_id, opts)
+  accept_conflict("accept_local_conflict", "accepted local conflict snapshot", queue_id, opts)
+end
+
+function M.accept_remote_conflict(queue_id, opts)
+  accept_conflict("accept_remote_conflict", "accepted remote conflict copy", queue_id, opts)
 end
 
 function M.recover_local_edits(opts)
