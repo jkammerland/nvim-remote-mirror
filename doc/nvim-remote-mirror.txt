@@ -219,8 +219,23 @@ COMMANDS                                      *nvim-remote-mirror-commands*
 :RemoteStatus
     Show known, cached, indexed, dirty, and pending mirror counts plus the
     plugin connection state, pending reconnect or explicit disconnect state,
-    background metadata scan state, and last known remote health. This is a
-    local fast path and does not probe SSH.
+    background metadata scan state, LSP summary, and last known remote health.
+    This is a local fast path and does not probe SSH.
+
+:RemoteLspStart {cmd...}
+    Start a simple remote LSP command for the active workspace. For complex
+    server configs, prefer start_lsp() from Lua.
+
+:RemoteLspStop
+    Stop active remote LSP clients for the current workspace.
+
+:RemoteLspRestart [cmd...]
+    Restart the last remote LSP command, or restart with a new simple command
+    when arguments are provided.
+
+:RemoteLspStatus
+    Show active remote LSP clients, last command, last error, workspace, and
+    last-known remote health.
 
 :RemoteDisconnect
     Stop the sidecar and agent.
@@ -428,21 +443,32 @@ and build outputs outside the mirror root unless they should exist remotely.
 ==============================================================================
 LSP                                                *nvim-remote-mirror-lsp*
 
-After :RemoteConnect completes, use start_lsp() to run a language server on
-the remote side while Neovim receives local mirror paths.
+After :RemoteConnect completes, use start_lsp() or :RemoteLspStart to run a
+language server on the remote side while Neovim receives local mirror paths.
 The proxy starts the server in the remote workspace directory. SSH targets use
 the configured connect timeout and cd to the remote root before server launch.
 start_lsp() probes the remote first and skips vim.lsp.start() while the remote
-is unavailable or in backoff. lsp_client_config() remains available as a
-low-level config builder when you need manual control.
+is unavailable or in backoff, recording the last LSP error for :RemoteLspStatus.
+lsp_client_config() remains available as a low-level config builder when you
+need manual control.
+Started LSP client IDs are tracked by workspace identity. :RemoteDisconnect and
+:RemoteLspStop stop only clients for the matching remote workspace; stale async
+starts are ignored when the active workspace changes.
 The proxy rewrites file:// URI values, workspace-edit URI object keys, and known
-path fields between local mirror and remote workspace prefixes. Unrelated prose
-strings are left untouched, and path boundaries are checked before rewriting.
+path fields between local mirror and remote workspace prefixes. Plain path
+prose strings are left untouched and path boundaries are checked before
+rewriting. Prose strings that begin with a matching file:// URI prefix are a
+known rewrite-hardening follow-up.
 
 >
   local nrm = require("nvim_remote_mirror")
   nrm.start_lsp({ "rust-analyzer" }, {
     name = "remote-rust-analyzer",
+  })
+
+  nrm.start_lsp({
+    name = "remote-rust-analyzer",
+    cmd = { "rust-analyzer" },
   })
 <
 

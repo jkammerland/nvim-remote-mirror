@@ -43,6 +43,13 @@ local function add_section(lines, title)
   table.insert(lines, string.rep("-", #title))
 end
 
+local function command_text(command)
+  if type(command) ~= "table" or #command == 0 then
+    return nil
+  end
+  return table.concat(command, " ")
+end
+
 local function scan_text(status)
   local scan = value(status.background_scan_state, "not_started")
   if scan == "completed" and status.background_scan_summary then
@@ -81,6 +88,19 @@ local function format_dashboard_lines(status, err)
     add_line(lines, "Retry After", tostring(math.floor(tonumber(status.retry_after_ms or connection.retry_after_ms) or 0)) .. " ms")
   end
   add_line(lines, "Error", status.remote_error or connection.remote_error or connection.error or connection.reason)
+
+  local lsp = status.lsp or {}
+  add_section(lines, "LSP")
+  add_line(lines, "Active", number_value(lsp.active))
+  add_line(lines, "Last Command", command_text(lsp.last_command))
+  add_line(lines, "Last Error", lsp.last_error)
+  if type(lsp.clients) == "table" and #lsp.clients > 0 then
+    local names = {}
+    for _, client in ipairs(lsp.clients) do
+      table.insert(names, tostring(client.name or client.id))
+    end
+    add_line(lines, "Clients", table.concat(names, ", "))
+  end
 
   add_section(lines, "Mirror")
   add_line(lines, "Mirror Root", connection.mirror_root)

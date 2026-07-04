@@ -84,9 +84,15 @@ M.background_mirror_running = false
 M.background_mirror_generation = 0
 M.background_scan_after = nil
 M.mirror_autocmd_group = nil
+M.lsp_clients = {}
+M.lsp_last = nil
+M.lsp_last_error = nil
+M.lsp_generation = 0
 
 local setup_mirror_autohydrate
 local update_remote_state
+local stop_lsp_for_client
+local lsp_status_result
 
 local function notify(message, level)
   vim.schedule(function()
@@ -832,6 +838,9 @@ local function decorate_status_result(result)
   result.connection_summary = connection_summary()
   result.remote_summary = status_remote_summary(result)
   result.background_scan_summary = background_scan_summary(result)
+  if lsp_status_result then
+    result.lsp = lsp_status_result({ notify = false })
+  end
   return result
 end
 
@@ -1358,6 +1367,9 @@ function M.connect(target, opts)
       end,
       on_exit = function(_, code)
         if M.client == client then
+          if stop_lsp_for_client then
+            stop_lsp_for_client(client, { quiet = true, force = true })
+          end
           M.client = nil
           clear_mirror_autohydrate()
         end
@@ -1439,6 +1451,9 @@ function M.disconnect(opts)
   end
   local client = M.client
   client.closing = true
+  if stop_lsp_for_client then
+    stop_lsp_for_client(client, { quiet = true, force = true })
+  end
   pcall(M.request, "disconnect", {}, function() end)
   fail_pending(client, "disconnected")
   vim.defer_fn(function()
@@ -2479,9 +2494,18 @@ function M.grep(query)
   end)
 end
 
+local function status_lsp_summary()
+  local lsp = lsp_status_result and lsp_status_result({ notify = false }) or { active = 0 }
+  local summary = "lsp=" .. tostring(tonumber(lsp.active) or 0)
+  if lsp.last_error then
+    summary = summary .. " lsp_error=" .. tostring(lsp.last_error):gsub("%s+", " "):sub(1, 160)
+  end
+  return summary
+end
+
 function M.status()
   if not M.client or not M.client.job_id then
-    notify(connection_summary(), vim.log.levels.WARN)
+    notify(connection_summary() .. " " .. status_lsp_summary(), vim.log.levels.WARN)
     return
   end
   M.request("status", {}, function(err, result)
@@ -2493,7 +2517,7 @@ function M.status()
     local scan_summary = background_scan_summary(result)
     notify(
       string.format(
-        "known=%d cached=%d indexed=%d dirty=%d pending=%d failed=%d unreplayable=%d conflicts=%d stale=%d deleted=%d %s %s%s",
+        "known=%d cached=%d indexed=%d dirty=%d pending=%d failed=%d unreplayable=%d conflicts=%d stale=%d deleted=%d %s %s %s%s",
         result.known_files,
         result.cached_files,
         result.indexed_files or 0,
@@ -2506,6 +2530,7 @@ function M.status()
         result.deleted_files,
         connection_summary(),
         status_remote_summary(result),
+        status_lsp_summary(),
         scan_summary and (" " .. scan_summary) or ""
       )
     )
@@ -2820,6 +2845,159 @@ local function validate_lsp_command(command)
   end
 end
 
+local function clone_list(list)
+  local copy = {}
+  for index, value in ipairs(list or {}) do
+    copy[index] = value
+  end
+  return copy
+end
+
+local function clone_table(value)
+  local ok, copy = pcall(vim.deepcopy, value or {})
+  if ok then
+    return copy
+  end
+  return value or {}
+end
+
+local function normalize_lsp_args(command, opts)
+  if type(command) == "table" and type(command.cmd) == "table" then
+    local client_opts = {}
+    for key, value in pairs(command) do
+      if key ~= "cmd" then
+        client_opts[key] = value
+      end
+    end
+    if opts then
+      client_opts = vim.tbl_deep_extend("force", client_opts, opts)
+    end
+    return command.cmd, client_opts
+  end
+  return command, opts or {}
+end
+
+local function lsp_workspace_id(client)
+  local identity = client_identity(client)
+  if not identity then
+    return nil
+  end
+  return table.concat({
+    identity.workspace_key or "",
+    identity.target_arg or "",
+    identity.files_root or "",
+  }, "\31")
+end
+
+local function lsp_client_by_id(client_id)
+  if vim.lsp and type(vim.lsp.get_client_by_id) == "function" then
+    return vim.lsp.get_client_by_id(client_id)
+  end
+  return nil
+end
+
+local function record_lsp_client(client, client_id, command, opts, config)
+  M.lsp_last = {
+    command = clone_list(command),
+    opts = clone_table(opts),
+  }
+  M.lsp_last_error = nil
+  if client_id == nil then
+    return
+  end
+  local identity = client_identity(client)
+  M.lsp_clients[client_id] = {
+    id = client_id,
+    name = config.name,
+    command = clone_list(command),
+    workspace_id = lsp_workspace_id(client),
+    workspace_key = identity and identity.workspace_key or nil,
+    target = identity and identity.target_arg or nil,
+    files_root = identity and identity.files_root or nil,
+  }
+end
+
+lsp_status_result = function(opts)
+  opts = opts or {}
+  local current_workspace = lsp_workspace_id(M.client)
+  local clients = {}
+  for client_id, record in pairs(M.lsp_clients) do
+    local include = opts.all == true or current_workspace == nil or record.workspace_id == current_workspace
+    if include then
+      local lsp_client = lsp_client_by_id(client_id)
+      if vim.lsp and type(vim.lsp.get_client_by_id) == "function" and not lsp_client then
+        M.lsp_clients[client_id] = nil
+      else
+        table.insert(clients, {
+          id = client_id,
+          name = record.name or (lsp_client and lsp_client.name) or "remote-lsp",
+          command = clone_list(record.command),
+          workspace_key = record.workspace_key,
+          target = record.target,
+          files_root = record.files_root,
+        })
+      end
+    end
+  end
+  table.sort(clients, function(left, right)
+    return tostring(left.id) < tostring(right.id)
+  end)
+  return {
+    active = #clients,
+    clients = clients,
+    connected = M.client ~= nil and M.client.job_id ~= nil,
+    workspace_key = M.client and M.client.hello and optional_string(M.client.hello.workspace_key) or nil,
+    remote_status = M.client and M.client.hello and optional_string(M.client.hello.remote_status) or nil,
+    remote_available = M.client and M.client.hello and M.client.hello.remote_available or nil,
+    remote_error = M.client and M.client.hello and optional_string(M.client.hello.remote_error) or nil,
+    retry_after_ms = M.client and M.client.hello and M.client.hello.retry_after_ms or nil,
+    last_command = M.lsp_last and clone_list(M.lsp_last.command) or nil,
+    last_error = M.lsp_last_error,
+  }
+end
+
+local function stop_lsp_record(client_id, force)
+  local stopped = false
+  local has_lookup = vim.lsp and type(vim.lsp.get_client_by_id) == "function"
+  local lsp_client = lsp_client_by_id(client_id)
+  if lsp_client and type(lsp_client.stop) == "function" then
+    lsp_client:stop(force == true)
+    stopped = true
+  elseif lsp_client and vim.lsp and type(vim.lsp.stop_client) == "function" then
+    vim.lsp.stop_client(client_id, force == true)
+    stopped = true
+  elseif not has_lookup and vim.lsp and type(vim.lsp.stop_client) == "function" then
+    vim.lsp.stop_client(client_id, force == true)
+    stopped = true
+  end
+  M.lsp_clients[client_id] = nil
+  return stopped
+end
+
+stop_lsp_for_client = function(client, opts)
+  opts = opts or {}
+  M.lsp_generation = M.lsp_generation + 1
+  local workspace_id = lsp_workspace_id(client)
+  local stopped = 0
+  for client_id, record in pairs(M.lsp_clients) do
+    if opts.all == true or (workspace_id and record.workspace_id == workspace_id) then
+      if stop_lsp_record(client_id, opts.force) then
+        stopped = stopped + 1
+      end
+    end
+  end
+  if opts.quiet ~= true then
+    if stopped > 0 then
+      notify("stopped " .. tostring(stopped) .. " remote LSP client(s)")
+    elseif not client and opts.all ~= true then
+      notify("remote LSP inactive; not connected", vim.log.levels.WARN)
+    else
+      notify("no remote LSP clients to stop", vim.log.levels.WARN)
+    end
+  end
+  return stopped
+end
+
 local function remote_unavailable_message(prefix, result)
   local message = prefix
   if result and optional_string(result.remote_error) then
@@ -2836,7 +3014,8 @@ function M.lsp_client_config(command, opts)
   if not M.client or not M.client.hello then
     error("not connected; run :RemoteConnect first")
   end
-  validate_lsp_command(command)
+  local lsp_command, client_opts = normalize_lsp_args(command, opts)
+  validate_lsp_command(lsp_command)
 
   local cmd = {
     M.config.sidecar,
@@ -2853,28 +3032,32 @@ function M.lsp_client_config(command, opts)
     table.insert(cmd, tostring(M.config.ssh_connect_timeout_seconds))
   end
   table.insert(cmd, "--")
-  for _, value in ipairs(command) do
+  for _, value in ipairs(lsp_command) do
     table.insert(cmd, value)
   end
 
   return vim.tbl_deep_extend("force", {
     cmd = cmd,
     root_dir = M.client.hello.files_root,
-  }, opts or {})
+  }, client_opts or {})
 end
 
 function M.start_lsp(command, opts)
   if not M.client or not M.client.hello then
     error("not connected; run :RemoteConnect first")
   end
-  validate_lsp_command(command)
+  local lsp_command, client_opts = normalize_lsp_args(command, opts)
+  validate_lsp_command(lsp_command)
 
   local client = M.client
+  M.lsp_generation = M.lsp_generation + 1
+  local generation = M.lsp_generation
   M.remote_probe(function(err, result)
-    if M.client ~= client then
+    if M.client ~= client or generation ~= M.lsp_generation then
       return
     end
     if err then
+      M.lsp_last_error = "remote probe failed before LSP start: " .. tostring(err)
       notify("remote probe failed before LSP start: " .. tostring(err), vim.log.levels.ERROR)
       return
     end
@@ -2882,22 +3065,94 @@ function M.start_lsp(command, opts)
       return
     end
     if not result or result.remote_available ~= true then
+      M.lsp_last_error = remote_unavailable_message("remote unavailable; LSP not started", result)
       notify(
-        remote_unavailable_message("remote unavailable; LSP not started", result),
+        M.lsp_last_error,
         vim.log.levels.WARN
       )
       return
     end
 
-    local ok, config_or_error = pcall(M.lsp_client_config, command, opts)
+    local ok, config_or_error = pcall(M.lsp_client_config, lsp_command, client_opts)
     if not ok then
+      M.lsp_last_error = tostring(config_or_error)
       notify(tostring(config_or_error), vim.log.levels.ERROR)
       return
     end
     vim.schedule(function()
-      vim.lsp.start(config_or_error)
+      if M.client ~= client or generation ~= M.lsp_generation then
+        return
+      end
+      M.lsp_last = {
+        command = clone_list(lsp_command),
+        opts = clone_table(client_opts),
+      }
+      local started, client_id_or_error = pcall(vim.lsp.start, config_or_error)
+      if not started then
+        M.lsp_last_error = tostring(client_id_or_error)
+        notify("remote LSP start failed: " .. tostring(client_id_or_error), vim.log.levels.ERROR)
+        return
+      end
+      record_lsp_client(client, client_id_or_error, lsp_command, client_opts, config_or_error)
+      if client_id_or_error == nil then
+        M.lsp_last_error = "remote LSP start returned no client id"
+        notify(M.lsp_last_error, vim.log.levels.WARN)
+      end
     end)
   end)
+end
+
+function M.lsp_status(opts)
+  opts = opts or {}
+  local result = lsp_status_result(opts)
+  if opts.notify ~= false then
+    local parts = { "remote LSP active=" .. tostring(result.active) }
+    if result.workspace_key then
+      table.insert(parts, "workspace=" .. tostring(result.workspace_key))
+    end
+    if result.last_command then
+      table.insert(parts, "command=" .. table.concat(result.last_command, " "))
+    end
+    if result.remote_status then
+      table.insert(parts, "remote=" .. tostring(result.remote_status))
+    end
+    if result.retry_after_ms then
+      table.insert(parts, "retry_after_ms=" .. tostring(math.floor(tonumber(result.retry_after_ms) or 0)))
+    end
+    if result.last_error then
+      table.insert(parts, "last_error=" .. tostring(result.last_error):gsub("%s+", " "):sub(1, 160))
+    elseif result.active > 0 then
+      local names = {}
+      for _, client in ipairs(result.clients) do
+        table.insert(names, tostring(client.name))
+      end
+      table.insert(parts, "clients=" .. table.concat(names, ","))
+    elseif not result.connected then
+      table.insert(parts, "not_connected")
+    end
+    notify(table.concat(parts, " "), result.active > 0 and vim.log.levels.INFO or vim.log.levels.WARN)
+  end
+  return result
+end
+
+function M.stop_lsp(opts)
+  return stop_lsp_for_client(M.client, opts)
+end
+
+function M.restart_lsp(command, opts)
+  local lsp_command = command
+  local client_opts = opts
+  if lsp_command == nil or (type(lsp_command) == "table" and #lsp_command == 0 and lsp_command.cmd == nil) then
+    if not M.lsp_last then
+      error("no previous remote LSP command to restart")
+    end
+    lsp_command = clone_list(M.lsp_last.command)
+    client_opts = vim.tbl_deep_extend("force", clone_table(M.lsp_last.opts), opts or {})
+  else
+    lsp_command, client_opts = normalize_lsp_args(lsp_command, opts)
+  end
+  M.stop_lsp({ quiet = true, force = true })
+  M.start_lsp(lsp_command, client_opts)
 end
 
 vim.api.nvim_create_augroup("NvimRemoteMirror", { clear = true })

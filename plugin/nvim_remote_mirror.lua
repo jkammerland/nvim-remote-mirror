@@ -145,3 +145,25 @@ end, {
 vim.api.nvim_create_user_command("RemoteStatus", function()
   nrm.status()
 end, {})
+
+vim.api.nvim_create_user_command("RemoteLspStart", function(opts)
+  local command = vim.split(opts.args, "%s+", { trimempty = true })
+  nrm.start_lsp(command)
+end, {
+  nargs = "+",
+})
+
+vim.api.nvim_create_user_command("RemoteLspStop", function()
+  nrm.stop_lsp()
+end, {})
+
+vim.api.nvim_create_user_command("RemoteLspRestart", function(opts)
+  local command = vim.split(opts.args, "%s+", { trimempty = true })
+  nrm.restart_lsp(#command > 0 and command or nil)
+end, {
+  nargs = "*",
+})
+
+vim.api.nvim_create_user_command("RemoteLspStatus", function()
+  nrm.lsp_status()
+end, {})

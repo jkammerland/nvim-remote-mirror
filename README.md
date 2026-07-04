@@ -143,6 +143,10 @@ Dashboard keys:
 | `:RemoteGrep {query}` | Search remote and cached mirror files |
 | `:RemotePrefetch {path...}` | Hydrate files into the mirror |
 | `:RemoteStatus` | Print a status summary |
+| `:RemoteLspStart {cmd...}` | Start a simple remote LSP command |
+| `:RemoteLspStop` | Stop active remote LSP clients for the current workspace |
+| `:RemoteLspRestart [cmd...]` | Restart the last or provided remote LSP command |
+| `:RemoteLspStatus` | Print remote LSP client/status details |
 | `:RemoteSaveQueue [limit]` | Put queued saves in quickfix |
 | `:RemoteFlush` | Flush current remote buffer |
 | `:RemoteAdopt [path]` | Explicitly create or take over a new mirror-root path |

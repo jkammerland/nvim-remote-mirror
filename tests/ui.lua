@@ -105,6 +105,9 @@ local function main()
   nrm.client = fake_client()
   nrm.connection_status = "connected"
   nrm.connection_target = "ssh://host/repo"
+  nrm.lsp_clients = {}
+  nrm.lsp_last = { command = { "rust-analyzer" }, opts = { name = "remote-rust" } }
+  nrm.lsp_last_error = "server exited"
   nrm.request = function(method, params, callback)
     if method == "status" then
       assert_eq(next(params), nil)
@@ -179,6 +182,9 @@ local function main()
 
   local lines = ui._format_dashboard_lines(status)
   assert_line_contains(lines, "Connection")
+  assert_line_contains(lines, "LSP")
+  assert_line_contains(lines, "rust-analyzer")
+  assert_line_contains(lines, "server exited")
   assert_line_contains(lines, "Mirror")
   assert_line_contains(lines, "Mirror Root")
   assert_line_contains(lines, "/mirror/workspace")
