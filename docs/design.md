@@ -44,12 +44,10 @@ changing Neovim commands.
 
 ## Next Milestones
 
-1. Polish the dashboard and queue workflows.
-2. Harden plugin compatibility through mirror path/root semantics.
-3. Add provider adapters for file and grep pickers where mirror files are not enough.
-4. Add conflict diff/resolve commands with explicit accept/retry actions.
-5. Expand remote LSP dogfooding and status reporting.
-6. Add transport abstraction tests before any non-SSH transport work.
+The current daily-driver v1 sprint plan lives in [v1-roadmap.md](v1-roadmap.md).
+In priority order, it covers dashboard and queue workflows, picker/search
+compatibility, remote LSP hardening, formatter/linter/git policy, and release
+readiness.
 
 See [architecture-user-stories.md](architecture-user-stories.md) for the
 reviewed user stories behind the current architecture hardening work.

@@ -209,6 +209,7 @@ to stderr.
 | Doc | Contents |
 | --- | --- |
 | [docs/design.md](docs/design.md) | Goal, architecture, and next milestones |
+| [docs/v1-roadmap.md](docs/v1-roadmap.md) | Daily-driver v1 sprint plan and acceptance gates |
 | [docs/configuration.md](docs/configuration.md) | Configuration options |
 | [docs/plugin-compatibility.md](docs/plugin-compatibility.md) | How normal plugins should interact with mirror paths |
 | [docs/save-recovery.md](docs/save-recovery.md) | Save queue and conflict behavior |
