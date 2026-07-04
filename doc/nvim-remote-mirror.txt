@@ -272,6 +272,9 @@ CONFIGURATION                                  *nvim-remote-mirror-config*
     background_mirror_refresh_limit = 32,
     background_mirror_max_file_bytes = 128 * 1024,
     background_mirror_max_total_bytes = 512 * 1024,
+    picker = {
+      provider = "auto",
+    },
   })
 <
 
@@ -376,6 +379,32 @@ Workspace state keys preserve the legacy identity material: local for local
 workspaces and the bare SSH target string for SSH workspaces. This keeps
 existing mirrors stable, including the historical collision with an SSH target
 named local. Future non-SSH transports should use namespaced identity material.
+
+==============================================================================
+PICKER API                                      *nvim-remote-mirror-pickers*
+
+The generic picker module uses sidecar-backed remote file and grep results with
+builtin vim.ui.select selection. Plugin-specific Telescope/fzf/snacks sources
+are not implemented yet; unknown or unavailable providers warn and use builtin
+selection.
+>
+  local pickers = require("nvim_remote_mirror.pickers")
+
+  pickers.files({
+    query = "src",
+    on_select = function(item)
+      require("nvim_remote_mirror").open(item.path)
+    end,
+  })
+
+  pickers.grep({ query = "TODO" })
+
+  require("nvim_remote_mirror").grep_async("TODO", { limit = 50 }, function(err, result)
+    if not err then
+      vim.print(result.hits)
+    end
+  end)
+<
 
 ==============================================================================
 LIMITS                                        *nvim-remote-mirror-limits*

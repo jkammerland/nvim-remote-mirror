@@ -61,6 +61,9 @@ M.config = {
   background_mirror_refresh_limit = 32,
   background_mirror_max_file_bytes = 128 * 1024,
   background_mirror_max_total_bytes = 512 * 1024,
+  picker = {
+    provider = "auto",
+  },
 }
 
 M.client = nil
@@ -1789,6 +1792,8 @@ end
 function M.open(path, opts)
   opts = opts or {}
   local client = M.client
+  local on_open = type(opts.on_open) == "function" and opts.on_open or nil
+  local on_error = type(opts.on_error) == "function" and opts.on_error or nil
   M.request("open", {
     path = path,
     force = opts.force == true,
@@ -1796,6 +1801,9 @@ function M.open(path, opts)
   }, function(err, result)
     if err then
       notify(err, vim.log.levels.ERROR)
+      if on_error then
+        on_error(err)
+      end
       return
     end
     if not result or result.preempted then
@@ -1808,6 +1816,9 @@ function M.open(path, opts)
       vim.cmd.edit(vim.fn.fnameescape(result.local_path))
       set_remote_buffer_identity(0, client, result)
       warn_cached_open(result)
+      if on_open then
+        on_open(result)
+      end
       vim.defer_fn(function()
         prefetch_related(result.path)
       end, 20)
@@ -2108,6 +2119,209 @@ local function merge_remote_with_dirty_cache(remote_result, dirty_hits)
   end
 
   return merged
+end
+
+function M.grep_async(query, opts, callback)
+  if type(opts) == "function" then
+    callback = opts
+    opts = {}
+  end
+  opts = opts or {}
+  callback = callback or function() end
+  query = query or ""
+  local limit = math.max(tonumber(opts.limit or M.config.grep_limit) or 0, 0)
+  local grep_remote_page_files = math.max(
+    math.floor(tonumber(opts.max_files or opts.remote_page_files or M.config.grep_remote_page_files) or 512),
+    1
+  )
+  local is_current = type(opts.is_current) == "function" and opts.is_current or function()
+    return true
+  end
+  local use_cache = opts.cache ~= false
+  local result_acc = {
+    hits = {},
+    truncated = false,
+    hydrated = 0,
+    hydrate_errors = {},
+    hydrate_truncated = false,
+    scanned_files = 0,
+    source = "remote",
+  }
+  local remote_has_result = false
+  local remote_done = false
+  local remote_error = nil
+  local cache_done = not use_cache
+  local cache_error = nil
+  local cache_result = nil
+  local dirty_cache_hits = {}
+  local finished = false
+
+  local function append_page(result)
+    remote_has_result = true
+    for _, hit in ipairs(result.hits or {}) do
+      table.insert(result_acc.hits, hit)
+    end
+    result_acc.truncated = result.truncated == true
+    result_acc.next_after = result.next_after
+    result_acc.session_id = result.session_id
+    result_acc.scanned_files = (result_acc.scanned_files or 0) + (tonumber(result.scanned_files) or 0)
+    result_acc.hydrated = (result_acc.hydrated or 0) + (tonumber(result.hydrated) or 0)
+    result_acc.hydrate_truncated = result_acc.hydrate_truncated or result.hydrate_truncated == true
+    for _, hydrate_error in ipairs(result.hydrate_errors or {}) do
+      table.insert(result_acc.hydrate_errors, hydrate_error)
+    end
+  end
+
+  local function finish_once(err, result)
+    if finished or not is_current() then
+      return
+    end
+    finished = true
+    callback(err, result)
+  end
+
+  local function finish_if_ready()
+    if finished or not is_current() or not remote_done or not cache_done then
+      return
+    end
+
+    if remote_error and not remote_has_result and #(result_acc.hits or {}) == 0 then
+      if not use_cache or opts.cache_fallback == false then
+        finish_once(remote_error, nil)
+        return
+      end
+      if cache_error then
+        finish_once(remote_error or cache_error, nil)
+        return
+      end
+      cache_result = cache_result or { hits = {} }
+      cache_result.source = "cache"
+      cache_result.remote_error = remote_error
+      finish_once(nil, cache_result)
+      return
+    end
+
+    if result_acc.preempted and not remote_has_result and #(result_acc.hits or {}) == 0 then
+      if use_cache and opts.cache_fallback ~= false and not cache_error then
+        cache_result = cache_result or { hits = {} }
+        cache_result.source = "cache"
+        cache_result.remote_preempted = true
+        finish_once(nil, cache_result)
+        return
+      end
+      if cache_error then
+        result_acc.cache_error = cache_error
+      end
+      finish_once(nil, result_acc)
+      return
+    end
+
+    if remote_error then
+      result_acc.remote_error = remote_error
+      result_acc.truncated = true
+    end
+    if cache_error then
+      result_acc.cache_error = cache_error
+    end
+
+    local merged = use_cache and merge_remote_with_dirty_cache(result_acc, dirty_cache_hits) or result_acc
+    if remote_error then
+      merged.remote_error = remote_error
+      merged.truncated = true
+    end
+    if cache_error then
+      merged.cache_error = cache_error
+    end
+    finish_once(nil, merged)
+  end
+
+  local function request_cache()
+    if not use_cache or not is_current() then
+      return
+    end
+    request_async("grep_cache", {
+      query = query,
+      limit = limit,
+      max_files = opts.cache_max_files or M.config.grep_cache_max_files,
+      max_file_bytes = opts.cache_max_file_bytes or M.config.grep_cache_max_file_bytes,
+      max_total_bytes = opts.cache_max_total_bytes or M.config.grep_cache_max_total_bytes,
+    }, function(cache_err, result)
+      if not is_current() then
+        return
+      end
+      if cache_err then
+        cache_error = cache_err
+      else
+        cache_result = result or { hits = {} }
+        dirty_cache_hits = {}
+        for _, hit in ipairs(cache_result.hits or {}) do
+          if hit.dirty and optional_string(hit.local_path) then
+            table.insert(dirty_cache_hits, hit)
+          end
+        end
+      end
+      cache_done = true
+      finish_if_ready()
+    end)
+  end
+
+  local function request_page(after, session_id)
+    if not is_current() then
+      return
+    end
+    local remaining = math.max(limit - #(result_acc.hits or {}), 0)
+    if remaining <= 0 then
+      result_acc.truncated = true
+      remote_done = true
+      finish_if_ready()
+      return
+    end
+    request_async("grep", {
+      query = query,
+      limit = remaining,
+      after = after,
+      session_id = session_id,
+      max_files = grep_remote_page_files,
+      hydrate = opts.hydrate ~= false,
+      max_file_bytes = opts.max_file_bytes or M.config.grep_remote_max_file_bytes,
+      max_total_bytes = opts.max_total_bytes or M.config.grep_remote_max_total_bytes,
+    }, function(err, result)
+      if not is_current() then
+        return
+      end
+      if err then
+        remote_error = err
+        remote_done = true
+        finish_if_ready()
+        return
+      end
+      result = result or { hits = {} }
+      if result.preempted then
+        result_acc.truncated = true
+        result_acc.preempted = true
+        result_acc.next_after = optional_string(result.next_after) or after
+        result_acc.session_id = optional_string(result.session_id) or session_id
+        remote_done = true
+        finish_if_ready()
+        return
+      end
+      append_page(result)
+      local next_after = optional_string(result.next_after)
+      local next_session_id = optional_string(result.session_id)
+      local has_more = result.truncated == true
+        and (next_after or next_session_id)
+        and #(result_acc.hits or {}) < limit
+      if has_more then
+        request_page(next_after, next_session_id)
+      else
+        remote_done = true
+        finish_if_ready()
+      end
+    end)
+  end
+
+  request_page(nil, nil)
+  request_cache()
 end
 
 function M.grep(query)

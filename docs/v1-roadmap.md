@@ -135,9 +135,10 @@ remote truth.
   data without quickfix side effects.
 - Provide generic APIs that optional integrations can call without making
   Telescope, fzf-lua, snacks, or other pickers required dependencies.
-- Add `picker.provider = "auto"` configuration with `"builtin"`,
-  `"telescope"`, `"fzf_lua"`, `"snacks"`, and `"mini_pick"` as explicit values.
-- Display workspace-relative paths; open selections through `RemoteOpen`.
+- Add `picker.provider = "auto"` configuration for builtin `vim.ui.select`
+  selection; non-builtin provider names warn and fall back until plugin-specific
+  adapters are implemented.
+- Display workspace-relative paths; open selections through the Lua `open()` API.
 - Prefer sidecar-backed `find_paths` and `grep` over scanning hydrated mirror
   files.
 

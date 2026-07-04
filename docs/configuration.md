@@ -61,6 +61,12 @@ files.
 | `prefetch_max_file_bytes` | `4 MiB` |
 | `prefetch_max_total_bytes` | `16 MiB` |
 
+## Picker Integration
+
+| Option | Default | Notes |
+| --- | --- | --- |
+| `picker.provider` | `auto` | `auto` and `builtin` use `vim.ui.select`; non-builtin providers are reserved for future adapters and currently warn before using builtin |
+
 ## Save Adoption
 
 | Option | Default | Notes |

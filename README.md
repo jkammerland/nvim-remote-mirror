@@ -171,6 +171,28 @@ Dashboard keys:
 
 See [docs/configuration.md](docs/configuration.md) for the larger option list.
 
+## Picker API
+
+The generic picker adapter uses sidecar-backed remote results with builtin
+`vim.ui.select` selection. Plugin-specific Telescope/fzf/snacks sources are not
+implemented yet; non-builtin provider names warn and use the builtin selector.
+
+```lua
+local pickers = require("nvim_remote_mirror.pickers")
+
+pickers.files({
+  query = "src",
+  on_select = function(item)
+    require("nvim_remote_mirror").open(item.path)
+  end,
+})
+
+pickers.grep({ query = "TODO" })
+```
+
+For data-only integrations, call `require("nvim_remote_mirror").grep_async()`
+to receive grep hits without quickfix side effects.
+
 Mirror files live under the sidecar state directory, typically below
 `~/.local/state/nvim-remote-mirror` on Linux when `state_dir` is unset. Open
 `:RemoteWorkspace` to inspect the active mirror root and files root.

@@ -42,8 +42,8 @@ root. This makes cwd-based plugins behave like they are inside the project:
 | Plugin class | Current strategy |
 | --- | --- |
 | Motions, text objects, syntax | Work on local buffers |
-| File pickers | Use mirror files or remote-specific picker commands |
-| Grep/search | Prefer sidecar-backed `:RemoteGrep`; local grep only sees hydrated files |
+| File pickers | Use mirror files or `require("nvim_remote_mirror.pickers").files()` |
+| Grep/search | Prefer sidecar-backed `:RemoteGrep` or `pickers.grep()`; local grep only sees hydrated files |
 | LSP | Run remote server through the LSP proxy with path translation |
 | Formatters/linters | Need explicit local-vs-remote tool policy |
 | Git plugins | Need a remote git adapter or sidecar git commands |
@@ -72,3 +72,10 @@ provide. The preferred order is:
 2. Provide small path/root helpers.
 3. Add a focused adapter for remote-only behavior.
 4. Avoid making general UI plugins required dependencies.
+
+The first generic adapter is `require("nvim_remote_mirror.pickers")`. It uses
+sidecar-backed file and grep APIs with builtin `vim.ui.select` selection.
+Plugin-specific Telescope/fzf/snacks sources are future work; non-builtin
+provider names warn and use builtin selection today. Data-only integrations
+should call `require("nvim_remote_mirror").grep_async()` instead of scraping
+quickfix.
