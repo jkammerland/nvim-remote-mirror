@@ -21,7 +21,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
     mpsc, Arc, Condvar, Mutex, OnceLock,
@@ -40,6 +40,7 @@ const SEARCH_INDEX_MAX_FILE_BYTES: u64 = DEFAULT_BATCH_MAX_FILE_BYTES;
 const SEARCH_TRIGRAM_BYTES: usize = 3;
 const REMOTE_UNAVAILABLE_BACKOFF_BASE_MS: u64 = 2_000;
 const REMOTE_UNAVAILABLE_BACKOFF_MAX_MS: u64 = 60_000;
+const LSP_PROXY_EXIT_GRACE_MS: u64 = 500;
 const MAX_SAVE_PAYLOAD_BYTES: u64 = (MAX_FRAME_LEN - (1024 * 1024)) as u64;
 const SAVE_INLINE_MAX_BYTES: u64 = 4 * 1024 * 1024;
 const FAST_FLUSH_SNAPSHOT_MAX_BYTES: u64 = 1024 * 1024;
@@ -6796,29 +6797,160 @@ fn run_lsp_proxy(
     let upstream_local = local_prefix.clone();
     let upstream_remote = remote_prefix.clone();
 
-    let _upstream = thread::spawn(move || -> Result<()> {
+    let child = Arc::new(Mutex::new(child));
+    let upstream_child = Arc::clone(&child);
+    let mut upstream = Some(thread::spawn(move || -> Result<()> {
         let stdin = io::stdin();
         let mut client_reader = BufReader::new(stdin.lock());
-        while let Some(body) = read_lsp_message(&mut client_reader)? {
-            let rewritten = rewrite_lsp_body(&body, &upstream_local, &upstream_remote)?;
-            write_lsp_message(&mut server_stdin, &rewritten)?;
-        }
-        Ok(())
-    });
+        let result = (|| -> Result<()> {
+            while let Some(body) = read_lsp_message(&mut client_reader)? {
+                let rewritten = rewrite_lsp_body(&body, &upstream_local, &upstream_remote)?;
+                write_lsp_message(&mut server_stdin, &rewritten)?;
+            }
+            Ok(())
+        })();
+        drop(server_stdin);
+        finish_lsp_upstream_result(
+            result,
+            &upstream_child,
+            Duration::from_millis(LSP_PROXY_EXIT_GRACE_MS),
+        )
+    }));
 
     let stdout = io::stdout();
     let mut client_writer = stdout.lock();
     let mut server_reader = BufReader::new(server_stdout);
-    while let Some(body) = read_lsp_message(&mut server_reader)? {
-        let rewritten = rewrite_lsp_body(&body, &remote_prefix, &local_prefix)?;
-        write_lsp_message(&mut client_writer, &rewritten)?;
+    let downstream_result = (|| -> Result<()> {
+        while let Some(body) = read_lsp_message(&mut server_reader)? {
+            let rewritten = rewrite_lsp_body(&body, &remote_prefix, &local_prefix)?;
+            write_lsp_message(&mut client_writer, &rewritten)?;
+        }
+        Ok(())
+    })();
+    if let Err(err) = downstream_result {
+        return fail_lsp_downstream(err, &child, &mut upstream);
     }
 
-    let status = child.wait()?;
+    join_lsp_upstream_if_finished(&mut upstream, &child)?;
+
+    let status = {
+        let mut child = child
+            .lock()
+            .map_err(|_| anyhow!("language server child lock poisoned"))?;
+        wait_lsp_child_with_grace(&mut child, Duration::from_millis(LSP_PROXY_EXIT_GRACE_MS))?
+    };
+    join_lsp_upstream_if_finished(&mut upstream, &child)?;
     if !status.success() {
         bail!("language server exited with {status}");
     }
     Ok(())
+}
+
+fn fail_lsp_downstream(
+    err: anyhow::Error,
+    child: &Arc<Mutex<Child>>,
+    upstream: &mut Option<thread::JoinHandle<Result<()>>>,
+) -> Result<()> {
+    let status_context = match kill_and_wait_lsp_child_handle(child) {
+        Ok(status) => format!("language server stopped with {status}"),
+        Err(wait_err) => format!("failed to reap language server: {wait_err:#}"),
+    };
+    if let Err(upstream_err) = join_lsp_upstream_if_finished(upstream, child) {
+        return Err(err).context(format!(
+            "LSP proxy downstream pump failed; {status_context}; upstream also failed: {upstream_err:#}"
+        ));
+    }
+    Err(err).context(format!(
+        "LSP proxy downstream pump failed; {status_context}"
+    ))
+}
+
+fn finish_lsp_upstream_result(
+    result: Result<()>,
+    child: &Arc<Mutex<Child>>,
+    grace: Duration,
+) -> Result<()> {
+    match result {
+        Ok(()) => {
+            let status = wait_lsp_child_handle_with_grace(child, grace)
+                .context("language server did not stop after LSP client input closed")?;
+            if !status.success() {
+                bail!("language server exited with {status}");
+            }
+            Ok(())
+        }
+        Err(err) => {
+            let status_context = match kill_and_wait_lsp_child_handle(child) {
+                Ok(status) => format!("language server stopped with {status}"),
+                Err(wait_err) => format!("failed to reap language server: {wait_err:#}"),
+            };
+            Err(err).context(status_context)
+        }
+    }
+}
+
+fn join_lsp_upstream_if_finished(
+    upstream: &mut Option<thread::JoinHandle<Result<()>>>,
+    child: &Arc<Mutex<Child>>,
+) -> Result<()> {
+    let finished = upstream
+        .as_ref()
+        .map(|handle| handle.is_finished())
+        .unwrap_or(false);
+    if !finished {
+        return Ok(());
+    }
+    let handle = upstream.take().expect("checked upstream handle");
+    match handle.join() {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(err)) => {
+            let status_context = match kill_and_wait_lsp_child_handle(child) {
+                Ok(status) => format!("language server stopped with {status}"),
+                Err(wait_err) => format!("failed to reap language server: {wait_err:#}"),
+            };
+            Err(err).context(format!("LSP proxy upstream pump failed; {status_context}"))
+        }
+        Err(_) => {
+            let status_context = match kill_and_wait_lsp_child_handle(child) {
+                Ok(status) => format!("language server stopped with {status}"),
+                Err(wait_err) => format!("failed to reap language server: {wait_err:#}"),
+            };
+            bail!("LSP proxy upstream pump panicked; {status_context}")
+        }
+    }
+}
+
+fn wait_lsp_child_handle_with_grace(
+    child: &Arc<Mutex<Child>>,
+    grace: Duration,
+) -> Result<ExitStatus> {
+    let mut child = child
+        .lock()
+        .map_err(|_| anyhow!("language server child lock poisoned"))?;
+    wait_lsp_child_with_grace(&mut child, grace)
+}
+
+fn kill_and_wait_lsp_child_handle(child: &Arc<Mutex<Child>>) -> Result<ExitStatus> {
+    let mut child = child
+        .lock()
+        .map_err(|_| anyhow!("language server child lock poisoned"))?;
+    kill_child_tree(&mut child);
+    child.wait().context("failed to wait for language server")
+}
+
+fn wait_lsp_child_with_grace(child: &mut Child, grace: Duration) -> Result<ExitStatus> {
+    let deadline = Instant::now() + grace;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        if Instant::now() >= deadline {
+            kill_child_tree(child);
+            let status = child.wait()?;
+            bail!("language server did not exit within {grace:?}; killed with {status}");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 struct LspLaunch {
@@ -11288,6 +11420,159 @@ mod tests {
         let stdout = String::from_utf8(output.stdout).unwrap();
         assert!(stdout.contains(&format!("PWD=<{}>", remote_root.display())));
         assert!(stdout.contains("ARG=<arg with spaces; $(echo nope)>"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lsp_wait_reports_child_exit_status() {
+        let mut child = Command::new("sh").arg("-c").arg("exit 7").spawn().unwrap();
+        let status = wait_lsp_child_with_grace(&mut child, Duration::from_secs(1)).unwrap();
+        assert_eq!(status.code(), Some(7));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lsp_wait_kills_stalled_child_after_grace() {
+        let mut child = Command::new("sh").arg("-c").arg("sleep 5").spawn().unwrap();
+        let started = Instant::now();
+        let err = wait_lsp_child_with_grace(&mut child, Duration::from_millis(20)).unwrap_err();
+        let elapsed = started.elapsed();
+        assert!(
+            err.to_string().contains("language server did not exit"),
+            "{err:#}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "wait should kill promptly, elapsed {elapsed:?}"
+        );
+        let status = child.try_wait().unwrap().expect("child should be reaped");
+        assert!(!status.success());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lsp_upstream_eof_kills_stalled_child_after_grace() {
+        let child = Arc::new(Mutex::new(
+            Command::new("sh").arg("-c").arg("sleep 5").spawn().unwrap(),
+        ));
+        let started = Instant::now();
+        let err =
+            finish_lsp_upstream_result(Ok(()), &child, Duration::from_millis(20)).unwrap_err();
+        let elapsed = started.elapsed();
+
+        assert!(
+            format!("{err:#}")
+                .contains("language server did not stop after LSP client input closed"),
+            "{err:#}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "upstream EOF should not wait for natural child exit, elapsed {elapsed:?}"
+        );
+        let status = child
+            .lock()
+            .unwrap()
+            .try_wait()
+            .unwrap()
+            .expect("child should be reaped");
+        assert!(!status.success());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lsp_upstream_pending_join_returns_without_blocking() {
+        let child = Arc::new(Mutex::new(
+            Command::new("sh").arg("-c").arg("sleep 5").spawn().unwrap(),
+        ));
+        let child_for_join = Arc::clone(&child);
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let (done_tx, done_rx) = mpsc::channel::<(Result<()>, bool, bool)>();
+        let joiner = thread::spawn(move || {
+            let mut upstream = Some(thread::spawn(move || -> Result<()> {
+                release_rx.recv().unwrap();
+                Ok(())
+            }));
+            let result = join_lsp_upstream_if_finished(&mut upstream, &child_for_join);
+            let upstream_pending = upstream.is_some();
+            let child_running = child_for_join.lock().unwrap().try_wait().unwrap().is_none();
+            done_tx
+                .send((result, upstream_pending, child_running))
+                .unwrap();
+        });
+
+        let (result, upstream_pending, child_running) =
+            match done_rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(received) => received,
+                Err(_) => {
+                    release_tx.send(()).unwrap();
+                    joiner.join().unwrap();
+                    panic!("unfinished upstream join should return promptly");
+                }
+            };
+        result.unwrap();
+        assert!(upstream_pending);
+        assert!(child_running);
+
+        release_tx.send(()).unwrap();
+        joiner.join().unwrap();
+        kill_and_wait_lsp_child_handle(&child).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lsp_downstream_error_kills_and_reaps_child() {
+        let child = Arc::new(Mutex::new(
+            Command::new("sh").arg("-c").arg("sleep 5").spawn().unwrap(),
+        ));
+        let mut upstream = None;
+
+        let err = fail_lsp_downstream(anyhow!("client stdout closed"), &child, &mut upstream)
+            .unwrap_err();
+
+        assert!(format!("{err:#}").contains("LSP proxy downstream pump failed"));
+        assert!(format!("{err:#}").contains("client stdout closed"));
+        let status = child
+            .lock()
+            .unwrap()
+            .try_wait()
+            .unwrap()
+            .expect("child should be reaped");
+        assert!(!status.success());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lsp_upstream_finished_join_succeeds_without_killing_child() {
+        let child = Arc::new(Mutex::new(
+            Command::new("sh").arg("-c").arg("sleep 5").spawn().unwrap(),
+        ));
+        let mut upstream = Some(thread::spawn(|| -> Result<()> { Ok(()) }));
+        while !upstream.as_ref().unwrap().is_finished() {
+            thread::sleep(Duration::from_millis(1));
+        }
+        join_lsp_upstream_if_finished(&mut upstream, &child).unwrap();
+
+        assert!(child.lock().unwrap().try_wait().unwrap().is_none());
+        kill_and_wait_lsp_child_handle(&child).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lsp_upstream_error_kills_child_handle() {
+        let child = Arc::new(Mutex::new(
+            Command::new("sh").arg("-c").arg("sleep 5").spawn().unwrap(),
+        ));
+        let mut upstream = Some(thread::spawn(|| -> Result<()> {
+            bail!("upstream broken pipe")
+        }));
+        while !upstream.as_ref().unwrap().is_finished() {
+            thread::sleep(Duration::from_millis(1));
+        }
+
+        let err = join_lsp_upstream_if_finished(&mut upstream, &child).unwrap_err();
+        assert!(format!("{err:#}").contains("upstream broken pipe"));
+        let status = child.lock().unwrap().wait().unwrap();
+        assert!(!status.success());
     }
 
     #[cfg(unix)]
