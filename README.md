@@ -122,6 +122,7 @@ Dashboard keys:
 | `z` | Set current tab cwd to the mirror files root |
 | `s` | Save queue |
 | `C` | Conflicts |
+| `F` | Flush queued saves |
 | `r` | Refresh dashboard |
 | `R` | Reconnect |
 | `d` | Disconnect |

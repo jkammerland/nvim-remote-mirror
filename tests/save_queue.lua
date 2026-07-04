@@ -52,6 +52,15 @@ local function qf_first_text()
   return items[1] and items[1].text or nil
 end
 
+local function wait_for_quickfix_text(needle)
+  local ok = vim.wait(300, function()
+    return tostring(qf_first_text()):find(needle, 1, true) ~= nil
+  end)
+  if not ok then
+    error("timed out waiting for quickfix text " .. vim.inspect(needle))
+  end
+end
+
 local function main()
   local calls = {}
   local tmp = vim.fn.tempname()
@@ -76,6 +85,7 @@ local function main()
         pending = 1,
         failed = 1,
         conflict = 1,
+        unreplayable = 1,
       },
       entries = {
         {
@@ -121,8 +131,13 @@ local function main()
   assert_contains(items[3].text, "remote=" .. remote_conflict)
   assert_eq(vim.fn.bufname(items[3].bufnr), remote_conflict)
   assert_contains(notifications[1].message, "showing=3 total=4")
+  assert_contains(notifications[1].message, "unreplayable=1")
   assert_contains(notifications[1].message, "truncated_at=3")
   assert_eq(notifications[1].level, vim.log.levels.ERROR)
+  assert_contains(
+    nrm.format_save_queue_entry({ state = "unreplayable", path = "lost.rs" }),
+    "snapshot=missing"
+  )
 
   nrm.request = function(method, params, callback)
     table.insert(calls, { method = method, params = params })
@@ -143,6 +158,37 @@ local function main()
   wait_for_notification_count(2)
   assert_eq(notifications[2].message, "save queue is empty")
   assert_eq(#calls, 2)
+
+  nrm.request = function(method, params, callback)
+    table.insert(calls, { method = method, params = params })
+    assert_eq(method, "save_queue")
+    assert_eq(next(params), nil)
+    callback(nil, {
+      total = 1,
+      counts = {
+        pending = 0,
+        failed = 0,
+        conflict = 0,
+        unreplayable = 1,
+      },
+      entries = {
+        {
+          queue_id = 13,
+          path = "lost.rs",
+          state = "unreplayable",
+          local_path = tmp .. "/lost.rs",
+        },
+      },
+    })
+  end
+
+  nrm.save_queue()
+  wait_for_quickfix_count(1)
+  wait_for_notification_count(3)
+  assert_contains(qf_first_text(), "[unreplayable] #13 lost.rs")
+  assert_contains(qf_first_text(), "snapshot=missing")
+  assert_contains(notifications[3].message, "unreplayable=1")
+  assert_eq(notifications[3].level, vim.log.levels.WARN)
 
   local pending = {}
   nrm.client = { job_id = 1, hello = { workspace_key = "workspace-a" } }
@@ -167,7 +213,7 @@ local function main()
       },
     },
   })
-  wait_for_quickfix_count(1)
+  wait_for_quickfix_text("[pending] #11 new.rs")
   assert_eq(qf_title(), "RemoteSaveQueue")
   assert_eq(qf_first_text(), "[pending] #11 new.rs")
 

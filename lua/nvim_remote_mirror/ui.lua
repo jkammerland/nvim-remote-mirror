@@ -5,6 +5,8 @@ local M = {}
 local state = {
   buf = nil,
   win = nil,
+  dashboard_generation = 0,
+  queue_generation = 0,
 }
 
 local function notify(message, level)
@@ -12,8 +14,15 @@ local function notify(message, level)
 end
 
 local function value(text, fallback)
-  if text == nil or text == "" then
+  if text == nil or text == vim.NIL or text == "" then
     return fallback or "-"
+  end
+  return tostring(text)
+end
+
+local function optional_path(text)
+  if text == nil or text == vim.NIL or text == "" then
+    return nil
   end
   return tostring(text)
 end
@@ -59,8 +68,9 @@ local function format_dashboard_lines(status, err)
 
   add_section(lines, "Actions")
   table.insert(lines, "  c connect    o open       f files      g grep")
-  table.insert(lines, "  z cwd        s saves      C conflicts  r refresh")
-  table.insert(lines, "  d disconnect R reconnect  q close      x close")
+  table.insert(lines, "  z cwd        s saves      C conflicts  F flush")
+  table.insert(lines, "  r refresh    d disconnect R reconnect  q close")
+  table.insert(lines, "  x close")
 
   add_section(lines, "Connection")
   add_line(lines, "State", connection.status)
@@ -110,11 +120,14 @@ local function close()
     vim.api.nvim_win_close(state.win, true)
   end
   state.win = nil
+  state.dashboard_generation = state.dashboard_generation + 1
 end
 
 local function map(buf, lhs, rhs, desc)
   vim.keymap.set("n", lhs, rhs, { buffer = buf, nowait = true, silent = true, desc = desc })
 end
+
+local flush_queue_safe
 
 local function ensure_window()
   if state.win and vim.api.nvim_win_is_valid(state.win) then
@@ -137,6 +150,7 @@ local function ensure_window()
     title = " Remote Workspace ",
     title_pos = "center",
   })
+  state.dashboard_generation = state.dashboard_generation + 1
   vim.wo[state.win].wrap = false
   vim.wo[state.win].cursorline = true
 
@@ -144,6 +158,25 @@ local function ensure_window()
   map(state.buf, "x", close, "Remote mirror: close")
   map(state.buf, "s", M.queue, "Remote mirror: queue")
   map(state.buf, "C", M.conflicts, "Remote mirror: conflicts")
+  map(state.buf, "F", function()
+    local generation = state.dashboard_generation
+    local buf = state.buf
+    local win = state.win
+    flush_queue_safe({
+      on_done = function()
+        if
+          generation ~= state.dashboard_generation
+          or state.buf ~= buf
+          or state.win ~= win
+          or not win
+          or not vim.api.nvim_win_is_valid(win)
+        then
+          return
+        end
+        M.refresh_workspace()
+      end,
+    })
+  end, "Remote mirror: flush queue")
   map(state.buf, "r", M.refresh_workspace, "Remote mirror: refresh")
   map(state.buf, "c", M.connect, "Remote mirror: connect")
   map(state.buf, "o", M.open, "Remote mirror: open")
@@ -172,10 +205,13 @@ end
 
 function M.refresh_workspace()
   ensure_window()
+  state.queue_generation = state.queue_generation + 1
+  local generation = state.dashboard_generation
+  local buf = state.buf
   set_lines({ "nvim-remote-mirror", "", "Loading workspace status..." })
   nrm.status_async(function(err, status)
     vim.schedule(function()
-      if not state.buf or not vim.api.nvim_buf_is_valid(state.buf) then
+      if generation ~= state.dashboard_generation or state.buf ~= buf or not state.buf or not vim.api.nvim_buf_is_valid(state.buf) then
         return
       end
       set_lines(format_dashboard_lines(status, err))
@@ -298,45 +334,81 @@ local function diff_paths(left, right)
   vim.cmd("vertical diffsplit " .. vim.fn.fnameescape(right))
 end
 
+flush_queue_safe = function(opts)
+  local ok, err = pcall(nrm.flush_queue, opts or {})
+  if not ok then
+    notify(tostring(err), vim.log.levels.ERROR)
+  end
+end
+
+local function user_queue_opts(opts)
+  local result = {}
+  for key, val in pairs(opts or {}) do
+    if key ~= "_queue_generation" then
+      result[key] = val
+    end
+  end
+  return result
+end
+
 local function queue_actions(entry, opts)
   opts = opts or {}
   local actions = {}
-  if entry.local_path then
+  local local_path = optional_path(entry.local_path)
+  local snapshot_path = optional_path(entry.snapshot_path)
+  local remote_conflict_path = optional_path(entry.remote_conflict_path)
+  if local_path then
     table.insert(actions, {
       label = "Open local mirror file",
       run = function()
-        edit_path(entry.local_path)
+        edit_path(local_path)
       end,
     })
   end
-  if entry.snapshot_path then
+  if snapshot_path then
     table.insert(actions, {
       label = "Open saved snapshot",
       run = function()
-        edit_path(entry.snapshot_path)
+        edit_path(snapshot_path)
       end,
     })
   end
-  if entry.remote_conflict_path then
+  if remote_conflict_path then
     table.insert(actions, {
       label = "Open remote conflict copy",
       run = function()
-        edit_path(entry.remote_conflict_path)
+        edit_path(remote_conflict_path)
       end,
     })
   end
-  if entry.local_path and entry.remote_conflict_path then
+  if snapshot_path and remote_conflict_path then
     table.insert(actions, {
-      label = "Diff local vs remote conflict",
+      label = "Diff saved snapshot vs remote conflict",
       run = function()
-        diff_paths(entry.local_path, entry.remote_conflict_path)
+        diff_paths(snapshot_path, remote_conflict_path)
+      end,
+    })
+  end
+  if local_path and remote_conflict_path then
+    table.insert(actions, {
+      label = "Diff local mirror vs remote conflict",
+      run = function()
+        diff_paths(local_path, remote_conflict_path)
       end,
     })
   end
   table.insert(actions, {
     label = "Retry queued saves",
     run = function()
-      nrm.flush_queue()
+      local generation = opts._queue_generation
+      flush_queue_safe({
+        on_done = function(err)
+          if err or (generation and generation ~= state.queue_generation) then
+            return
+          end
+          M.queue(user_queue_opts(opts))
+        end,
+      })
     end,
   })
   table.insert(actions, {
@@ -385,10 +457,15 @@ end
 
 function M.queue(opts)
   opts = opts or {}
+  state.queue_generation = state.queue_generation + 1
+  local generation = state.queue_generation
   nrm.save_queue_async({
     limit = opts.limit or 100,
     state = opts.conflicts_only and "conflict" or nil,
   }, function(err, result)
+    if generation ~= state.queue_generation then
+      return
+    end
     if err then
       notify(err, vim.log.levels.ERROR)
       return
@@ -411,8 +488,10 @@ function M.queue(opts)
         return nrm.format_save_queue_entry(entry)
       end,
     }, function(entry)
-      if entry then
-        select_queue_action(entry, opts)
+      if entry and generation == state.queue_generation then
+        local action_opts = user_queue_opts(opts)
+        action_opts._queue_generation = generation
+        select_queue_action(entry, action_opts)
       end
     end)
   end)

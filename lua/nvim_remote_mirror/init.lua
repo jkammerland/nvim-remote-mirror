@@ -586,6 +586,9 @@ local function save_queue_entry_text(entry)
   if remote_conflict_path then
     table.insert(parts, "remote=" .. remote_conflict_path)
   end
+  if state == "unreplayable" and not optional_string(entry.snapshot_path) then
+    table.insert(parts, "snapshot=missing")
+  end
   local last_error = optional_string(entry.last_error)
   if last_error then
     table.insert(parts, "error=" .. last_error:sub(1, 160))
@@ -598,7 +601,7 @@ local function save_queue_level(counts)
   if (tonumber(counts.conflict) or 0) > 0 then
     return vim.log.levels.ERROR
   end
-  if (tonumber(counts.failed) or 0) > 0 then
+  if (tonumber(counts.failed) or 0) > 0 or (tonumber(counts.unreplayable) or 0) > 0 then
     return vim.log.levels.WARN
   end
   return vim.log.levels.INFO
@@ -2358,11 +2361,12 @@ function M.save_queue(opts)
       local counts = result.counts or {}
       local total = tonumber(result.total) or #entries
       local message = string.format(
-        "save queue: showing=%d total=%d pending=%d failed=%d conflicts=%d",
+        "save queue: showing=%d total=%d pending=%d failed=%d unreplayable=%d conflicts=%d",
         #entries,
         total,
         tonumber(counts.pending) or 0,
         tonumber(counts.failed) or 0,
+        tonumber(counts.unreplayable) or 0,
         tonumber(counts.conflict) or 0
       )
       if result.truncated then

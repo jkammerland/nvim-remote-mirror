@@ -97,8 +97,8 @@ UI                                                *nvim-remote-mirror-ui*
 
 Dashboard keys:
     c connect        o open path      f find files     g grep
-    z cwd            s save queue     C conflicts      r refresh
-    d disconnect     R reconnect      q/x close
+    z cwd            s save queue     C conflicts      F flush queue
+    r refresh        d disconnect     R reconnect      q/x close
 
 ==============================================================================
 COMMANDS                                      *nvim-remote-mirror-commands*
@@ -191,9 +191,9 @@ COMMANDS                                      *nvim-remote-mirror-commands*
     queued, conflict, and remaining counts.
 
 :RemoteSaveQueue [limit]
-    List pending, failed, and conflicted saves from the local durable queue in
-    quickfix. This command reads local mirror state only, so it remains useful
-    while the remote is unavailable.
+    List pending, failed, unreplayable, and conflicted saves from the local
+    durable queue in quickfix. This command reads local mirror state only, so it
+    remains useful while the remote is unavailable.
 
 :RemoteValidate [path]
     Validate the current remote buffer or a workspace-relative path against the

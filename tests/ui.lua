@@ -44,6 +44,33 @@ local function assert_dashboard_closed(message)
   assert_eq(vim.bo.filetype == "nrm-dashboard", false, message)
 end
 
+local function find_action(actions, label)
+  for _, action in ipairs(actions) do
+    if action.label == label then
+      return action
+    end
+  end
+  error("missing action " .. vim.inspect(label))
+end
+
+local function action_exists(actions, label)
+  for _, action in ipairs(actions) do
+    if action.label == label then
+      return true
+    end
+  end
+  return false
+end
+
+local function find_buf_map(lhs)
+  for _, mapping in ipairs(vim.api.nvim_buf_get_keymap(0, "n")) do
+    if mapping.lhs == lhs then
+      return mapping
+    end
+  end
+  error("missing buffer map " .. vim.inspect(lhs))
+end
+
 local function fake_client()
   return {
     job_id = 1,
@@ -157,6 +184,7 @@ local function main()
   assert_line_contains(lines, "/mirror/workspace")
   assert_line_contains(lines, "Save Queue")
   assert_line_contains(lines, "z cwd")
+  assert_line_contains(lines, "F flush")
   assert_line_contains(lines, "src/main.rs")
 
   local find_result = nil
@@ -181,6 +209,65 @@ local function main()
 
   local actions = ui._queue_actions(queue_result.entries[1])
   assert_eq(#actions >= 4, true)
+
+  local tmp = vim.fn.tempname()
+  vim.fn.mkdir(tmp, "p")
+  local local_path = tmp .. "/local.rs"
+  local snapshot_path = tmp .. "/snapshot.rs"
+  local remote_path = tmp .. "/remote.rs"
+  vim.fn.writefile({ "local" }, local_path)
+  vim.fn.writefile({ "snapshot" }, snapshot_path)
+  vim.fn.writefile({ "remote" }, remote_path)
+  local conflict_actions = ui._queue_actions({
+    path = "src/lib.rs",
+    state = "conflict",
+    local_path = local_path,
+    snapshot_path = snapshot_path,
+    remote_conflict_path = remote_path,
+  })
+  find_action(conflict_actions, "Diff saved snapshot vs remote conflict")
+  find_action(conflict_actions, "Diff local mirror vs remote conflict")
+
+  local null_path_actions = ui._queue_actions({
+    path = "lost.rs",
+    state = "unreplayable",
+    local_path = vim.NIL,
+    snapshot_path = vim.NIL,
+    remote_conflict_path = vim.NIL,
+  })
+  assert_eq(action_exists(null_path_actions, "Open local mirror file"), false)
+  assert_eq(action_exists(null_path_actions, "Open saved snapshot"), false)
+  assert_eq(action_exists(null_path_actions, "Open remote conflict copy"), false)
+  assert_eq(action_exists(null_path_actions, "Diff saved snapshot vs remote conflict"), false)
+  assert_eq(action_exists(null_path_actions, "Diff local mirror vs remote conflict"), false)
+  assert_eq(action_exists(null_path_actions, "Retry queued saves"), true)
+
+  local old_cmd = vim.cmd
+  local commands = {}
+  vim.cmd = function(command)
+    table.insert(commands, command)
+  end
+  find_action(conflict_actions, "Diff saved snapshot vs remote conflict").run()
+  vim.cmd = old_cmd
+  assert_contains(commands[1], snapshot_path)
+  assert_contains(commands[2], remote_path)
+
+  local old_flush_queue = nrm.flush_queue
+  local old_ui_queue = ui.queue
+  local refreshed = false
+  nrm.flush_queue = function(opts)
+    opts.on_done(nil, { attempts = {}, remaining = 0 })
+  end
+  ui.queue = function(opts)
+    refreshed = opts.conflicts_only == true
+  end
+  find_action(ui._queue_actions({ path = "src/lib.rs" }, { conflicts_only = true }), "Retry queued saves").run()
+  assert_eq(refreshed, true)
+  refreshed = false
+  find_action(ui._queue_actions({ path = "src/lib.rs" }, { conflicts_only = true, _queue_generation = -1 }), "Retry queued saves").run()
+  assert_eq(refreshed, false)
+  nrm.flush_queue = old_flush_queue
+  ui.queue = old_ui_queue
 
   local conflict_select_prompt = nil
   vim.ui.select = function(items, opts)
@@ -252,6 +339,40 @@ local function main()
   ui.grep()
   assert_eq(grep_query, "needle")
   assert_dashboard_closed("successful grep should close dashboard")
+
+  local original_notify = vim.notify
+  local flush_notice = nil
+  vim.notify = function(message, level)
+    flush_notice = {
+      message = message,
+      level = level,
+    }
+  end
+  nrm.flush_queue = function()
+    error("not connected; run :RemoteConnect first")
+  end
+  ui.workspace()
+  assert_dashboard_visible("workspace dashboard should open before failed flush")
+  local ok, flush_err = pcall(find_buf_map("F").callback)
+  assert_eq(ok, true, flush_err)
+  assert_contains(flush_notice.message, "not connected; run :RemoteConnect first")
+  assert_eq(flush_notice.level, vim.log.levels.ERROR)
+
+  local pending_flush_done = nil
+  nrm.flush_queue = function(opts)
+    pending_flush_done = opts.on_done
+  end
+  ui.workspace()
+  assert_dashboard_visible("workspace dashboard should open before async flush")
+  find_buf_map("F").callback()
+  assert_eq(type(pending_flush_done), "function")
+  find_buf_map("q").callback()
+  assert_dashboard_closed("dashboard close should invalidate pending flush refresh")
+  pending_flush_done(nil, { attempts = {}, remaining = 0 })
+  assert_dashboard_closed("stale flush callback should not reopen dashboard")
+
+  vim.notify = original_notify
+  nrm.flush_queue = old_flush_queue
 
   vim.ui.input = original_input
   nrm.open = original_open
