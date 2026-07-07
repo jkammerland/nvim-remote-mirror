@@ -4,13 +4,7 @@ local nrm = require("nvim_remote_mirror")
 
 local function assert_eq(actual, expected, message)
   if actual ~= expected then
-    error(
-      (message or "assertion failed")
-        .. ": expected "
-        .. vim.inspect(expected)
-        .. ", got "
-        .. vim.inspect(actual)
-    )
+    error((message or "assertion failed") .. ": expected " .. vim.inspect(expected) .. ", got " .. vim.inspect(actual))
   end
 end
 
@@ -97,9 +91,17 @@ local function main()
   assert_contains(qf[3].text, "space name.rs")
   assert_eq(vim.api.nvim_buf_get_name(qf[4].bufnr), files_root .. '/"quoted.lua')
   assert_contains(qf[5].text, "src/newname.rs")
-  assert_eq(table.concat(vim.tbl_map(function(item)
-    return item.text
-  end, qf), "\n"):find("oldname", 1, true), nil)
+  assert_eq(
+    table
+      .concat(
+        vim.tbl_map(function(item)
+          return item.text
+        end, qf),
+        "\n"
+      )
+      :find("oldname", 1, true),
+    nil
+  )
   wait_until(function()
     return #notifications > 0
   end, "expected truncation notification")

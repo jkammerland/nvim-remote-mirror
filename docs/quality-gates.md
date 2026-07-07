@@ -26,7 +26,8 @@ CI runs the same categories plus the small performance smoke. The Lua syntax
 gate intentionally enumerates tracked files so new modules such as picker or
 adapter helpers are checked without updating a hand-maintained file list.
 Run `just ci` for the local equivalent of CI's required checks plus the small
-performance smoke.
+performance smoke. CI also installs and runs the pinned optional lint/audit
+tools listed below.
 
 ## Extra Local Checks
 
@@ -34,28 +35,40 @@ These checks need tools that are not required for the default developer setup:
 
 ```sh
 just lint-extra
-just audit
+just audit-strict
 just miri-protocol
+just fuzz-protocol
 ```
 
 `just lint-extra` runs:
 
-- `stylua --check lua plugin tests`
-- `selene lua plugin tests`
+- `stylua --check lua plugin tests` with StyLua `2.5.2` in CI.
+- `selene lua plugin tests` with Selene `0.31.0` in CI.
 - `bash -n scripts/*.sh`
-- `shellcheck scripts/*.sh`
+- `shellcheck scripts/*.sh` with ShellCheck `0.10.0` in CI.
 
-`just audit` runs `cargo audit -f Cargo.lock`. It should be used before
-release, dependency bumps, and security-sensitive changes. `just audit-strict`
-also denies warning-class advisories, but it is not clean today because
-`bincode 1.3.x` is reported as unmaintained.
+Selene uses the repo-local `vim.yml` standard-library shim to treat the Neovim
+`vim` global as an available API while still linting ordinary Lua mistakes.
 
-`just miri-protocol` runs only the `nrm-protocol` tests under Miri with strict
-provenance enabled. That crate is the best sanitizer-like target because it owns
-frame parsing and bincode round-trips without subprocess, SQLite, thread, or
-filesystem dependencies.
+`just audit` runs `cargo audit -f Cargo.lock`. `just audit-strict` also denies
+warning-class advisories and is part of `just ci`; CI installs cargo-audit
+`0.22.1`.
+
+`just miri-protocol` runs only the `nrm-protocol` library tests under Miri with
+strict provenance enabled. It needs nightly Rust, Miri, and `clang` for the
+local nightly sysroot build. That crate is the best sanitizer-like target
+because it owns frame parsing and postcard round-trips without subprocess,
+SQLite, thread, or filesystem dependencies.
 If the recipe fails while Miri is building its sysroot, fix the local nightly
 Miri/linker setup before treating the result as a repo test failure.
+
+`just fuzz-protocol` runs the `cargo-fuzz` target for framed sidecar-agent RPC
+decoding. It needs nightly Rust, `cargo-fuzz`, and `clang` for sanitizer-backed
+linking. It is bounded to 30 seconds by default so it is useful as a local smoke
+check; longer fuzzing belongs in explicit release or security work.
+If it fails while linking sanitizer-instrumented build scripts, verify the local
+nightly sanitizer/linker setup before treating the result as a fuzz target
+failure.
 
 ## Sanitizer Position
 
@@ -75,9 +88,8 @@ rename, subprocess shutdown, and queue hazard ordering.
 
 ## Current Follow-Ups
 
-- Migrate the binary RPC codec off `bincode 1.3.x` or explicitly accept the
-  unmaintained warning before making `audit-strict` a required gate.
-- Decide whether CI should install and enforce `stylua`, `selene`, and
-  `shellcheck`. The configs already exist; the tools are currently optional.
-- Add protocol fuzzing if the sidecar-agent boundary becomes exposed to
+- Keep `cargo audit -D warnings` clean as dependencies change.
+- Decide whether to pin/install a specific Neovim release in CI instead of
+  relying on the runner's apt package.
+- Add longer scheduled fuzzing if the sidecar-agent boundary becomes exposed to
   untrusted peers or if frame parsing grows more complex.

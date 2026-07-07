@@ -108,8 +108,7 @@ function M.grep(opts)
   local user_is_current = opts.is_current
   local grep_opts = vim.tbl_extend("force", opts, {
     is_current = function()
-      return generation == state.grep_generation
-        and (type(user_is_current) ~= "function" or user_is_current())
+      return generation == state.grep_generation and (type(user_is_current) ~= "function" or user_is_current())
     end,
   })
   if query == "" then

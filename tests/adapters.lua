@@ -6,13 +6,7 @@ local adapters = require("nvim_remote_mirror.adapters")
 
 local function assert_eq(actual, expected, message)
   if actual ~= expected then
-    error(
-      (message or "assertion failed")
-        .. ": expected "
-        .. vim.inspect(expected)
-        .. ", got "
-        .. vim.inspect(actual)
-    )
+    error((message or "assertion failed") .. ": expected " .. vim.inspect(expected) .. ", got " .. vim.inspect(actual))
   end
 end
 
@@ -199,9 +193,12 @@ local function main()
       assert_eq(vim.b.nrm_remote_hash, "hash-open")
     end,
   })
-  assert_eq(vim.wait(1000, function()
-    return #open_events == 2
-  end), true)
+  assert_eq(
+    vim.wait(1000, function()
+      return #open_events == 2
+    end),
+    true
+  )
   assert_eq(table.concat(open_events, ","), "request,on_open")
 
   local stale_open_called = false

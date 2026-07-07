@@ -4,13 +4,7 @@ local nrm = require("nvim_remote_mirror")
 
 local function assert_eq(actual, expected, message)
   if actual ~= expected then
-    error(
-      (message or "assertion failed")
-        .. ": expected "
-        .. vim.inspect(expected)
-        .. ", got "
-        .. vim.inspect(actual)
-    )
+    error((message or "assertion failed") .. ": expected " .. vim.inspect(expected) .. ", got " .. vim.inspect(actual))
   end
 end
 
@@ -134,10 +128,7 @@ local function main()
   assert_contains(notifications[1].message, "unreplayable=1")
   assert_contains(notifications[1].message, "truncated_at=3")
   assert_eq(notifications[1].level, vim.log.levels.ERROR)
-  assert_contains(
-    nrm.format_save_queue_entry({ state = "unreplayable", path = "lost.rs" }),
-    "snapshot=missing"
-  )
+  assert_contains(nrm.format_save_queue_entry({ state = "unreplayable", path = "lost.rs" }), "snapshot=missing")
   assert_contains(
     nrm.format_save_queue_entry({
       state = "conflict",

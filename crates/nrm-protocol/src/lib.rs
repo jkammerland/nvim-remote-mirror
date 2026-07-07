@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 
-pub const PROTOCOL_VERSION: u16 = 6;
+pub const PROTOCOL_VERSION: u16 = 7;
 pub const MAX_FRAME_LEN: usize = 64 * 1024 * 1024;
 pub const MAX_CONFLICT_CONTENT_BYTES: usize = 4 * 1024 * 1024;
 
@@ -325,7 +325,7 @@ pub enum FrameError {
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("codec error: {0}")]
-    Codec(#[from] Box<bincode::ErrorKind>),
+    Codec(#[from] postcard::Error),
 }
 
 pub fn write_frame<W, T>(writer: &mut W, value: &T) -> Result<(), FrameError>
@@ -333,7 +333,7 @@ where
     W: Write,
     T: Serialize,
 {
-    let bytes = bincode::serialize(value)?;
+    let bytes = postcard::to_allocvec(value)?;
     if bytes.len() > MAX_FRAME_LEN {
         return Err(FrameError::TooLarge(bytes.len()));
     }
@@ -354,9 +354,15 @@ where
     if len > MAX_FRAME_LEN {
         return Err(FrameError::TooLarge(len));
     }
-    let mut bytes = vec![0_u8; len];
-    reader.read_exact(&mut bytes)?;
-    Ok(bincode::deserialize(&bytes)?)
+    let mut bytes = Vec::new();
+    let bytes_read = reader.by_ref().take(len as u64).read_to_end(&mut bytes)?;
+    if bytes_read != len {
+        return Err(FrameError::Io(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "frame body ended before advertised length",
+        )));
+    }
+    Ok(postcard::from_bytes(&bytes)?)
 }
 
 #[cfg(test)]
@@ -588,5 +594,32 @@ mod tests {
         bytes.extend_from_slice(&((MAX_FRAME_LEN as u32) + 1).to_be_bytes());
         let result: Result<Request, FrameError> = read_frame(&mut Cursor::new(bytes));
         assert!(matches!(result, Err(FrameError::TooLarge(_))));
+    }
+
+    #[test]
+    fn rejects_truncated_frame_body() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&8_u32.to_be_bytes());
+        bytes.extend_from_slice(&[1, 2, 3]);
+
+        let result: Result<RpcMessage, FrameError> = read_frame(&mut Cursor::new(bytes));
+
+        match result {
+            Err(FrameError::Io(error)) => {
+                assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+            }
+            other => panic!("expected unexpected EOF, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_frame_payload() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&4_u32.to_be_bytes());
+        bytes.extend_from_slice(&[0xff, 0xff, 0xff, 0xff]);
+
+        let result: Result<RpcMessage, FrameError> = read_frame(&mut Cursor::new(bytes));
+
+        assert!(matches!(result, Err(FrameError::Codec(_))));
     }
 }

@@ -1,7 +1,7 @@
 # Protocol Notes
 
 Neovim talks to the local sidecar with newline-delimited JSON. The sidecar talks
-to the agent with length-prefixed binary RPC.
+to the agent with length-prefixed postcard-encoded binary RPC.
 
 ## Neovim to Sidecar
 
@@ -38,7 +38,7 @@ The sidecar sends framed binary RPC to `nrm-agent`. Each request has an ID and
 each response carries the same ID. Current SSH transport runs the agent process
 over stdio.
 
-Current agent protocol version: `6`.
+Current agent protocol version: `7`.
 
 Remote git primitives are agent RPCs, not local mirror operations:
 

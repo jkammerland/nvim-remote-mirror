@@ -427,7 +427,7 @@ local function connect_socket_channel(client, socket_path)
   return nil
 end
 
-local function start_socket_daemon(client, target, socket_path)
+local function start_socket_daemon(_client, target, socket_path)
   vim.fn.mkdir(vim.fn.fnamemodify(socket_path, ":h"), "p", 448)
   local command = vim.list_extend({ M.config.sidecar }, listener_args(target, socket_path))
   local job_id = vim.fn.jobstart(command, {
@@ -680,7 +680,8 @@ local function connection_summary()
   if M.reconnect_pending then
     table.insert(parts, "reconnect=pending")
   end
-  if (M.connection_status == "reconnect_pending" or M.connection_status == "reconnecting")
+  if
+    (M.connection_status == "reconnect_pending" or M.connection_status == "reconnecting")
     and M.config.reconnect_max_attempts
   then
     table.insert(
@@ -881,8 +882,7 @@ local function identity_key(identity)
 end
 
 local function identity_has_scope(identity)
-  return identity
-    and (identity.workspace_key ~= nil or identity.target_arg ~= nil or identity.files_root ~= nil)
+  return identity and (identity.workspace_key ~= nil or identity.target_arg ~= nil or identity.files_root ~= nil)
 end
 
 local function identity_relative_path(identity, local_path)
@@ -1095,9 +1095,7 @@ local function schedule_save_recovery_on_connect(client, generation)
   local recover_limit = math.max(math.floor(tonumber(M.config.recover_local_edits_limit) or 256), 1)
 
   local function still_current()
-    return M.client == client
-      and not client.closing
-      and generation == M.reconnect_generation
+    return M.client == client and not client.closing and generation == M.reconnect_generation
   end
 
   local function replay_once()
@@ -1115,12 +1113,7 @@ local function schedule_save_recovery_on_connect(client, generation)
         end
         local counts = flush_queue_summary(result)
         local remaining = tonumber(result.remaining) or 0
-        if
-          remaining > 0
-          and #(result.attempts or {}) > 0
-          and counts.queued == 0
-          and counts.conflict == 0
-        then
+        if remaining > 0 and #(result.attempts or {}) > 0 and counts.queued == 0 and counts.conflict == 0 then
           vim.defer_fn(replay_once, delay)
         end
       end,
@@ -1205,11 +1198,7 @@ local function schedule_background_mirror(delay, generation)
 
     local client = M.client
     M.remote_probe(function(err, probe)
-      if
-        not M.background_mirror_running
-        or generation ~= M.background_mirror_generation
-        or M.client ~= client
-      then
+      if not M.background_mirror_running or generation ~= M.background_mirror_generation or M.client ~= client then
         return
       end
       if err or not probe or probe.remote_available ~= true then
@@ -1227,11 +1216,7 @@ local function schedule_background_mirror(delay, generation)
         scan_params.after = M.background_scan_after
       end
       M.request("scan", scan_params, function(scan_err, scan_result)
-        if
-          not M.background_mirror_running
-          or generation ~= M.background_mirror_generation
-          or M.client ~= client
-        then
+        if not M.background_mirror_running or generation ~= M.background_mirror_generation or M.client ~= client then
           return
         end
         if scan_err or not scan_result or scan_result.preempted then
@@ -1246,9 +1231,7 @@ local function schedule_background_mirror(delay, generation)
         end
 
         local function still_current_background()
-          return M.background_mirror_running
-            and generation == M.background_mirror_generation
-            and M.client == client
+          return M.background_mirror_running and generation == M.background_mirror_generation and M.client == client
         end
 
         local function finish_background_tick()
@@ -1282,11 +1265,7 @@ local function schedule_background_mirror(delay, generation)
           max_file_bytes = M.config.background_mirror_max_file_bytes,
           max_total_bytes = M.config.background_mirror_max_total_bytes,
         }, function()
-          if
-            not M.background_mirror_running
-            or generation ~= M.background_mirror_generation
-            or M.client ~= client
-          then
+          if not M.background_mirror_running or generation ~= M.background_mirror_generation or M.client ~= client then
             return
           end
           finish_background_tick()
@@ -1523,11 +1502,7 @@ function M.request(method, params, callback)
         local timed_out = clear_pending(client, id)
         if timed_out then
           send_cancel_request(client, id)
-          pcall(
-            timed_out,
-            "request `" .. method .. "` timed out after " .. tostring(timeout_ms) .. " ms",
-            nil
-          )
+          pcall(timed_out, "request `" .. method .. "` timed out after " .. tostring(timeout_ms) .. " ms", nil)
         end
       end)
     end)
@@ -1592,10 +1567,7 @@ end
 
 local function warn_cached_open(result)
   if result.force_skipped then
-    notify(
-      "kept dirty local mirror for " .. result.path .. "; force rehydrate skipped",
-      vim.log.levels.WARN
-    )
+    notify("kept dirty local mirror for " .. result.path .. "; force rehydrate skipped", vim.log.levels.WARN)
     return
   end
   if result.restored_from_snapshot then
@@ -1603,10 +1575,7 @@ local function warn_cached_open(result)
     return
   end
   if result.cached and result.cache_reason and result.cache_reason ~= "cached" then
-    notify(
-      "opened cached " .. result.cache_reason .. " mirror for " .. result.path,
-      vim.log.levels.WARN
-    )
+    notify("opened cached " .. result.cache_reason .. " mirror for " .. result.path, vim.log.levels.WARN)
   end
 end
 
@@ -1721,55 +1690,51 @@ function setup_mirror_autohydrate(client)
       end
 
       set_buffer_hydrate_pending(bufnr, client, relative_path)
-      M.request(
-        "open",
-        {
-          path = relative_path,
-          force = false,
-          batch_max_file_bytes = M.config.open_batch_max_file_bytes,
-        },
-        function(err, result)
-          if err then
-            vim.schedule(function()
-              if M.client == client and vim.api.nvim_buf_is_valid(bufnr) then
-                set_buffer_hydrate_failed(bufnr, relative_path)
-              end
-            end)
-            notify("failed to hydrate " .. relative_path .. ": " .. err, vim.log.levels.ERROR)
-            return
-          end
-          if not result then
-            return
-          end
-          if result.preempted then
-            vim.schedule(function()
-              if M.client == client and vim.api.nvim_buf_is_valid(bufnr) then
-                set_buffer_hydrate_failed(bufnr, relative_path)
-              end
-            end)
-            return
-          end
+      M.request("open", {
+        path = relative_path,
+        force = false,
+        batch_max_file_bytes = M.config.open_batch_max_file_bytes,
+      }, function(err, result)
+        if err then
           vim.schedule(function()
-            if M.client ~= client or client.closing or not vim.api.nvim_buf_is_valid(bufnr) then
-              return
-            end
-            if normalize_local_path(vim.api.nvim_buf_get_name(bufnr)) ~= local_path then
-              return
-            end
-            if vim.api.nvim_get_option_value("modified", { buf = bufnr }) then
+            if M.client == client and vim.api.nvim_buf_is_valid(bufnr) then
               set_buffer_hydrate_failed(bufnr, relative_path)
-              notify("skipped hydrate for modified mirror buffer " .. relative_path, vim.log.levels.WARN)
-              return
-            end
-            if apply_mirror_file_to_buffer(bufnr, result.local_path, result, client) then
-              warn_cached_open(result)
-              vim.defer_fn(function()
-                prefetch_related(result.path)
-              end, 20)
             end
           end)
+          notify("failed to hydrate " .. relative_path .. ": " .. err, vim.log.levels.ERROR)
+          return
         end
-      )
+        if not result then
+          return
+        end
+        if result.preempted then
+          vim.schedule(function()
+            if M.client == client and vim.api.nvim_buf_is_valid(bufnr) then
+              set_buffer_hydrate_failed(bufnr, relative_path)
+            end
+          end)
+          return
+        end
+        vim.schedule(function()
+          if M.client ~= client or client.closing or not vim.api.nvim_buf_is_valid(bufnr) then
+            return
+          end
+          if normalize_local_path(vim.api.nvim_buf_get_name(bufnr)) ~= local_path then
+            return
+          end
+          if vim.api.nvim_get_option_value("modified", { buf = bufnr }) then
+            set_buffer_hydrate_failed(bufnr, relative_path)
+            notify("skipped hydrate for modified mirror buffer " .. relative_path, vim.log.levels.WARN)
+            return
+          end
+          if apply_mirror_file_to_buffer(bufnr, result.local_path, result, client) then
+            warn_cached_open(result)
+            vim.defer_fn(function()
+              prefetch_related(result.path)
+            end, 20)
+          end
+        end)
+      end)
     end,
   })
 end
@@ -1856,8 +1821,7 @@ local function flush_remote_path(path, opts)
     local reason = M.client and "workspace mismatch" or "disconnected"
     local is_new = mark_deferred_flush(bufnr, path, reason, identity, opts.adopt == true)
     if is_new then
-      local suffix = reason == "workspace mismatch" and " until its workspace is reconnected"
-        or " until reconnect"
+      local suffix = reason == "workspace mismatch" and " until its workspace is reconnected" or " until reconnect"
       notify("deferred remote save for " .. path .. suffix, vim.log.levels.WARN)
     end
     return
@@ -1884,10 +1848,7 @@ local function flush_remote_path(path, opts)
     end
     if result.status == "queued" then
       clear_deferred_flush(result.path or path, identity)
-      notify(
-        "remote save queued for " .. result.path .. ": " .. result.reason,
-        vim.log.levels.WARN
-      )
+      notify("remote save queued for " .. result.path .. ": " .. result.reason, vim.log.levels.WARN)
       return
     end
     clear_deferred_flush(result.path or path, identity)
@@ -1906,16 +1867,14 @@ function M.flush_buffer(bufnr, opts)
   opts = opts or {}
   if vim.b[bufnr].nrm_hydrate_pending then
     notify(
-      "remote save skipped while hydrate is pending for "
-        .. tostring(vim.b[bufnr].nrm_hydrate_path or "buffer"),
+      "remote save skipped while hydrate is pending for " .. tostring(vim.b[bufnr].nrm_hydrate_path or "buffer"),
       vim.log.levels.WARN
     )
     return
   end
   if vim.b[bufnr].nrm_hydrate_failed then
     notify(
-      "remote save disabled because hydrate failed for "
-        .. tostring(vim.b[bufnr].nrm_hydrate_path or "buffer"),
+      "remote save disabled because hydrate failed for " .. tostring(vim.b[bufnr].nrm_hydrate_path or "buffer"),
       vim.log.levels.ERROR
     )
     return
@@ -2327,9 +2286,7 @@ function M.grep_async(query, opts, callback)
       append_page(result)
       local next_after = optional_string(result.next_after)
       local next_session_id = optional_string(result.session_id)
-      local has_more = result.truncated == true
-        and (next_after or next_session_id)
-        and #(result_acc.hits or {}) < limit
+      local has_more = result.truncated == true and (next_after or next_session_id) and #(result_acc.hits or {}) < limit
       if has_more then
         request_page(next_after, next_session_id)
       else
@@ -2442,11 +2399,7 @@ function M.grep(query)
       local hydrate_errors = #(result.hydrate_errors or {})
       if hydrate_errors > 0 or result.hydrate_truncated then
         notify(
-          "grep hydrated "
-            .. tostring(result.hydrated or 0)
-            .. " files with "
-            .. tostring(hydrate_errors)
-            .. " errors",
+          "grep hydrated " .. tostring(result.hydrated or 0) .. " files with " .. tostring(hydrate_errors) .. " errors",
           vim.log.levels.WARN
         )
       end
@@ -2575,10 +2528,7 @@ local function git_unquote_path(path)
       index = index + 1
     else
       local next_char = path:sub(index + 1, index + 1)
-      if next_char == "\\" or next_char == '"' then
-        table.insert(out, next_char)
-        index = index + 2
-      elseif next_char == "t" then
+      if next_char == "t" then
         table.insert(out, "\t")
         index = index + 2
       elseif next_char == "n" then
@@ -2658,10 +2608,7 @@ local function git_status_items(result)
 end
 
 local function git_command_failed(result)
-  return result
-    and result.truncated ~= true
-    and result.status_code ~= nil
-    and tonumber(result.status_code) ~= 0
+  return result and result.truncated ~= true and result.status_code ~= nil and tonumber(result.status_code) ~= 0
 end
 
 local function git_error_text(result, fallback)
@@ -3067,9 +3014,7 @@ local function notify_conflict_resolution_result(action, result)
   local path = optional_string(result.path) or "<unknown>"
   local level = vim.log.levels.INFO
   local message
-  if status == "applied" then
-    message = action .. " for " .. path
-  elseif status == "accepted_remote" then
+  if status == "applied" or status == "accepted_remote" then
     message = action .. " for " .. path
   elseif status == "conflict" then
     level = vim.log.levels.ERROR
@@ -3353,10 +3298,7 @@ local function stop_lsp_record(client_id, force)
   if lsp_client and type(lsp_client.stop) == "function" then
     lsp_client:stop(force == true)
     stopped = true
-  elseif lsp_client and vim.lsp and type(vim.lsp.stop_client) == "function" then
-    vim.lsp.stop_client(client_id, force == true)
-    stopped = true
-  elseif not has_lookup and vim.lsp and type(vim.lsp.stop_client) == "function" then
+  elseif vim.lsp and type(vim.lsp.stop_client) == "function" and (lsp_client or not has_lookup) then
     vim.lsp.stop_client(client_id, force == true)
     stopped = true
   end
@@ -3456,10 +3398,7 @@ function M.start_lsp(command, opts)
     end
     if not result or result.remote_available ~= true then
       M.lsp_last_error = remote_unavailable_message("remote unavailable; LSP not started", result)
-      notify(
-        M.lsp_last_error,
-        vim.log.levels.WARN
-      )
+      notify(M.lsp_last_error, vim.log.levels.WARN)
       return
     end
 

@@ -85,7 +85,11 @@ local function format_dashboard_lines(status, err)
   add_line(lines, "Transport", connection.transport)
   add_line(lines, "Remote", status.remote_status or connection.remote_status or "unchecked")
   if status.retry_after_ms or connection.retry_after_ms then
-    add_line(lines, "Retry After", tostring(math.floor(tonumber(status.retry_after_ms or connection.retry_after_ms) or 0)) .. " ms")
+    add_line(
+      lines,
+      "Retry After",
+      tostring(math.floor(tonumber(status.retry_after_ms or connection.retry_after_ms) or 0)) .. " ms"
+    )
   end
   add_line(lines, "Error", status.remote_error or connection.remote_error or connection.error or connection.reason)
 
@@ -231,7 +235,12 @@ function M.refresh_workspace()
   set_lines({ "nvim-remote-mirror", "", "Loading workspace status..." })
   nrm.status_async(function(err, status)
     vim.schedule(function()
-      if generation ~= state.dashboard_generation or state.buf ~= buf or not state.buf or not vim.api.nvim_buf_is_valid(state.buf) then
+      if
+        generation ~= state.dashboard_generation
+        or state.buf ~= buf
+        or not state.buf
+        or not vim.api.nvim_buf_is_valid(state.buf)
+      then
         return
       end
       set_lines(format_dashboard_lines(status, err))
@@ -445,12 +454,7 @@ local function queue_actions(entry, opts)
       end,
     })
   end
-  if
-    entry.state == "conflict"
-    and queue_id
-    and remote_conflict_path
-    and entry.remote_conflict_truncated ~= true
-  then
+  if entry.state == "conflict" and queue_id and remote_conflict_path and entry.remote_conflict_truncated ~= true then
     table.insert(actions, {
       label = "Accept remote conflict copy",
       run = function()

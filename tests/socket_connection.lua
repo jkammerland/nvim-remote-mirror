@@ -5,13 +5,7 @@ local nrm = require("nvim_remote_mirror")
 
 local function assert_eq(actual, expected, message)
   if actual ~= expected then
-    error(
-      (message or "assertion failed")
-        .. ": expected "
-        .. vim.inspect(expected)
-        .. ", got "
-        .. vim.inspect(actual)
-    )
+    error((message or "assertion failed") .. ": expected " .. vim.inspect(expected) .. ", got " .. vim.inspect(actual))
   end
 end
 

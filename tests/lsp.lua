@@ -4,13 +4,7 @@ local nrm = require("nvim_remote_mirror")
 
 local function assert_eq(actual, expected, message)
   if actual ~= expected then
-    error(
-      (message or "assertion failed")
-        .. ": expected "
-        .. vim.inspect(expected)
-        .. ", got "
-        .. vim.inspect(actual)
-    )
+    error((message or "assertion failed") .. ": expected " .. vim.inspect(expected) .. ", got " .. vim.inspect(actual))
   end
 end
 
@@ -57,10 +51,7 @@ local function main()
   local original_lsp_stop_client = vim.lsp.stop_client
   local original_lsp_get_client_by_id = vim.lsp.get_client_by_id
 
-  local notifications = {}
-  vim.notify = function(message, level)
-    table.insert(notifications, { message = tostring(message), level = level })
-  end
+  vim.notify = function() end
 
   local active_clients = {}
   local stopped = {}
@@ -74,13 +65,13 @@ local function main()
 
   local next_client_id = 10
   local start_configs = {}
-  vim.lsp.start = function(config)
+  vim.lsp.start = function(lsp_config)
     local id = next_client_id
     next_client_id = next_client_id + 1
-    table.insert(start_configs, config)
+    table.insert(start_configs, lsp_config)
     active_clients[id] = {
       id = id,
-      name = config.name or "remote-lsp",
+      name = lsp_config.name or "remote-lsp",
       stop = function(_, force)
         table.insert(stopped, { id = id, force = force })
         active_clients[id] = nil
@@ -202,13 +193,13 @@ local function main()
   end, "nil LSP start was not recorded")
 
   vim.lsp.start = original_lsp_start
-  vim.lsp.start = function(config)
+  vim.lsp.start = function(lsp_config)
     local id = next_client_id
     next_client_id = next_client_id + 1
-    table.insert(start_configs, config)
+    table.insert(start_configs, lsp_config)
     active_clients[id] = {
       id = id,
-      name = config.name or "remote-lsp",
+      name = lsp_config.name or "remote-lsp",
       stop = function(_, force)
         table.insert(stopped, { id = id, force = force })
         active_clients[id] = nil

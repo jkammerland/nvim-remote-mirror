@@ -226,6 +226,8 @@ just check
 just ci
 just lint-extra
 just audit
+just audit-strict
+just fuzz-protocol
 cargo bench --workspace --no-run --locked
 scripts/perf_smoke.sh --small
 NRM_PERF_LARGE=1 scripts/perf_smoke.sh --large
@@ -237,8 +239,8 @@ benchmarks cover protocol frames and agent scan/grep paths; run them without
 `--no-run` for manual before/after measurements. The small perf smoke runs in
 CI and through `just ci`; the large mode is intended for local before/after
 timing on bigger synthetic workspaces.
-`just lint-extra`, `just audit`, and `just miri-protocol` are optional local
-quality gates for release or riskier changes; see
+`just lint-extra`, `just audit-strict`, `just miri-protocol`, and
+`just fuzz-protocol` are local quality gates for release or riskier changes; see
 [docs/quality-gates.md](docs/quality-gates.md).
 
 Set `NRM_TRACE=1` when starting the sidecar to emit JSON trace events for

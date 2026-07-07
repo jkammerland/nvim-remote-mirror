@@ -5,13 +5,7 @@ local ui = require("nvim_remote_mirror.ui")
 
 local function assert_eq(actual, expected, message)
   if actual ~= expected then
-    error(
-      (message or "assertion failed")
-        .. ": expected "
-        .. vim.inspect(expected)
-        .. ", got "
-        .. vim.inspect(actual)
-    )
+    error((message or "assertion failed") .. ": expected " .. vim.inspect(expected) .. ", got " .. vim.inspect(actual))
   end
 end
 
@@ -283,7 +277,10 @@ local function main()
   find_action(ui._queue_actions({ path = "src/lib.rs" }, { conflicts_only = true }), "Retry queued saves").run()
   assert_eq(refreshed, true)
   refreshed = false
-  find_action(ui._queue_actions({ path = "src/lib.rs" }, { conflicts_only = true, _queue_generation = -1 }), "Retry queued saves").run()
+  find_action(
+    ui._queue_actions({ path = "src/lib.rs" }, { conflicts_only = true, _queue_generation = -1 }),
+    "Retry queued saves"
+  ).run()
   assert_eq(refreshed, false)
   nrm.flush_queue = old_flush_queue
   ui.queue = old_ui_queue
@@ -319,12 +316,15 @@ local function main()
   assert_eq(accepted_remote, 42)
   assert_eq(refreshed, true)
   refreshed = false
-  find_action(ui._queue_actions({
-    queue_id = 43,
-    path = "src/lib.rs",
-    state = "conflict",
-    snapshot_path = snapshot_path,
-  }, { conflicts_only = true, _queue_generation = -1 }), "Accept local saved snapshot").run()
+  find_action(
+    ui._queue_actions({
+      queue_id = 43,
+      path = "src/lib.rs",
+      state = "conflict",
+      snapshot_path = snapshot_path,
+    }, { conflicts_only = true, _queue_generation = -1 }),
+    "Accept local saved snapshot"
+  ).run()
   assert_eq(refreshed, false)
   nrm.accept_local_conflict = old_accept_local_conflict
   nrm.accept_remote_conflict = old_accept_remote_conflict

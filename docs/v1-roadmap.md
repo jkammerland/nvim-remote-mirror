@@ -310,7 +310,9 @@ performance checks that make failures diagnosable before data is at risk.
 - `just ci`
 - `just lint-extra`
 - `just audit`
+- `just audit-strict`
 - `just miri-protocol`
+- `just fuzz-protocol`
 - `scripts/perf_smoke.sh --small`
 - `cargo bench --workspace --no-run --locked`
 - Add `tests/health.lua` for healthcheck command behavior once implemented.
