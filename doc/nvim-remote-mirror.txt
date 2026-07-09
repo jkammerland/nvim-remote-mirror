@@ -242,6 +242,10 @@ COMMANDS                                      *nvim-remote-mirror-commands*
     a bare remote_agent such as nrm-agent installs to
     $HOME/.local/bin/nrm-agent; an absolute remote_agent installs to that
     absolute path. [!] overwrites an existing target.
+    This is a POSIX SSH installer. Linux/Unix remotes are supported, and macOS
+    remotes are supported when the local agent path points to a Darwin binary
+    for the remote CPU. Windows OpenSSH/PowerShell remotes are not supported by
+    this installer yet.
 
 :RemoteUpdateAgent[!] [path]
     Upload the configured local agent binary when :RemoteHealth reports a
@@ -346,6 +350,11 @@ argument overrides the default.
 Non-interactive SSH may not load the same PATH as an interactive login shell.
 If :RemoteHealth reports missing_agent, run :RemoteInstallAgent or set
 remote_agent to an absolute remote path.
+Remote install copies the configured local agent bytes as-is; it does not
+cross-compile. When installing from Linux to macOS, build nrm-agent on macOS and
+copy that artifact back to a Linux-local path, then point agent at that artifact
+for the macOS SSH session. Switch agent back before using local workspaces or
+targets with a different OS/CPU.
 Set connection = "socket" to connect through a reusable Unix-domain sidecar
 listener. If socket_path is unset, the plugin derives a stable path under
 socket_dir, state_dir/sockets, or the system temp directory from the target and

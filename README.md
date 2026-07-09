@@ -64,6 +64,19 @@ The plugin does not silently install or update the remote agent during connect.
 `$HOME/.local/bin/nrm-agent`, and SSH launches prepend `$HOME/.local/bin` to
 `PATH` so non-interactive sessions can find it.
 
+Remote install is POSIX SSH only today:
+
+| Remote OS | Install support | Notes |
+| --- | --- | --- |
+| Linux/Unix | Supported | The remote needs `sh`, `dirname`, `mkdir`, `chmod`, and `mv` |
+| macOS | Supported with a macOS agent binary | Build `nrm-agent` for the remote Mac architecture; the installer does not cross-compile |
+| Windows OpenSSH/PowerShell | Not supported yet | The SSH planner and installer currently assume POSIX paths and `sh -lc` |
+
+The installer uploads bytes from the local `agent` path exactly as configured.
+If Neovim is running on Linux and the SSH target is macOS, build a Darwin
+`nrm-agent` natively and make that binary available on the local machine before
+running `:RemoteInstallAgent`. Otherwise the remote will receive a Linux binary.
+
 Non-interactive SSH often skips shell startup files. If this fails:
 
 ```sh

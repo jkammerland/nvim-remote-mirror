@@ -43,6 +43,41 @@ Non-interactive SSH may not load the same PATH as your login shell. If
 `remote_agent` to an absolute remote path such as
 `/home/me/.local/bin/nrm-agent`.
 
+### Remote Install Platform Support
+
+`:RemoteInstallAgent` is an upload/install command, not a build command. It
+copies the local `agent` binary bytes over SSH and verifies the remote binary
+with `--version`.
+
+| Remote OS | Status | Details |
+| --- | --- | --- |
+| Linux/Unix | Supported | Requires a POSIX SSH session with `sh`, `dirname`, `mkdir`, `chmod`, and `mv` |
+| macOS | Supported when binary matches | Use a Darwin `nrm-agent` for the target CPU, such as arm64 on Apple Silicon |
+| Windows OpenSSH/PowerShell | Not supported yet | SSH launch/install assumes POSIX paths and `sh -lc`; Windows path parsing and PowerShell install are future work |
+
+If your local editor is Linux but the remote target is macOS, build the agent on
+the Mac and copy the artifact back to a Linux-local path that the sidecar can
+read:
+
+```sh
+ssh mac-builder.example 'cd /path/to/nvim-remote-mirror && cargo build --release'
+mkdir -p target/remote-agents
+scp mac-builder.example:/path/to/nvim-remote-mirror/target/release/nrm-agent \
+  target/remote-agents/nrm-agent-darwin-arm64
+```
+
+Then point `agent` at that artifact for the macOS SSH session:
+
+```lua
+require("nvim_remote_mirror").setup({
+  agent = vim.fn.expand("~/repos/nvim-remote-mirror/target/remote-agents/nrm-agent-darwin-arm64"),
+  remote_agent = "nrm-agent",
+})
+```
+
+Because `agent` is currently global, switch it back to your local-platform
+binary before using local workspaces or SSH targets with a different OS/CPU.
+
 ## Transport
 
 | Option | Default | Notes |

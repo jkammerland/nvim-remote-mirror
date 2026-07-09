@@ -49,6 +49,12 @@ remote work, preempts active lane workers, uploads over SSH stdin to a temporary
 file, validates the installed binary with `--version`, then starts a fresh agent
 probe.
 
+Bootstrap is currently a POSIX SSH capability. The remote install script assumes
+`sh -lc`, POSIX paths, `dirname`, `mkdir`, `chmod`, and `mv`. It uploads the
+configured local agent bytes as-is, so cross-OS installs require the caller to
+provide a local path to a binary already built for the remote OS/CPU. Windows
+OpenSSH/PowerShell remotes need a separate future command planner and installer.
+
 Install/update params:
 
 ```json
