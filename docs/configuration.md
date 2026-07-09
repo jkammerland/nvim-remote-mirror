@@ -5,7 +5,9 @@ Configure the plugin from Lua:
 ```lua
 require("nvim_remote_mirror").setup({
   connection = "socket",
+  agent = "/path/to/local/nrm-agent",
   remote_agent = "nrm-agent",
+  remote_agent_install_path = "$HOME/.local/bin/nrm-agent",
 })
 ```
 
@@ -14,13 +16,32 @@ require("nvim_remote_mirror").setup({
 | Option | Default | Notes |
 | --- | --- | --- |
 | `sidecar` | `target/debug/nrm-sidecar` or `nrm-sidecar` | Local sidecar binary |
-| `agent` | `target/debug/nrm-agent` or `nrm-agent` | Agent for local targets |
+| `agent` | `target/debug/nrm-agent` or `nrm-agent` | Agent for local targets and SSH install/update source |
 | `remote_agent` | `nrm-agent` | Command executed on SSH hosts |
+| `remote_agent_install_path` | `nil` | Optional default target path for explicit SSH agent install/update |
 
-For `ssh://` targets, `remote_agent` is used on the remote host. The local
-`agent` path is not copied to the remote. Non-interactive SSH may not load the
-same PATH as your login shell; if `ssh host 'command -v nrm-agent'` fails, set
-`remote_agent` to an absolute remote path such as `/home/me/.local/bin/nrm-agent`.
+For `ssh://` targets, `remote_agent` is the remote command and `agent` remains
+the local binary used by `:RemoteInstallAgent` and `:RemoteUpdateAgent`. Connect
+does not silently install or update remote binaries. Run `:RemoteHealth` after
+connecting to classify remote failures, then run `:RemoteInstallAgent[!]` or
+`:RemoteUpdateAgent[!]` when you want the sidecar to upload the local `agent`
+binary over SSH.
+
+If `remote_agent` is a bare command such as `nrm-agent`, SSH launches prepend
+`$HOME/.local/bin` to `PATH`, and the default managed install target is
+`$HOME/.local/bin/nrm-agent`. If `remote_agent` is absolute, explicit install
+defaults to that absolute path. `remote_agent_install_path` or the optional
+command argument overrides either default:
+
+```vim
+:RemoteInstallAgent /opt/nrm/bin/nrm-agent
+:RemoteUpdateAgent!
+```
+
+Non-interactive SSH may not load the same PATH as your login shell. If
+`:RemoteHealth` reports `missing_agent`, either run `:RemoteInstallAgent` or set
+`remote_agent` to an absolute remote path such as
+`/home/me/.local/bin/nrm-agent`.
 
 ## Transport
 

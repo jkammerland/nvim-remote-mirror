@@ -74,7 +74,7 @@ local function format_dashboard_lines(status, err)
   end
 
   add_section(lines, "Actions")
-  table.insert(lines, "  c connect    o open       f files      g grep")
+  table.insert(lines, "  c connect    h health     o open       f files      g grep")
   table.insert(lines, "  z cwd        s saves      C conflicts  F flush")
   table.insert(lines, "  r refresh    d disconnect R reconnect  q close")
   table.insert(lines, "  x close")
@@ -92,6 +92,17 @@ local function format_dashboard_lines(status, err)
     )
   end
   add_line(lines, "Error", status.remote_error or connection.remote_error or connection.error or connection.reason)
+
+  add_section(lines, "Agent")
+  add_line(lines, "Status", status.agent_status or connection.agent_status)
+  add_line(lines, "Version", status.agent_version or connection.agent_version)
+  add_line(lines, "Expected", status.expected_agent_version or connection.expected_agent_version)
+  add_line(lines, "Remote Path", status.remote_agent or connection.remote_agent)
+  add_line(lines, "Install Path", status.remote_agent_install_path or connection.remote_agent_install_path)
+  add_line(lines, "Local Source", status.local_agent_path or connection.local_agent_path)
+  add_line(lines, "Local Ready", tostring(status.local_agent_available or connection.local_agent_available or false))
+  add_line(lines, "Repair", status.repair_command or connection.repair_command)
+  add_line(lines, "Local Error", status.local_agent_error or connection.local_agent_error)
 
   local lsp = status.lsp or {}
   add_section(lines, "LSP")
@@ -202,6 +213,15 @@ local function ensure_window()
     })
   end, "Remote mirror: flush queue")
   map(state.buf, "r", M.refresh_workspace, "Remote mirror: refresh")
+  map(state.buf, "h", function()
+    nrm.remote_health(function(err)
+      if err then
+        notify(tostring(err), vim.log.levels.ERROR)
+        return
+      end
+      M.refresh_workspace()
+    end)
+  end, "Remote mirror: health")
   map(state.buf, "c", M.connect, "Remote mirror: connect")
   map(state.buf, "o", M.open, "Remote mirror: open")
   map(state.buf, "f", M.files, "Remote mirror: files")

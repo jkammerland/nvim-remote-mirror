@@ -32,6 +32,34 @@ notifications.
 transport metadata, command names, notification names, capabilities, and the
 last known remote health. It must not block on SSH.
 
+Clients that understand command metadata should check
+`capabilities.remote_agent_bootstrap == true` before presenting remote agent
+repair actions. The public commands are:
+
+| Method | Lane | Mutates | Behavior |
+| --- | --- | --- | --- |
+| `remote_health` | read/control | no | Actively probes the agent and decorates health with `agent_status`, expected versions, local/remote agent paths, install/update availability, and a suggested `repair_command` |
+| `remote_agent_install` | write/control | yes | Uploads the configured local agent binary to an SSH target and then probes health |
+| `remote_agent_update` | write/control | yes | Replaces an incompatible/missing SSH agent, skipping when already compatible unless `force = true` |
+
+`remote_agent_install` and `remote_agent_update` are explicit user actions. The
+sidecar must not silently install or update the remote agent during
+`workspace_info` or connect. During replacement, the sidecar cancels queued
+remote work, preempts active lane workers, uploads over SSH stdin to a temporary
+file, validates the installed binary with `--version`, then starts a fresh agent
+probe.
+
+Install/update params:
+
+```json
+{"force":true,"install_path":"$HOME/.local/bin/nrm-agent"}
+```
+
+For bare remote agent commands such as `nrm-agent`, SSH launches prepend
+`$HOME/.local/bin` to `PATH`, and the managed default install path is
+`$HOME/.local/bin/nrm-agent`. Absolute `remote_agent` values default their
+install path to the same absolute path.
+
 ## Agent Boundary
 
 The sidecar sends framed binary RPC to `nrm-agent`. Each request has an ID and
@@ -70,3 +98,5 @@ sidecar/agent protocol versions must fail with a clear protocol version mismatch
 message. The sidecar reports that failure as `remote_status = "unavailable"` in
 `remote_probe`, `workspace_info`, and `workspace/remote_health` notifications so
 Neovim can keep serving local mirror operations while the remote agent is fixed.
+`remote_health` additionally reports `agent_status = "protocol_mismatch"` for
+this case so clients can suggest `RemoteUpdateAgent`.

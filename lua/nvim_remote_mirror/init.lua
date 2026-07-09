@@ -22,6 +22,7 @@ M.config = {
   sidecar = executable_or_default("nrm-sidecar"),
   agent = executable_or_default("nrm-agent"),
   remote_agent = "nrm-agent",
+  remote_agent_install_path = nil,
   connection = "stdio",
   socket_path = nil,
   socket_dir = nil,
@@ -300,6 +301,10 @@ local function sidecar_args(target)
   if target.ssh then
     table.insert(args, "--ssh")
     table.insert(args, target.ssh)
+    if optional_string(M.config.agent) then
+      table.insert(args, "--local-agent")
+      table.insert(args, M.config.agent)
+    end
   end
   if M.config.state_dir then
     table.insert(args, "--state-dir")
@@ -352,6 +357,7 @@ local function socket_path_for(target_arg, target)
     target_arg or "",
     M.config.sidecar or "",
     agent or "",
+    target and target.ssh and (M.config.agent or "") or "",
     M.config.state_dir or "",
     tostring(M.config.request_timeout_ms or ""),
     tostring(M.config.ssh_connect_timeout_seconds or ""),
@@ -636,6 +642,26 @@ update_remote_state = function(client, result)
   client.hello.remote_available = result.remote_available
   client.hello.remote_error = result.remote_error
   client.hello.retry_after_ms = result.retry_after_ms
+  for _, field in ipairs({
+    "agent_status",
+    "agent_version",
+    "expected_agent_version",
+    "protocol_version",
+    "expected_protocol_version",
+    "remote_agent",
+    "remote_agent_install_path",
+    "managed_remote_agent_path",
+    "local_agent_path",
+    "local_agent_available",
+    "local_agent_error",
+    "install_available",
+    "update_available",
+    "repair_command",
+  }) do
+    if result[field] ~= nil then
+      client.hello[field] = result[field]
+    end
+  end
 end
 
 local function status_remote_summary(result)
@@ -649,6 +675,27 @@ local function status_remote_summary(result)
   if remote_error and result.remote_available == false then
     remote_error = remote_error:gsub("%s+", " ")
     table.insert(parts, "error=" .. remote_error:sub(1, 160))
+  end
+  return table.concat(parts, " ")
+end
+
+local function agent_summary(result)
+  result = result or {}
+  local parts = {}
+  local agent_status = optional_string(result.agent_status)
+  if agent_status then
+    table.insert(parts, "agent=" .. agent_status)
+  end
+  local agent_version = optional_string(result.agent_version)
+  local expected_agent_version = optional_string(result.expected_agent_version)
+  if agent_version then
+    table.insert(parts, "agent_version=" .. agent_version)
+  elseif expected_agent_version then
+    table.insert(parts, "expected_agent=" .. expected_agent_version)
+  end
+  local repair = optional_string(result.repair_command)
+  if repair then
+    table.insert(parts, "repair=" .. repair)
   end
   return table.concat(parts, " ")
 end
@@ -726,6 +773,20 @@ function M.connection_state()
     remote_available = hello.remote_available,
     remote_error = optional_string(hello.remote_error),
     retry_after_ms = hello.retry_after_ms,
+    agent_status = optional_string(hello.agent_status),
+    agent_version = optional_string(hello.agent_version),
+    expected_agent_version = optional_string(hello.expected_agent_version),
+    protocol_version = hello.protocol_version,
+    expected_protocol_version = hello.expected_protocol_version,
+    remote_agent = optional_string(hello.remote_agent),
+    remote_agent_install_path = optional_string(hello.remote_agent_install_path),
+    managed_remote_agent_path = optional_string(hello.managed_remote_agent_path),
+    local_agent_path = optional_string(hello.local_agent_path),
+    local_agent_available = hello.local_agent_available,
+    local_agent_error = optional_string(hello.local_agent_error),
+    install_available = hello.install_available,
+    update_available = hello.update_available,
+    repair_command = optional_string(hello.repair_command),
   }
 end
 
@@ -1563,6 +1624,90 @@ function M.remote_probe(callback)
       callback(err, result)
     end
   end)
+end
+
+function M.remote_health(callback)
+  local client = M.client
+  if not client or not client.job_id then
+    error("not connected; run :RemoteConnect first")
+  end
+
+  M.request("remote_health", {}, function(err, result)
+    if not err and M.client == client and not (result and result.preempted) then
+      update_remote_state(client, result)
+    end
+    if callback then
+      callback(err, result)
+      return
+    end
+    if err then
+      notify(err, vim.log.levels.ERROR)
+      return
+    end
+    notify(vim.trim(status_remote_summary(result or {}) .. " " .. agent_summary(result or {})))
+  end)
+end
+
+local function remote_agent_bootstrap_params(opts)
+  opts = opts or {}
+  local params = {}
+  if opts.force == true then
+    params.force = true
+  end
+  local install_path = optional_string(opts.install_path) or optional_string(M.config.remote_agent_install_path)
+  if install_path then
+    params.install_path = install_path
+  end
+  return params
+end
+
+local function remote_agent_bootstrap(method, opts, callback)
+  local client = M.client
+  if not client or not client.job_id then
+    error("not connected; run :RemoteConnect first")
+  end
+
+  M.request(method, remote_agent_bootstrap_params(opts), function(err, result)
+    local health = result and result.remote_health or nil
+    if not err and M.client == client and health then
+      update_remote_state(client, health)
+    end
+    if callback then
+      callback(err, result)
+      return
+    end
+    if err then
+      notify(err, vim.log.levels.ERROR)
+      return
+    end
+    local status = result and result.status or "ok"
+    local install_path = optional_string(result and result.install_path)
+    local health_summary = agent_summary(health or {})
+    local message = "remote agent " .. tostring(status)
+    if install_path then
+      message = message .. " at " .. install_path
+    end
+    if health_summary ~= "" then
+      message = message .. " " .. health_summary
+    end
+    notify(message)
+  end)
+end
+
+function M.install_agent(opts, callback)
+  if type(opts) == "function" then
+    callback = opts
+    opts = {}
+  end
+  remote_agent_bootstrap("remote_agent_install", opts, callback)
+end
+
+function M.update_agent(opts, callback)
+  if type(opts) == "function" then
+    callback = opts
+    opts = {}
+  end
+  remote_agent_bootstrap("remote_agent_update", opts, callback)
 end
 
 local function warn_cached_open(result)
@@ -2854,7 +2999,7 @@ function M.status()
     local scan_summary = background_scan_summary(result)
     notify(
       string.format(
-        "known=%d cached=%d indexed=%d dirty=%d pending=%d failed=%d unreplayable=%d conflicts=%d stale=%d deleted=%d %s %s %s%s",
+        "known=%d cached=%d indexed=%d dirty=%d pending=%d failed=%d unreplayable=%d conflicts=%d stale=%d deleted=%d %s %s %s %s%s",
         result.known_files,
         result.cached_files,
         result.indexed_files or 0,
@@ -2867,6 +3012,7 @@ function M.status()
         result.deleted_files,
         connection_summary(),
         status_remote_summary(result),
+        agent_summary(result),
         status_lsp_summary(),
         scan_summary and (" " .. scan_summary) or ""
       )

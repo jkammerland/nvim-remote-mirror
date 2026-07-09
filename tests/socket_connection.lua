@@ -122,6 +122,7 @@ local function main()
   assert_eq(arg_after(daemon_command, "--remote-root"), "/repo")
   assert_eq(arg_after(daemon_command, "--ssh"), "host")
   assert_eq(arg_after(daemon_command, "--agent"), "nrm-agent")
+  assert_eq(arg_after(daemon_command, "--local-agent"), "/local/build/nrm-agent")
 
   nrm.disconnect()
   local closed = vim.wait(500, function()
@@ -145,7 +146,9 @@ local function main()
   local path_b = nrm._test_socket_path_for("ssh://host/repo", { ssh = "host", remote_root = "/repo" })
   nrm.config.remote_agent = "other-agent"
   local path_c = nrm._test_socket_path_for("ssh://host/repo", { ssh = "host", remote_root = "/repo" })
-  if path_a == path_b or path_b == path_c then
+  nrm.config.agent = "/local/build/other-nrm-agent"
+  local path_d = nrm._test_socket_path_for("ssh://host/repo", { ssh = "host", remote_root = "/repo" })
+  if path_a == path_b or path_b == path_c or path_c == path_d then
     error("socket path did not change with daemon-affecting config")
   end
 end

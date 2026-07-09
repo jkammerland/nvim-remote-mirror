@@ -274,8 +274,10 @@ performance checks that make failures diagnosable before data is at risk.
 
 **Implementation:**
 
-- Add a healthcheck command that validates sidecar path, agent path, SSH
-  command, protocol version, writable state dir, and remote workspace access.
+- Add explicit health and remote agent repair commands. Implemented:
+  `:RemoteHealth`, `:RemoteInstallAgent[!]`, and `:RemoteUpdateAgent[!]`
+  classify missing, incompatible, non-executable, and missing-root failures and
+  can upload the configured local agent over SSH.
 - Sync configuration docs and help with Lua defaults, including prefetch,
   autohydrate, and queue replay delay options.
 - Add failure-injection coverage for sidecar restart, agent kill, SSH drop,
@@ -293,8 +295,8 @@ performance checks that make failures diagnosable before data is at risk.
 ```vim
 :RemoteWorkspace
 :RemoteStatus
-" Future:
-":RemoteHealth
+:RemoteHealth
+:RemoteUpdateAgent
 ```
 
 **Acceptance:**

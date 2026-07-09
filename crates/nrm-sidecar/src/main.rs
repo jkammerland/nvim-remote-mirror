@@ -47,6 +47,7 @@ const SAVE_INLINE_MAX_BYTES: u64 = 4 * 1024 * 1024;
 const FAST_FLUSH_SNAPSHOT_MAX_BYTES: u64 = 1024 * 1024;
 const REMOTE_INTERACTIVE_QUEUE_CAPACITY: usize = 128;
 const REMOTE_BACKGROUND_QUEUE_CAPACITY: usize = 128;
+const REMOTE_AGENT_MANAGED_PATH: &str = "$HOME/.local/bin/nrm-agent";
 const BACKGROUND_SCAN_CURSOR_KEY: &str = "background_scan_cursor";
 const BACKGROUND_SCAN_COMPLETED_AT_KEY: &str = "background_scan_completed_at_ms";
 const SIDECAR_COMMAND_SPECS: &[SidecarCommandSpec] = &[
@@ -56,6 +57,23 @@ const SIDECAR_COMMAND_SPECS: &[SidecarCommandSpec] = &[
     SidecarCommandSpec::public("save_queue", "local", None, false, true, false),
     SidecarCommandSpec::public("find_paths", "local", None, false, true, false),
     SidecarCommandSpec::public("remote_probe", "remote", Some("read"), false, false, true),
+    SidecarCommandSpec::public("remote_health", "remote", Some("read"), false, false, true),
+    SidecarCommandSpec::public(
+        "remote_agent_install",
+        "remote",
+        Some("write"),
+        true,
+        false,
+        false,
+    ),
+    SidecarCommandSpec::public(
+        "remote_agent_update",
+        "remote",
+        Some("write"),
+        true,
+        false,
+        false,
+    ),
     SidecarCommandSpec::public("scan", "remote", Some("read"), false, false, true),
     SidecarCommandSpec::public("open", "hybrid", Some("read_or_write"), false, true, true),
     SidecarCommandSpec::public("prefetch", "remote", Some("read"), false, false, true),
@@ -182,6 +200,8 @@ enum CommandKind {
         #[arg(long, default_value = "nrm-agent")]
         agent: String,
         #[arg(long)]
+        local_agent: Option<PathBuf>,
+        #[arg(long)]
         state_dir: Option<PathBuf>,
         #[arg(long, default_value_t = 30_000)]
         request_timeout_ms: u64,
@@ -197,6 +217,8 @@ enum CommandKind {
         ssh: Option<String>,
         #[arg(long, default_value = "nrm-agent")]
         agent: String,
+        #[arg(long)]
+        local_agent: Option<PathBuf>,
         #[arg(long)]
         state_dir: Option<PathBuf>,
         #[arg(long, default_value_t = 30_000)]
@@ -411,6 +433,12 @@ impl SshTransport {
             remote_command,
         ]
     }
+
+    fn command(&self, remote_command: String) -> Command {
+        let mut command = Command::new("ssh");
+        command.args(self.command_args(remote_command));
+        command
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -501,6 +529,7 @@ impl RemoteTransport {
 #[derive(Debug, Clone)]
 struct AgentLaunch {
     agent: String,
+    local_agent: Option<PathBuf>,
     remote_root: PathBuf,
     request_timeout: Duration,
     transport: RemoteTransport,
@@ -848,6 +877,11 @@ impl RemoteBackoffState {
         slot.consecutive_failures = 0;
     }
 
+    fn clear_all(&mut self) {
+        self.clear_lane(AgentBackoffLane::Read);
+        self.clear_lane(AgentBackoffLane::Write);
+    }
+
     fn health_error(&self) -> Option<(Option<Instant>, String)> {
         let now = Instant::now();
         let slots = [&self.read, &self.write];
@@ -883,6 +917,7 @@ fn remote_unavailable_backoff_ms(consecutive_failures: u32) -> u64 {
 impl AgentClient {
     fn new(
         agent: String,
+        local_agent: Option<PathBuf>,
         transport: RemoteTransport,
         remote_root: PathBuf,
         request_timeout: Duration,
@@ -891,6 +926,7 @@ impl AgentClient {
         Self {
             launch: AgentLaunch {
                 agent,
+                local_agent,
                 remote_root,
                 request_timeout,
                 transport,
@@ -1035,6 +1071,12 @@ impl AgentClient {
     fn clear_remote_unavailable(&mut self) {
         if let Ok(mut backoff) = self.remote_backoff.lock() {
             backoff.clear_lane(self.backoff_lane);
+        }
+    }
+
+    fn clear_all_remote_unavailable(&mut self) {
+        if let Ok(mut backoff) = self.remote_backoff.lock() {
+            backoff.clear_all();
         }
     }
 
@@ -3557,6 +3599,7 @@ fn workspace_info_value(
             "remote_agent": true,
             "lsp_proxy": true,
             "remote_git": true,
+            "remote_agent_bootstrap": true,
             "transport_neutral_agent_frames": true,
             "agent_abort_handle": true,
             "agent_abort_scope": "lane_worker",
@@ -3709,6 +3752,15 @@ fn request_is_write_lane(request: &ClientRequest) -> bool {
             | "flush_queue"
             | "accept_local_conflict"
             | "accept_remote_conflict"
+            | "remote_agent_install"
+            | "remote_agent_update"
+    )
+}
+
+fn request_replaces_remote_agent(request: &ClientRequest) -> bool {
+    matches!(
+        request.method.as_str(),
+        "remote_agent_install" | "remote_agent_update"
     )
 }
 
@@ -3884,6 +3936,13 @@ impl RemoteQueue {
     fn shutdown_and_drain(&self) -> Vec<RemoteWork> {
         let mut state = self.state.lock().expect("remote queue mutex poisoned");
         state.closed = true;
+        let drained = state.drain_all();
+        self.ready.notify_all();
+        drained
+    }
+
+    fn drain_queued(&self) -> Vec<RemoteWork> {
+        let mut state = self.state.lock().expect("remote queue mutex poisoned");
         let drained = state.drain_all();
         self.ready.notify_all();
         drained
@@ -4336,6 +4395,7 @@ impl Sidecar {
         remote_root: PathBuf,
         transport: RemoteTransport,
         agent: String,
+        local_agent: Option<PathBuf>,
         state_dir: Option<PathBuf>,
         request_timeout_ms: u64,
         agent_interrupt: AgentInterrupt,
@@ -4344,6 +4404,7 @@ impl Sidecar {
         let mirror = Mirror::open(state_dir, &workspace_key)?;
         let agent = AgentClient::new(
             agent,
+            local_agent,
             transport,
             remote_root.clone(),
             Duration::from_millis(request_timeout_ms),
@@ -4382,6 +4443,9 @@ impl Sidecar {
             "save_queue" => self.mirror.save_queue(&params),
             "find_paths" => self.mirror.find_paths(&params),
             "remote_probe" => Ok(self.remote_probe(preempt_epoch)),
+            "remote_health" => Ok(self.remote_health(preempt_epoch)),
+            "remote_agent_install" => self.remote_agent_install(params, false, preempt_epoch),
+            "remote_agent_update" => self.remote_agent_install(params, true, preempt_epoch),
             "scan" => self.scan(params, preempt_epoch),
             "open" => self.open(params, preempt_epoch),
             "prefetch" => self.prefetch(params, preempt_epoch),
@@ -4510,6 +4574,167 @@ impl Sidecar {
             "retry_after_ms": self.agent.remote_backoff().map(|(remaining, _)| remaining).unwrap_or(0),
             "remote_error": error
         })
+    }
+
+    fn remote_health(&mut self, preempt_epoch: u64) -> Value {
+        let probe = self.remote_probe(preempt_epoch);
+        self.decorate_remote_agent_health(probe)
+    }
+
+    fn remote_agent_install(
+        &mut self,
+        params: Value,
+        update: bool,
+        preempt_epoch: u64,
+    ) -> Result<Value> {
+        let force = params
+            .get("force")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let target_path = params
+            .get("install_path")
+            .and_then(Value::as_str)
+            .filter(|path| !path.trim().is_empty())
+            .map(ToString::to_string)
+            .unwrap_or_else(|| default_remote_agent_install_path(&self.agent.launch.agent));
+
+        let before = self.remote_health(preempt_epoch);
+        let before_status = before
+            .get("agent_status")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        if update && !force && before_status == "ok" {
+            return Ok(json!({
+                "status": "skipped",
+                "reason": "remote agent is already compatible",
+                "install_path": target_path,
+                "remote_health": before
+            }));
+        }
+
+        let source = self.local_agent_source()?;
+        let bytes = fs::read(&source)
+            .with_context(|| format!("failed to read local agent {}", source.display()))?;
+        let source_hash = hash_bytes(&bytes);
+        let effective_force = force || (update && before_status != "missing_agent");
+
+        let ssh = match &self.agent.launch.transport {
+            RemoteTransport::Ssh(ssh) => ssh.clone(),
+            RemoteTransport::Local => {
+                bail!("remote agent install/update is only supported for ssh targets")
+            }
+        };
+
+        self.agent.kill_worker();
+        self.agent.clear_all_remote_unavailable();
+        let command = ssh.command(remote_agent_install_command(&target_path, effective_force));
+        let output = run_command_capture(
+            command,
+            Some(bytes),
+            self.agent.launch.request_timeout,
+            "remote agent install",
+        )?;
+        if !output.status.success() {
+            bail!(
+                "remote agent install failed with {}: {}",
+                output.status,
+                output.stderr
+            );
+        }
+
+        self.agent.kill_worker();
+        self.agent.clear_all_remote_unavailable();
+        let after = self.remote_health(preempt_epoch);
+        Ok(json!({
+            "status": if update { "updated" } else { "installed" },
+            "install_path": output.stdout.lines().last().unwrap_or(&target_path),
+            "requested_install_path": target_path,
+            "source_path": source.to_string_lossy(),
+            "source_hash": source_hash,
+            "bytes": source.metadata().map(|metadata| metadata.len()).unwrap_or(0),
+            "force": effective_force,
+            "remote_health": after
+        }))
+    }
+
+    fn local_agent_source(&self) -> Result<PathBuf> {
+        let source = self
+            .agent
+            .launch
+            .local_agent
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(&self.agent.launch.agent));
+        let metadata = fs::metadata(&source)
+            .with_context(|| format!("local agent source is not readable: {}", source.display()))?;
+        if !metadata.is_file() {
+            bail!("local agent source is not a file: {}", source.display());
+        }
+        Ok(source)
+    }
+
+    fn decorate_remote_agent_health(&self, mut value: Value) -> Value {
+        let install_path = default_remote_agent_install_path(&self.agent.launch.agent);
+        let source = self
+            .agent
+            .launch
+            .local_agent
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(&self.agent.launch.agent));
+        let local_agent_available = fs::metadata(&source)
+            .map(|metadata| metadata.is_file())
+            .unwrap_or(false);
+        let local_agent_error = (!local_agent_available)
+            .then(|| format!("local agent source is not readable: {}", source.display()));
+        let agent_status = classify_remote_agent_status(&value);
+        let is_ssh = matches!(self.agent.launch.transport, RemoteTransport::Ssh(_));
+        let update_available = is_ssh
+            && local_agent_available
+            && matches!(
+                agent_status.as_str(),
+                "missing_agent" | "agent_not_executable" | "protocol_mismatch" | "version_mismatch"
+            );
+        if let Some(object) = value.as_object_mut() {
+            object.insert("agent_status".to_string(), json!(agent_status));
+            object.insert(
+                "expected_agent_version".to_string(),
+                json!(env!("CARGO_PKG_VERSION")),
+            );
+            object.insert(
+                "expected_protocol_version".to_string(),
+                json!(PROTOCOL_VERSION),
+            );
+            object.insert("remote_agent".to_string(), json!(self.agent.launch.agent));
+            object.insert("remote_agent_install_path".to_string(), json!(install_path));
+            object.insert(
+                "managed_remote_agent_path".to_string(),
+                json!(REMOTE_AGENT_MANAGED_PATH),
+            );
+            object.insert(
+                "local_agent_path".to_string(),
+                json!(source.to_string_lossy()),
+            );
+            object.insert(
+                "local_agent_available".to_string(),
+                json!(local_agent_available),
+            );
+            if let Some(error) = local_agent_error {
+                object.insert("local_agent_error".to_string(), json!(error));
+            }
+            object.insert(
+                "install_available".to_string(),
+                json!(is_ssh && local_agent_available),
+            );
+            object.insert("update_available".to_string(), json!(update_available));
+            if update_available {
+                object.insert("repair_command".to_string(), json!("RemoteUpdateAgent"));
+            } else if is_ssh && !local_agent_available {
+                object.insert(
+                    "repair_command".to_string(),
+                    json!("configure local agent path"),
+                );
+            }
+        }
+        value
     }
 
     fn scan(&mut self, params: Value, preempt_epoch: u64) -> Result<Value> {
@@ -5948,6 +6173,7 @@ fn main() -> Result<()> {
             remote_root,
             ssh,
             agent,
+            local_agent,
             state_dir,
             request_timeout_ms,
             ssh_connect_timeout_seconds,
@@ -5955,6 +6181,7 @@ fn main() -> Result<()> {
             remote_root,
             RemoteTransport::from_ssh(ssh, ssh_connect_timeout_seconds),
             agent,
+            local_agent,
             state_dir,
             request_timeout_ms,
         ),
@@ -5963,6 +6190,7 @@ fn main() -> Result<()> {
             remote_root,
             ssh,
             agent,
+            local_agent,
             state_dir,
             request_timeout_ms,
             ssh_connect_timeout_seconds,
@@ -5971,6 +6199,7 @@ fn main() -> Result<()> {
             remote_root,
             RemoteTransport::from_ssh(ssh, ssh_connect_timeout_seconds),
             agent,
+            local_agent,
             state_dir,
             request_timeout_ms,
         ),
@@ -5993,6 +6222,7 @@ fn run_server(
     remote_root: PathBuf,
     transport: RemoteTransport,
     agent: String,
+    local_agent: Option<PathBuf>,
     state_dir: Option<PathBuf>,
     request_timeout_ms: u64,
 ) -> Result<()> {
@@ -6003,6 +6233,7 @@ fn run_server(
         remote_root,
         transport,
         agent,
+        local_agent,
         state_dir,
         request_timeout_ms,
         stdin.lock(),
@@ -6019,6 +6250,7 @@ fn run_listener(
     remote_root: PathBuf,
     transport: RemoteTransport,
     agent: String,
+    local_agent: Option<PathBuf>,
     state_dir: Option<PathBuf>,
     request_timeout_ms: u64,
 ) -> Result<()> {
@@ -6039,6 +6271,7 @@ fn run_listener(
                 remote_root.clone(),
                 transport.clone(),
                 agent.clone(),
+                local_agent.clone(),
                 state_dir.clone(),
                 request_timeout_ms,
                 stream,
@@ -6062,6 +6295,7 @@ fn run_listener(
     _remote_root: PathBuf,
     _transport: RemoteTransport,
     _agent: String,
+    _local_agent: Option<PathBuf>,
     _state_dir: Option<PathBuf>,
     _request_timeout_ms: u64,
 ) -> Result<()> {
@@ -6095,6 +6329,7 @@ fn run_socket_server_session(
     remote_root: PathBuf,
     transport: RemoteTransport,
     agent: String,
+    local_agent: Option<PathBuf>,
     state_dir: Option<PathBuf>,
     request_timeout_ms: u64,
     stream: UnixStream,
@@ -6110,6 +6345,7 @@ fn run_socket_server_session(
         remote_root,
         transport,
         agent,
+        local_agent,
         state_dir,
         request_timeout_ms,
         reader,
@@ -6130,6 +6366,7 @@ fn run_server_session<R>(
     remote_root: PathBuf,
     transport: RemoteTransport,
     agent: String,
+    local_agent: Option<PathBuf>,
     state_dir: Option<PathBuf>,
     request_timeout_ms: u64,
     reader: R,
@@ -6144,10 +6381,13 @@ where
         remote_root,
         transport,
         agent,
+        local_agent,
         state_dir,
         request_timeout_ms,
         agent_interrupt.clone(),
     )?;
+    let control_interrupt = AgentInterrupt::default();
+    let mut control_sidecar = sidecar.clone_for_lane(control_interrupt.clone())?;
     let write_interrupt = AgentInterrupt::default();
     let write_sidecar = sidecar.clone_for_lane(write_interrupt.clone())?;
     let pending_remote = Arc::new(Mutex::new(PendingRemote::default()));
@@ -6172,7 +6412,7 @@ where
     let read_worker = spawn_remote_worker(
         sidecar,
         Arc::clone(&read_queue),
-        read_preempt,
+        read_preempt.clone(),
         active_remote.clone(),
         Arc::clone(&pending_remote),
         Arc::clone(&pending_writes),
@@ -6182,7 +6422,7 @@ where
     let write_worker = spawn_remote_worker(
         write_sidecar,
         Arc::clone(&write_queue),
-        write_preempt,
+        write_preempt.clone(),
         active_remote.clone(),
         Arc::clone(&pending_remote),
         Arc::clone(&pending_writes),
@@ -6226,6 +6466,7 @@ where
                 explicit_end = true;
                 exit.shutdown_listener = request.method == "shutdown";
                 agent_interrupt.request_shutdown();
+                control_interrupt.request_shutdown();
                 write_interrupt.request_shutdown();
                 clear_pending_works(
                     &pending_remote,
@@ -6294,6 +6535,41 @@ where
                     Err(error) => result_to_client_response(request.id, Err(error)),
                 };
                 send_client_response(&response_tx, response);
+                continue;
+            }
+
+            if request.method == "remote_health" {
+                let preempt_epoch = control_sidecar.agent.preempt_handle().epoch();
+                let response = handle_client_request(&mut control_sidecar, request, preempt_epoch);
+                send_client_response(&response_tx, response);
+                send_client_notification(
+                    &response_tx,
+                    control_sidecar.remote_health_notification(),
+                );
+                continue;
+            }
+
+            if request_replaces_remote_agent(&request) {
+                read_preempt.request_preemption();
+                write_preempt.request_preemption();
+                agent_interrupt.kill_current();
+                write_interrupt.kill_current();
+                let drained: Vec<_> = read_queue
+                    .drain_queued()
+                    .into_iter()
+                    .chain(write_queue.drain_queued())
+                    .collect();
+                for work in drained {
+                    clear_pending_work(&pending_remote, &pending_writes, &work);
+                    send_client_response(&response_tx, canceled_client_response(work));
+                }
+                let preempt_epoch = control_sidecar.agent.preempt_handle().epoch();
+                let response = handle_client_request(&mut control_sidecar, request, preempt_epoch);
+                send_client_response(&response_tx, response);
+                send_client_notification(
+                    &response_tx,
+                    control_sidecar.remote_health_notification(),
+                );
                 continue;
             }
 
@@ -6412,6 +6688,7 @@ where
 
     if !explicit_end {
         agent_interrupt.request_shutdown();
+        control_interrupt.request_shutdown();
         write_interrupt.request_shutdown();
         clear_pending_works(
             &pending_remote,
@@ -7049,6 +7326,79 @@ fn wait_lsp_child_with_grace(child: &mut Child, grace: Duration) -> Result<ExitS
     }
 }
 
+struct CapturedProcessOutput {
+    status: ExitStatus,
+    stdout: String,
+    stderr: String,
+}
+
+fn run_command_capture(
+    mut command: Command,
+    input: Option<Vec<u8>>,
+    timeout: Duration,
+    context: &str,
+) -> Result<CapturedProcessOutput> {
+    if input.is_some() {
+        command.stdin(Stdio::piped());
+    } else {
+        command.stdin(Stdio::null());
+    }
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("failed to start {context}"))?;
+
+    let stdin_writer = if let Some(input) = input {
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow!("{context} stdin was not piped"))?;
+        Some(thread::spawn(move || -> Result<()> {
+            stdin.write_all(&input)?;
+            Ok(())
+        }))
+    } else {
+        None
+    };
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            if let Some(writer) = stdin_writer {
+                match writer.join() {
+                    Ok(result) => result.with_context(|| format!("{context} stdin failed"))?,
+                    Err(_) => bail!("{context} stdin writer panicked"),
+                }
+            }
+            let mut stdout = Vec::new();
+            if let Some(mut stream) = child.stdout.take() {
+                stream.read_to_end(&mut stdout)?;
+            }
+            let mut stderr = Vec::new();
+            if let Some(mut stream) = child.stderr.take() {
+                stream.read_to_end(&mut stderr)?;
+            }
+            return Ok(CapturedProcessOutput {
+                status,
+                stdout: String::from_utf8_lossy(&stdout).trim().to_string(),
+                stderr: String::from_utf8_lossy(&stderr).trim().to_string(),
+            });
+        }
+        if Instant::now() >= deadline {
+            kill_child_tree(&mut child);
+            let status = child.wait()?;
+            if let Some(writer) = stdin_writer {
+                let _ = writer.join();
+            }
+            bail!(
+                "{context} timed out after {} ms; killed with {status}",
+                timeout.as_millis()
+            );
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
 struct LspLaunch {
     plan: ProcessLaunchPlan,
 }
@@ -7066,6 +7416,19 @@ impl LspLaunch {
 }
 
 fn agent_remote_command(agent: &str, remote_root: &Path) -> String {
+    if remote_agent_uses_managed_path(agent) {
+        return [
+            shell_quote("sh"),
+            shell_quote("-lc"),
+            shell_quote("PATH=\"$HOME/.local/bin:$PATH\"; exec \"$@\""),
+            shell_quote("nrm-agent-launch"),
+            shell_quote(agent),
+            shell_quote("serve"),
+            shell_quote("--root"),
+            shell_quote(remote_root.to_string_lossy()),
+        ]
+        .join(" ");
+    }
     [
         shell_quote(agent),
         shell_quote("serve"),
@@ -7073,6 +7436,92 @@ fn agent_remote_command(agent: &str, remote_root: &Path) -> String {
         shell_quote(remote_root.to_string_lossy()),
     ]
     .join(" ")
+}
+
+fn remote_agent_uses_managed_path(agent: &str) -> bool {
+    !agent.contains('/')
+}
+
+fn default_remote_agent_install_path(agent: &str) -> String {
+    if agent.starts_with('/') {
+        agent.to_string()
+    } else {
+        REMOTE_AGENT_MANAGED_PATH.to_string()
+    }
+}
+
+fn remote_agent_install_command(target_path: &str, force: bool) -> String {
+    let force = if force { "1" } else { "0" };
+    let script = r#"set -eu
+target="$1"
+force="$2"
+case "$target" in
+  "$HOME"/*) ;;
+  "\$HOME"/*) target="$HOME/${target#"\$HOME"/}" ;;
+  "~"/*) target="$HOME/${target#"~/"}" ;;
+esac
+dir=$(dirname -- "$target")
+mkdir -p -- "$dir"
+if [ -e "$target" ] && [ "$force" != "1" ]; then
+  echo "remote agent already exists at $target" >&2
+  exit 23
+fi
+tmp="${target}.nrm-tmp.$$"
+trap 'rm -f "$tmp"' EXIT HUP INT TERM
+cat > "$tmp"
+chmod 755 "$tmp"
+mv -f "$tmp" "$target"
+trap - EXIT
+"$target" --version >/dev/null
+printf '%s\n' "$target"
+"#;
+    [
+        shell_quote("sh"),
+        shell_quote("-lc"),
+        shell_quote(script),
+        shell_quote("nrm-agent-install"),
+        shell_quote(target_path),
+        shell_quote(force),
+    ]
+    .join(" ")
+}
+
+fn classify_remote_agent_status(value: &Value) -> String {
+    if value
+        .get("remote_available")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        let agent_version = value.get("agent_version").and_then(Value::as_str);
+        if agent_version.is_some_and(|version| version != env!("CARGO_PKG_VERSION")) {
+            return "version_mismatch".to_string();
+        }
+        return "ok".to_string();
+    }
+
+    let error = value
+        .get("remote_error")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if error.contains("protocol version mismatch") {
+        return "protocol_mismatch".to_string();
+    }
+    if error.contains("failed to canonicalize root")
+        || error.contains("no such file or directory") && error.contains("--root")
+    {
+        return "remote_root_missing".to_string();
+    }
+    if error.contains("permission denied") || error.contains("not executable") {
+        return "agent_not_executable".to_string();
+    }
+    if error.contains("failed to launch agent")
+        || error.contains("not found")
+        || error.contains("no such file or directory")
+    {
+        return "missing_agent".to_string();
+    }
+    "unavailable".to_string()
 }
 
 fn lsp_remote_command(remote_root: PathBuf, command: Vec<String>) -> String {
@@ -7445,6 +7894,7 @@ mod tests {
         Sidecar {
             agent: AgentClient::new(
                 "unused-agent".to_string(),
+                None,
                 RemoteTransport::Local,
                 PathBuf::from("/unused"),
                 Duration::from_millis(1),
@@ -7645,10 +8095,68 @@ mod tests {
     }
 
     #[test]
+    fn remote_agent_managed_path_rules_are_explicit() {
+        assert!(remote_agent_uses_managed_path("nrm-agent"));
+        assert!(!remote_agent_uses_managed_path("./nrm-agent"));
+        assert!(!remote_agent_uses_managed_path("/opt/nrm-agent"));
+        assert_eq!(
+            default_remote_agent_install_path("nrm-agent"),
+            REMOTE_AGENT_MANAGED_PATH
+        );
+        assert_eq!(
+            default_remote_agent_install_path("/opt/bin/nrm-agent"),
+            "/opt/bin/nrm-agent"
+        );
+    }
+
+    #[test]
+    fn remote_agent_status_classifies_common_failures() {
+        assert_eq!(
+            classify_remote_agent_status(&json!({
+                "remote_available": true,
+                "agent_version": env!("CARGO_PKG_VERSION")
+            })),
+            "ok"
+        );
+        assert_eq!(
+            classify_remote_agent_status(&json!({
+                "remote_available": true,
+                "agent_version": "0.0.0"
+            })),
+            "version_mismatch"
+        );
+        assert_eq!(
+            classify_remote_agent_status(&json!({
+                "remote_error": "protocol version mismatch: agent=1 client=2"
+            })),
+            "protocol_mismatch"
+        );
+        assert_eq!(
+            classify_remote_agent_status(&json!({
+                "remote_error": "failed to canonicalize root: No such file or directory"
+            })),
+            "remote_root_missing"
+        );
+        assert_eq!(
+            classify_remote_agent_status(&json!({
+                "remote_error": "failed to launch agent: Permission denied"
+            })),
+            "agent_not_executable"
+        );
+        assert_eq!(
+            classify_remote_agent_status(&json!({
+                "remote_error": "failed to launch agent: nrm-agent: not found"
+            })),
+            "missing_agent"
+        );
+    }
+
+    #[test]
     fn non_retryable_agent_rpc_error_does_not_poison_remote_backoff() {
         let dir = tempdir().unwrap();
         let mut client = AgentClient::new(
             "missing-agent".to_string(),
+            None,
             RemoteTransport::Local,
             dir.path().to_path_buf(),
             Duration::from_millis(100),
@@ -7673,6 +8181,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut client = AgentClient::new(
             "missing-agent".to_string(),
+            None,
             RemoteTransport::Local,
             dir.path().to_path_buf(),
             Duration::from_millis(100),
@@ -7833,6 +8342,7 @@ mod tests {
                 .join("missing-agent")
                 .to_string_lossy()
                 .to_string(),
+            None,
             Some(state_dir.path().to_path_buf()),
             1,
             AgentInterrupt::default(),
@@ -7919,6 +8429,7 @@ mod tests {
                 .join("missing-agent")
                 .to_string_lossy()
                 .to_string(),
+            None,
             Some(state_dir.path().to_path_buf()),
             30_000,
             AgentInterrupt::default(),
@@ -8047,6 +8558,7 @@ mod tests {
             remote_dir.path().join("repo"),
             RemoteTransport::Local,
             "missing-agent".to_string(),
+            None,
             Some(state_dir.path().to_path_buf()),
             1,
             FailingRequestReader,
@@ -8076,6 +8588,7 @@ mod tests {
                 listener_root,
                 RemoteTransport::Local,
                 "missing-agent".to_string(),
+                None,
                 Some(listener_state),
                 1,
             )
@@ -8176,6 +8689,7 @@ mod tests {
                 listener_root,
                 RemoteTransport::Local,
                 listener_agent,
+                None,
                 Some(listener_state),
                 30_000,
             )
@@ -8292,6 +8806,7 @@ mod tests {
                 listener_root,
                 transport,
                 listener_agent,
+                None,
                 Some(listener_state),
                 30_000,
             )
@@ -8555,6 +9070,7 @@ mod tests {
         let (tx, _rx) = mpsc::channel();
         let mut client = AgentClient::new(
             "unused-agent".to_string(),
+            None,
             RemoteTransport::Local,
             PathBuf::from("/unused"),
             Duration::from_secs(1),
@@ -8587,6 +9103,7 @@ mod tests {
                 .join("missing-agent")
                 .to_string_lossy()
                 .to_string(),
+            None,
             Some(state_dir.path().to_path_buf()),
             1,
             AgentInterrupt::default(),
@@ -9778,6 +10295,7 @@ mod tests {
                 .join("missing-agent")
                 .to_string_lossy()
                 .to_string(),
+            None,
             Some(state_dir.path().to_path_buf()),
             1,
             AgentInterrupt::default(),
@@ -9812,6 +10330,7 @@ mod tests {
                 .join("missing-agent")
                 .to_string_lossy()
                 .to_string(),
+            None,
             Some(state_dir.path().to_path_buf()),
             1,
             AgentInterrupt::default(),
@@ -11288,6 +11807,40 @@ mod tests {
     }
 
     #[test]
+    fn remote_queue_drain_queued_keeps_queue_open() {
+        let queue = RemoteQueue::new(8, 8);
+        queue
+            .try_push(test_remote_work(1, "prefetch"), None)
+            .unwrap();
+        queue.try_push(test_remote_work(2, "open"), None).unwrap();
+
+        let drained = queue.drain_queued();
+
+        assert_eq!(drained.len(), 2);
+        assert_eq!(drained[0].request.id, 1);
+        assert_eq!(drained[1].request.id, 2);
+        queue.try_push(test_remote_work(3, "status"), None).unwrap();
+        assert_eq!(queue.pop().unwrap().request.id, 3);
+        queue.shutdown_and_drain();
+    }
+
+    #[test]
+    fn remote_agent_replacement_requests_are_write_control_work() {
+        for method in ["remote_agent_install", "remote_agent_update"] {
+            let request = test_client_request(9, method, json!({}));
+
+            assert!(request_is_write_lane(&request));
+            assert!(request_replaces_remote_agent(&request));
+        }
+
+        assert!(!request_replaces_remote_agent(&test_client_request(
+            10,
+            "remote_health",
+            json!({})
+        )));
+    }
+
+    #[test]
     fn remote_queue_close_keeps_interactive_work_and_drains_background() {
         let queue = RemoteQueue::new(8, 8);
         queue
@@ -11616,7 +12169,7 @@ mod tests {
                 "-o",
                 "ServerAliveCountMax=2",
                 "host",
-                "'nrm-agent' 'serve' '--root' '/tmp/repo with '\\''quote'\\'' ; x'"
+                "'sh' '-lc' 'PATH=\"$HOME/.local/bin:$PATH\"; exec \"$@\"' 'nrm-agent-launch' 'nrm-agent' 'serve' '--root' '/tmp/repo with '\\''quote'\\'' ; x'"
             ]
         );
     }
@@ -11899,6 +12452,127 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn managed_agent_ssh_remote_command_prepends_home_local_bin() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let home = dir.path().join("home");
+        let bin = home.join(".local/bin");
+        fs::create_dir_all(&bin).unwrap();
+        let fake_agent = bin.join("nrm-agent");
+        fs::write(
+            &fake_agent,
+            "#!/bin/sh\nprintf 'ARG1=<%s>\\nARG2=<%s>\\nARG3=<%s>\\n' \"$1\" \"$2\" \"$3\"\n",
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&fake_agent).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&fake_agent, permissions).unwrap();
+
+        let remote_root = dir.path().join("repo with spaces");
+        fs::create_dir_all(&remote_root).unwrap();
+        let remote_command = agent_remote_command("nrm-agent", &remote_root);
+        let output = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(remote_command)
+            .env("HOME", &home)
+            .env("PATH", "/usr/bin:/bin")
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(stdout.contains("ARG1=<serve>"));
+        assert!(stdout.contains("ARG2=<--root>"));
+        assert!(stdout.contains(&format!("ARG3=<{}>", remote_root.display())));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_agent_install_command_expands_home_and_installs_executable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let home = dir.path().join("home");
+        fs::create_dir_all(&home).unwrap();
+        let agent_body =
+            b"#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo fake-agent; exit 0; fi\nexit 0\n";
+        let command = remote_agent_install_command("$HOME/.local/bin/nrm-agent test", false);
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .env("HOME", &home)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(agent_body).unwrap();
+        let output = child.wait_with_output().unwrap();
+
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let installed = home.join(".local/bin/nrm-agent test");
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap().trim(),
+            installed.to_string_lossy()
+        );
+        assert_eq!(fs::read(&installed).unwrap(), agent_body);
+        assert_eq!(
+            fs::metadata(&installed).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_agent_install_command_refuses_existing_without_force() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir().unwrap();
+        let home = dir.path().join("home");
+        let bin = home.join(".local/bin");
+        fs::create_dir_all(&bin).unwrap();
+        let installed = bin.join("nrm-agent");
+        fs::write(&installed, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut permissions = fs::metadata(&installed).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&installed, permissions).unwrap();
+
+        let command = remote_agent_install_command("$HOME/.local/bin/nrm-agent", false);
+        let mut child = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .env("HOME", &home)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(b"new").unwrap();
+        let output = child.wait_with_output().unwrap();
+
+        assert_eq!(output.status.code(), Some(23));
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("remote agent already exists"),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            fs::read_to_string(&installed).unwrap(),
+            "#!/bin/sh\nexit 0\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn active_open_preemption_cleans_partial_hydration() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -11917,6 +12591,7 @@ mod tests {
             remote_root,
             RemoteTransport::Local,
             fake_agent.to_string_lossy().to_string(),
+            None,
             Some(dir.path().join("state")),
             30_000,
             interrupt.clone(),
@@ -11966,6 +12641,7 @@ mod tests {
             remote_root,
             RemoteTransport::Local,
             fake_agent.to_string_lossy().to_string(),
+            None,
             Some(dir.path().join("state")),
             30_000,
             interrupt.clone(),
@@ -12086,6 +12762,7 @@ mod tests {
         interrupt.request_shutdown();
         let mut client = AgentClient::new(
             "unused-agent".to_string(),
+            None,
             RemoteTransport::Local,
             PathBuf::from("/unused"),
             Duration::from_secs(30),
@@ -12106,6 +12783,7 @@ mod tests {
                 .join("missing-agent")
                 .to_string_lossy()
                 .to_string(),
+            None,
             RemoteTransport::Local,
             dir.path().to_path_buf(),
             Duration::from_secs(30),
@@ -12140,6 +12818,7 @@ mod tests {
                 .join("missing-agent")
                 .to_string_lossy()
                 .to_string(),
+            None,
             RemoteTransport::Local,
             dir.path().to_path_buf(),
             Duration::from_secs(30),
@@ -12175,6 +12854,7 @@ mod tests {
                 .join("missing-agent")
                 .to_string_lossy()
                 .to_string(),
+            None,
             RemoteTransport::Local,
             dir.path().to_path_buf(),
             Duration::from_secs(30),
@@ -12210,6 +12890,7 @@ mod tests {
                 .join("missing-agent")
                 .to_string_lossy()
                 .to_string(),
+            None,
             RemoteTransport::Local,
             dir.path().to_path_buf(),
             Duration::from_secs(30),
@@ -12240,6 +12921,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut read_client = AgentClient::new(
             dir.path().join("agent").to_string_lossy().to_string(),
+            None,
             RemoteTransport::Local,
             dir.path().to_path_buf(),
             Duration::from_secs(30),
@@ -12271,6 +12953,7 @@ mod tests {
 
         let mut client = AgentClient::new(
             fake_agent.to_string_lossy().to_string(),
+            None,
             RemoteTransport::Local,
             dir.path().to_path_buf(),
             Duration::from_millis(50),
@@ -12302,6 +12985,7 @@ mod tests {
         let client_interrupt = interrupt.clone();
         let mut client = AgentClient::new(
             fake_agent.to_string_lossy().to_string(),
+            None,
             RemoteTransport::Local,
             dir.path().to_path_buf(),
             Duration::from_secs(30),
@@ -12344,6 +13028,7 @@ mod tests {
         let interrupt = AgentInterrupt::default();
         let mut client = AgentClient::new(
             fake_agent.to_string_lossy().to_string(),
+            None,
             RemoteTransport::Local,
             dir.path().to_path_buf(),
             Duration::from_secs(30),
@@ -12394,6 +13079,7 @@ mod tests {
         let interrupt = AgentInterrupt::default();
         let mut client = AgentClient::new(
             fake_agent.to_string_lossy().to_string(),
+            None,
             RemoteTransport::Local,
             dir.path().to_path_buf(),
             Duration::from_secs(30),

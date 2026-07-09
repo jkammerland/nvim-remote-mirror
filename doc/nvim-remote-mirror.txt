@@ -33,7 +33,8 @@ Requirements:
     - Neovim 0.10+, with Neovim 0.11+ preferred.
     - Rust toolchain on the local machine.
     - SSH access for ssh://host/path targets.
-    - nrm-agent installed and executable on each remote host.
+    - nrm-agent installed and executable on each remote host, or installable
+      with :RemoteInstallAgent after connecting.
 
 Build the binaries from the checkout:
 >
@@ -45,6 +46,14 @@ Install nrm-agent on each remote host:
   scp target/release/nrm-agent myhost:~/.local/bin/nrm-agent
   ssh myhost 'chmod +x ~/.local/bin/nrm-agent'
 <
+
+Or connect and run the explicit repair flow:
+>
+  :RemoteConnect ssh://myhost/home/me/project
+  :RemoteHealth
+  :RemoteInstallAgent
+<
+Connect does not silently install or update remote binaries.
 
 Non-interactive SSH may not load ~/.profile or shell rc files. If this fails:
 >
@@ -97,7 +106,7 @@ UI                                                *nvim-remote-mirror-ui*
     the sidecar, so large pending queues do not hide later conflict entries.
 
 Dashboard keys:
-    c connect        o open path      f find files     g grep
+    c connect        h health         o open path      f find files     g grep
     z cwd            s save queue     C conflicts      F flush queue
     r refresh        d disconnect     R reconnect      q/x close
 
@@ -222,6 +231,23 @@ COMMANDS                                      *nvim-remote-mirror-commands*
     background metadata scan state, LSP summary, and last known remote health.
     This is a local fast path and does not probe SSH.
 
+:RemoteHealth
+    Probe the remote agent explicitly and update last-known remote health. The
+    result includes agent compatibility state such as ok, missing_agent,
+    version_mismatch, protocol_mismatch, agent_not_executable, or
+    remote_root_missing when the sidecar can classify the failure.
+
+:RemoteInstallAgent[!] [path]
+    Upload the configured local agent binary to an SSH target. Without [path],
+    a bare remote_agent such as nrm-agent installs to
+    $HOME/.local/bin/nrm-agent; an absolute remote_agent installs to that
+    absolute path. [!] overwrites an existing target.
+
+:RemoteUpdateAgent[!] [path]
+    Upload the configured local agent binary when :RemoteHealth reports a
+    missing, incompatible, or non-executable remote agent. Without [!], a
+    compatible agent is skipped.
+
 :RemoteGitStatus [path...]
     Run remote `git status --porcelain=v1 -z --branch --untracked-files=all`
     through the agent and put changed paths in quickfix. Optional paths are
@@ -261,6 +287,7 @@ CONFIGURATION                                  *nvim-remote-mirror-config*
     sidecar = "/path/to/nrm-sidecar",
     agent = "/path/to/local/nrm-agent",
     remote_agent = "nrm-agent",
+    remote_agent_install_path = nil,
     connection = "stdio",
     socket_path = nil,
     socket_dir = nil,
@@ -307,12 +334,18 @@ CONFIGURATION                                  *nvim-remote-mirror-config*
   })
 <
 
-For ssh:// targets, remote_agent is executed on the remote host. The local agent
-path is used only for local targets, so a checkout-local target/debug/nrm-agent
-is not accidentally sent to SSH hosts.
+For ssh:// targets, remote_agent is executed on the remote host. The local
+agent path is used for local targets and as the upload source for explicit
+:RemoteInstallAgent and :RemoteUpdateAgent commands. It is not silently copied
+on connect.
+If remote_agent is a bare command such as nrm-agent, SSH agent launches prepend
+$HOME/.local/bin to PATH and explicit install defaults to
+$HOME/.local/bin/nrm-agent. If remote_agent is absolute, explicit install
+defaults to that absolute path. remote_agent_install_path or an optional command
+argument overrides the default.
 Non-interactive SSH may not load the same PATH as an interactive login shell.
-If ssh host 'command -v nrm-agent' fails, set remote_agent to an absolute
-remote path.
+If :RemoteHealth reports missing_agent, run :RemoteInstallAgent or set
+remote_agent to an absolute remote path.
 Set connection = "socket" to connect through a reusable Unix-domain sidecar
 listener. If socket_path is unset, the plugin derives a stable path under
 socket_dir, state_dir/sockets, or the system temp directory from the target and

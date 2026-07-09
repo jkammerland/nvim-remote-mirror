@@ -146,6 +146,32 @@ vim.api.nvim_create_user_command("RemoteStatus", function()
   nrm.status()
 end, {})
 
+vim.api.nvim_create_user_command("RemoteHealth", function()
+  nrm.remote_health()
+end, {})
+
+vim.api.nvim_create_user_command("RemoteInstallAgent", function(opts)
+  nrm.install_agent({
+    force = opts.bang,
+    install_path = opts.args ~= "" and opts.args or nil,
+  })
+end, {
+  nargs = "?",
+  complete = "file",
+  bang = true,
+})
+
+vim.api.nvim_create_user_command("RemoteUpdateAgent", function(opts)
+  nrm.update_agent({
+    force = opts.bang,
+    install_path = opts.args ~= "" and opts.args or nil,
+  })
+end, {
+  nargs = "?",
+  complete = "file",
+  bang = true,
+})
+
 vim.api.nvim_create_user_command("RemoteGitStatus", function(opts)
   nrm.git_status({ paths = opts.fargs })
 end, {

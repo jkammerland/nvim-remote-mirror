@@ -19,6 +19,7 @@ but it is not a polished replacement for SSHFS or VS Code Remote yet.
 | Local mirror open/find/grep | Working |
 | Save queue and conflicts | Working |
 | Socket sidecar mode | Working, one active Neovim client |
+| Remote agent health/install/update | Explicit commands |
 | Remote LSP proxy | Basic |
 | Remote git status/diff/blame | Basic |
 | Terminals, DAP, plugin remoting | Not built |
@@ -31,7 +32,7 @@ but it is not a polished replacement for SSHFS or VS Code Remote yet.
 | Neovim 0.10+ | local | Neovim 0.11+ is preferred |
 | Rust toolchain | local | Builds `nrm-sidecar` and `nrm-agent` |
 | SSH | local and remote | Used for `ssh://host/path` targets |
-| `nrm-agent` | remote | Must be executable on the remote host |
+| `nrm-agent` | remote | Must be executable on the remote host; can be installed with `:RemoteInstallAgent` |
 
 ## Install
 
@@ -41,12 +42,27 @@ Build the local binaries:
 cargo build --release
 ```
 
-Install the remote agent on each remote host:
+Install the remote agent on each remote host manually:
 
 ```sh
 scp target/release/nrm-agent myhost:~/.local/bin/nrm-agent
 ssh myhost 'chmod +x ~/.local/bin/nrm-agent'
 ```
+
+Or connect and run an explicit repair command from Neovim:
+
+```vim
+:RemoteConnect ssh://myhost/home/me/project
+:RemoteHealth
+:RemoteInstallAgent
+```
+
+The plugin does not silently install or update the remote agent during connect.
+`:RemoteInstallAgent[!]` and `:RemoteUpdateAgent[!]` upload the configured local
+`agent` binary to the remote host over SSH. For a bare `remote_agent =
+"nrm-agent"`, the managed install path defaults to
+`$HOME/.local/bin/nrm-agent`, and SSH launches prepend `$HOME/.local/bin` to
+`PATH` so non-interactive sessions can find it.
 
 Non-interactive SSH often skips shell startup files. If this fails:
 
@@ -121,6 +137,7 @@ Dashboard keys:
 | `f` | Find file |
 | `g` | Grep |
 | `z` | Set current tab cwd to the mirror files root |
+| `h` | Check remote agent health |
 | `s` | Save queue |
 | `C` | Conflicts |
 | `F` | Flush queued saves |
@@ -144,6 +161,9 @@ Dashboard keys:
 | `:RemoteGrep {query}` | Search remote and cached mirror files |
 | `:RemotePrefetch {path...}` | Hydrate files into the mirror |
 | `:RemoteStatus` | Print a status summary |
+| `:RemoteHealth` | Probe remote agent health and compatibility |
+| `:RemoteInstallAgent[!] [path]` | Upload the local `agent` binary to the remote host |
+| `:RemoteUpdateAgent[!] [path]` | Replace the remote agent when health reports mismatch |
 | `:RemoteGitStatus [path...]` | Put remote git status entries in quickfix |
 | `:RemoteGitDiff [path]` | Open a remote git diff scratch buffer |
 | `:RemoteGitBlame [path]` | Put remote git blame output in quickfix |
@@ -168,7 +188,9 @@ Dashboard keys:
 | --- | --- | --- |
 | `connection` | `"stdio"` | Set to `"socket"` for reusable sidecar mode |
 | `state_dir` | `nil` | Durable mirror state root; default is Neovim state data |
+| `agent` | local checkout/debug path or `"nrm-agent"` | Local agent and SSH upload source |
 | `remote_agent` | `"nrm-agent"` | Remote command run over SSH |
+| `remote_agent_install_path` | `nil` | Optional default remote path for `:RemoteInstallAgent` and `:RemoteUpdateAgent` |
 | `request_timeout_ms` | `30000` | Neovim-to-sidecar request timeout |
 | `ssh_connect_timeout_seconds` | `10` | SSH connection timeout |
 | `find_limit` | `200` | Max file picker results |
@@ -212,7 +234,7 @@ Mirror files live under the sidecar state directory, typically below
 | --- | --- |
 | `not connected` | Run `:RemoteWorkspace` or `:RemoteConnect ...` |
 | SSH target fails | Confirm `ssh myhost` works without prompts |
-| Remote agent missing | Confirm `ssh myhost 'command -v nrm-agent'` |
+| Remote agent missing | Run `:RemoteHealth`, then `:RemoteInstallAgent`; or confirm `ssh myhost 'command -v nrm-agent'` |
 | Opens are stale | Use `:RemoteValidate` or `:RemoteOpen! path` |
 | Saves are queued | Open `:RemoteQueue`, then retry with `:RemoteFlushQueue` |
 | Save conflict | Open `:RemoteConflicts`; accept-local uploads the saved local snapshot, accept-remote is blocked for partial remote copies |
