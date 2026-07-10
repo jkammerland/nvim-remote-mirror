@@ -1,5 +1,6 @@
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
+mod agent_install;
 mod lsp_rewrite;
 mod remote_host;
 use lsp_rewrite::rewrite_lsp_body;
@@ -24,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest as _, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
@@ -377,6 +379,352 @@ struct ResolvedAgentSource {
     _registry_artifact: Option<FetchedArtifact>,
 }
 
+struct AgentInstallPreflight {
+    before: Value,
+    target_path: String,
+    effective_force: bool,
+    skip: bool,
+}
+
+struct PreparedAgentInstall {
+    source: ResolvedAgentSource,
+    upload: File,
+    source_hash: String,
+    source_sha256: String,
+    source_size: u64,
+    ssh: SshTransport,
+    plan: agent_install::PosixInstallPlan,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AgentInstallFinalState {
+    TargetUnchanged,
+    PreviousRestored,
+    CandidateHealthy,
+    LiveStateUnknown,
+}
+
+#[derive(Debug)]
+struct AgentInstallTransactionError {
+    final_state: AgentInstallFinalState,
+    message: String,
+}
+
+impl fmt::Display for AgentInstallTransactionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for AgentInstallTransactionError {}
+
+fn install_transaction_error(
+    final_state: AgentInstallFinalState,
+    message: impl Into<String>,
+) -> AgentInstallTransactionError {
+    AgentInstallTransactionError {
+        final_state,
+        message: message.into(),
+    }
+}
+
+trait AgentInstallOps {
+    fn stage(&mut self) -> Result<agent_install::StagedInstall>;
+    fn validate_staged(&mut self, staged: &agent_install::StagedInstall) -> Result<()>;
+    fn activate(
+        &mut self,
+        staged: &agent_install::StagedInstall,
+    ) -> Result<agent_install::ActivatedInstall>;
+    fn reconcile_activation(
+        &mut self,
+        staged: &agent_install::StagedInstall,
+    ) -> Result<agent_install::ActivationRecovery>;
+    fn validate_reconciliation(
+        &mut self,
+        recovery: &agent_install::ActivationRecovery,
+    ) -> Result<()>;
+    fn validate_activated(&mut self, activated: &agent_install::ActivatedInstall) -> Result<()>;
+    fn rollback(
+        &mut self,
+        activated: &agent_install::ActivatedInstall,
+    ) -> Result<agent_install::RollbackOutcome>;
+    fn validate_rollback(&mut self, rollback: &agent_install::RollbackOutcome) -> Result<()>;
+    fn cleanup(&mut self, staged: &agent_install::StagedInstall) -> Result<()>;
+}
+
+fn run_agent_install_transaction(
+    operations: &mut impl AgentInstallOps,
+) -> std::result::Result<agent_install::ActivatedInstall, AgentInstallTransactionError> {
+    let staged = operations.stage().map_err(|error| {
+        install_transaction_error(
+            AgentInstallFinalState::TargetUnchanged,
+            format!("staging_failed: failed to stage remote agent: {error}"),
+        )
+    })?;
+    if let Err(error) = operations.validate_staged(&staged) {
+        let cleanup = operations.cleanup(&staged).err();
+        return Err(install_transaction_error(
+            AgentInstallFinalState::TargetUnchanged,
+            format!(
+                "staged_validation_failed: {error}{}",
+                cleanup
+                    .map(|cleanup| format!("; cleanup_failed: {cleanup}"))
+                    .unwrap_or_default()
+            ),
+        ));
+    }
+    let activated = match operations.activate(&staged) {
+        Ok(activated) => activated,
+        Err(error) => {
+            let recovery = operations.reconcile_activation(&staged).map_err(|recovery| {
+                install_transaction_error(
+                    AgentInstallFinalState::LiveStateUnknown,
+                    format!(
+                        "rollback_failed: activation reconciliation failed: {recovery}; original activation failure: {error}"
+                    ),
+                )
+            })?;
+            operations.validate_reconciliation(&recovery).map_err(
+                |recovery_error| {
+                    install_transaction_error(
+                        AgentInstallFinalState::LiveStateUnknown,
+                        format!(
+                            "rollback_failed: reconciled target reprobe failed: {recovery_error}; original activation failure: {error}"
+                        ),
+                    )
+                },
+            )?;
+            let final_state = match recovery.kind {
+                agent_install::ActivationRecoveryKind::ActivationUnchangedPresent
+                | agent_install::ActivationRecoveryKind::ActivationUnchangedMissing => {
+                    AgentInstallFinalState::TargetUnchanged
+                }
+                agent_install::ActivationRecoveryKind::RestoredPrevious
+                | agent_install::ActivationRecoveryKind::RemovedCandidate => {
+                    AgentInstallFinalState::PreviousRestored
+                }
+            };
+            return Err(install_transaction_error(
+                final_state,
+                format!(
+                    "activation_failed: {error}; reconciliation={:?}",
+                    recovery.kind
+                ),
+            ));
+        }
+    };
+    if let Err(error) = operations.validate_activated(&activated) {
+        let rollback = operations.rollback(&activated).map_err(|rollback| {
+            install_transaction_error(
+                AgentInstallFinalState::LiveStateUnknown,
+                format!("rollback_failed: {rollback}; original postactivation failure: {error}"),
+            )
+        })?;
+        operations.validate_rollback(&rollback).map_err(|rollback| {
+            install_transaction_error(
+                AgentInstallFinalState::LiveStateUnknown,
+                format!(
+                    "rollback_failed: restored agent reprobe failed: {rollback}; original postactivation failure: {error}"
+                ),
+            )
+        })?;
+        return Err(install_transaction_error(
+            AgentInstallFinalState::PreviousRestored,
+            format!("post_activation_validation_failed: {error}; rollback=restored"),
+        ));
+    }
+    operations.cleanup(&activated.staged).map_err(|error| {
+        install_transaction_error(
+            AgentInstallFinalState::CandidateHealthy,
+            format!(
+                "cleanup_failed: activated agent is healthy but backup cleanup failed: {error}"
+            ),
+        )
+    })?;
+    Ok(activated)
+}
+
+struct PosixSshInstallOps<'a> {
+    plan: agent_install::PosixInstallPlan,
+    ssh: SshTransport,
+    source: Option<File>,
+    launch: AgentLaunch,
+    normal_agent: &'a mut AgentClient,
+    timeout: Duration,
+}
+
+impl PosixSshInstallOps<'_> {
+    fn command_output(&self, command: String, context: &str) -> Result<CapturedProcessOutput> {
+        run_command_capture(self.ssh.command(command), None, self.timeout, context)
+    }
+
+    fn require_success(output: CapturedProcessOutput) -> Result<String> {
+        if output.status.success() {
+            return Ok(output.stdout);
+        }
+        let failure =
+            agent_install::classify_install_failure(output.status.code(), output.stderr.as_str());
+        bail!("{}: {}", install_failure_code(failure.kind), failure.detail);
+    }
+
+    fn confirm_target_absent(&self, hook: &agent_install::PosixValidationHook) -> Result<()> {
+        let command = self
+            .plan
+            .absence_check_command(hook)
+            .context("invalid absent-target validation hook")?;
+        let output = self.command_output(command, "remote agent absence check")?;
+        let stdout = Self::require_success(output)?;
+        self.plan
+            .parse_absence_check_stdout(hook, &stdout)
+            .context("remote agent absence check returned an invalid record")
+    }
+}
+
+impl AgentInstallOps for PosixSshInstallOps<'_> {
+    fn stage(&mut self) -> Result<agent_install::StagedInstall> {
+        let source = self
+            .source
+            .take()
+            .ok_or_else(|| anyhow!("agent source was already consumed"))?;
+        let output = run_command_capture(
+            self.ssh.command(self.plan.stage_command()),
+            Some(Box::new(source)),
+            self.timeout,
+            "remote agent staging",
+        )?;
+        let stdout = Self::require_success(output)?;
+        self.plan
+            .parse_stage_stdout(&stdout)
+            .context("remote agent staging returned an invalid record")
+    }
+
+    fn validate_staged(&mut self, staged: &agent_install::StagedInstall) -> Result<()> {
+        let hook = self.plan.staged_validation(staged);
+        probe_agent_at(&self.launch, &hook.executable_path, self.timeout)
+            .context("staged agent Hello failed")
+    }
+
+    fn activate(
+        &mut self,
+        staged: &agent_install::StagedInstall,
+    ) -> Result<agent_install::ActivatedInstall> {
+        let output = self.command_output(
+            self.plan.activate_command(staged),
+            "remote agent activation",
+        )?;
+        let stdout = Self::require_success(output)?;
+        self.plan
+            .parse_activation_stdout(staged, &stdout)
+            .context("remote agent activation returned an invalid record")
+    }
+
+    fn validate_activated(&mut self, activated: &agent_install::ActivatedInstall) -> Result<()> {
+        let _hook = self.plan.post_activation_validation(activated);
+        probe_normal_agent(self.normal_agent).context("normal-path agent Hello failed")
+    }
+
+    fn reconcile_activation(
+        &mut self,
+        staged: &agent_install::StagedInstall,
+    ) -> Result<agent_install::ActivationRecovery> {
+        self.normal_agent.kill_worker();
+        let output = self.command_output(
+            self.plan.reconcile_activation_command(staged),
+            "remote agent activation reconciliation",
+        )?;
+        let stdout = Self::require_success(output)?;
+        self.plan
+            .parse_reconciliation_stdout(staged, &stdout)
+            .context("remote agent activation reconciliation returned an invalid record")
+    }
+
+    fn validate_reconciliation(
+        &mut self,
+        recovery: &agent_install::ActivationRecovery,
+    ) -> Result<()> {
+        let hook = self.plan.reconciliation_validation(recovery);
+        match hook.mode {
+            agent_install::ValidationMode::Reprobe => {
+                probe_restored_agent_at(&self.launch, &hook.executable_path, self.timeout)
+                    .context("reconciled agent Hello failed")?;
+                self.normal_agent.clear_all_remote_unavailable();
+                Ok(())
+            }
+            agent_install::ValidationMode::ExpectMissing => {
+                self.confirm_target_absent(&hook)?;
+                self.normal_agent.clear_all_remote_unavailable();
+                Ok(())
+            }
+            agent_install::ValidationMode::FullHelloExact => {
+                bail!("reconciliation returned an invalid validation mode")
+            }
+        }
+    }
+
+    fn rollback(
+        &mut self,
+        activated: &agent_install::ActivatedInstall,
+    ) -> Result<agent_install::RollbackOutcome> {
+        self.normal_agent.kill_worker();
+        let output = self.command_output(
+            self.plan.rollback_command(activated),
+            "remote agent rollback",
+        )?;
+        let stdout = Self::require_success(output)?;
+        self.plan
+            .parse_rollback_stdout(activated, &stdout)
+            .context("remote agent rollback returned an invalid record")
+    }
+
+    fn validate_rollback(&mut self, rollback: &agent_install::RollbackOutcome) -> Result<()> {
+        let hook = self.plan.rollback_validation(rollback);
+        match hook.mode {
+            agent_install::ValidationMode::Reprobe => {
+                probe_restored_agent_at(&self.launch, &hook.executable_path, self.timeout)
+                    .context("restored agent Hello failed")?;
+                self.normal_agent.clear_all_remote_unavailable();
+                Ok(())
+            }
+            agent_install::ValidationMode::ExpectMissing => {
+                self.confirm_target_absent(&hook)?;
+                self.normal_agent.clear_all_remote_unavailable();
+                Ok(())
+            }
+            agent_install::ValidationMode::FullHelloExact => {
+                bail!("rollback returned an invalid validation mode")
+            }
+        }
+    }
+
+    fn cleanup(&mut self, staged: &agent_install::StagedInstall) -> Result<()> {
+        let output =
+            self.command_output(self.plan.cleanup_command(staged), "remote agent cleanup")?;
+        let stdout = Self::require_success(output)?;
+        self.plan
+            .parse_cleanup_stdout(staged, &stdout)
+            .context("remote agent cleanup returned an invalid record")
+    }
+}
+
+fn install_failure_code(kind: agent_install::InstallFailureKind) -> &'static str {
+    use agent_install::InstallFailureKind;
+    match kind {
+        InstallFailureKind::AlreadyExists => "already_exists",
+        InstallFailureKind::InvalidTarget => "invalid_target",
+        InstallFailureKind::StageCreateFailed => "stage_create_failed",
+        InstallFailureKind::UploadFailed => "upload_failed",
+        InstallFailureKind::ChmodFailed => "chmod_failed",
+        InstallFailureKind::VersionExecutionFailed => "version_exec_failed",
+        InstallFailureKind::VersionMismatch => "version_mismatch",
+        InstallFailureKind::InvalidState => "invalid_state",
+        InstallFailureKind::ActivationFailed => "activation_failed",
+        InstallFailureKind::ProcessInUse => "process_in_use",
+        InstallFailureKind::RollbackFailed => "rollback_failed",
+        InstallFailureKind::CleanupFailed => "cleanup_failed",
+        InstallFailureKind::CommandFailed => "command_failed",
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct ClientRequest {
     id: u64,
@@ -551,6 +899,7 @@ impl ProcessLaunchPlan {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SshTransport {
+    program: PathBuf,
     target: String,
     connect_timeout_seconds: u64,
 }
@@ -573,7 +922,7 @@ impl SshTransport {
     }
 
     fn command(&self, remote_command: String) -> Command {
-        let mut command = Command::new("ssh");
+        let mut command = Command::new(&self.program);
         command.args(self.command_args(remote_command));
         command
     }
@@ -591,6 +940,7 @@ impl RemoteTransport {
             Some(target) => {
                 validate_ssh_destination(&target)?;
                 Ok(Self::Ssh(SshTransport {
+                    program: PathBuf::from("ssh"),
                     target,
                     connect_timeout_seconds,
                 }))
@@ -651,7 +1001,7 @@ impl RemoteTransport {
             Self::Ssh(ssh) => {
                 validate_remote_root(host, remote_root)?;
                 Ok(ProcessLaunchPlan {
-                    program: "ssh".to_string(),
+                    program: ssh.program.to_string_lossy().to_string(),
                     args: ssh.command_args(match host.path_style {
                         RemotePathStyle::Posix => posix_agent_remote_command(agent, remote_root),
                         RemotePathStyle::Windows => {
@@ -679,7 +1029,7 @@ impl RemoteTransport {
             Self::Ssh(ssh) => {
                 validate_remote_root(host, &remote_root)?;
                 Ok(ProcessLaunchPlan {
-                    program: "ssh".to_string(),
+                    program: ssh.program.to_string_lossy().to_string(),
                     args: ssh.command_args(match host.path_style {
                         RemotePathStyle::Posix => posix_lsp_remote_command(remote_root, command),
                         RemotePathStyle::Windows => {
@@ -869,6 +1219,7 @@ struct AgentLaunch {
     request_timeout: Duration,
     transport: RemoteTransport,
     remote_host_info: Arc<Mutex<Option<RemoteHostInfo>>>,
+    worker_generation: Arc<AtomicU64>,
 }
 
 impl AgentLaunch {
@@ -982,6 +1333,18 @@ impl AgentInterrupt {
         }
     }
 
+    fn kill_current_and_wait(&self) {
+        let handle = self
+            .current_abort
+            .lock()
+            .ok()
+            .and_then(|current| current.as_ref().map(Arc::clone));
+        if let Some(handle) = handle {
+            handle.abort();
+            handle.wait();
+        }
+    }
+
     #[cfg(test)]
     fn has_current_abort(&self) -> bool {
         self.current_abort
@@ -1008,6 +1371,7 @@ impl AgentPreempt {
 struct AgentWorker {
     tx: mpsc::Sender<AgentWorkerCommand>,
     abort: Arc<dyn AgentAbortHandle>,
+    join: Option<thread::JoinHandle<()>>,
 }
 
 trait AgentSession: Send {
@@ -1162,6 +1526,7 @@ struct AgentClient {
     backoff_lane: AgentBackoffLane,
     remote_backoff: Arc<Mutex<RemoteBackoffState>>,
     next_id: RequestId,
+    worker_generation: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1320,6 +1685,7 @@ impl AgentClient {
                 request_timeout,
                 transport,
                 remote_host_info: Arc::new(Mutex::new(None)),
+                worker_generation: Arc::new(AtomicU64::new(0)),
             },
             interrupt,
             preempt: AgentPreempt::default(),
@@ -1328,6 +1694,7 @@ impl AgentClient {
             backoff_lane: AgentBackoffLane::Read,
             remote_backoff: Arc::new(Mutex::new(RemoteBackoffState::default())),
             next_id: 1,
+            worker_generation: 0,
         }
     }
 
@@ -1341,6 +1708,7 @@ impl AgentClient {
             backoff_lane: AgentBackoffLane::Write,
             remote_backoff: Arc::clone(&self.remote_backoff),
             next_id: 1,
+            worker_generation: self.launch.worker_generation.load(Ordering::SeqCst),
         }
     }
 
@@ -1374,7 +1742,7 @@ impl AgentClient {
         interrupt.set_abort_handle(Arc::clone(&abort));
         let (tx, rx) = mpsc::channel::<AgentWorkerCommand>();
         let worker_abort = Arc::clone(&abort);
-        thread::spawn(move || {
+        let join = thread::spawn(move || {
             let mut session: Box<dyn AgentSession> =
                 Box::new(FramedAgentSession::new(stdin, stdout));
             while let Ok(command) = rx.recv() {
@@ -1388,7 +1756,11 @@ impl AgentClient {
             interrupt.clear_abort_handle(&worker_abort);
         });
 
-        Ok(AgentWorker { tx, abort })
+        Ok(AgentWorker {
+            tx,
+            abort,
+            join: Some(join),
+        })
     }
 
     fn request(&mut self, request: Request) -> Result<Response> {
@@ -1600,8 +1972,7 @@ impl AgentClient {
             if tx.send(command).is_ok() {
                 break;
             }
-            self.worker = None;
-            self.handshake_complete = false;
+            self.kill_worker();
             self.launch.invalidate_remote_host_info();
             if attempt == 1 {
                 return Err(self.mark_remote_unavailable(format!(
@@ -1657,8 +2028,7 @@ impl AgentClient {
                 Ok(reply) => return self.handle_worker_reply(reply),
                 Err(mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    self.worker = None;
-                    self.handshake_complete = false;
+                    self.kill_worker();
                     self.launch.invalidate_remote_host_info();
                     return Err(self.mark_remote_unavailable(format!(
                         "agent worker exited while request {id} was pending"
@@ -1673,14 +2043,12 @@ impl AgentClient {
             AgentWorkerReply::Response(Response::Error { message }) => Err(anyhow!(message)),
             AgentWorkerReply::Response(response) => Ok(AgentRequestOutcome::Response(response)),
             AgentWorkerReply::Error(error) if error.retryable => {
-                self.worker = None;
-                self.handshake_complete = false;
+                self.kill_worker();
                 Err(self.mark_remote_unavailable(format_rpc_error(error)))
             }
             AgentWorkerReply::Error(error) => Err(anyhow!(format_rpc_error(error))),
             AgentWorkerReply::TransportError(message) => {
-                self.worker = None;
-                self.handshake_complete = false;
+                self.kill_worker();
                 self.launch.invalidate_remote_host_info();
                 Err(self.mark_remote_unavailable(message))
             }
@@ -1691,8 +2059,13 @@ impl AgentClient {
         if self.interrupt.is_shutdown_requested() {
             bail!("agent worker is shut down");
         }
+        let shared_generation = self.launch.worker_generation.load(Ordering::SeqCst);
+        if self.worker.is_some() && self.worker_generation != shared_generation {
+            self.kill_worker();
+        }
         if self.worker.is_none() {
             self.worker = Some(Self::spawn_worker(&self.launch, self.interrupt.clone())?);
+            self.worker_generation = shared_generation;
         }
         Ok(self.worker.as_ref().expect("worker was just initialized"))
     }
@@ -1706,17 +2079,93 @@ impl AgentClient {
 
     fn kill_worker(&mut self) {
         self.handshake_complete = false;
-        if let Some(worker) = self.worker.take() {
+        if let Some(mut worker) = self.worker.take() {
             drop(worker.tx);
             worker.abort.abort();
             worker.abort.wait();
+            if let Some(join) = worker.join.take() {
+                let _ = join.join();
+            }
         }
+    }
+
+    fn invalidate_shared_workers(&mut self) {
+        self.launch.worker_generation.fetch_add(1, Ordering::SeqCst);
+        self.kill_worker();
     }
 }
 
 impl Drop for AgentClient {
     fn drop(&mut self) {
         self.kill_worker();
+    }
+}
+
+fn probe_agent_at(launch: &AgentLaunch, executable: &str, timeout: Duration) -> Result<()> {
+    let mut candidate = AgentClient::new_with_registry(
+        executable.to_string(),
+        None,
+        None,
+        launch.transport.clone(),
+        launch.remote_root.clone(),
+        timeout,
+        AgentInterrupt::default(),
+    );
+    candidate.launch.remote_host_info = Arc::clone(&launch.remote_host_info);
+    let result = probe_normal_agent(&mut candidate);
+    candidate.kill_worker();
+    result
+}
+
+fn probe_restored_agent_at(
+    launch: &AgentLaunch,
+    executable: &str,
+    timeout: Duration,
+) -> Result<()> {
+    let mut candidate = AgentClient::new_with_registry(
+        executable.to_string(),
+        None,
+        None,
+        launch.transport.clone(),
+        launch.remote_root.clone(),
+        timeout,
+        AgentInterrupt::default(),
+    );
+    candidate.launch.remote_host_info = Arc::clone(&launch.remote_host_info);
+    let preempt_epoch = candidate.preempt.epoch();
+    let result = match candidate.send_request_outcome(
+        Request::Hello {
+            client_version: env!("CARGO_PKG_VERSION").to_string(),
+            protocol_version: PROTOCOL_VERSION,
+        },
+        false,
+        preempt_epoch,
+    ) {
+        Ok(AgentRequestOutcome::Response(Response::Hello { .. })) => Ok(()),
+        Err(error) if is_agent_compatibility_mismatch(&error.to_string()) => Ok(()),
+        Ok(AgentRequestOutcome::Response(other)) => {
+            bail!("unexpected restored-agent Hello response: {other:?}")
+        }
+        Ok(AgentRequestOutcome::Preempted) => bail!("restored-agent Hello was preempted"),
+        Err(error) => Err(error),
+    };
+    candidate.kill_worker();
+    result
+}
+
+fn is_agent_compatibility_mismatch(message: &str) -> bool {
+    message.contains("package version mismatch:") || message.contains("protocol version mismatch:")
+}
+
+fn probe_normal_agent(agent: &mut AgentClient) -> Result<()> {
+    agent.kill_worker();
+    agent.clear_all_remote_unavailable();
+    match agent.request(Request::Hello {
+        client_version: env!("CARGO_PKG_VERSION").to_string(),
+        protocol_version: PROTOCOL_VERSION,
+    })? {
+        Response::Hello { .. } => Ok(()),
+        other => bail!("unexpected Hello response from agent: {other:?}"),
     }
 }
 
@@ -4100,6 +4549,15 @@ struct StartedRemoteWork {
     preempt_epoch: u64,
 }
 
+enum RemoteWorkerControl {
+    ResetAgent { reply: mpsc::SyncSender<()> },
+}
+
+enum RemoteWorkerItem {
+    Work(StartedRemoteWork),
+    Control(RemoteWorkerControl),
+}
+
 #[derive(Debug, Clone)]
 struct ActiveRemoteWork {
     id: u64,
@@ -4194,6 +4652,7 @@ fn request_replaces_remote_agent(request: &ClientRequest) -> bool {
 struct RemoteQueue {
     state: Mutex<RemoteQueueState>,
     ready: Condvar,
+    quiescent: Condvar,
     interactive_capacity: usize,
     background_capacity: usize,
 }
@@ -4203,6 +4662,9 @@ struct RemoteQueueState {
     interactive_len: usize,
     background_len: usize,
     closed: bool,
+    maintenance_paused: bool,
+    in_flight: usize,
+    controls: VecDeque<RemoteWorkerControl>,
 }
 
 impl RemotePriority {
@@ -4283,8 +4745,12 @@ impl RemoteQueue {
                 interactive_len: 0,
                 background_len: 0,
                 closed: false,
+                maintenance_paused: false,
+                in_flight: 0,
+                controls: VecDeque::new(),
             }),
             ready: Condvar::new(),
+            quiescent: Condvar::new(),
             interactive_capacity,
             background_capacity,
         }
@@ -4297,7 +4763,7 @@ impl RemoteQueue {
     ) -> Result<Vec<RemoteWork>, RemoteWork> {
         let priority = work.priority;
         let mut state = self.state.lock().expect("remote queue mutex poisoned");
-        if state.closed {
+        if state.closed || state.maintenance_paused {
             return Err(work);
         }
 
@@ -4332,23 +4798,50 @@ impl RemoteQueue {
 
     #[cfg(test)]
     fn pop(&self) -> Option<RemoteWork> {
-        self.pop_started_with_epoch(None)
-            .map(|started| started.work)
+        let started = self.pop_started_with_epoch(None)?;
+        self.finish_started();
+        Some(started.work)
     }
 
+    #[cfg(test)]
     fn pop_started(&self, preempt: &AgentPreempt) -> Option<StartedRemoteWork> {
-        self.pop_started_with_epoch(Some(preempt))
+        loop {
+            match self.pop_worker_item(Some(preempt))? {
+                RemoteWorkerItem::Work(started) => return Some(started),
+                RemoteWorkerItem::Control(RemoteWorkerControl::ResetAgent { reply }) => {
+                    let _ = reply.send(());
+                }
+            }
+        }
     }
 
+    #[cfg(test)]
     fn pop_started_with_epoch(&self, preempt: Option<&AgentPreempt>) -> Option<StartedRemoteWork> {
+        loop {
+            match self.pop_worker_item(preempt)? {
+                RemoteWorkerItem::Work(started) => return Some(started),
+                RemoteWorkerItem::Control(RemoteWorkerControl::ResetAgent { reply }) => {
+                    let _ = reply.send(());
+                }
+            }
+        }
+    }
+
+    fn pop_worker_item(&self, preempt: Option<&AgentPreempt>) -> Option<RemoteWorkerItem> {
         let mut state = self.state.lock().expect("remote queue mutex poisoned");
         loop {
-            if let Some(index) = state.next_ready_index() {
-                let preempt_epoch = preempt.map(AgentPreempt::epoch).unwrap_or(0);
-                return Some(StartedRemoteWork {
-                    work: state.remove(index),
-                    preempt_epoch,
-                });
+            if let Some(control) = state.controls.pop_front() {
+                return Some(RemoteWorkerItem::Control(control));
+            }
+            if !state.maintenance_paused {
+                if let Some(index) = state.next_ready_index() {
+                    state.in_flight = state.in_flight.saturating_add(1);
+                    let preempt_epoch = preempt.map(AgentPreempt::epoch).unwrap_or(0);
+                    return Some(RemoteWorkerItem::Work(StartedRemoteWork {
+                        work: state.remove(index),
+                        preempt_epoch,
+                    }));
+                }
             }
             if state.closed {
                 return None;
@@ -4368,11 +4861,66 @@ impl RemoteQueue {
         drained
     }
 
+    #[cfg(test)]
     fn drain_queued(&self) -> Vec<RemoteWork> {
         let mut state = self.state.lock().expect("remote queue mutex poisoned");
         let drained = state.drain_all();
         self.ready.notify_all();
         drained
+    }
+
+    fn begin_maintenance_and_drain(&self) -> Vec<RemoteWork> {
+        let mut state = self.state.lock().expect("remote queue mutex poisoned");
+        state.maintenance_paused = true;
+        let drained = state.drain_all();
+        self.ready.notify_all();
+        drained
+    }
+
+    fn wait_quiescent_for(&self, timeout: Duration) -> bool {
+        let Ok(state) = self.state.lock() else {
+            return false;
+        };
+        if state.in_flight == 0 {
+            return true;
+        }
+        self.quiescent
+            .wait_timeout_while(state, timeout, |state| state.in_flight != 0)
+            .map(|(state, _)| state.in_flight == 0)
+            .unwrap_or(false)
+    }
+
+    fn end_maintenance(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.maintenance_paused = false;
+            self.ready.notify_all();
+        }
+    }
+
+    fn finish_started(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.in_flight = state.in_flight.saturating_sub(1);
+            if state.in_flight == 0 {
+                self.quiescent.notify_all();
+            }
+        }
+    }
+
+    fn reset_agent_worker(&self, timeout: Duration) -> Result<()> {
+        let (reply, receiver) = mpsc::sync_channel(0);
+        {
+            let mut state = self.state.lock().expect("remote queue mutex poisoned");
+            if state.closed {
+                bail!("remote worker queue closed during agent maintenance");
+            }
+            state
+                .controls
+                .push_back(RemoteWorkerControl::ResetAgent { reply });
+            self.ready.notify_one();
+        }
+        receiver
+            .recv_timeout(timeout)
+            .map_err(|error| anyhow!("remote agent worker reset did not complete: {error}"))
     }
 
     fn close_and_drain_background(&self) -> Vec<RemoteWork> {
@@ -4468,6 +5016,66 @@ impl RemoteQueueState {
             }
         }
         drained
+    }
+}
+
+struct RemoteMaintenanceGuard {
+    read_queue: Arc<RemoteQueue>,
+    write_queue: Arc<RemoteQueue>,
+}
+
+impl RemoteMaintenanceGuard {
+    fn begin(
+        read_queue: Arc<RemoteQueue>,
+        write_queue: Arc<RemoteQueue>,
+    ) -> (Self, Vec<RemoteWork>) {
+        let drained = read_queue
+            .begin_maintenance_and_drain()
+            .into_iter()
+            .chain(write_queue.begin_maintenance_and_drain())
+            .collect();
+        (
+            Self {
+                read_queue,
+                write_queue,
+            },
+            drained,
+        )
+    }
+}
+
+impl Drop for RemoteMaintenanceGuard {
+    fn drop(&mut self) {
+        self.read_queue.end_maintenance();
+        self.write_queue.end_maintenance();
+    }
+}
+
+fn wait_for_remote_queues_quiescent(
+    read_queue: &RemoteQueue,
+    write_queue: &RemoteQueue,
+    read_interrupt: &AgentInterrupt,
+    write_interrupt: &AgentInterrupt,
+    timeout: Duration,
+) -> Result<()> {
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .unwrap_or_else(Instant::now);
+    loop {
+        read_interrupt.kill_current();
+        write_interrupt.kill_current();
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            bail!("timed out waiting for remote agent lanes to quiesce");
+        }
+        let wait = remaining.min(Duration::from_millis(10));
+        let read_idle = read_queue.wait_quiescent_for(wait);
+        let write_idle = write_queue.wait_quiescent_for(wait);
+        if read_idle && write_idle {
+            read_interrupt.kill_current_and_wait();
+            write_interrupt.kill_current_and_wait();
+            return Ok(());
+        }
     }
 }
 
@@ -4909,7 +5517,11 @@ impl Sidecar {
 
     fn handle(&mut self, method: &str, params: Value, preempt_epoch: u64) -> Result<Value> {
         let result = self.handle_inner(method, params, preempt_epoch);
-        self.record_remote_health();
+        let preserve_health =
+            matches!(method, "remote_agent_install" | "remote_agent_update") && result.is_err();
+        if !preserve_health {
+            self.record_remote_health();
+        }
         result
     }
 
@@ -4971,6 +5583,20 @@ impl Sidecar {
     fn record_remote_health(&self) {
         if let Ok(mut health) = self.remote_health.lock() {
             *health = self.agent.remote_health();
+        }
+    }
+
+    fn record_agent_install_error_health(&mut self, error: &AgentInstallTransactionError) {
+        match error.final_state {
+            AgentInstallFinalState::TargetUnchanged | AgentInstallFinalState::PreviousRestored => {}
+            AgentInstallFinalState::CandidateHealthy => self.record_remote_health(),
+            AgentInstallFinalState::LiveStateUnknown => {
+                self.agent.kill_worker();
+                let _ = self.agent.mark_remote_unavailable(format!(
+                    "remote agent live state is unknown after failed installation: {error}"
+                ));
+                self.record_remote_health();
+            }
         }
     }
 
@@ -5061,12 +5687,12 @@ impl Sidecar {
         self.decorate_remote_agent_health(probe)
     }
 
-    fn remote_agent_install(
+    fn remote_agent_install_preflight(
         &mut self,
-        params: Value,
+        params: &Value,
         update: bool,
         preempt_epoch: u64,
-    ) -> Result<Value> {
+    ) -> AgentInstallPreflight {
         let force = params
             .get("force")
             .and_then(Value::as_bool)
@@ -5083,28 +5709,60 @@ impl Sidecar {
             .get("agent_status")
             .and_then(Value::as_str)
             .unwrap_or("unknown");
-        if update && !force && before_status == "ok" {
+        AgentInstallPreflight {
+            effective_force: force || (update && before_status != "missing_agent"),
+            skip: update && !force && before_status == "ok",
+            before,
+            target_path,
+        }
+    }
+
+    fn remote_agent_install(
+        &mut self,
+        params: Value,
+        update: bool,
+        preempt_epoch: u64,
+    ) -> Result<Value> {
+        let preflight = self.remote_agent_install_preflight(&params, update, preempt_epoch);
+        if preflight.skip {
             return Ok(json!({
                 "status": "skipped",
                 "reason": "remote agent is already compatible",
-                "install_path": target_path,
-                "remote_health": before
+                "install_path": preflight.target_path,
+                "remote_health": preflight.before
             }));
         }
+        self.record_remote_health();
+        let prepared = self.prepare_remote_agent_install(&preflight)?;
+        self.agent.invalidate_shared_workers();
+        self.agent.clear_all_remote_unavailable();
+        self.remote_agent_install_prepared(preflight, prepared, update, preempt_epoch)
+    }
 
+    fn prepare_remote_agent_install(
+        &self,
+        preflight: &AgentInstallPreflight,
+    ) -> Result<PreparedAgentInstall> {
+        let ssh = match &self.agent.launch.transport {
+            RemoteTransport::Ssh(ssh) => ssh.clone(),
+            RemoteTransport::Local => {
+                bail!("remote agent install/update is only supported for ssh targets")
+            }
+        };
+        let host = self.agent.launch.remote_host_info()?;
+        if host.path_style != RemotePathStyle::Posix {
+            bail!("unsupported_platform: Windows transactional install is not yet available");
+        }
+        let plan = agent_install::PosixInstallPlan::new(
+            &preflight.target_path,
+            env!("CARGO_PKG_VERSION"),
+            PROTOCOL_VERSION,
+            preflight.effective_force,
+        )
+        .context("invalid POSIX remote agent install plan")?;
         let mut source = self.resolve_agent_source()?;
-        source
-            .file
-            .seek(SeekFrom::Start(0))
-            .with_context(|| format!("failed to seek agent source {}", source.path.display()))?;
-        let mut bytes = Vec::new();
-        source
-            .file
-            .read_to_end(&mut bytes)
-            .with_context(|| format!("failed to read agent source {}", source.path.display()))?;
-        let source_hash = hash_bytes(&bytes);
-        let source_sha256 = sha256_bytes(&bytes);
-        let source_size = bytes.len();
+        let (source_hash, source_sha256, source_size) = hash_agent_source(&mut source.file)
+            .with_context(|| format!("failed to hash agent source {}", source.path.display()))?;
         if source
             .expected_sha256
             .as_deref()
@@ -5115,38 +5773,66 @@ impl Sidecar {
                 source.expected_sha256.as_deref().unwrap_or_default()
             );
         }
-        let effective_force = force || (update && before_status != "missing_agent");
+        let upload = source
+            .file
+            .try_clone()
+            .context("failed to clone agent source for streaming upload")?;
+        Ok(PreparedAgentInstall {
+            source,
+            upload,
+            source_hash,
+            source_sha256,
+            source_size,
+            ssh,
+            plan,
+        })
+    }
 
-        let ssh = match &self.agent.launch.transport {
-            RemoteTransport::Ssh(ssh) => ssh.clone(),
-            RemoteTransport::Local => {
-                bail!("remote agent install/update is only supported for ssh targets")
+    fn remote_agent_install_prepared(
+        &mut self,
+        preflight: AgentInstallPreflight,
+        prepared: PreparedAgentInstall,
+        update: bool,
+        preempt_epoch: u64,
+    ) -> Result<Value> {
+        let AgentInstallPreflight {
+            before: _,
+            target_path,
+            effective_force,
+            skip: _,
+        } = preflight;
+        let PreparedAgentInstall {
+            source,
+            upload,
+            source_hash,
+            source_sha256,
+            source_size,
+            ssh,
+            plan,
+        } = prepared;
+        let launch = self.agent.launch.clone();
+        let timeout = self.agent.launch.request_timeout;
+        let mut operations = PosixSshInstallOps {
+            plan,
+            ssh,
+            source: Some(upload),
+            launch,
+            normal_agent: &mut self.agent,
+            timeout,
+        };
+        let transaction = run_agent_install_transaction(&mut operations);
+        drop(operations);
+        let activated = match transaction {
+            Ok(activated) => activated,
+            Err(error) => {
+                self.record_agent_install_error_health(&error);
+                return Err(anyhow!(error));
             }
         };
-
-        self.agent.kill_worker();
-        self.agent.clear_all_remote_unavailable();
-        let command = ssh.command(remote_agent_install_command(&target_path, effective_force));
-        let output = run_command_capture(
-            command,
-            Some(bytes),
-            self.agent.launch.request_timeout,
-            "remote agent install",
-        )?;
-        if !output.status.success() {
-            bail!(
-                "remote agent install failed with {}: {}",
-                output.status,
-                output.stderr
-            );
-        }
-
-        self.agent.kill_worker();
-        self.agent.clear_all_remote_unavailable();
         let after = self.remote_health(preempt_epoch);
         let mut result = json!({
             "status": if update { "updated" } else { "installed" },
-            "install_path": output.stdout.lines().last().unwrap_or(&target_path),
+            "install_path": activated.staged.target_path,
             "requested_install_path": target_path,
             "source_path": source.path.to_string_lossy(),
             "source_hash": source_hash,
@@ -7172,21 +7858,81 @@ where
             }
 
             if request_replaces_remote_agent(&request) {
+                let update = request.method == "remote_agent_update";
+                let request_id = request.id;
+                let preempt_epoch = control_sidecar.agent.preempt_handle().epoch();
+                let preflight = control_sidecar.remote_agent_install_preflight(
+                    &request.params,
+                    update,
+                    preempt_epoch,
+                );
+                if preflight.skip {
+                    send_client_response(
+                        &response_tx,
+                        result_to_client_response(
+                            request_id,
+                            Ok(json!({
+                                "status": "skipped",
+                                "reason": "remote agent is already compatible",
+                                "install_path": preflight.target_path,
+                                "remote_health": preflight.before
+                            })),
+                        ),
+                    );
+                    continue;
+                }
+
+                control_sidecar.record_remote_health();
+                let prepared = match control_sidecar.prepare_remote_agent_install(&preflight) {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        send_client_response(
+                            &response_tx,
+                            result_to_client_response(request_id, Err(error)),
+                        );
+                        send_client_notification(
+                            &response_tx,
+                            control_sidecar.remote_health_notification(),
+                        );
+                        continue;
+                    }
+                };
+
+                let (maintenance, drained) = RemoteMaintenanceGuard::begin(
+                    Arc::clone(&read_queue),
+                    Arc::clone(&write_queue),
+                );
                 read_preempt.request_preemption();
                 write_preempt.request_preemption();
-                agent_interrupt.kill_current();
-                write_interrupt.kill_current();
-                let drained: Vec<_> = read_queue
-                    .drain_queued()
-                    .into_iter()
-                    .chain(write_queue.drain_queued())
-                    .collect();
                 for work in drained {
                     clear_pending_work(&pending_remote, &pending_writes, &work);
                     send_client_response(&response_tx, canceled_client_response(work));
                 }
-                let preempt_epoch = control_sidecar.agent.preempt_handle().epoch();
-                let response = handle_client_request(&mut control_sidecar, request, preempt_epoch);
+                let maintenance_timeout = control_sidecar.agent.launch.request_timeout;
+                let result = (|| -> Result<Value> {
+                    wait_for_remote_queues_quiescent(
+                        &read_queue,
+                        &write_queue,
+                        &agent_interrupt,
+                        &write_interrupt,
+                        maintenance_timeout,
+                    )?;
+                    control_sidecar.agent.invalidate_shared_workers();
+                    control_sidecar.agent.clear_all_remote_unavailable();
+                    read_queue.reset_agent_worker(maintenance_timeout)?;
+                    write_queue.reset_agent_worker(maintenance_timeout)?;
+                    control_sidecar.remote_agent_install_prepared(
+                        preflight,
+                        prepared,
+                        update,
+                        preempt_epoch,
+                    )
+                })();
+                drop(maintenance);
+                if result.is_ok() {
+                    control_sidecar.record_remote_health();
+                }
+                let response = result_to_client_response(request_id, result);
                 send_client_response(&response_tx, response);
                 send_client_notification(
                     &response_tx,
@@ -7404,6 +8150,22 @@ fn join_writer(handle: thread::JoinHandle<Result<()>>, name: &str) -> Result<()>
     }
 }
 
+struct RemoteInFlightGuard {
+    queue: Arc<RemoteQueue>,
+}
+
+impl RemoteInFlightGuard {
+    fn new(queue: Arc<RemoteQueue>) -> Self {
+        Self { queue }
+    }
+}
+
+impl Drop for RemoteInFlightGuard {
+    fn drop(&mut self) {
+        self.queue.finish_started();
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_remote_worker(
     mut sidecar: Sidecar,
@@ -7415,64 +8177,74 @@ fn spawn_remote_worker(
     interrupt: AgentInterrupt,
     response_tx: mpsc::SyncSender<ServerMessage>,
 ) -> thread::JoinHandle<()> {
-    thread::spawn(move || {
-        while let Some(started) = queue.pop_started(&preempt) {
-            let preempt_epoch = started.preempt_epoch;
-            let work = started.work;
-            let request_id = work.request.id;
-            let queue_wait_ms = duration_ms(work.enqueued_at.elapsed());
-            let method = work.request.method.clone();
-            let lane = work.lane;
-            let priority = work.priority;
-            active.set(&work);
-            if interrupt.is_shutdown_requested() {
-                clear_pending_work(&pending_remote, &pending_writes, &work);
-                active.clear(request_id);
-                clear_pending_works(&pending_remote, &pending_writes, queue.shutdown_and_drain());
-                break;
+    thread::spawn(move || loop {
+        let Some(item) = queue.pop_worker_item(Some(&preempt)) else {
+            break;
+        };
+        let started = match item {
+            RemoteWorkerItem::Work(started) => started,
+            RemoteWorkerItem::Control(RemoteWorkerControl::ResetAgent { reply }) => {
+                sidecar.agent.kill_worker();
+                let _ = reply.send(());
+                continue;
             }
-
-            let should_shutdown = matches!(work.request.method.as_str(), "shutdown" | "disconnect");
-            let RemoteWork {
-                request,
-                hazard,
-                write_hazard_registered,
-                ..
-            } = work;
-            let response = handle_client_request(&mut sidecar, request, preempt_epoch);
-            clear_pending_hazard(
-                &pending_remote,
-                &pending_writes,
-                &hazard,
-                write_hazard_registered,
-            );
+        };
+        let _in_flight = RemoteInFlightGuard::new(Arc::clone(&queue));
+        let preempt_epoch = started.preempt_epoch;
+        let work = started.work;
+        let request_id = work.request.id;
+        let queue_wait_ms = duration_ms(work.enqueued_at.elapsed());
+        let method = work.request.method.clone();
+        let lane = work.lane;
+        let priority = work.priority;
+        active.set(&work);
+        if interrupt.is_shutdown_requested() {
+            clear_pending_work(&pending_remote, &pending_writes, &work);
             active.clear(request_id);
-            trace_event(
-                "request_finished",
-                json!({
-                    "request_id": request_id,
-                    "method": method,
-                    "lane": lane.label(),
-                    "priority": priority.label(),
-                    "queue_wait_ms": queue_wait_ms,
-                    "ok": response.ok,
-                    "preempted": response.result.as_ref()
-                        .and_then(|result| result.get("preempted"))
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false),
-                    "truncated": response.result.as_ref()
-                        .and_then(|result| result.get("truncated"))
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false),
-                    "error": response.error.as_deref()
-                }),
-            );
-            send_client_response(&response_tx, response);
-            send_client_notification(&response_tx, sidecar.remote_health_notification());
-            if should_shutdown || interrupt.is_shutdown_requested() {
-                clear_pending_works(&pending_remote, &pending_writes, queue.shutdown_and_drain());
-                break;
-            }
+            clear_pending_works(&pending_remote, &pending_writes, queue.shutdown_and_drain());
+            break;
+        }
+
+        let should_shutdown = matches!(work.request.method.as_str(), "shutdown" | "disconnect");
+        let RemoteWork {
+            request,
+            hazard,
+            write_hazard_registered,
+            ..
+        } = work;
+        let response = handle_client_request(&mut sidecar, request, preempt_epoch);
+        clear_pending_hazard(
+            &pending_remote,
+            &pending_writes,
+            &hazard,
+            write_hazard_registered,
+        );
+        active.clear(request_id);
+        trace_event(
+            "request_finished",
+            json!({
+                "request_id": request_id,
+                "method": method,
+                "lane": lane.label(),
+                "priority": priority.label(),
+                "queue_wait_ms": queue_wait_ms,
+                "ok": response.ok,
+                "preempted": response.result.as_ref()
+                    .and_then(|result| result.get("preempted"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                "truncated": response.result.as_ref()
+                    .and_then(|result| result.get("truncated"))
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                "error": response.error.as_deref()
+            }),
+        );
+        send_client_response(&response_tx, response);
+        send_client_notification(&response_tx, sidecar.remote_health_notification());
+        if should_shutdown || interrupt.is_shutdown_requested() {
+            clear_pending_works(&pending_remote, &pending_writes, queue.shutdown_and_drain());
+            break;
         }
     })
 }
@@ -7961,7 +8733,7 @@ struct CapturedProcessOutput {
 
 fn run_command_capture(
     mut command: Command,
-    input: Option<Vec<u8>>,
+    input: Option<Box<dyn Read + Send>>,
     timeout: Duration,
     context: &str,
 ) -> Result<CapturedProcessOutput> {
@@ -7975,13 +8747,13 @@ fn run_command_capture(
         .spawn()
         .with_context(|| format!("failed to start {context}"))?;
 
-    let stdin_writer = if let Some(input) = input {
+    let stdin_writer = if let Some(mut input) = input {
         let mut stdin = child
             .stdin
             .take()
             .ok_or_else(|| anyhow!("{context} stdin was not piped"))?;
         Some(thread::spawn(move || -> Result<()> {
-            stdin.write_all(&input)?;
+            io::copy(&mut input, &mut stdin)?;
             Ok(())
         }))
     } else {
@@ -7991,12 +8763,10 @@ fn run_command_capture(
     let deadline = Instant::now() + timeout;
     loop {
         if let Some(status) = child.try_wait()? {
-            if let Some(writer) = stdin_writer {
-                match writer.join() {
-                    Ok(result) => result.with_context(|| format!("{context} stdin failed"))?,
-                    Err(_) => bail!("{context} stdin writer panicked"),
-                }
-            }
+            let stdin_result = stdin_writer.map(|writer| match writer.join() {
+                Ok(result) => result.with_context(|| format!("{context} stdin failed")),
+                Err(_) => Err(anyhow!("{context} stdin writer panicked")),
+            });
             let mut stdout = Vec::new();
             if let Some(mut stream) = child.stdout.take() {
                 stream.read_to_end(&mut stdout)?;
@@ -8004,6 +8774,11 @@ fn run_command_capture(
             let mut stderr = Vec::new();
             if let Some(mut stream) = child.stderr.take() {
                 stream.read_to_end(&mut stderr)?;
+            }
+            if status.success() {
+                if let Some(result) = stdin_result {
+                    result?;
+                }
             }
             return Ok(CapturedProcessOutput {
                 status,
@@ -8113,42 +8888,6 @@ fn default_remote_agent_install_path(agent: &str) -> String {
     } else {
         REMOTE_AGENT_MANAGED_PATH.to_string()
     }
-}
-
-fn remote_agent_install_command(target_path: &str, force: bool) -> String {
-    let force = if force { "1" } else { "0" };
-    let script = r#"set -eu
-target="$1"
-force="$2"
-case "$target" in
-  "$HOME"/*) ;;
-  "\$HOME"/*) target="$HOME/${target#"\$HOME"/}" ;;
-  "~"/*) target="$HOME/${target#"~/"}" ;;
-esac
-dir=$(dirname -- "$target")
-mkdir -p -- "$dir"
-if [ -e "$target" ] && [ "$force" != "1" ]; then
-  echo "remote agent already exists at $target" >&2
-  exit 23
-fi
-tmp="${target}.nrm-tmp.$$"
-trap 'rm -f "$tmp"' EXIT HUP INT TERM
-cat > "$tmp"
-chmod 755 "$tmp"
-mv -f "$tmp" "$target"
-trap - EXIT
-"$target" --version >/dev/null
-printf '%s\n' "$target"
-"#;
-    [
-        shell_quote("sh"),
-        shell_quote("-lc"),
-        shell_quote(script),
-        shell_quote("nrm-agent-install"),
-        shell_quote(target_path),
-        shell_quote(force),
-    ]
-    .join(" ")
 }
 
 fn classify_remote_agent_status(value: &Value) -> String {
@@ -8465,6 +9204,35 @@ fn hash_bytes(bytes: &[u8]) -> String {
     blake3::hash(bytes).to_hex().to_string()
 }
 
+fn hash_agent_source(file: &mut File) -> Result<(String, String, u64)> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut blake3 = blake3::Hasher::new();
+    let mut sha256 = Sha256::new();
+    let mut size = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        size = size.saturating_add(read as u64);
+        blake3.update(&buffer[..read]);
+        sha256.update(&buffer[..read]);
+    }
+    file.seek(SeekFrom::Start(0))?;
+    let source_hash = blake3.finalize().to_hex().to_string();
+    let source_sha256 = {
+        let digest = sha256.finalize();
+        let mut output = String::with_capacity(64);
+        for byte in digest {
+            use std::fmt::Write as _;
+            write!(&mut output, "{byte:02x}").expect("writing to String cannot fail");
+        }
+        output
+    };
+    Ok((source_hash, source_sha256, size))
+}
+
 fn sha256_bytes(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     let mut output = String::with_capacity(64);
@@ -8667,6 +9435,441 @@ mod tests {
             .contains("threshold must be between 1 and 1"));
     }
 
+    struct ScriptedInstallOps {
+        calls: Vec<&'static str>,
+        fail_at: Option<&'static str>,
+        target: Option<&'static str>,
+        stage_exists: bool,
+        backup: Option<&'static str>,
+    }
+
+    impl ScriptedInstallOps {
+        fn new(fail_at: Option<&'static str>) -> Self {
+            Self {
+                calls: Vec::new(),
+                fail_at,
+                target: Some("previous"),
+                stage_exists: false,
+                backup: None,
+            }
+        }
+
+        fn without_previous(fail_at: Option<&'static str>) -> Self {
+            Self {
+                target: None,
+                ..Self::new(fail_at)
+            }
+        }
+
+        fn fails(&self, phase: &str) -> bool {
+            self.fail_at == Some(phase)
+                || (self.fail_at == Some("rollback_after_activation")
+                    && matches!(phase, "validate_activated" | "rollback"))
+        }
+
+        fn staged(had_previous: bool) -> agent_install::StagedInstall {
+            agent_install::StagedInstall {
+                target_path: "/tmp/nrm-agent".to_string(),
+                stage_path: "/tmp/nrm-agent.nrm-stage.abcdef".to_string(),
+                backup_path: "/tmp/nrm-agent.nrm-backup.abcdef".to_string(),
+                had_previous,
+            }
+        }
+    }
+
+    impl AgentInstallOps for ScriptedInstallOps {
+        fn stage(&mut self) -> Result<agent_install::StagedInstall> {
+            self.calls.push("stage");
+            if self.fails("stage") {
+                bail!("upload failed");
+            }
+            let had_previous = self.target.is_some();
+            self.stage_exists = true;
+            Ok(Self::staged(had_previous))
+        }
+
+        fn validate_staged(&mut self, _staged: &agent_install::StagedInstall) -> Result<()> {
+            self.calls.push("validate_staged");
+            if self.fails("validate_staged") {
+                bail!("wrong protocol");
+            }
+            Ok(())
+        }
+
+        fn activate(
+            &mut self,
+            staged: &agent_install::StagedInstall,
+        ) -> Result<agent_install::ActivatedInstall> {
+            self.calls.push("activate");
+            if self.fails("activate") {
+                bail!("process_in_use: target is locked");
+            }
+            if self.fail_at == Some("activate_stage_lost_without_backup") {
+                self.stage_exists = false;
+                bail!("transport failed after stage disappeared");
+            }
+            self.backup = self.target.take();
+            self.target = Some("candidate");
+            self.stage_exists = false;
+            if self.fail_at == Some("activate_after_mutation") {
+                bail!("transport failed after remote activation");
+            }
+            if self.fail_at == Some("activate_malformed_record") {
+                bail!("remote agent activation returned an invalid record");
+            }
+            Ok(agent_install::ActivatedInstall {
+                staged: staged.clone(),
+                had_previous: self.backup.is_some(),
+            })
+        }
+
+        fn reconcile_activation(
+            &mut self,
+            staged: &agent_install::StagedInstall,
+        ) -> Result<agent_install::ActivationRecovery> {
+            self.calls.push("reconcile_activation");
+            if self.fails("reconcile_activation") {
+                bail!("reconciliation failed");
+            }
+            let kind = if self.stage_exists {
+                if self.target.is_some() != staged.had_previous {
+                    bail!("staged prior state changed before reconciliation");
+                }
+                self.stage_exists = false;
+                self.backup = None;
+                if self.target.is_some() {
+                    agent_install::ActivationRecoveryKind::ActivationUnchangedPresent
+                } else {
+                    agent_install::ActivationRecoveryKind::ActivationUnchangedMissing
+                }
+            } else if staged.had_previous {
+                let previous = self
+                    .backup
+                    .take()
+                    .ok_or_else(|| anyhow!("missing prior-agent backup"))?;
+                self.target = Some(previous);
+                agent_install::ActivationRecoveryKind::RestoredPrevious
+            } else {
+                if self.backup.is_some() {
+                    bail!("unexpected backup for new install");
+                }
+                self.target = None;
+                agent_install::ActivationRecoveryKind::RemovedCandidate
+            };
+            Ok(agent_install::ActivationRecovery {
+                target_path: "/tmp/nrm-agent".to_string(),
+                kind,
+            })
+        }
+
+        fn validate_reconciliation(
+            &mut self,
+            recovery: &agent_install::ActivationRecovery,
+        ) -> Result<()> {
+            self.calls.push("validate_reconciliation");
+            if self.fails("validate_reconciliation") {
+                bail!("reconciled target validation failed");
+            }
+            let should_be_present = matches!(
+                recovery.kind,
+                agent_install::ActivationRecoveryKind::ActivationUnchangedPresent
+                    | agent_install::ActivationRecoveryKind::RestoredPrevious
+            );
+            if self.target.is_some() != should_be_present {
+                bail!("reconciliation outcome does not match target state");
+            }
+            Ok(())
+        }
+
+        fn validate_activated(
+            &mut self,
+            _activated: &agent_install::ActivatedInstall,
+        ) -> Result<()> {
+            self.calls.push("validate_activated");
+            if self.fails("validate_activated") {
+                bail!("normal Hello failed");
+            }
+            Ok(())
+        }
+
+        fn rollback(
+            &mut self,
+            _activated: &agent_install::ActivatedInstall,
+        ) -> Result<agent_install::RollbackOutcome> {
+            self.calls.push("rollback");
+            if self.fails("rollback") {
+                bail!("restore failed");
+            }
+            self.target = self.backup.take();
+            self.stage_exists = false;
+            Ok(agent_install::RollbackOutcome {
+                target_path: "/tmp/nrm-agent".to_string(),
+                restored_previous: self.target.is_some(),
+            })
+        }
+
+        fn validate_rollback(&mut self, _rollback: &agent_install::RollbackOutcome) -> Result<()> {
+            self.calls.push("validate_rollback");
+            if self.fails("validate_rollback") {
+                bail!("restored Hello failed");
+            }
+            Ok(())
+        }
+
+        fn cleanup(&mut self, _staged: &agent_install::StagedInstall) -> Result<()> {
+            self.calls.push("cleanup");
+            if self.fails("cleanup") {
+                bail!("cleanup denied");
+            }
+            self.stage_exists = false;
+            self.backup = None;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn transaction_commits_only_after_both_hello_checks() {
+        let mut operations = ScriptedInstallOps::new(None);
+        run_agent_install_transaction(&mut operations).unwrap();
+        assert_eq!(
+            operations.calls,
+            [
+                "stage",
+                "validate_staged",
+                "activate",
+                "validate_activated",
+                "cleanup"
+            ]
+        );
+        assert_eq!(operations.target, Some("candidate"));
+        assert!(!operations.stage_exists);
+        assert_eq!(operations.backup, None);
+    }
+
+    #[test]
+    fn transaction_staged_failure_leaves_target_untouched_and_cleans_stage() {
+        let mut operations = ScriptedInstallOps::new(Some("validate_staged"));
+        let error = run_agent_install_transaction(&mut operations).unwrap_err();
+        assert_eq!(error.final_state, AgentInstallFinalState::TargetUnchanged);
+        assert!(error.to_string().contains("staged_validation_failed"));
+        assert_eq!(operations.calls, ["stage", "validate_staged", "cleanup"]);
+        assert_eq!(operations.target, Some("previous"));
+        assert!(!operations.stage_exists);
+    }
+
+    #[test]
+    fn transaction_postactivation_failure_restores_and_reprobes_previous() {
+        let mut operations = ScriptedInstallOps::new(Some("validate_activated"));
+        let error = run_agent_install_transaction(&mut operations).unwrap_err();
+        assert_eq!(error.final_state, AgentInstallFinalState::PreviousRestored);
+        assert!(error
+            .to_string()
+            .contains("post_activation_validation_failed"));
+        assert!(error.to_string().contains("rollback=restored"));
+        assert_eq!(
+            operations.calls,
+            [
+                "stage",
+                "validate_staged",
+                "activate",
+                "validate_activated",
+                "rollback",
+                "validate_rollback"
+            ]
+        );
+        assert_eq!(operations.target, Some("previous"));
+    }
+
+    #[test]
+    fn transaction_reports_rollback_failed_with_original_error() {
+        let mut operations = ScriptedInstallOps::new(Some("rollback_after_activation"));
+        let error = run_agent_install_transaction(&mut operations).unwrap_err();
+        assert_eq!(error.final_state, AgentInstallFinalState::LiveStateUnknown);
+        assert!(error.to_string().contains("rollback_failed"));
+        assert!(error.to_string().contains("normal Hello failed"));
+        assert!(operations.calls.contains(&"rollback"));
+    }
+
+    #[test]
+    fn transaction_reports_process_in_use_without_touching_previous() {
+        let mut operations = ScriptedInstallOps::new(Some("activate"));
+        let error = run_agent_install_transaction(&mut operations).unwrap_err();
+        assert_eq!(error.final_state, AgentInstallFinalState::TargetUnchanged);
+        assert!(error.to_string().contains("process_in_use"));
+        assert_eq!(operations.target, Some("previous"));
+        assert_eq!(
+            operations.calls,
+            [
+                "stage",
+                "validate_staged",
+                "activate",
+                "reconcile_activation",
+                "validate_reconciliation"
+            ]
+        );
+        assert!(!operations.stage_exists);
+        assert_eq!(operations.backup, None);
+    }
+
+    #[test]
+    fn transaction_transport_error_after_remote_mv_restores_previous() {
+        let mut operations = ScriptedInstallOps::new(Some("activate_after_mutation"));
+        let error = run_agent_install_transaction(&mut operations).unwrap_err();
+        assert_eq!(error.final_state, AgentInstallFinalState::PreviousRestored);
+        assert!(error.to_string().contains("activation_failed"));
+        assert!(error.to_string().contains("RestoredPrevious"));
+        assert_eq!(operations.target, Some("previous"));
+        assert_eq!(operations.backup, None);
+        assert!(!operations.stage_exists);
+        assert_eq!(
+            operations.calls,
+            [
+                "stage",
+                "validate_staged",
+                "activate",
+                "reconcile_activation",
+                "validate_reconciliation"
+            ]
+        );
+    }
+
+    #[test]
+    fn transaction_malformed_activation_record_after_mv_restores_previous() {
+        let mut operations = ScriptedInstallOps::new(Some("activate_malformed_record"));
+        let error = run_agent_install_transaction(&mut operations)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("invalid record"));
+        assert!(error.contains("RestoredPrevious"));
+        assert_eq!(operations.target, Some("previous"));
+        assert_eq!(operations.backup, None);
+        assert!(!operations.stage_exists);
+        assert!(operations.calls.contains(&"validate_reconciliation"));
+    }
+
+    #[test]
+    fn transaction_ambiguous_activation_without_prior_removes_candidate() {
+        let mut operations = ScriptedInstallOps::without_previous(Some("activate_after_mutation"));
+        let error = run_agent_install_transaction(&mut operations).unwrap_err();
+        assert_eq!(error.final_state, AgentInstallFinalState::PreviousRestored);
+        assert!(error.to_string().contains("RemovedCandidate"));
+        assert_eq!(operations.target, None);
+        assert_eq!(operations.backup, None);
+        assert!(!operations.stage_exists);
+        assert!(operations.calls.contains(&"validate_reconciliation"));
+    }
+
+    #[test]
+    fn transaction_missing_stage_and_prior_backup_fails_closed() {
+        let mut operations = ScriptedInstallOps::new(Some("activate_stage_lost_without_backup"));
+        let error = run_agent_install_transaction(&mut operations).unwrap_err();
+        assert_eq!(error.final_state, AgentInstallFinalState::LiveStateUnknown);
+        assert!(error.to_string().contains("rollback_failed"));
+        assert!(error.to_string().contains("missing prior-agent backup"));
+        assert!(error
+            .to_string()
+            .contains("transport failed after stage disappeared"));
+        assert_eq!(operations.target, Some("previous"));
+        assert_eq!(operations.backup, None);
+        assert!(!operations.stage_exists);
+        assert_eq!(
+            operations.calls,
+            [
+                "stage",
+                "validate_staged",
+                "activate",
+                "reconcile_activation"
+            ]
+        );
+    }
+
+    #[test]
+    fn transaction_cleanup_failure_reports_healthy_candidate_state() {
+        let mut operations = ScriptedInstallOps::new(Some("cleanup"));
+        let error = run_agent_install_transaction(&mut operations).unwrap_err();
+        assert_eq!(error.final_state, AgentInstallFinalState::CandidateHealthy);
+        assert!(error.to_string().contains("cleanup_failed"));
+        assert_eq!(operations.target, Some("candidate"));
+        assert_eq!(operations.backup, Some("previous"));
+    }
+
+    #[test]
+    fn install_error_health_tracks_typed_live_target_state() {
+        let dir = tempdir().unwrap();
+        let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
+        let mut sidecar = test_sidecar(mirror);
+        *sidecar.remote_health.lock().unwrap() = RemoteHealth::connected();
+
+        let unchanged =
+            install_transaction_error(AgentInstallFinalState::TargetUnchanged, "staging failed");
+        sidecar.record_agent_install_error_health(&unchanged);
+        assert_eq!(
+            sidecar.remote_health.lock().unwrap().state,
+            RemoteHealthState::Connected
+        );
+
+        sidecar.agent.handshake_complete = true;
+        let healthy =
+            install_transaction_error(AgentInstallFinalState::CandidateHealthy, "cleanup failed");
+        sidecar.record_agent_install_error_health(&healthy);
+        assert_eq!(
+            sidecar.remote_health.lock().unwrap().state,
+            RemoteHealthState::Connected
+        );
+
+        let unknown =
+            install_transaction_error(AgentInstallFinalState::LiveStateUnknown, "rollback failed");
+        sidecar.record_agent_install_error_health(&unknown);
+        let health = sidecar.remote_health.lock().unwrap();
+        assert_eq!(health.state, RemoteHealthState::Unavailable);
+        assert!(health
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("live state is unknown"));
+    }
+
+    #[test]
+    fn failed_agent_source_preparation_does_not_invalidate_workers() {
+        let dir = tempdir().unwrap();
+        let mirror = Mirror::open(Some(dir.path().join("state")), "test").unwrap();
+        let mut sidecar = test_sidecar(mirror);
+        sidecar.agent.launch.transport = RemoteTransport::Ssh(SshTransport {
+            program: PathBuf::from("ssh"),
+            target: "example.test".to_string(),
+            connect_timeout_seconds: 1,
+        });
+        sidecar.agent.launch.local_agent = Some(dir.path().join("missing-agent"));
+        *sidecar.agent.launch.remote_host_info.lock().unwrap() = Some(test_posix_host());
+        let generation = sidecar
+            .agent
+            .launch
+            .worker_generation
+            .load(Ordering::SeqCst);
+        let preflight = AgentInstallPreflight {
+            before: json!({"agent_status": "ok"}),
+            target_path: "/home/test/.local/bin/nrm-agent".to_string(),
+            effective_force: true,
+            skip: false,
+        };
+
+        let error = sidecar
+            .prepare_remote_agent_install(&preflight)
+            .err()
+            .expect("missing source must fail preparation")
+            .to_string();
+
+        assert!(error.contains("local agent source is not readable"));
+        assert_eq!(
+            sidecar
+                .agent
+                .launch
+                .worker_generation
+                .load(Ordering::SeqCst),
+            generation
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn file_registry_source_is_verified_cached_and_never_falls_back_to_local() {
@@ -8792,6 +9995,7 @@ mod tests {
         sidecar.agent.worker = Some(AgentWorker {
             tx,
             abort: Arc::new(TestAbortHandle::default()),
+            join: None,
         });
         sidecar
     }
@@ -8814,6 +10018,7 @@ mod tests {
         sidecar.agent.worker = Some(AgentWorker {
             tx,
             abort: Arc::new(TestAbortHandle::default()),
+            join: None,
         });
         sidecar
     }
@@ -8846,6 +10051,7 @@ mod tests {
         sidecar.agent.worker = Some(AgentWorker {
             tx,
             abort: Arc::new(TestAbortHandle::default()),
+            join: None,
         });
         sidecar
     }
@@ -9041,6 +10247,42 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(protocol_error.contains("protocol version mismatch"));
+    }
+
+    #[test]
+    fn restored_agent_probe_accepts_only_compatibility_mismatches() {
+        assert!(is_agent_compatibility_mismatch(
+            "agent rpc error (agent): package version mismatch: client=0.2.0 agent=0.1.0"
+        ));
+        assert!(is_agent_compatibility_mismatch(
+            "protocol version mismatch: client=8 agent=7"
+        ));
+        assert!(!is_agent_compatibility_mismatch(
+            "failed to start agent: permission denied"
+        ));
+        assert!(!is_agent_compatibility_mismatch(
+            "unexpected restored-agent Hello response"
+        ));
+    }
+
+    #[test]
+    fn command_capture_keeps_remote_error_when_streaming_stdin_breaks() {
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("printf 'NRM_INSTALL_ERROR_V1\\talready_exists\\n' >&2; exit 23");
+        let input = io::Cursor::new(vec![0_u8; 1024 * 1024]);
+
+        let output = run_command_capture(
+            command,
+            Some(Box::new(input)),
+            Duration::from_secs(1),
+            "test upload",
+        )
+        .unwrap();
+
+        assert_eq!(output.status.code(), Some(23));
+        assert!(output.stderr.contains("already_exists"));
     }
 
     #[test]
@@ -10030,6 +11272,19 @@ mod tests {
     }
 
     #[test]
+    fn agent_interrupt_abort_and_wait_reaps_registered_worker() {
+        let interrupt = AgentInterrupt::default();
+        let handle = Arc::new(TestAbortHandle::default());
+        let handle_trait: Arc<dyn AgentAbortHandle> = handle.clone();
+        interrupt.set_abort_handle(handle_trait);
+
+        interrupt.kill_current_and_wait();
+
+        assert_eq!(handle.aborts.load(Ordering::SeqCst), 1);
+        assert_eq!(handle.waits.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn agent_interrupt_keeps_replacement_when_stale_handle_clears() {
         let interrupt = AgentInterrupt::default();
         let stale = Arc::new(TestAbortHandle::default());
@@ -10067,6 +11322,7 @@ mod tests {
         client.worker = Some(AgentWorker {
             tx,
             abort: handle_trait,
+            join: None,
         });
         client.handshake_complete = true;
 
@@ -10076,6 +11332,41 @@ mod tests {
         assert!(!client.handshake_complete);
         assert_eq!(handle.aborts.load(Ordering::SeqCst), 1);
         assert_eq!(handle.waits.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn shared_worker_generation_discards_idle_lane_workers_after_replacement() {
+        let read_handle = Arc::new(TestAbortHandle::default());
+        let write_handle = Arc::new(TestAbortHandle::default());
+        let (read_tx, _read_rx) = mpsc::channel();
+        let (write_tx, _write_rx) = mpsc::channel();
+        let mut read = AgentClient::new(
+            "definitely-missing-agent".to_string(),
+            None,
+            RemoteTransport::Local,
+            PathBuf::from("/unused"),
+            Duration::from_millis(10),
+            AgentInterrupt::default(),
+        );
+        let mut write = read.clone_for_lane(AgentInterrupt::default());
+        read.worker = Some(AgentWorker {
+            tx: read_tx,
+            abort: read_handle.clone(),
+            join: None,
+        });
+        write.worker = Some(AgentWorker {
+            tx: write_tx,
+            abort: write_handle.clone(),
+            join: None,
+        });
+
+        read.invalidate_shared_workers();
+        assert!(write.ensure_worker().is_err());
+
+        assert_eq!(read_handle.aborts.load(Ordering::SeqCst), 1);
+        assert_eq!(read_handle.waits.load(Ordering::SeqCst), 1);
+        assert_eq!(write_handle.aborts.load(Ordering::SeqCst), 1);
+        assert_eq!(write_handle.waits.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -12813,6 +14104,60 @@ mod tests {
     }
 
     #[test]
+    fn remote_queue_maintenance_closes_claim_race_and_resumes_after_guard_drop() {
+        let read = Arc::new(RemoteQueue::new(8, 8));
+        let write = Arc::new(RemoteQueue::new(8, 8));
+        read.try_push(test_remote_work(1, "open"), None).unwrap();
+        write.try_push(test_remote_work(2, "flush"), None).unwrap();
+
+        let (maintenance, drained) =
+            RemoteMaintenanceGuard::begin(Arc::clone(&read), Arc::clone(&write));
+        assert_eq!(drained.len(), 2);
+        assert!(read.try_push(test_remote_work(3, "open"), None).is_err());
+        assert!(write.try_push(test_remote_work(4, "flush"), None).is_err());
+
+        drop(maintenance);
+        read.try_push(test_remote_work(5, "open"), None).unwrap();
+        assert_eq!(read.pop().unwrap().request.id, 5);
+        read.shutdown_and_drain();
+        write.shutdown_and_drain();
+    }
+
+    #[test]
+    fn remote_queue_quiescence_waits_for_claimed_work_cleanup() {
+        let queue = RemoteQueue::new(8, 8);
+        queue.try_push(test_remote_work(1, "open"), None).unwrap();
+        let item = queue.pop_worker_item(None).unwrap();
+        assert!(matches!(item, RemoteWorkerItem::Work(_)));
+        queue.begin_maintenance_and_drain();
+
+        assert!(!queue.wait_quiescent_for(Duration::from_millis(1)));
+        queue.finish_started();
+        assert!(queue.wait_quiescent_for(Duration::from_millis(1)));
+        queue.end_maintenance();
+        queue.shutdown_and_drain();
+    }
+
+    #[test]
+    fn remote_queue_reset_control_is_acknowledged_while_maintenance_is_paused() {
+        let queue = Arc::new(RemoteQueue::new(8, 8));
+        queue.begin_maintenance_and_drain();
+        let worker_queue = Arc::clone(&queue);
+        let worker = thread::spawn(move || {
+            let item = worker_queue.pop_worker_item(None).unwrap();
+            let RemoteWorkerItem::Control(RemoteWorkerControl::ResetAgent { reply }) = item else {
+                panic!("expected reset control");
+            };
+            reply.send(()).unwrap();
+        });
+
+        queue.reset_agent_worker(Duration::from_secs(1)).unwrap();
+        worker.join().unwrap();
+        queue.end_maintenance();
+        queue.shutdown_and_drain();
+    }
+
+    #[test]
     fn remote_agent_replacement_requests_are_write_control_work() {
         for method in ["remote_agent_install", "remote_agent_update"] {
             let request = test_client_request(9, method, json!({}));
@@ -13645,86 +14990,6 @@ mod tests {
         assert!(stdout.contains("ARG1=<serve>"));
         assert!(stdout.contains("ARG2=<--root>"));
         assert!(stdout.contains(&format!("ARG3=<{}>", remote_root.display())));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn remote_agent_install_command_expands_home_and_installs_executable() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = tempdir().unwrap();
-        let home = dir.path().join("home");
-        fs::create_dir_all(&home).unwrap();
-        let agent_body =
-            b"#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo fake-agent; exit 0; fi\nexit 0\n";
-        let command = remote_agent_install_command("$HOME/.local/bin/nrm-agent test", false);
-        let mut child = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(command)
-            .env("HOME", &home)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        child.stdin.take().unwrap().write_all(agent_body).unwrap();
-        let output = child.wait_with_output().unwrap();
-
-        assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let installed = home.join(".local/bin/nrm-agent test");
-        assert_eq!(
-            String::from_utf8(output.stdout).unwrap().trim(),
-            installed.to_string_lossy()
-        );
-        assert_eq!(fs::read(&installed).unwrap(), agent_body);
-        assert_eq!(
-            fs::metadata(&installed).unwrap().permissions().mode() & 0o777,
-            0o755
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn remote_agent_install_command_refuses_existing_without_force() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = tempdir().unwrap();
-        let home = dir.path().join("home");
-        let bin = home.join(".local/bin");
-        fs::create_dir_all(&bin).unwrap();
-        let installed = bin.join("nrm-agent");
-        fs::write(&installed, "#!/bin/sh\nexit 0\n").unwrap();
-        let mut permissions = fs::metadata(&installed).unwrap().permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&installed, permissions).unwrap();
-
-        let command = remote_agent_install_command("$HOME/.local/bin/nrm-agent", false);
-        let mut child = std::process::Command::new("sh")
-            .arg("-c")
-            .arg(command)
-            .env("HOME", &home)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        child.stdin.take().unwrap().write_all(b"new").unwrap();
-        let output = child.wait_with_output().unwrap();
-
-        assert_eq!(output.status.code(), Some(23));
-        assert!(
-            String::from_utf8_lossy(&output.stderr).contains("remote agent already exists"),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert_eq!(
-            fs::read_to_string(&installed).unwrap(),
-            "#!/bin/sh\nexit 0\n"
-        );
     }
 
     #[cfg(unix)]
