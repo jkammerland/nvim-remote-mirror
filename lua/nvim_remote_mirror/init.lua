@@ -176,18 +176,163 @@ local function validate_ssh_destination(destination)
   end
 end
 
+local function percent_decode_ssh_path(path)
+  local decoded = {}
+  local index = 1
+  while index <= #path do
+    local byte = path:byte(index)
+    if byte == string.byte("%") then
+      local escape = path:sub(index + 1, index + 2)
+      if #escape ~= 2 or not escape:match("^%x%x$") then
+        error("ssh target path contains a malformed percent escape")
+      end
+      table.insert(decoded, string.char(tonumber(escape, 16)))
+      index = index + 3
+    else
+      table.insert(decoded, string.char(byte))
+      index = index + 1
+    end
+  end
+  return table.concat(decoded)
+end
+
+local function validate_ssh_path(path)
+  local index = 1
+  while index <= #path do
+    local byte = path:byte(index)
+    local codepoint = nil
+    local length = 1
+    if byte < 0x80 then
+      codepoint = byte
+    elseif byte >= 0xC2 and byte <= 0xDF then
+      length = 2
+      local second = path:byte(index + 1)
+      if not second or second < 0x80 or second > 0xBF then
+        error("ssh target path must be valid UTF-8")
+      end
+      codepoint = (byte - 0xC0) * 0x40 + (second - 0x80)
+    elseif byte >= 0xE0 and byte <= 0xEF then
+      length = 3
+      local second = path:byte(index + 1)
+      local third = path:byte(index + 2)
+      local second_min = byte == 0xE0 and 0xA0 or 0x80
+      local second_max = byte == 0xED and 0x9F or 0xBF
+      if not second or not third or second < second_min or second > second_max or third < 0x80 or third > 0xBF then
+        error("ssh target path must be valid UTF-8")
+      end
+      codepoint = (byte - 0xE0) * 0x1000 + (second - 0x80) * 0x40 + (third - 0x80)
+    elseif byte >= 0xF0 and byte <= 0xF4 then
+      length = 4
+      local second = path:byte(index + 1)
+      local third = path:byte(index + 2)
+      local fourth = path:byte(index + 3)
+      local second_min = byte == 0xF0 and 0x90 or 0x80
+      local second_max = byte == 0xF4 and 0x8F or 0xBF
+      if
+        not second
+        or not third
+        or not fourth
+        or second < second_min
+        or second > second_max
+        or third < 0x80
+        or third > 0xBF
+        or fourth < 0x80
+        or fourth > 0xBF
+      then
+        error("ssh target path must be valid UTF-8")
+      end
+      codepoint = (byte - 0xF0) * 0x40000 + (second - 0x80) * 0x1000 + (third - 0x80) * 0x40 + (fourth - 0x80)
+    else
+      error("ssh target path must be valid UTF-8")
+    end
+    if codepoint < 32 or (codepoint >= 0x7F and codepoint <= 0x9F) then
+      error("ssh target path must not contain control characters")
+    end
+    index = index + length
+  end
+
+  if path:sub(1, 1) ~= "/" then
+    error("expected ssh://host/absolute/path")
+  end
+  if path:sub(2, 2) == "/" or path:sub(2, 2) == "\\" then
+    error("ssh target path must not use a UNC root")
+  end
+
+  local first_segment = path:match("^/([^/]*)") or ""
+  if first_segment:match("^%a:") then
+    if not path:match("^/%a:/") then
+      error("ssh target path must use an absolute drive root")
+    end
+    local windows_path = first_segment:sub(1, 1):upper() .. path:sub(3)
+    if windows_path:find("\\", 1, true) then
+      error("ssh target drive paths must use forward slashes")
+    end
+    if windows_path:find("//", 1, true) then
+      error("ssh target drive paths must not contain empty segments")
+    end
+    local remainder = windows_path:sub(4)
+    for segment in remainder:gmatch("[^/]+") do
+      if segment == "." or segment == ".." then
+        error("ssh target drive paths must not contain dot segments")
+      end
+      if segment:find(":", 1, true) then
+        error("ssh target drive paths must not contain alternate data streams")
+      end
+      if segment:match("[ .]$") then
+        error("ssh target drive path segments must not end in a dot or space")
+      end
+    end
+    return windows_path
+  end
+  if first_segment:sub(-1) == ":" then
+    error("ssh target path contains an invalid drive root")
+  end
+
+  if path:find("//", 2, true) then
+    error("ssh target paths must not contain empty segments")
+  end
+  for segment in path:gmatch("[^/]+") do
+    if segment == "." or segment == ".." then
+      error("ssh target paths must not contain dot segments")
+    end
+  end
+
+  return path
+end
+
+local function percent_encode_ssh_path(path)
+  local encoded = {}
+  for index = 1, #path do
+    local byte = path:byte(index)
+    local unreserved = (byte >= string.byte("A") and byte <= string.byte("Z"))
+      or (byte >= string.byte("a") and byte <= string.byte("z"))
+      or (byte >= string.byte("0") and byte <= string.byte("9"))
+      or byte == string.byte("-")
+      or byte == string.byte(".")
+      or byte == string.byte("_")
+      or byte == string.byte("~")
+    if unreserved or byte == string.byte("/") or byte == string.byte(":") then
+      table.insert(encoded, string.char(byte))
+    else
+      table.insert(encoded, string.format("%%%02X", byte))
+    end
+  end
+  return table.concat(encoded)
+end
+
 local function parse_target(target)
   if target == nil or target == "" then
     return { remote_root = normalize_local_root(uv.cwd()) }
   end
 
-  local ssh_body = target:match("^ssh://(.+)$")
-  if ssh_body then
+  if target:sub(1, 6) == "ssh://" then
+    local ssh_body = target:sub(7)
     local host, path = ssh_body:match("^([^/]+)(/.*)$")
     if not host or not path then
       error("expected ssh://host/absolute/path")
     end
     validate_ssh_destination(host)
+    path = validate_ssh_path(percent_decode_ssh_path(path))
     return { ssh = host, remote_root = path }
   end
 
@@ -196,7 +341,11 @@ end
 
 local function reconnect_arg(target)
   if target.ssh then
-    return "ssh://" .. target.ssh .. target.remote_root
+    local path = target.remote_root
+    if path:match("^%a:/") then
+      path = "/" .. path
+    end
+    return "ssh://" .. target.ssh .. percent_encode_ssh_path(path)
   end
   return target.remote_root
 end
@@ -416,6 +565,7 @@ end
 
 if vim.g.nvim_remote_mirror_test then
   M._test_parse_target = parse_target
+  M._test_reconnect_arg = reconnect_arg
   M._test_sidecar_args = sidecar_args
   M._test_listener_args = listener_args
   M._test_socket_path_for = socket_path_for

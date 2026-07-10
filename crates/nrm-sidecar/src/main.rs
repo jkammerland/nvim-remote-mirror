@@ -1,11 +1,17 @@
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 mod lsp_rewrite;
+mod remote_host;
 use lsp_rewrite::rewrite_lsp_body;
 use nrm_protocol::{
     read_frame, write_frame, BatchReadFile, BatchValidateFile, FileMeta, Request, RequestId,
     Response, RpcError, RpcMessage, SaveOutcome, WriteStartOutcome, MAX_FRAME_LEN,
     PROTOCOL_VERSION,
+};
+use remote_host::{
+    local_host_info, parse_posix_probe, parse_powershell_probe, posix_probe_command,
+    powershell_probe_command, powershell_process_command, validate_remote_root, RemoteHostInfo,
+    RemotePathStyle,
 };
 use rusqlite::Row;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -42,6 +48,8 @@ const DEFAULT_GIT_OUTPUT_MAX_BYTES: u64 = 1024 * 1024;
 const REMOTE_UNAVAILABLE_BACKOFF_BASE_MS: u64 = 2_000;
 const REMOTE_UNAVAILABLE_BACKOFF_MAX_MS: u64 = 60_000;
 const LSP_PROXY_EXIT_GRACE_MS: u64 = 500;
+const LSP_PROXY_SSH_EXIT_GRACE_MS: u64 = 3_000;
+const REMOTE_HOST_PROBE_TIMEOUT_MS: u64 = 15_000;
 const MAX_SAVE_PAYLOAD_BYTES: u64 = (MAX_FRAME_LEN - (1024 * 1024)) as u64;
 const SAVE_INLINE_MAX_BYTES: u64 = 4 * 1024 * 1024;
 const FAST_FLUSH_SNAPSHOT_MAX_BYTES: u64 = 1024 * 1024;
@@ -469,9 +477,40 @@ impl RemoteTransport {
         }
     }
 
-    fn agent_plan(&self, agent: &str, remote_root: &Path) -> ProcessLaunchPlan {
+    fn normalize_remote_root(&self, remote_root: PathBuf) -> Result<PathBuf> {
+        if matches!(self, Self::Local) {
+            return Ok(remote_root);
+        }
+        let remote_root = remote_root
+            .into_os_string()
+            .into_string()
+            .map_err(|_| anyhow!("SSH remote root must be valid UTF-8"))?;
+        if remote_root.chars().any(char::is_control) {
+            bail!("SSH remote root must not contain control characters");
+        }
+        let bytes = remote_root.as_bytes();
+        if bytes.len() >= 3
+            && bytes[0].is_ascii_alphabetic()
+            && bytes[1] == b':'
+            && bytes[2] == b'/'
+        {
+            let mut canonical = bytes.to_vec();
+            canonical[0] = canonical[0].to_ascii_uppercase();
+            return Ok(PathBuf::from(
+                String::from_utf8(canonical).expect("uppercasing ASCII preserves UTF-8"),
+            ));
+        }
+        Ok(PathBuf::from(remote_root))
+    }
+
+    fn agent_plan(
+        &self,
+        agent: &str,
+        remote_root: &Path,
+        host: &RemoteHostInfo,
+    ) -> Result<ProcessLaunchPlan> {
         match self {
-            Self::Local => ProcessLaunchPlan {
+            Self::Local => Ok(ProcessLaunchPlan {
                 program: agent.to_string(),
                 args: vec![
                     "serve".to_string(),
@@ -479,27 +518,48 @@ impl RemoteTransport {
                     remote_root.to_string_lossy().to_string(),
                 ],
                 current_dir: None,
-            },
-            Self::Ssh(ssh) => ProcessLaunchPlan {
-                program: "ssh".to_string(),
-                args: ssh.command_args(agent_remote_command(agent, remote_root)),
-                current_dir: None,
-            },
+            }),
+            Self::Ssh(ssh) => {
+                validate_remote_root(host, remote_root)?;
+                Ok(ProcessLaunchPlan {
+                    program: "ssh".to_string(),
+                    args: ssh.command_args(match host.path_style {
+                        RemotePathStyle::Posix => posix_agent_remote_command(agent, remote_root),
+                        RemotePathStyle::Windows => {
+                            powershell_agent_remote_command(agent, remote_root, host)?
+                        }
+                    }),
+                    current_dir: None,
+                })
+            }
         }
     }
 
-    fn lsp_plan(&self, remote_root: PathBuf, command: Vec<String>) -> ProcessLaunchPlan {
+    fn lsp_plan(
+        &self,
+        remote_root: PathBuf,
+        command: Vec<String>,
+        host: &RemoteHostInfo,
+    ) -> Result<ProcessLaunchPlan> {
         match self {
-            Self::Local => ProcessLaunchPlan {
+            Self::Local => Ok(ProcessLaunchPlan {
                 program: command[0].clone(),
                 args: command[1..].to_vec(),
                 current_dir: Some(remote_root),
-            },
-            Self::Ssh(ssh) => ProcessLaunchPlan {
-                program: "ssh".to_string(),
-                args: ssh.command_args(lsp_remote_command(remote_root, command)),
-                current_dir: None,
-            },
+            }),
+            Self::Ssh(ssh) => {
+                validate_remote_root(host, &remote_root)?;
+                Ok(ProcessLaunchPlan {
+                    program: "ssh".to_string(),
+                    args: ssh.command_args(match host.path_style {
+                        RemotePathStyle::Posix => posix_lsp_remote_command(remote_root, command),
+                        RemotePathStyle::Windows => {
+                            powershell_lsp_remote_command(remote_root, command)?
+                        }
+                    }),
+                    current_dir: None,
+                })
+            }
         }
     }
 
@@ -602,6 +662,75 @@ fn validate_agent_hello(agent_version: &str, protocol_version: u16) -> Result<()
     Ok(())
 }
 
+fn detect_remote_host_info(
+    transport: &RemoteTransport,
+    request_timeout: Duration,
+) -> Result<RemoteHostInfo> {
+    let RemoteTransport::Ssh(ssh) = transport else {
+        return local_host_info();
+    };
+    let probe_budget = request_timeout.min(Duration::from_millis(REMOTE_HOST_PROBE_TIMEOUT_MS));
+    let started = Instant::now();
+
+    let powershell_error = match run_remote_host_probe(
+        ssh,
+        powershell_probe_command(),
+        probe_budget,
+        "PowerShell remote host probe",
+    ) {
+        Ok(stdout) => match parse_powershell_probe(&stdout) {
+            Ok(info) => return Ok(info),
+            Err(error) => error.to_string(),
+        },
+        Err(error) => error.to_string(),
+    };
+    let remaining = probe_budget.saturating_sub(started.elapsed());
+    if remaining.is_zero() {
+        bail!(
+            "failed to detect remote host within {} ms: PowerShell probe failed: {powershell_error}",
+            probe_budget.as_millis()
+        );
+    }
+
+    match run_remote_host_probe(
+        ssh,
+        posix_probe_command(),
+        remaining,
+        "POSIX remote host probe",
+    ) {
+        Ok(stdout) => parse_posix_probe(&stdout).with_context(|| {
+            format!(
+                "failed to detect remote host (PowerShell probe failed: {powershell_error})"
+            )
+        }),
+        Err(posix_error) => bail!(
+            "failed to detect remote host: PowerShell probe failed: {powershell_error}; POSIX probe failed: {posix_error}"
+        ),
+    }
+}
+
+fn run_remote_host_probe(
+    ssh: &SshTransport,
+    remote_command: String,
+    timeout: Duration,
+    context: &str,
+) -> Result<String> {
+    let output = run_command_capture(ssh.command(remote_command), None, timeout, context)?;
+    if !output.status.success() {
+        let stderr = output.stderr.trim();
+        bail!(
+            "{context} exited with {}{}",
+            output.status,
+            if stderr.is_empty() {
+                String::new()
+            } else {
+                format!(": {stderr}")
+            }
+        );
+    }
+    Ok(output.stdout)
+}
+
 #[derive(Debug, Clone)]
 struct AgentLaunch {
     agent: String,
@@ -609,6 +738,38 @@ struct AgentLaunch {
     remote_root: PathBuf,
     request_timeout: Duration,
     transport: RemoteTransport,
+    remote_host_info: Arc<Mutex<Option<RemoteHostInfo>>>,
+}
+
+impl AgentLaunch {
+    fn remote_host_info(&self) -> Result<RemoteHostInfo> {
+        let mut cached = self
+            .remote_host_info
+            .lock()
+            .map_err(|_| anyhow!("remote host information cache lock poisoned"))?;
+        if let Some(info) = cached.as_ref() {
+            return Ok(info.clone());
+        }
+        let info = detect_remote_host_info(&self.transport, self.request_timeout)?;
+        if matches!(self.transport, RemoteTransport::Ssh(_)) {
+            validate_remote_root(&info, &self.remote_root)?;
+        }
+        *cached = Some(info.clone());
+        Ok(info)
+    }
+
+    fn invalidate_remote_host_info(&self) {
+        if let Ok(mut cached) = self.remote_host_info.lock() {
+            *cached = None;
+        }
+    }
+
+    fn cached_remote_host_info(&self) -> Option<RemoteHostInfo> {
+        self.remote_host_info
+            .try_lock()
+            .ok()
+            .and_then(|cached| cached.clone())
+    }
 }
 
 #[derive(Clone, Default)]
@@ -1006,6 +1167,7 @@ impl AgentClient {
                 remote_root,
                 request_timeout,
                 transport,
+                remote_host_info: Arc::new(Mutex::new(None)),
             },
             interrupt,
             preempt: AgentPreempt::default(),
@@ -1031,9 +1193,10 @@ impl AgentClient {
     }
 
     fn spawn_worker(launch: &AgentLaunch, interrupt: AgentInterrupt) -> Result<AgentWorker> {
+        let host = launch.remote_host_info()?;
         let plan = launch
             .transport
-            .agent_plan(&launch.agent, &launch.remote_root);
+            .agent_plan(&launch.agent, &launch.remote_root, &host)?;
         let mut command = plan.command();
         configure_agent_process(&mut command);
 
@@ -1272,7 +1435,10 @@ impl AgentClient {
         for attempt in 0..2 {
             let tx = match self.ensure_worker() {
                 Ok(worker) => worker.tx.clone(),
-                Err(error) => return Err(self.mark_remote_unavailable(error.to_string())),
+                Err(error) => {
+                    self.launch.invalidate_remote_host_info();
+                    return Err(self.mark_remote_unavailable(error.to_string()));
+                }
             };
             let command = AgentWorkerCommand {
                 id,
@@ -1284,6 +1450,7 @@ impl AgentClient {
             }
             self.worker = None;
             self.handshake_complete = false;
+            self.launch.invalidate_remote_host_info();
             if attempt == 1 {
                 return Err(self.mark_remote_unavailable(format!(
                     "agent worker exited before request {id} could be sent"
@@ -1325,6 +1492,7 @@ impl AgentClient {
             let elapsed = started.elapsed();
             if elapsed >= timeout {
                 self.kill_worker();
+                self.launch.invalidate_remote_host_info();
                 return Err(self.mark_remote_unavailable(format!(
                     "agent request {id} timed out after {} ms",
                     timeout.as_millis()
@@ -1339,6 +1507,7 @@ impl AgentClient {
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     self.worker = None;
                     self.handshake_complete = false;
+                    self.launch.invalidate_remote_host_info();
                     return Err(self.mark_remote_unavailable(format!(
                         "agent worker exited while request {id} was pending"
                     )));
@@ -1360,6 +1529,7 @@ impl AgentClient {
             AgentWorkerReply::TransportError(message) => {
                 self.worker = None;
                 self.handshake_complete = false;
+                self.launch.invalidate_remote_host_info();
                 Err(self.mark_remote_unavailable(message))
             }
         }
@@ -3662,6 +3832,7 @@ fn workspace_info_value(
     files_root: &Path,
     transport: &RemoteTransport,
     remote_health: RemoteHealth,
+    remote_host: Option<&RemoteHostInfo>,
 ) -> Value {
     let remote_health_value = remote_health.to_value();
     let mut value = json!({
@@ -3704,6 +3875,9 @@ fn workspace_info_value(
         },
         "remote_health": remote_health_value
     });
+    if let (Some(object), Some(remote_host)) = (value.as_object_mut(), remote_host) {
+        object.insert("remote_host".to_string(), json!(remote_host));
+    }
     remote_health.insert_into(&mut value);
     value
 }
@@ -3729,6 +3903,7 @@ struct FastState {
     workspace_key: String,
     pending_remote: Arc<Mutex<PendingRemote>>,
     remote_health: Arc<Mutex<RemoteHealth>>,
+    remote_host_info: Arc<Mutex<Option<RemoteHostInfo>>>,
 }
 
 enum FastHandle {
@@ -4345,6 +4520,7 @@ impl FastState {
             workspace_key: sidecar.workspace_key.clone(),
             pending_remote,
             remote_health: Arc::clone(&sidecar.remote_health),
+            remote_host_info: Arc::clone(&sidecar.agent.launch.remote_host_info),
         }
     }
 
@@ -4372,6 +4548,11 @@ impl FastState {
     }
 
     fn workspace_info(&self) -> Value {
+        let remote_host = self
+            .remote_host_info
+            .try_lock()
+            .ok()
+            .and_then(|cached| cached.clone());
         workspace_info_value(
             &self.workspace_key,
             &self.remote_root,
@@ -4379,6 +4560,7 @@ impl FastState {
             &self.files_root,
             &self.transport,
             self.remote_health_snapshot(),
+            remote_host.as_ref(),
         )
     }
 
@@ -4570,6 +4752,7 @@ impl Sidecar {
     }
 
     fn workspace_info(&self) -> Value {
+        let remote_host = self.agent.launch.cached_remote_host_info();
         workspace_info_value(
             &self.workspace_key,
             &self.remote_root,
@@ -4577,6 +4760,7 @@ impl Sidecar {
             self.mirror.files_root(),
             &self.agent.launch.transport,
             self.agent.remote_health(),
+            remote_host.as_ref(),
         )
     }
 
@@ -6273,14 +6457,18 @@ fn main() -> Result<()> {
             state_dir,
             request_timeout_ms,
             ssh_connect_timeout_seconds,
-        } => run_server(
-            remote_root,
-            RemoteTransport::from_ssh(ssh, ssh_connect_timeout_seconds)?,
-            agent,
-            local_agent,
-            state_dir,
-            request_timeout_ms,
-        ),
+        } => {
+            let transport = RemoteTransport::from_ssh(ssh, ssh_connect_timeout_seconds)?;
+            let remote_root = transport.normalize_remote_root(remote_root)?;
+            run_server(
+                remote_root,
+                transport,
+                agent,
+                local_agent,
+                state_dir,
+                request_timeout_ms,
+            )
+        }
         CommandKind::Listen {
             socket,
             remote_root,
@@ -6290,27 +6478,30 @@ fn main() -> Result<()> {
             state_dir,
             request_timeout_ms,
             ssh_connect_timeout_seconds,
-        } => run_listener(
-            socket,
-            remote_root,
-            RemoteTransport::from_ssh(ssh, ssh_connect_timeout_seconds)?,
-            agent,
-            local_agent,
-            state_dir,
-            request_timeout_ms,
-        ),
+        } => {
+            let transport = RemoteTransport::from_ssh(ssh, ssh_connect_timeout_seconds)?;
+            let remote_root = transport.normalize_remote_root(remote_root)?;
+            run_listener(
+                socket,
+                remote_root,
+                transport,
+                agent,
+                local_agent,
+                state_dir,
+                request_timeout_ms,
+            )
+        }
         CommandKind::LspProxy {
             remote_root,
             local_root,
             ssh,
             ssh_connect_timeout_seconds,
             command,
-        } => run_lsp_proxy(
-            remote_root,
-            local_root,
-            RemoteTransport::from_ssh(ssh, ssh_connect_timeout_seconds)?,
-            command,
-        ),
+        } => {
+            let transport = RemoteTransport::from_ssh(ssh, ssh_connect_timeout_seconds)?;
+            let remote_root = transport.normalize_remote_root(remote_root)?;
+            run_lsp_proxy(remote_root, local_root, transport, command)
+        }
     }
 }
 
@@ -7242,7 +7433,16 @@ fn run_lsp_proxy(
         bail!("lsp-proxy requires a language server command after --");
     }
 
-    let launch = LspLaunch::new(remote_root.clone(), transport, command);
+    let host = detect_remote_host_info(
+        &transport,
+        Duration::from_millis(REMOTE_HOST_PROBE_TIMEOUT_MS),
+    )?;
+    let exit_grace = if matches!(transport, RemoteTransport::Ssh(_)) {
+        Duration::from_millis(LSP_PROXY_SSH_EXIT_GRACE_MS)
+    } else {
+        Duration::from_millis(LSP_PROXY_EXIT_GRACE_MS)
+    };
+    let launch = LspLaunch::new(remote_root.clone(), transport, command, &host)?;
     let mut child_command = launch.command();
     configure_agent_process(&mut child_command);
 
@@ -7279,11 +7479,7 @@ fn run_lsp_proxy(
             Ok(())
         })();
         drop(server_stdin);
-        finish_lsp_upstream_result(
-            result,
-            &upstream_child,
-            Duration::from_millis(LSP_PROXY_EXIT_GRACE_MS),
-        )
+        finish_lsp_upstream_result(result, &upstream_child, exit_grace)
     }));
 
     let stdout = io::stdout();
@@ -7306,7 +7502,7 @@ fn run_lsp_proxy(
         let mut child = child
             .lock()
             .map_err(|_| anyhow!("language server child lock poisoned"))?;
-        wait_lsp_child_with_grace(&mut child, Duration::from_millis(LSP_PROXY_EXIT_GRACE_MS))?
+        wait_lsp_child_with_grace(&mut child, exit_grace)?
     };
     join_lsp_upstream_if_finished(&mut upstream, &child)?;
     if !status.success() {
@@ -7500,10 +7696,15 @@ struct LspLaunch {
 }
 
 impl LspLaunch {
-    fn new(remote_root: PathBuf, transport: RemoteTransport, command: Vec<String>) -> Self {
-        Self {
-            plan: transport.lsp_plan(remote_root, command),
-        }
+    fn new(
+        remote_root: PathBuf,
+        transport: RemoteTransport,
+        command: Vec<String>,
+        host: &RemoteHostInfo,
+    ) -> Result<Self> {
+        Ok(Self {
+            plan: transport.lsp_plan(remote_root, command, host)?,
+        })
     }
 
     fn command(&self) -> Command {
@@ -7511,7 +7712,7 @@ impl LspLaunch {
     }
 }
 
-fn agent_remote_command(agent: &str, remote_root: &Path) -> String {
+fn posix_agent_remote_command(agent: &str, remote_root: &Path) -> String {
     if remote_agent_uses_managed_path(agent) {
         return [
             shell_quote("sh"),
@@ -7534,8 +7735,41 @@ fn agent_remote_command(agent: &str, remote_root: &Path) -> String {
     .join(" ")
 }
 
+fn powershell_agent_remote_command(
+    agent: &str,
+    remote_root: &Path,
+    host: &RemoteHostInfo,
+) -> Result<String> {
+    let remote_root = remote_root
+        .to_str()
+        .ok_or_else(|| anyhow!("Windows remote root must be valid UTF-8"))?;
+    let args = vec![
+        "serve".to_string(),
+        "--root".to_string(),
+        remote_root.to_string(),
+    ];
+    let (program, path_prepend) = if remote_agent_uses_managed_path(agent) {
+        let local_app_data = host
+            .local_app_data
+            .as_deref()
+            .ok_or_else(|| anyhow!("Windows remote host did not report LOCALAPPDATA"))?;
+        let managed_dir = format!("{}\\nrm\\bin", local_app_data.trim_end_matches(['/', '\\']));
+        let program = if agent.eq_ignore_ascii_case("nrm-agent")
+            || agent.eq_ignore_ascii_case("nrm-agent.exe")
+        {
+            format!("{managed_dir}\\nrm-agent.exe")
+        } else {
+            agent.to_string()
+        };
+        (program, Some(managed_dir))
+    } else {
+        (agent.to_string(), None)
+    };
+    powershell_process_command(&program, &args, None, path_prepend.as_deref())
+}
+
 fn remote_agent_uses_managed_path(agent: &str) -> bool {
-    !agent.contains('/')
+    !agent.contains(['/', '\\', ':'])
 }
 
 fn default_remote_agent_install_path(agent: &str) -> String {
@@ -7623,7 +7857,7 @@ fn classify_remote_agent_status(value: &Value) -> String {
     "unavailable".to_string()
 }
 
-fn lsp_remote_command(remote_root: PathBuf, command: Vec<String>) -> String {
+fn posix_lsp_remote_command(remote_root: PathBuf, command: Vec<String>) -> String {
     let mut parts = vec![
         shell_quote("sh"),
         shell_quote("-lc"),
@@ -7633,6 +7867,13 @@ fn lsp_remote_command(remote_root: PathBuf, command: Vec<String>) -> String {
     ];
     parts.extend(command.into_iter().map(shell_quote));
     parts.join(" ")
+}
+
+fn powershell_lsp_remote_command(remote_root: PathBuf, command: Vec<String>) -> Result<String> {
+    let remote_root = remote_root
+        .to_str()
+        .ok_or_else(|| anyhow!("Windows remote root must be valid UTF-8"))?;
+    powershell_process_command(&command[0], &command[1..], Some(remote_root), None)
 }
 
 fn shell_quote(value: impl AsRef<str>) -> String {
@@ -7989,6 +8230,17 @@ mod tests {
         test_meta_kind(path, hash, size, false, false)
     }
 
+    fn test_posix_host() -> RemoteHostInfo {
+        parse_posix_probe("NRM_HOST_INFO_V1\nLinux\nx86_64\n/home/test\n").unwrap()
+    }
+
+    fn test_windows_host() -> RemoteHostInfo {
+        parse_powershell_probe(
+            r#"{"schema_version":1,"os":"windows","arch":"AMD64","shell":"powershell","home":"C:\\Users\\test","local_app_data":"C:\\Users\\test\\AppData\\Local","path_style":"windows"}"#,
+        )
+        .unwrap()
+    }
+
     fn test_sidecar(mirror: Mirror) -> Sidecar {
         Sidecar {
             agent: AgentClient::new(
@@ -8196,8 +8448,11 @@ mod tests {
     #[test]
     fn remote_agent_managed_path_rules_are_explicit() {
         assert!(remote_agent_uses_managed_path("nrm-agent"));
+        assert!(remote_agent_uses_managed_path("nrm-agent.exe"));
         assert!(!remote_agent_uses_managed_path("./nrm-agent"));
         assert!(!remote_agent_uses_managed_path("/opt/nrm-agent"));
+        assert!(!remote_agent_uses_managed_path(r"C:\nrm\nrm-agent.exe"));
+        assert!(!remote_agent_uses_managed_path("C:/nrm/nrm-agent.exe"));
         assert_eq!(
             default_remote_agent_install_path("nrm-agent"),
             REMOTE_AGENT_MANAGED_PATH
@@ -12112,6 +12367,26 @@ mod tests {
     }
 
     #[test]
+    fn ssh_remote_root_normalization_canonicalizes_windows_drive_letter() {
+        let transport = RemoteTransport::from_ssh(Some("host".to_string()), 10).unwrap();
+        assert_eq!(
+            transport
+                .normalize_remote_root(PathBuf::from("b:/repos/project"))
+                .unwrap(),
+            PathBuf::from("B:/repos/project")
+        );
+        assert_eq!(
+            transport
+                .normalize_remote_root(PathBuf::from("/home/me/repo"))
+                .unwrap(),
+            PathBuf::from("/home/me/repo")
+        );
+        assert!(transport
+            .normalize_remote_root(PathBuf::from("/repo\nname"))
+            .is_err());
+    }
+
+    #[test]
     fn workspace_key_uses_stable_transport_identity() {
         let path = PathBuf::from("/repo");
         assert_eq!(
@@ -12350,7 +12625,12 @@ mod tests {
     fn agent_local_transport_launches_agent_directly() {
         let plan = RemoteTransport::from_ssh(None, 10)
             .unwrap()
-            .agent_plan("nrm-agent", Path::new("/tmp/repo with spaces"));
+            .agent_plan(
+                "nrm-agent",
+                Path::new("/tmp/repo with spaces"),
+                &test_posix_host(),
+            )
+            .unwrap();
 
         assert_eq!(plan.program, "nrm-agent");
         assert_eq!(plan.args, vec!["serve", "--root", "/tmp/repo with spaces"]);
@@ -12361,7 +12641,12 @@ mod tests {
     fn agent_ssh_transport_uses_quoted_remote_command_and_connection_options() {
         let plan = RemoteTransport::from_ssh(Some("host".to_string()), 7)
             .unwrap()
-            .agent_plan("nrm-agent", Path::new("/tmp/repo with 'quote' ; x"));
+            .agent_plan(
+                "nrm-agent",
+                Path::new("/tmp/repo with 'quote' ; x"),
+                &test_posix_host(),
+            )
+            .unwrap();
 
         assert_eq!(plan.program, "ssh");
         assert_eq!(plan.current_dir, None);
@@ -12384,12 +12669,49 @@ mod tests {
     }
 
     #[test]
+    fn agent_windows_ssh_transport_uses_encoded_powershell_and_canonical_drive_root() {
+        let plan = RemoteTransport::from_ssh(Some("windows-host".to_string()), 7)
+            .unwrap()
+            .agent_plan(
+                "nrm-agent",
+                Path::new("B:/repo with 'quote' ; x"),
+                &test_windows_host(),
+            )
+            .unwrap();
+
+        assert_eq!(plan.program, "ssh");
+        assert_eq!(plan.args[plan.args.len() - 2], "windows-host");
+        let remote_command = plan.args.last().unwrap();
+        assert!(remote_command.starts_with("powershell.exe -NoLogo -NoProfile"));
+        assert!(!remote_command.contains("repo with"));
+        assert!(!remote_command.contains("'quote'"));
+    }
+
+    #[test]
+    fn windows_ssh_planners_reject_posix_unc_and_drive_relative_roots() {
+        let transport = RemoteTransport::from_ssh(Some("windows-host".to_string()), 7).unwrap();
+        let host = test_windows_host();
+        for root in ["/repo", "//server/share", "B:relative", "B:\\repo"] {
+            let error = transport
+                .agent_plan("nrm-agent", Path::new(root), &host)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("Windows remote root") || error.contains("UNC"),
+                "{root}: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn lsp_local_launch_runs_in_remote_root() {
         let launch = LspLaunch::new(
             PathBuf::from("/repo"),
             RemoteTransport::Local,
             vec!["rust-analyzer".to_string(), "--stdio".to_string()],
-        );
+            &test_posix_host(),
+        )
+        .unwrap();
 
         assert_eq!(launch.plan.program, "rust-analyzer");
         assert_eq!(launch.plan.args, vec!["--stdio"]);
@@ -12406,7 +12728,9 @@ mod tests {
                 "--config".to_string(),
                 "check.command=\"clippy\"; $(echo no)".to_string(),
             ],
-        );
+            &test_posix_host(),
+        )
+        .unwrap();
 
         assert_eq!(launch.plan.program, "ssh");
         assert_eq!(launch.plan.current_dir, None);
@@ -12429,6 +12753,101 @@ mod tests {
     }
 
     #[test]
+    fn lsp_windows_ssh_launch_uses_encoded_powershell_relay() {
+        let launch = LspLaunch::new(
+            PathBuf::from("B:/repo with space"),
+            RemoteTransport::from_ssh(Some("windows-host".to_string()), 7).unwrap(),
+            vec![
+                "rust-analyzer.exe".to_string(),
+                "--config".to_string(),
+                "check.command=clippy; Write-Output owned".to_string(),
+            ],
+            &test_windows_host(),
+        )
+        .unwrap();
+
+        assert_eq!(launch.plan.program, "ssh");
+        let remote_command = launch.plan.args.last().unwrap();
+        assert!(remote_command.starts_with("powershell.exe -NoLogo -NoProfile"));
+        assert!(!remote_command.contains("Write-Output owned"));
+        assert!(!remote_command.contains("repo with space"));
+    }
+
+    #[test]
+    fn remote_host_cache_is_shared_across_agent_lanes_and_can_be_invalidated() {
+        let read = AgentClient::new(
+            "nrm-agent".to_string(),
+            None,
+            RemoteTransport::from_ssh(Some("host".to_string()), 10).unwrap(),
+            PathBuf::from("/repo"),
+            Duration::from_secs(30),
+            AgentInterrupt::default(),
+        );
+        let write = read.clone_for_lane(AgentInterrupt::default());
+        *read.launch.remote_host_info.lock().unwrap() = Some(test_posix_host());
+
+        assert_eq!(
+            write.launch.cached_remote_host_info().unwrap().target,
+            "x86_64-unknown-linux-musl"
+        );
+        write.launch.invalidate_remote_host_info();
+        assert!(read.launch.cached_remote_host_info().is_none());
+    }
+
+    #[test]
+    fn fast_workspace_info_does_not_wait_for_remote_host_detection_lock() {
+        let dir = tempdir().unwrap();
+        let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
+        let sidecar = test_sidecar(mirror);
+        let fast =
+            FastState::from_sidecar(&sidecar, Arc::new(Mutex::new(PendingRemote::default())));
+        let _detection_guard = sidecar.agent.launch.remote_host_info.lock().unwrap();
+
+        let info = fast.workspace_info();
+
+        assert!(info.get("remote_host").is_none());
+        assert_eq!(info["remote_status"], "unchecked");
+    }
+
+    #[test]
+    fn local_host_detection_does_not_apply_ssh_root_syntax() {
+        let client = AgentClient::new(
+            "nrm-agent".to_string(),
+            None,
+            RemoteTransport::Local,
+            PathBuf::from(r"C:\repo"),
+            Duration::from_secs(30),
+            AgentInterrupt::default(),
+        );
+
+        client.launch.remote_host_info().unwrap();
+    }
+
+    #[test]
+    fn agent_transport_failure_invalidates_shared_remote_host_cache() {
+        let read = AgentClient::new(
+            "nrm-agent".to_string(),
+            None,
+            RemoteTransport::from_ssh(Some("host".to_string()), 10).unwrap(),
+            PathBuf::from("/repo"),
+            Duration::from_secs(30),
+            AgentInterrupt::default(),
+        );
+        let mut write = read.clone_for_lane(AgentInterrupt::default());
+        *read.launch.remote_host_info.lock().unwrap() = Some(test_posix_host());
+
+        let error = write
+            .handle_worker_reply(AgentWorkerReply::TransportError(
+                "ssh transport closed".to_string(),
+            ))
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("ssh transport closed"));
+        assert!(read.launch.cached_remote_host_info().is_none());
+    }
+
+    #[test]
     fn shell_quote_handles_metacharacters() {
         assert_eq!(shell_quote(""), "''");
         assert_eq!(shell_quote("plain"), "'plain'");
@@ -12443,7 +12862,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let remote_root = dir.path().join("repo with 'quote' ; x");
         fs::create_dir_all(&remote_root).unwrap();
-        let remote_command = lsp_remote_command(
+        let remote_command = posix_lsp_remote_command(
             remote_root.clone(),
             vec![
                 "sh".to_string(),
@@ -12642,7 +13061,7 @@ mod tests {
         fs::set_permissions(&fake_agent, permissions).unwrap();
 
         let fake_agent = fake_agent.to_string_lossy().to_string();
-        let remote_command = agent_remote_command(&fake_agent, &remote_root);
+        let remote_command = posix_agent_remote_command(&fake_agent, &remote_root);
         let output = std::process::Command::new("sh")
             .arg("-c")
             .arg(remote_command)
@@ -12681,7 +13100,7 @@ mod tests {
 
         let remote_root = dir.path().join("repo with spaces");
         fs::create_dir_all(&remote_root).unwrap();
-        let remote_command = agent_remote_command("nrm-agent", &remote_root);
+        let remote_command = posix_agent_remote_command("nrm-agent", &remote_root);
         let output = std::process::Command::new("sh")
             .arg("-c")
             .arg(remote_command)
