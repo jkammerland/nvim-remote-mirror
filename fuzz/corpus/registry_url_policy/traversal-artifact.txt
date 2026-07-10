@@ -1,0 +1,2 @@
+file:///tmp/nrm/releases/v{version}/nrm-agent-manifest-v1.json
+../nrm-agent

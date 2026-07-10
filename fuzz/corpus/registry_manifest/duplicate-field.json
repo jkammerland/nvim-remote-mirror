@@ -1,0 +1,1 @@
+{"schema_version":1,"schema_version":1,"package":"nrm-agent","version":"0.1.0","protocol_version":7,"source_commit":"0123456789abcdef0123456789abcdef01234567","artifacts":[{"target":"aarch64-pc-windows-msvc","filename":"nrm-agent-0.1.0-aarch64-pc-windows-msvc.exe","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","size":1}]}

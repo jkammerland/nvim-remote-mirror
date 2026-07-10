@@ -10,10 +10,34 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 nrm-protocol = { path = "../crates/nrm-protocol" }
+nrm-registry = { path = "../crates/nrm-registry" }
+semver = "1.0"
+url = "2.5"
 
 [[bin]]
 name = "protocol_frame"
 path = "fuzz_targets/protocol_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "registry_manifest"
+path = "fuzz_targets/registry_manifest.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "registry_signatures"
+path = "fuzz_targets/registry_signatures.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "registry_url_policy"
+path = "fuzz_targets/registry_url_policy.rs"
 test = false
 doc = false
 bench = false

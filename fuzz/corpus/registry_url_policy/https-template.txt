@@ -1,0 +1,1 @@
+https://example.com/releases/v{version}/nrm-agent-manifest-v1.json

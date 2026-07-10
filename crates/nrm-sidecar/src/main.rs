@@ -1,5 +1,5 @@
 use anyhow::{anyhow, bail, Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 mod lsp_rewrite;
 mod remote_host;
 use lsp_rewrite::rewrite_lsp_body;
@@ -8,6 +8,10 @@ use nrm_protocol::{
     Response, RpcError, RpcMessage, SaveOutcome, WriteStartOutcome, MAX_FRAME_LEN,
     PROTOCOL_VERSION,
 };
+use nrm_registry::{
+    fetch_verified_artifact, AgentTarget, ArtifactSource, FetchConfig, FetchedArtifact,
+    ManifestSource, RegistryUrlTemplate, TrustedKeySet,
+};
 use remote_host::{
     local_host_info, parse_posix_probe, parse_powershell_probe, posix_probe_command,
     powershell_probe_command, powershell_process_command, validate_remote_root, RemoteHostInfo,
@@ -15,11 +19,13 @@ use remote_host::{
 };
 use rusqlite::Row;
 use rusqlite::{params, Connection, OptionalExtension};
+use semver::Version;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
+use sha2::{Digest as _, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::unix::fs::FileTypeExt;
 #[cfg(unix)]
@@ -56,6 +62,9 @@ const FAST_FLUSH_SNAPSHOT_MAX_BYTES: u64 = 1024 * 1024;
 const REMOTE_INTERACTIVE_QUEUE_CAPACITY: usize = 128;
 const REMOTE_BACKGROUND_QUEUE_CAPACITY: usize = 128;
 const REMOTE_AGENT_MANAGED_PATH: &str = "$HOME/.local/bin/nrm-agent";
+const DEFAULT_REGISTRY_CACHE_MAX_BYTES: u64 = 512 * 1024 * 1024;
+const DEFAULT_REGISTRY_TIMEOUT_MS: u64 = 120_000;
+const REGISTRY_POLICY_DISABLED: &str = "disabled";
 const BACKGROUND_SCAN_CURSOR_KEY: &str = "background_scan_cursor";
 const BACKGROUND_SCAN_COMPLETED_AT_KEY: &str = "background_scan_completed_at_ms";
 const SIDECAR_COMMAND_SPECS: &[SidecarCommandSpec] = &[
@@ -215,6 +224,8 @@ enum CommandKind {
         request_timeout_ms: u64,
         #[arg(long, default_value_t = 10)]
         ssh_connect_timeout_seconds: u64,
+        #[command(flatten)]
+        registry: RegistryCliArgs,
     },
     Listen {
         #[arg(long)]
@@ -233,6 +244,8 @@ enum CommandKind {
         request_timeout_ms: u64,
         #[arg(long, default_value_t = 10)]
         ssh_connect_timeout_seconds: u64,
+        #[command(flatten)]
+        registry: RegistryCliArgs,
     },
     LspProxy {
         #[arg(long)]
@@ -246,6 +259,122 @@ enum CommandKind {
         #[arg(last = true, required = true)]
         command: Vec<String>,
     },
+}
+
+#[derive(Debug, Clone, Args)]
+struct RegistryCliArgs {
+    #[arg(long)]
+    remote_agent_registry_url: Option<String>,
+    #[arg(
+        long = "remote-agent-registry-public-key",
+        value_name = "KEY_ID=BASE64",
+        action = clap::ArgAction::Append
+    )]
+    remote_agent_registry_public_keys: Vec<String>,
+    #[arg(long, default_value_t = 1)]
+    remote_agent_registry_signature_threshold: usize,
+    #[arg(long)]
+    remote_agent_registry_cache_dir: Option<PathBuf>,
+    #[arg(long, default_value_t = DEFAULT_REGISTRY_CACHE_MAX_BYTES)]
+    remote_agent_registry_cache_max_bytes: u64,
+    #[arg(long, default_value_t = DEFAULT_REGISTRY_TIMEOUT_MS)]
+    remote_agent_registry_timeout_ms: u64,
+}
+
+impl RegistryCliArgs {
+    fn into_config(self) -> Result<Option<RegistryLaunchConfig>> {
+        let Some(url) = self.remote_agent_registry_url else {
+            if !self.remote_agent_registry_public_keys.is_empty()
+                || self.remote_agent_registry_cache_dir.is_some()
+                || self.remote_agent_registry_signature_threshold != 1
+                || self.remote_agent_registry_cache_max_bytes != DEFAULT_REGISTRY_CACHE_MAX_BYTES
+                || self.remote_agent_registry_timeout_ms != DEFAULT_REGISTRY_TIMEOUT_MS
+            {
+                bail!("remote agent registry options require --remote-agent-registry-url");
+            }
+            return Ok(None);
+        };
+        if self.remote_agent_registry_cache_max_bytes == 0 {
+            bail!("remote agent registry cache limit must be positive");
+        }
+        if self.remote_agent_registry_timeout_ms == 0 {
+            bail!("remote agent registry timeout must be positive");
+        }
+        let url_template = RegistryUrlTemplate::parse(&url)
+            .context("invalid remote agent registry URL template")?;
+        let mut entries = Vec::with_capacity(self.remote_agent_registry_public_keys.len());
+        for entry in self.remote_agent_registry_public_keys {
+            let (key_id, encoded) = entry
+                .split_once('=')
+                .ok_or_else(|| anyhow!("registry public keys must use KEY_ID=BASE64 syntax"))?;
+            entries.push((key_id.to_string(), encoded.to_string()));
+        }
+        let cache_dir_identity = self
+            .remote_agent_registry_cache_dir
+            .as_deref()
+            .map(|path| {
+                path.to_str().ok_or_else(|| {
+                    anyhow!("remote agent registry cache directory must be valid UTF-8")
+                })
+            })
+            .transpose()?
+            .unwrap_or("");
+        let mut policy_entries = entries.clone();
+        policy_entries.sort_by(|left, right| left.0.cmp(&right.0));
+        let mut policy_parts = vec![
+            "nrm-registry-policy-v1".to_string(),
+            url.clone(),
+            self.remote_agent_registry_signature_threshold.to_string(),
+            cache_dir_identity.to_string(),
+            self.remote_agent_registry_cache_max_bytes.to_string(),
+            self.remote_agent_registry_timeout_ms.to_string(),
+        ];
+        policy_parts.extend(
+            policy_entries
+                .iter()
+                .map(|(key_id, encoded)| format!("{key_id}={}", sha256_bytes(encoded.as_bytes()))),
+        );
+        let policy_fingerprint = sha256_bytes(policy_parts.join("\x1f").as_bytes());
+        let trusted_keys = TrustedKeySet::from_base64(entries)
+            .context("invalid remote agent registry public keys")?;
+        if self.remote_agent_registry_signature_threshold == 0
+            || self.remote_agent_registry_signature_threshold > trusted_keys.len()
+        {
+            bail!(
+                "remote agent registry signature threshold must be between 1 and {}",
+                trusted_keys.len()
+            );
+        }
+        Ok(Some(RegistryLaunchConfig {
+            url_template,
+            trusted_keys,
+            signature_threshold: self.remote_agent_registry_signature_threshold,
+            cache_dir: self.remote_agent_registry_cache_dir,
+            cache_max_bytes: self.remote_agent_registry_cache_max_bytes,
+            timeout: Duration::from_millis(self.remote_agent_registry_timeout_ms),
+            policy_fingerprint,
+        }))
+    }
+}
+
+#[derive(Clone, Debug)]
+struct RegistryLaunchConfig {
+    url_template: RegistryUrlTemplate,
+    trusted_keys: TrustedKeySet,
+    signature_threshold: usize,
+    cache_dir: Option<PathBuf>,
+    cache_max_bytes: u64,
+    timeout: Duration,
+    policy_fingerprint: String,
+}
+
+#[derive(Debug)]
+struct ResolvedAgentSource {
+    path: PathBuf,
+    file: File,
+    expected_sha256: Option<String>,
+    details: Value,
+    _registry_artifact: Option<FetchedArtifact>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -735,6 +864,7 @@ fn run_remote_host_probe(
 struct AgentLaunch {
     agent: String,
     local_agent: Option<PathBuf>,
+    registry: Option<RegistryLaunchConfig>,
     remote_root: PathBuf,
     request_timeout: Duration,
     transport: RemoteTransport,
@@ -1152,9 +1282,30 @@ fn remote_unavailable_backoff_ms(consecutive_failures: u32) -> u64 {
 }
 
 impl AgentClient {
+    #[cfg(test)]
     fn new(
         agent: String,
         local_agent: Option<PathBuf>,
+        transport: RemoteTransport,
+        remote_root: PathBuf,
+        request_timeout: Duration,
+        interrupt: AgentInterrupt,
+    ) -> Self {
+        Self::new_with_registry(
+            agent,
+            local_agent,
+            None,
+            transport,
+            remote_root,
+            request_timeout,
+            interrupt,
+        )
+    }
+
+    fn new_with_registry(
+        agent: String,
+        local_agent: Option<PathBuf>,
+        registry: Option<RegistryLaunchConfig>,
         transport: RemoteTransport,
         remote_root: PathBuf,
         request_timeout: Duration,
@@ -1164,6 +1315,7 @@ impl AgentClient {
             launch: AgentLaunch {
                 agent,
                 local_agent,
+                registry,
                 remote_root,
                 request_timeout,
                 transport,
@@ -3825,6 +3977,7 @@ fn sidecar_command_specs_value() -> Vec<Value> {
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn workspace_info_value(
     workspace_key: &str,
     remote_root: &Path,
@@ -3833,6 +3986,7 @@ fn workspace_info_value(
     transport: &RemoteTransport,
     remote_health: RemoteHealth,
     remote_host: Option<&RemoteHostInfo>,
+    registry_policy_fingerprint: &str,
 ) -> Value {
     let remote_health_value = remote_health.to_value();
     let mut value = json!({
@@ -3843,6 +3997,7 @@ fn workspace_info_value(
         "mirror_root": mirror_root.to_string_lossy(),
         "files_root": files_root.to_string_lossy(),
         "transport": transport.to_value(),
+        "registry_policy_fingerprint": registry_policy_fingerprint,
         "client_mode": "single_writer",
         "client_policy": {
             "mode": "single_writer",
@@ -3904,6 +4059,7 @@ struct FastState {
     pending_remote: Arc<Mutex<PendingRemote>>,
     remote_health: Arc<Mutex<RemoteHealth>>,
     remote_host_info: Arc<Mutex<Option<RemoteHostInfo>>>,
+    registry_policy_fingerprint: String,
 }
 
 enum FastHandle {
@@ -4521,6 +4677,7 @@ impl FastState {
             pending_remote,
             remote_health: Arc::clone(&sidecar.remote_health),
             remote_host_info: Arc::clone(&sidecar.agent.launch.remote_host_info),
+            registry_policy_fingerprint: sidecar.registry_policy_fingerprint().to_string(),
         }
     }
 
@@ -4561,6 +4718,7 @@ impl FastState {
             &self.transport,
             self.remote_health_snapshot(),
             remote_host.as_ref(),
+            &self.registry_policy_fingerprint,
         )
     }
 
@@ -4669,6 +4827,16 @@ impl FastState {
 }
 
 impl Sidecar {
+    fn registry_policy_fingerprint(&self) -> &str {
+        self.agent
+            .launch
+            .registry
+            .as_ref()
+            .map(|registry| registry.policy_fingerprint.as_str())
+            .unwrap_or(REGISTRY_POLICY_DISABLED)
+    }
+
+    #[cfg(test)]
     fn new(
         remote_root: PathBuf,
         transport: RemoteTransport,
@@ -4678,11 +4846,42 @@ impl Sidecar {
         request_timeout_ms: u64,
         agent_interrupt: AgentInterrupt,
     ) -> Result<Self> {
-        let workspace_key = workspace_key(&transport, &remote_root);
-        let mirror = Mirror::open(state_dir, &workspace_key)?;
-        let agent = AgentClient::new(
+        Self::new_with_registry(
+            remote_root,
+            transport,
             agent,
             local_agent,
+            None,
+            state_dir,
+            request_timeout_ms,
+            agent_interrupt,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_registry(
+        remote_root: PathBuf,
+        transport: RemoteTransport,
+        agent: String,
+        local_agent: Option<PathBuf>,
+        registry: Option<RegistryLaunchConfig>,
+        state_dir: Option<PathBuf>,
+        request_timeout_ms: u64,
+        agent_interrupt: AgentInterrupt,
+    ) -> Result<Self> {
+        let state_dir = state_dir.unwrap_or_else(default_state_dir);
+        let registry = registry.map(|mut config| {
+            config
+                .cache_dir
+                .get_or_insert_with(|| state_dir.join("registry-cache"));
+            config
+        });
+        let workspace_key = workspace_key(&transport, &remote_root);
+        let mirror = Mirror::open(Some(state_dir), &workspace_key)?;
+        let agent = AgentClient::new_with_registry(
+            agent,
+            local_agent,
+            registry,
             transport,
             remote_root.clone(),
             Duration::from_millis(request_timeout_ms),
@@ -4761,6 +4960,7 @@ impl Sidecar {
             &self.agent.launch.transport,
             self.agent.remote_health(),
             remote_host.as_ref(),
+            self.registry_policy_fingerprint(),
         )
     }
 
@@ -4892,10 +5092,29 @@ impl Sidecar {
             }));
         }
 
-        let source = self.local_agent_source()?;
-        let bytes = fs::read(&source)
-            .with_context(|| format!("failed to read local agent {}", source.display()))?;
+        let mut source = self.resolve_agent_source()?;
+        source
+            .file
+            .seek(SeekFrom::Start(0))
+            .with_context(|| format!("failed to seek agent source {}", source.path.display()))?;
+        let mut bytes = Vec::new();
+        source
+            .file
+            .read_to_end(&mut bytes)
+            .with_context(|| format!("failed to read agent source {}", source.path.display()))?;
         let source_hash = hash_bytes(&bytes);
+        let source_sha256 = sha256_bytes(&bytes);
+        let source_size = bytes.len();
+        if source
+            .expected_sha256
+            .as_deref()
+            .is_some_and(|expected| expected != source_sha256)
+        {
+            bail!(
+                "verified registry artifact changed before upload: expected={} actual={source_sha256}",
+                source.expected_sha256.as_deref().unwrap_or_default()
+            );
+        }
         let effective_force = force || (update && before_status != "missing_agent");
 
         let ssh = match &self.agent.launch.transport {
@@ -4925,31 +5144,116 @@ impl Sidecar {
         self.agent.kill_worker();
         self.agent.clear_all_remote_unavailable();
         let after = self.remote_health(preempt_epoch);
-        Ok(json!({
+        let mut result = json!({
             "status": if update { "updated" } else { "installed" },
             "install_path": output.stdout.lines().last().unwrap_or(&target_path),
             "requested_install_path": target_path,
-            "source_path": source.to_string_lossy(),
+            "source_path": source.path.to_string_lossy(),
             "source_hash": source_hash,
-            "bytes": source.metadata().map(|metadata| metadata.len()).unwrap_or(0),
+            "source_sha256": source_sha256,
+            "bytes": source_size,
             "force": effective_force,
             "remote_health": after
-        }))
+        });
+        if let (Some(result), Some(details)) = (result.as_object_mut(), source.details.as_object())
+        {
+            result.extend(details.clone());
+        }
+        Ok(result)
     }
 
-    fn local_agent_source(&self) -> Result<PathBuf> {
+    fn resolve_agent_source(&self) -> Result<ResolvedAgentSource> {
+        if let Some(registry) = &self.agent.launch.registry {
+            let host = self.agent.launch.remote_host_info()?;
+            let target = host.target.parse::<AgentTarget>().map_err(|()| {
+                anyhow!(
+                    "remote host selected unsupported registry target {:?}",
+                    host.target
+                )
+            })?;
+            let version = Version::parse(env!("CARGO_PKG_VERSION"))
+                .context("sidecar package version is not valid semantic versioning")?;
+            let manifest_url = registry
+                .url_template
+                .expand(&version)
+                .context("failed to expand remote agent registry URL")?;
+            let cache_dir = registry.cache_dir.as_deref().ok_or_else(|| {
+                anyhow!("remote agent registry cache directory was not initialized")
+            })?;
+            let fetched = fetch_verified_artifact(&FetchConfig {
+                manifest_url: &manifest_url,
+                target,
+                expected_version: &version,
+                expected_protocol_version: u32::from(PROTOCOL_VERSION),
+                trusted_keys: &registry.trusted_keys,
+                signature_threshold: registry.signature_threshold,
+                cache_dir,
+                cache_max_bytes: registry.cache_max_bytes,
+                timeout: registry.timeout,
+            })
+            .context("failed to retrieve a verified remote agent build")?;
+            let signing_key_ids: Vec<_> = fetched
+                .verified_manifest
+                .verified_signers
+                .iter()
+                .map(|signer| signer.key_id.clone())
+                .collect();
+            let file = fetched
+                .try_clone_file()
+                .context("failed to clone verified registry artifact handle")?;
+            let artifact_source = match fetched.source {
+                ArtifactSource::Network => "network",
+                ArtifactSource::File => "file",
+                ArtifactSource::Cache => "cache",
+            };
+            let manifest_source = match fetched.manifest_source {
+                ManifestSource::Network => "network",
+                ManifestSource::File => "file",
+                ManifestSource::VerifiedCacheFallback => "verified_cache_fallback",
+            };
+            let details = json!({
+                "agent_source": "registry",
+                "registry_manifest_url": manifest_url.as_str(),
+                "registry_target": target.to_string(),
+                "registry_manifest_sha256": fetched.verified_manifest.manifest_sha256,
+                "registry_signing_key_ids": signing_key_ids,
+                "registry_artifact_source": artifact_source,
+                "registry_manifest_source": manifest_source,
+                "registry_cache_state": {
+                    "manifest_fallback": fetched.cache_state.manifest_fallback,
+                    "artifact_hit": fetched.cache_state.artifact_hit,
+                }
+            });
+            return Ok(ResolvedAgentSource {
+                path: fetched.local_path.clone(),
+                file,
+                expected_sha256: Some(fetched.sha256.clone()),
+                details,
+                _registry_artifact: Some(fetched),
+            });
+        }
+
         let source = self
             .agent
             .launch
             .local_agent
             .clone()
             .unwrap_or_else(|| PathBuf::from(&self.agent.launch.agent));
-        let metadata = fs::metadata(&source)
+        let file = File::open(&source)
             .with_context(|| format!("local agent source is not readable: {}", source.display()))?;
+        let metadata = file
+            .metadata()
+            .with_context(|| format!("failed to stat local agent source: {}", source.display()))?;
         if !metadata.is_file() {
             bail!("local agent source is not a file: {}", source.display());
         }
-        Ok(source)
+        Ok(ResolvedAgentSource {
+            details: json!({ "agent_source": "local" }),
+            path: source,
+            file,
+            expected_sha256: None,
+            _registry_artifact: None,
+        })
     }
 
     fn decorate_remote_agent_health(&self, mut value: Value) -> Value {
@@ -4967,8 +5271,10 @@ impl Sidecar {
             .then(|| format!("local agent source is not readable: {}", source.display()));
         let agent_status = classify_remote_agent_status(&value);
         let is_ssh = matches!(self.agent.launch.transport, RemoteTransport::Ssh(_));
+        let registry_configured = self.agent.launch.registry.is_some();
+        let install_source_available = registry_configured || local_agent_available;
         let update_available = is_ssh
-            && local_agent_available
+            && install_source_available
             && matches!(
                 agent_status.as_str(),
                 "missing_agent" | "agent_not_executable" | "protocol_mismatch" | "version_mismatch"
@@ -4997,17 +5303,28 @@ impl Sidecar {
                 "local_agent_available".to_string(),
                 json!(local_agent_available),
             );
-            if let Some(error) = local_agent_error {
-                object.insert("local_agent_error".to_string(), json!(error));
+            object.insert(
+                "registry_configured".to_string(),
+                json!(registry_configured),
+            );
+            if !registry_configured {
+                object.insert("agent_source".to_string(), json!("local"));
+            } else {
+                object.insert("agent_source".to_string(), json!("registry"));
+            }
+            if !registry_configured {
+                if let Some(error) = local_agent_error {
+                    object.insert("local_agent_error".to_string(), json!(error));
+                }
             }
             object.insert(
                 "install_available".to_string(),
-                json!(is_ssh && local_agent_available),
+                json!(is_ssh && install_source_available),
             );
             object.insert("update_available".to_string(), json!(update_available));
             if update_available {
                 object.insert("repair_command".to_string(), json!("RemoteUpdateAgent"));
-            } else if is_ssh && !local_agent_available {
+            } else if is_ssh && !install_source_available {
                 object.insert(
                     "repair_command".to_string(),
                     json!("configure local agent path"),
@@ -6457,7 +6774,9 @@ fn main() -> Result<()> {
             state_dir,
             request_timeout_ms,
             ssh_connect_timeout_seconds,
+            registry,
         } => {
+            let registry = registry.into_config()?;
             let transport = RemoteTransport::from_ssh(ssh, ssh_connect_timeout_seconds)?;
             let remote_root = transport.normalize_remote_root(remote_root)?;
             run_server(
@@ -6465,6 +6784,7 @@ fn main() -> Result<()> {
                 transport,
                 agent,
                 local_agent,
+                registry,
                 state_dir,
                 request_timeout_ms,
             )
@@ -6478,7 +6798,9 @@ fn main() -> Result<()> {
             state_dir,
             request_timeout_ms,
             ssh_connect_timeout_seconds,
+            registry,
         } => {
+            let registry = registry.into_config()?;
             let transport = RemoteTransport::from_ssh(ssh, ssh_connect_timeout_seconds)?;
             let remote_root = transport.normalize_remote_root(remote_root)?;
             run_listener(
@@ -6487,6 +6809,7 @@ fn main() -> Result<()> {
                 transport,
                 agent,
                 local_agent,
+                registry,
                 state_dir,
                 request_timeout_ms,
             )
@@ -6510,6 +6833,7 @@ fn run_server(
     transport: RemoteTransport,
     agent: String,
     local_agent: Option<PathBuf>,
+    registry: Option<RegistryLaunchConfig>,
     state_dir: Option<PathBuf>,
     request_timeout_ms: u64,
 ) -> Result<()> {
@@ -6521,6 +6845,7 @@ fn run_server(
         transport,
         agent,
         local_agent,
+        registry,
         state_dir,
         request_timeout_ms,
         stdin.lock(),
@@ -6532,12 +6857,14 @@ fn run_server(
 }
 
 #[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
 fn run_listener(
     socket: PathBuf,
     remote_root: PathBuf,
     transport: RemoteTransport,
     agent: String,
     local_agent: Option<PathBuf>,
+    registry: Option<RegistryLaunchConfig>,
     state_dir: Option<PathBuf>,
     request_timeout_ms: u64,
 ) -> Result<()> {
@@ -6559,6 +6886,7 @@ fn run_listener(
                 transport.clone(),
                 agent.clone(),
                 local_agent.clone(),
+                registry.clone(),
                 state_dir.clone(),
                 request_timeout_ms,
                 stream,
@@ -6577,12 +6905,14 @@ fn run_listener(
 }
 
 #[cfg(not(unix))]
+#[allow(clippy::too_many_arguments)]
 fn run_listener(
     _socket: PathBuf,
     _remote_root: PathBuf,
     _transport: RemoteTransport,
     _agent: String,
     _local_agent: Option<PathBuf>,
+    _registry: Option<RegistryLaunchConfig>,
     _state_dir: Option<PathBuf>,
     _request_timeout_ms: u64,
 ) -> Result<()> {
@@ -6612,11 +6942,13 @@ fn prepare_listener_socket(socket: &Path) -> Result<()> {
 }
 
 #[cfg(unix)]
+#[allow(clippy::too_many_arguments)]
 fn run_socket_server_session(
     remote_root: PathBuf,
     transport: RemoteTransport,
     agent: String,
     local_agent: Option<PathBuf>,
+    registry: Option<RegistryLaunchConfig>,
     state_dir: Option<PathBuf>,
     request_timeout_ms: u64,
     stream: UnixStream,
@@ -6633,6 +6965,7 @@ fn run_socket_server_session(
         transport,
         agent,
         local_agent,
+        registry,
         state_dir,
         request_timeout_ms,
         reader,
@@ -6654,6 +6987,7 @@ fn run_server_session<R>(
     transport: RemoteTransport,
     agent: String,
     local_agent: Option<PathBuf>,
+    registry: Option<RegistryLaunchConfig>,
     state_dir: Option<PathBuf>,
     request_timeout_ms: u64,
     reader: R,
@@ -6664,11 +6998,12 @@ where
     R: BufRead,
 {
     let agent_interrupt = AgentInterrupt::default();
-    let sidecar = Sidecar::new(
+    let sidecar = Sidecar::new_with_registry(
         remote_root,
         transport,
         agent,
         local_agent,
+        registry,
         state_dir,
         request_timeout_ms,
         agent_interrupt.clone(),
@@ -8130,6 +8465,16 @@ fn hash_bytes(bytes: &[u8]) -> String {
     blake3::hash(bytes).to_hex().to_string()
 }
 
+fn sha256_bytes(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut output = String::with_capacity(64);
+    for byte in digest {
+        use std::fmt::Write as _;
+        write!(&mut output, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    output
+}
+
 fn hash_file(path: &Path) -> Result<String> {
     let mut file = File::open(path)?;
     let mut hasher = blake3::Hasher::new();
@@ -8187,6 +8532,9 @@ fn trace_event(event: &str, fields: Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::engine::general_purpose::STANDARD;
+    use base64::Engine as _;
+    use ed25519_dalek::{Signer as _, SigningKey};
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::AtomicUsize;
@@ -8239,6 +8587,181 @@ mod tests {
             r#"{"schema_version":1,"os":"windows","arch":"AMD64","shell":"powershell","home":"C:\\Users\\test","local_app_data":"C:\\Users\\test\\AppData\\Local","path_style":"windows"}"#,
         )
         .unwrap()
+    }
+
+    fn registry_cli_args() -> RegistryCliArgs {
+        RegistryCliArgs {
+            remote_agent_registry_url: None,
+            remote_agent_registry_public_keys: Vec::new(),
+            remote_agent_registry_signature_threshold: 1,
+            remote_agent_registry_cache_dir: None,
+            remote_agent_registry_cache_max_bytes: DEFAULT_REGISTRY_CACHE_MAX_BYTES,
+            remote_agent_registry_timeout_ms: DEFAULT_REGISTRY_TIMEOUT_MS,
+        }
+    }
+
+    #[test]
+    fn registry_cli_is_opt_in_and_rejects_orphaned_policy() {
+        assert!(registry_cli_args().into_config().unwrap().is_none());
+
+        let mut args = registry_cli_args();
+        args.remote_agent_registry_public_keys
+            .push("release-a=11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=".to_string());
+        let error = args.into_config().unwrap_err().to_string();
+        assert!(error.contains("require --remote-agent-registry-url"));
+    }
+
+    #[test]
+    fn registry_cli_parses_trust_policy_in_deterministic_key_order() {
+        let mut args = registry_cli_args();
+        args.remote_agent_registry_url =
+            Some("https://example.test/releases/v{version}/nrm-agent-manifest-v1.json".to_string());
+        args.remote_agent_registry_public_keys = vec![
+            "release-z=PUAXw+hDiVqStwqnTRt+vJyYLM8uxJaMwM1V8Sr0Zgw=".to_string(),
+            "release-a=11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=".to_string(),
+        ];
+        args.remote_agent_registry_signature_threshold = 1;
+        args.remote_agent_registry_cache_dir = Some(PathBuf::from("/tmp/nrm registry cache"));
+        args.remote_agent_registry_cache_max_bytes = 4096;
+        args.remote_agent_registry_timeout_ms = 7000;
+
+        let config = args.into_config().unwrap().unwrap();
+        assert_eq!(
+            config.trusted_keys.key_ids().collect::<Vec<_>>(),
+            vec!["release-a", "release-z"]
+        );
+        assert_eq!(config.signature_threshold, 1);
+        assert_eq!(config.cache_max_bytes, 4096);
+        assert_eq!(config.timeout, Duration::from_millis(7000));
+        assert_eq!(
+            config.policy_fingerprint,
+            "59697bb3ee09d89a1122612967070aa5bb29f3c4f420a6c0d64405bba134abf2"
+        );
+    }
+
+    #[test]
+    fn registry_cli_rejects_duplicate_key_material_and_bad_thresholds() {
+        let mut duplicate = registry_cli_args();
+        duplicate.remote_agent_registry_url =
+            Some("https://example.test/v{version}/manifest.json".to_string());
+        duplicate.remote_agent_registry_public_keys = vec![
+            "release-a=11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=".to_string(),
+            "release-b=11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=".to_string(),
+        ];
+        assert!(duplicate
+            .into_config()
+            .unwrap_err()
+            .to_string()
+            .contains("invalid remote agent registry public keys"));
+
+        let mut threshold = registry_cli_args();
+        threshold.remote_agent_registry_url =
+            Some("https://example.test/v{version}/manifest.json".to_string());
+        threshold.remote_agent_registry_public_keys =
+            vec!["release-a=11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=".to_string()];
+        threshold.remote_agent_registry_signature_threshold = 2;
+        assert!(threshold
+            .into_config()
+            .unwrap_err()
+            .to_string()
+            .contains("threshold must be between 1 and 1"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_registry_source_is_verified_cached_and_never_falls_back_to_local() {
+        let release = tempdir().unwrap();
+        let cache = tempdir().unwrap();
+        let state = tempdir().unwrap();
+        let target = AgentTarget::X86_64UnknownLinuxMusl;
+        let version = Version::parse(env!("CARGO_PKG_VERSION")).unwrap();
+        let filename = format!("nrm-agent-{version}-{target}");
+        let artifact_path = release.path().join(&filename);
+        let artifact_bytes = b"signed registry agent";
+        fs::write(&artifact_path, artifact_bytes).unwrap();
+
+        let manifest_path = release.path().join(format!("manifest-{version}.json"));
+        let signature_path = PathBuf::from(format!("{}.sig", manifest_path.display()));
+        let manifest = serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "package": "nrm-agent",
+            "version": version.to_string(),
+            "protocol_version": u32::from(PROTOCOL_VERSION),
+            "source_commit": "0123456789abcdef0123456789abcdef01234567",
+            "artifacts": [{
+                "target": target.to_string(),
+                "filename": filename,
+                "sha256": sha256_bytes(artifact_bytes),
+                "size": artifact_bytes.len(),
+            }]
+        }))
+        .unwrap();
+        let signing_key = SigningKey::from_bytes(&[42; 32]);
+        let signature = serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "signatures": [{
+                "key_id": "release-test",
+                "signature": STANDARD.encode(signing_key.sign(&manifest).to_bytes()),
+            }]
+        }))
+        .unwrap();
+        fs::write(&manifest_path, &manifest).unwrap();
+        fs::write(&signature_path, &signature).unwrap();
+
+        let decoy = release.path().join("unsigned-local-agent");
+        fs::write(&decoy, b"unsigned decoy").unwrap();
+        let template = format!(
+            "file://{}/manifest-{{version}}.json",
+            release.path().display()
+        );
+        let registry = RegistryLaunchConfig {
+            url_template: RegistryUrlTemplate::parse(&template).unwrap(),
+            trusted_keys: TrustedKeySet::from_base64([(
+                "release-test",
+                STANDARD.encode(signing_key.verifying_key().as_bytes()),
+            )])
+            .unwrap(),
+            signature_threshold: 1,
+            cache_dir: Some(cache.path().to_path_buf()),
+            cache_max_bytes: DEFAULT_REGISTRY_CACHE_MAX_BYTES,
+            timeout: Duration::from_secs(5),
+            policy_fingerprint: "test-registry-policy".to_string(),
+        };
+        let sidecar = Sidecar::new_with_registry(
+            PathBuf::from("/repo"),
+            RemoteTransport::Local,
+            "nrm-agent".to_string(),
+            Some(decoy.clone()),
+            Some(registry),
+            Some(state.path().to_path_buf()),
+            5_000,
+            AgentInterrupt::default(),
+        )
+        .unwrap();
+        *sidecar.agent.launch.remote_host_info.lock().unwrap() = Some(test_posix_host());
+
+        let mut source = sidecar.resolve_agent_source().unwrap();
+        let mut resolved = Vec::new();
+        source.file.read_to_end(&mut resolved).unwrap();
+        assert_eq!(resolved, artifact_bytes);
+        assert_ne!(source.path, decoy);
+        assert_eq!(source.details["agent_source"], "registry");
+        assert_eq!(source.details["registry_artifact_source"], "file");
+        drop(source);
+
+        fs::remove_file(&artifact_path).unwrap();
+        let mut cached = sidecar.resolve_agent_source().unwrap();
+        let mut cached_bytes = Vec::new();
+        cached.file.read_to_end(&mut cached_bytes).unwrap();
+        assert_eq!(cached_bytes, artifact_bytes);
+        assert_eq!(cached.details["registry_artifact_source"], "cache");
+        drop(cached);
+
+        fs::write(&signature_path, b"not a signature document").unwrap();
+        assert!(sidecar.resolve_agent_source().is_err());
+        fs::write(&signature_path, &signature).unwrap();
+        fs::remove_file(&manifest_path).unwrap();
+        assert!(sidecar.resolve_agent_source().is_err());
     }
 
     fn test_sidecar(mirror: Mirror) -> Sidecar {
@@ -9020,6 +9543,7 @@ mod tests {
             RemoteTransport::Local,
             "missing-agent".to_string(),
             None,
+            None,
             Some(state_dir.path().to_path_buf()),
             1,
             FailingRequestReader,
@@ -9049,6 +9573,7 @@ mod tests {
                 listener_root,
                 RemoteTransport::Local,
                 "missing-agent".to_string(),
+                None,
                 None,
                 Some(listener_state),
                 1,
@@ -9150,6 +9675,7 @@ mod tests {
                 listener_root,
                 RemoteTransport::Local,
                 listener_agent,
+                None,
                 None,
                 Some(listener_state),
                 30_000,
@@ -9267,6 +9793,7 @@ mod tests {
                 listener_root,
                 transport,
                 listener_agent,
+                None,
                 None,
                 Some(listener_state),
                 30_000,

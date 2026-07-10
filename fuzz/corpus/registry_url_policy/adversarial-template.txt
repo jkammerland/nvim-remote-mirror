@@ -1,0 +1,1 @@
+https://localhost./v{version}/manifest%20name.json

@@ -1,0 +1,2 @@
+https://example.com/releases/v{version}/nrm-agent-manifest-v1.json
+nrm-agent-0.1.0-x86_64-unknown-linux-musl

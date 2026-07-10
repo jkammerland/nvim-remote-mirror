@@ -23,6 +23,12 @@ M.config = {
   agent = executable_or_default("nrm-agent"),
   remote_agent = "nrm-agent",
   remote_agent_install_path = nil,
+  remote_agent_registry_url = nil,
+  remote_agent_registry_public_keys = {},
+  remote_agent_registry_signature_threshold = 1,
+  remote_agent_registry_cache_dir = nil,
+  remote_agent_registry_cache_max_bytes = 512 * 1024 * 1024,
+  remote_agent_registry_timeout_ms = 120000,
   connection = "stdio",
   socket_path = nil,
   socket_dir = nil,
@@ -110,6 +116,175 @@ local function optional_string(value)
     return value
   end
   return nil
+end
+
+local function decode_standard_base64(value)
+  if type(value) ~= "string" or #value == 0 or #value % 4 ~= 0 then
+    return nil
+  end
+  local alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+  local decoded = {}
+  for offset = 1, #value, 4 do
+    local chars = {
+      value:sub(offset, offset),
+      value:sub(offset + 1, offset + 1),
+      value:sub(offset + 2, offset + 2),
+      value:sub(offset + 3, offset + 3),
+    }
+    local numbers = {}
+    local padding = 0
+    for index, char in ipairs(chars) do
+      if char == "=" then
+        if offset + 3 ~= #value or index < 3 then
+          return nil
+        end
+        padding = padding + 1
+        numbers[index] = 0
+      else
+        if padding > 0 then
+          return nil
+        end
+        local position = alphabet:find(char, 1, true)
+        if not position then
+          return nil
+        end
+        numbers[index] = position - 1
+      end
+    end
+    if padding > 2 then
+      return nil
+    end
+    if padding == 1 and numbers[3] % 4 ~= 0 then
+      return nil
+    end
+    if padding == 2 and numbers[2] % 16 ~= 0 then
+      return nil
+    end
+    local packed = numbers[1] * 262144 + numbers[2] * 4096 + numbers[3] * 64 + numbers[4]
+    table.insert(decoded, string.char(math.floor(packed / 65536) % 256))
+    if padding < 2 then
+      table.insert(decoded, string.char(math.floor(packed / 256) % 256))
+    end
+    if padding == 0 then
+      table.insert(decoded, string.char(packed % 256))
+    end
+  end
+  return table.concat(decoded)
+end
+
+local function validate_registry_config(config)
+  local url = config.remote_agent_registry_url
+  if url ~= nil then
+    if type(url) ~= "string" or url == "" then
+      error("remote_agent_registry_url must be nil or a non-empty string")
+    end
+    local without_version, placeholders = url:gsub("{version}", "")
+    if placeholders ~= 1 then
+      error("remote_agent_registry_url must contain exactly one {version} placeholder")
+    end
+    if without_version:find("[{}]") then
+      error("remote_agent_registry_url contains an unsupported placeholder or unmatched brace")
+    end
+    if not url:match("^https://") and not url:match("^file:///") then
+      error("remote_agent_registry_url must use https:// or an absolute file:// URL")
+    end
+    if url:find("[?#]") or url:find("%s") then
+      error("remote_agent_registry_url must not contain queries, fragments, or whitespace")
+    end
+    local authority = url:match("^https://([^/]+)")
+    if url:match("^https://") and not authority then
+      error("remote_agent_registry_url must contain an HTTPS host")
+    end
+    if authority and authority:find("@", 1, true) then
+      error("remote_agent_registry_url must not contain credentials")
+    end
+    if url:match("^file:////") then
+      error("remote_agent_registry_url file paths must be local absolute paths")
+    end
+  end
+
+  local keys = config.remote_agent_registry_public_keys
+  if type(keys) ~= "table" then
+    error("remote_agent_registry_public_keys must be a key-id table")
+  end
+  local key_count = 0
+  local key_material = {}
+  for key_id, encoded in pairs(keys) do
+    if type(key_id) ~= "string" or #key_id == 0 or #key_id > 128 or not key_id:match("^[A-Za-z0-9._-]+$") then
+      error("remote agent registry key IDs must use 1-128 ASCII letters, digits, '.', '_', or '-'")
+    end
+    local decoded = decode_standard_base64(encoded)
+    if not decoded or #decoded ~= 32 then
+      error("remote agent registry public keys must be canonical standard-base64 32-byte keys")
+    end
+    if key_material[decoded] then
+      error("remote agent registry public keys must contain distinct key material")
+    end
+    key_material[decoded] = key_id
+    key_count = key_count + 1
+  end
+  local threshold = config.remote_agent_registry_signature_threshold
+  if type(threshold) ~= "number" or threshold % 1 ~= 0 or threshold < 1 then
+    error("remote_agent_registry_signature_threshold must be a positive integer")
+  end
+  if url and (key_count == 0 or threshold > key_count) then
+    error("registry signature threshold must not exceed the configured trusted key count")
+  end
+  local cache_dir = config.remote_agent_registry_cache_dir
+  if cache_dir ~= nil and (type(cache_dir) ~= "string" or cache_dir == "") then
+    error("remote_agent_registry_cache_dir must be nil or a non-empty string")
+  end
+  for _, field in ipairs({ "remote_agent_registry_cache_max_bytes", "remote_agent_registry_timeout_ms" }) do
+    local value = config[field]
+    if type(value) ~= "number" or value % 1 ~= 0 or value < 1 then
+      error(field .. " must be a positive integer")
+    end
+  end
+  if
+    not url
+    and (
+      key_count > 0
+      or threshold ~= 1
+      or cache_dir ~= nil
+      or config.remote_agent_registry_cache_max_bytes ~= 512 * 1024 * 1024
+      or config.remote_agent_registry_timeout_ms ~= 120000
+    )
+  then
+    error("remote agent registry options require remote_agent_registry_url")
+  end
+end
+
+local function sorted_registry_keys(config)
+  local entries = {}
+  for key_id, key in pairs(config.remote_agent_registry_public_keys or {}) do
+    table.insert(entries, { id = key_id, key = key })
+  end
+  table.sort(entries, function(left, right)
+    return left.id < right.id
+  end)
+  return entries
+end
+
+local function registry_policy_fingerprint(config)
+  if not config.remote_agent_registry_url then
+    return "disabled"
+  end
+  local parts = {
+    "nrm-registry-policy-v1",
+    config.remote_agent_registry_url,
+    tostring(config.remote_agent_registry_signature_threshold),
+    config.remote_agent_registry_cache_dir or "",
+    tostring(config.remote_agent_registry_cache_max_bytes),
+    tostring(config.remote_agent_registry_timeout_ms),
+  }
+  for _, entry in ipairs(sorted_registry_keys(config)) do
+    table.insert(parts, entry.id .. "=" .. vim.fn.sha256(entry.key))
+  end
+  return vim.fn.sha256(table.concat(parts, "\31"))
+end
+
+local function registry_policy_matches(result, expected)
+  return type(result) == "table" and optional_string(result.registry_policy_fingerprint) == expected
 end
 
 local function auto_adoption_enabled()
@@ -507,6 +682,24 @@ local function sidecar_args(target)
     table.insert(args, "--state-dir")
     table.insert(args, M.config.state_dir)
   end
+  if M.config.remote_agent_registry_url then
+    table.insert(args, "--remote-agent-registry-url")
+    table.insert(args, M.config.remote_agent_registry_url)
+    for _, entry in ipairs(sorted_registry_keys(M.config)) do
+      table.insert(args, "--remote-agent-registry-public-key")
+      table.insert(args, entry.id .. "=" .. entry.key)
+    end
+    table.insert(args, "--remote-agent-registry-signature-threshold")
+    table.insert(args, tostring(M.config.remote_agent_registry_signature_threshold))
+    if M.config.remote_agent_registry_cache_dir then
+      table.insert(args, "--remote-agent-registry-cache-dir")
+      table.insert(args, M.config.remote_agent_registry_cache_dir)
+    end
+    table.insert(args, "--remote-agent-registry-cache-max-bytes")
+    table.insert(args, tostring(M.config.remote_agent_registry_cache_max_bytes))
+    table.insert(args, "--remote-agent-registry-timeout-ms")
+    table.insert(args, tostring(M.config.remote_agent_registry_timeout_ms))
+  end
   table.insert(args, "--request-timeout-ms")
   table.insert(args, tostring(M.config.request_timeout_ms))
   table.insert(args, "--ssh-connect-timeout-seconds")
@@ -559,6 +752,9 @@ local function socket_path_for(target_arg, target)
     tostring(M.config.request_timeout_ms or ""),
     tostring(M.config.ssh_connect_timeout_seconds or ""),
   }, "\31")
+  if M.config.remote_agent_registry_url then
+    identity = identity .. "\31" .. registry_policy_fingerprint(M.config)
+  end
   local hash = vim.fn.sha256(identity):sub(1, 24)
   return path_join(default_socket_dir(), hash .. ".sock")
 end
@@ -569,6 +765,8 @@ if vim.g.nvim_remote_mirror_test then
   M._test_sidecar_args = sidecar_args
   M._test_listener_args = listener_args
   M._test_socket_path_for = socket_path_for
+  M._test_registry_policy_fingerprint = registry_policy_fingerprint
+  M._test_registry_policy_matches = registry_policy_matches
 end
 
 local function fail_pending(client, message)
@@ -1547,7 +1745,12 @@ function M.stop_background_mirror()
 end
 
 function M.setup(opts)
-  M.config = vim.tbl_deep_extend("force", M.config, opts or {})
+  local merged = vim.tbl_deep_extend("force", M.config, opts or {})
+  if opts and opts.remote_agent_registry_public_keys ~= nil then
+    merged.remote_agent_registry_public_keys = vim.deepcopy(opts.remote_agent_registry_public_keys)
+  end
+  validate_registry_config(merged)
+  M.config = merged
 end
 
 function M.connect(target, opts)
@@ -1577,6 +1780,7 @@ function M.connect(target, opts)
     target = target,
     target_arg = target_arg,
     closing = false,
+    expected_registry_policy_fingerprint = registry_policy_fingerprint(M.config),
   }
 
   local connection = opts.connection or M.config.connection or "stdio"
@@ -1654,6 +1858,25 @@ function M.connect(target, opts)
     if err then
       M.connection_error = err
       notify(err, vim.log.levels.ERROR)
+      return
+    end
+    if not registry_policy_matches(result, client.expected_registry_policy_fingerprint) then
+      local mismatch = "sidecar registry policy mismatch; refusing stale or differently configured daemon"
+      client.closing = true
+      fail_pending(client, mismatch)
+      if client.transport == "socket" and client.job_id then
+        pcall(vim.fn.chanclose, client.job_id)
+      elseif client.job_id then
+        pcall(vim.fn.jobstop, client.job_id)
+      end
+      if M.client == client then
+        M.client = nil
+      end
+      M.connection_status = "disconnected"
+      M.connection_reason = nil
+      M.connection_error = mismatch
+      M.reconnect_pending = false
+      notify(mismatch, vim.log.levels.ERROR)
       return
     end
     client.hello = result

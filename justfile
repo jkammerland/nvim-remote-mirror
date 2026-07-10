@@ -71,12 +71,17 @@ fuzz-protocol:
     if ! command -v clang >/dev/null 2>&1; then echo "clang is required for sanitizer-backed cargo-fuzz builds"; exit 127; fi
     host_triple="$(rustup run nightly rustc -vV | awk '/^host:/ { print $2 }')"; linker_env="CARGO_TARGET_$(printf '%s' "$host_triple" | tr '[:lower:]-' '[:upper:]_')_LINKER"; if [ -z "${!linker_env:-}" ]; then printf -v "$linker_env" '%s' clang; export "$linker_env"; fi; nightly_bin="$(dirname "$(rustup which --toolchain nightly cargo)")"; PATH="$nightly_bin:$PATH" cargo fuzz run protocol_frame -- -max_total_time=30
 
+fuzz-registry:
+    if ! command -v cargo-fuzz >/dev/null 2>&1; then echo "cargo-fuzz is required: cargo install cargo-fuzz --version {{cargo_fuzz_version}} --locked"; exit 127; fi
+    if ! command -v clang >/dev/null 2>&1; then echo "clang is required for sanitizer-backed cargo-fuzz builds"; exit 127; fi
+    host_triple="$(rustup run nightly rustc -vV | awk '/^host:/ { print $2 }')"; linker_env="CARGO_TARGET_$(printf '%s' "$host_triple" | tr '[:lower:]-' '[:upper:]_')_LINKER"; if [ -z "${!linker_env:-}" ]; then printf -v "$linker_env" '%s' clang; export "$linker_env"; fi; nightly_bin="$(dirname "$(rustup which --toolchain nightly cargo)")"; for target in registry_manifest registry_signatures registry_url_policy; do PATH="$nightly_bin:$PATH" cargo fuzz run "$target" -- -max_total_time=30; done
+
 perf-smoke-small:
     scripts/perf_smoke.sh --small
 
 lint-extra: lua-format-check lua-lint shell-lint
 
-quality-extra: lint-extra audit-strict miri-protocol fuzz-protocol
+quality-extra: lint-extra audit-strict miri-protocol fuzz-protocol fuzz-registry
 
 check: fmt-check clippy rust-test lua-syntax lua-test shell-syntax whitespace
 

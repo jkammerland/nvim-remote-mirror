@@ -83,6 +83,7 @@ local function main()
         result = {
           sidecar_version = "0.1.0",
           protocol_version = 5,
+          registry_policy_fingerprint = "disabled",
           workspace_key = "workspace",
           remote_root = "/repo",
           mirror_root = "/mirror/workspace",
