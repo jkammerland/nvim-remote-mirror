@@ -219,11 +219,18 @@ fn serve(root: PathBuf) -> Result<()> {
 fn handle_request(state: &mut AgentState, request: Request) -> Result<Response> {
     match request {
         Request::Hello {
-            protocol_version, ..
+            client_version,
+            protocol_version,
         } => {
             if protocol_version != PROTOCOL_VERSION {
                 bail!(
                     "protocol version mismatch: client={protocol_version} agent={PROTOCOL_VERSION}"
+                );
+            }
+            if client_version != env!("CARGO_PKG_VERSION") {
+                bail!(
+                    "package version mismatch: client={client_version} agent={}",
+                    env!("CARGO_PKG_VERSION")
                 );
             }
             Ok(Response::Hello {
@@ -2232,7 +2239,7 @@ mod tests {
         let error = handle_request(
             &mut state,
             Request::Hello {
-                client_version: "test".to_string(),
+                client_version: env!("CARGO_PKG_VERSION").to_string(),
                 protocol_version: PROTOCOL_VERSION + 1,
             },
         )
@@ -2240,6 +2247,49 @@ mod tests {
         .to_string();
 
         assert!(error.contains("protocol version mismatch"));
+    }
+
+    #[test]
+    fn hello_accepts_exact_package_and_protocol_versions() {
+        let dir = tempdir().unwrap();
+        let mut state = test_state(dir.path());
+
+        let response = handle_request(
+            &mut state,
+            Request::Hello {
+                client_version: env!("CARGO_PKG_VERSION").to_string(),
+                protocol_version: PROTOCOL_VERSION,
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(
+            response,
+            Response::Hello {
+                agent_version,
+                protocol_version: PROTOCOL_VERSION,
+                ..
+            } if agent_version == env!("CARGO_PKG_VERSION")
+        ));
+    }
+
+    #[test]
+    fn hello_rejects_incompatible_package_version() {
+        let dir = tempdir().unwrap();
+        let mut state = test_state(dir.path());
+
+        let error = handle_request(
+            &mut state,
+            Request::Hello {
+                client_version: "0.0.0-incompatible".to_string(),
+                protocol_version: PROTOCOL_VERSION,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("package version mismatch"));
+        assert!(error.contains("0.0.0-incompatible"));
     }
 
     #[cfg(unix)]

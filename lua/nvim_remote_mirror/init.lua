@@ -129,6 +129,53 @@ local function normalize_local_path(path)
   return vim.fn.fnamemodify(path, ":p"):gsub("\\", "/")
 end
 
+local function validate_ssh_destination(destination)
+  if destination == "" then
+    error("ssh destination must not be empty")
+  end
+  if destination:sub(1, 1) == "-" then
+    error("ssh destination must not begin with '-'")
+  end
+  if destination:find("[/\\]") then
+    error("ssh destination must not contain path separators")
+  end
+  for index = 1, #destination do
+    local byte = destination:byte(index)
+    if byte <= 32 or byte == 127 then
+      error("ssh destination must not contain whitespace or control characters")
+    end
+  end
+
+  local at_start, at_end = destination:find("@", 1, true)
+  local user = nil
+  local host = destination
+  if at_start then
+    if destination:find("@", at_end + 1, true) then
+      error("ssh destination must contain at most one '@'")
+    end
+    user = destination:sub(1, at_start - 1)
+    host = destination:sub(at_end + 1)
+    if user == "" or not user:match("^[%a%d._-]+$") then
+      error("ssh destination contains an invalid user name")
+    end
+  end
+  if host == "" or host:sub(1, 1) == "-" then
+    error("ssh destination contains an invalid host name")
+  end
+
+  if host:sub(1, 1) == "[" or host:sub(-1) == "]" then
+    if host:sub(1, 1) ~= "[" or host:sub(-1) ~= "]" or #host <= 2 then
+      error("ssh destination contains an invalid bracketed host")
+    end
+    local address = host:sub(2, -2)
+    if not address:match("^[%a%d:.%%_-]+$") then
+      error("ssh destination contains an invalid bracketed host")
+    end
+  elseif not host:match("^[%a%d._-]+$") then
+    error("ssh destination contains an invalid host name")
+  end
+end
+
 local function parse_target(target)
   if target == nil or target == "" then
     return { remote_root = normalize_local_root(uv.cwd()) }
@@ -140,6 +187,7 @@ local function parse_target(target)
     if not host or not path then
       error("expected ssh://host/absolute/path")
     end
+    validate_ssh_destination(host)
     return { ssh = host, remote_root = path }
   end
 
@@ -367,6 +415,7 @@ local function socket_path_for(target_arg, target)
 end
 
 if vim.g.nvim_remote_mirror_test then
+  M._test_parse_target = parse_target
   M._test_sidecar_args = sidecar_args
   M._test_listener_args = listener_args
   M._test_socket_path_for = socket_path_for

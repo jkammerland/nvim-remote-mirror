@@ -429,6 +429,7 @@ impl SshTransport {
             "ServerAliveInterval=15".to_string(),
             "-o".to_string(),
             "ServerAliveCountMax=2".to_string(),
+            "--".to_string(),
             self.target.clone(),
             remote_command,
         ]
@@ -448,13 +449,16 @@ enum RemoteTransport {
 }
 
 impl RemoteTransport {
-    fn from_ssh(ssh: Option<String>, connect_timeout_seconds: u64) -> Self {
+    fn from_ssh(ssh: Option<String>, connect_timeout_seconds: u64) -> Result<Self> {
         match ssh {
-            Some(target) => Self::Ssh(SshTransport {
-                target,
-                connect_timeout_seconds,
-            }),
-            None => Self::Local,
+            Some(target) => {
+                validate_ssh_destination(&target)?;
+                Ok(Self::Ssh(SshTransport {
+                    target,
+                    connect_timeout_seconds,
+                }))
+            }
+            None => Ok(Self::Local),
         }
     }
 
@@ -524,6 +528,78 @@ impl RemoteTransport {
             }),
         }
     }
+}
+
+fn validate_ssh_destination(destination: &str) -> Result<()> {
+    if destination.is_empty() {
+        bail!("ssh destination must not be empty");
+    }
+    if destination.starts_with('-') {
+        bail!("ssh destination must not begin with `-`");
+    }
+    if destination
+        .chars()
+        .any(|character| character.is_whitespace() || character.is_control())
+    {
+        bail!("ssh destination must not contain whitespace or control characters");
+    }
+    if destination.contains(['/', '\\']) {
+        bail!("ssh destination must not contain path separators");
+    }
+
+    let mut parts = destination.split('@');
+    let first = parts.next().unwrap_or_default();
+    let second = parts.next();
+    if parts.next().is_some() {
+        bail!("ssh destination must contain at most one `@`");
+    }
+    let (user, host) = match second {
+        Some(host) => (Some(first), host),
+        None => (None, first),
+    };
+    if user.is_some_and(|user| {
+        user.is_empty()
+            || !user
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    }) {
+        bail!("ssh destination contains an invalid user name");
+    }
+    if host.is_empty() || host.starts_with('-') {
+        bail!("ssh destination contains an invalid host name");
+    }
+
+    if host.starts_with('[') || host.ends_with(']') {
+        if !(host.starts_with('[') && host.ends_with(']')) || host.len() <= 2 {
+            bail!("ssh destination contains an invalid bracketed host");
+        }
+        let address = &host[1..host.len() - 1];
+        if !address.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b':' | b'.' | b'%' | b'_' | b'-')
+        }) {
+            bail!("ssh destination contains an invalid bracketed host");
+        }
+    } else if !host
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        bail!("ssh destination contains an invalid host name");
+    }
+
+    Ok(())
+}
+
+fn validate_agent_hello(agent_version: &str, protocol_version: u16) -> Result<()> {
+    if protocol_version != PROTOCOL_VERSION {
+        bail!("protocol version mismatch: sidecar={PROTOCOL_VERSION} agent={protocol_version}");
+    }
+    if agent_version != env!("CARGO_PKG_VERSION") {
+        bail!(
+            "package version mismatch: sidecar={} agent={agent_version}",
+            env!("CARGO_PKG_VERSION")
+        );
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -1127,11 +1203,21 @@ impl AgentClient {
             preempt_epoch,
         )?;
         match outcome {
-            AgentRequestOutcome::Response(Response::Hello { .. }) => {
-                self.handshake_complete = true;
-                self.clear_remote_unavailable();
-                Ok(None)
-            }
+            AgentRequestOutcome::Response(Response::Hello {
+                agent_version,
+                protocol_version,
+                ..
+            }) => match validate_agent_hello(&agent_version, protocol_version) {
+                Ok(()) => {
+                    self.handshake_complete = true;
+                    self.clear_remote_unavailable();
+                    Ok(None)
+                }
+                Err(error) => {
+                    self.kill_worker();
+                    Err(self.mark_remote_unavailable(error.to_string()))
+                }
+            },
             AgentRequestOutcome::Response(other) => {
                 self.kill_worker();
                 Err(self.mark_remote_unavailable(format!(
@@ -1144,11 +1230,21 @@ impl AgentClient {
 
     fn record_handshake_outcome(&mut self, outcome: &AgentRequestOutcome) -> Result<()> {
         match outcome {
-            AgentRequestOutcome::Response(Response::Hello { .. }) => {
-                self.handshake_complete = true;
-                self.clear_remote_unavailable();
-                Ok(())
-            }
+            AgentRequestOutcome::Response(Response::Hello {
+                agent_version,
+                protocol_version,
+                ..
+            }) => match validate_agent_hello(agent_version, *protocol_version) {
+                Ok(()) => {
+                    self.handshake_complete = true;
+                    self.clear_remote_unavailable();
+                    Ok(())
+                }
+                Err(error) => {
+                    self.kill_worker();
+                    Err(self.mark_remote_unavailable(error.to_string()))
+                }
+            },
             AgentRequestOutcome::Response(other) => {
                 self.kill_worker();
                 Err(self.mark_remote_unavailable(format!(
@@ -6179,7 +6275,7 @@ fn main() -> Result<()> {
             ssh_connect_timeout_seconds,
         } => run_server(
             remote_root,
-            RemoteTransport::from_ssh(ssh, ssh_connect_timeout_seconds),
+            RemoteTransport::from_ssh(ssh, ssh_connect_timeout_seconds)?,
             agent,
             local_agent,
             state_dir,
@@ -6197,7 +6293,7 @@ fn main() -> Result<()> {
         } => run_listener(
             socket,
             remote_root,
-            RemoteTransport::from_ssh(ssh, ssh_connect_timeout_seconds),
+            RemoteTransport::from_ssh(ssh, ssh_connect_timeout_seconds)?,
             agent,
             local_agent,
             state_dir,
@@ -6212,7 +6308,7 @@ fn main() -> Result<()> {
         } => run_lsp_proxy(
             remote_root,
             local_root,
-            RemoteTransport::from_ssh(ssh, ssh_connect_timeout_seconds),
+            RemoteTransport::from_ssh(ssh, ssh_connect_timeout_seconds)?,
             command,
         ),
     }
@@ -7507,6 +7603,9 @@ fn classify_remote_agent_status(value: &Value) -> String {
     if error.contains("protocol version mismatch") {
         return "protocol_mismatch".to_string();
     }
+    if error.contains("package version mismatch") {
+        return "version_mismatch".to_string();
+    }
     if error.contains("failed to canonicalize root")
         || error.contains("no such file or directory") && error.contains("--root")
     {
@@ -7960,7 +8059,7 @@ mod tests {
             let _ = hello
                 .reply
                 .send(AgentWorkerReply::Response(Response::Hello {
-                    agent_version: "test-agent".to_string(),
+                    agent_version: env!("CARGO_PKG_VERSION").to_string(),
                     protocol_version: PROTOCOL_VERSION,
                     capabilities: nrm_protocol::CapabilitySet::v1_agent(),
                 }));
@@ -8110,6 +8209,107 @@ mod tests {
     }
 
     #[test]
+    fn ssh_destination_validation_accepts_common_safe_forms() {
+        for destination in [
+            "host",
+            "host.example",
+            "user@host.example",
+            "build_host-1",
+            "[2001:db8::1]",
+            "user@[fe80::1%eth0]",
+        ] {
+            validate_ssh_destination(destination).unwrap();
+        }
+    }
+
+    #[test]
+    fn ssh_destination_validation_rejects_option_injection_and_malformed_values() {
+        for destination in [
+            "",
+            "-oProxyCommand=evil",
+            "user@-oProxyCommand=evil",
+            "host name",
+            "host\nname",
+            "host\u{0}name",
+            "host/path",
+            "host\\path",
+            "@host",
+            "user@",
+            "user@@host",
+            "host:22",
+            "[2001:db8::1",
+            "2001:db8::1",
+        ] {
+            assert!(
+                validate_ssh_destination(destination).is_err(),
+                "accepted invalid ssh destination {destination:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn agent_hello_requires_exact_package_and_protocol_versions() {
+        validate_agent_hello(env!("CARGO_PKG_VERSION"), PROTOCOL_VERSION).unwrap();
+
+        let version_error = validate_agent_hello("0.0.0-incompatible", PROTOCOL_VERSION)
+            .unwrap_err()
+            .to_string();
+        assert!(version_error.contains("package version mismatch"));
+
+        let protocol_error = validate_agent_hello(
+            env!("CARGO_PKG_VERSION"),
+            PROTOCOL_VERSION.saturating_add(1),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(protocol_error.contains("protocol version mismatch"));
+    }
+
+    #[test]
+    fn incompatible_agent_hello_blocks_ordinary_remote_work() {
+        for (response, expected_error, expected_status) in [
+            (
+                Response::Hello {
+                    agent_version: "0.0.0-incompatible".to_string(),
+                    protocol_version: PROTOCOL_VERSION,
+                    capabilities: nrm_protocol::CapabilitySet::v1_agent(),
+                },
+                "package version mismatch",
+                "version_mismatch",
+            ),
+            (
+                Response::Hello {
+                    agent_version: env!("CARGO_PKG_VERSION").to_string(),
+                    protocol_version: PROTOCOL_VERSION.saturating_add(1),
+                    capabilities: nrm_protocol::CapabilitySet::v1_agent(),
+                },
+                "protocol version mismatch",
+                "protocol_mismatch",
+            ),
+        ] {
+            let dir = tempdir().unwrap();
+            let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
+            let mut sidecar =
+                test_sidecar_with_agent_reply(mirror, AgentWorkerReply::Response(response));
+
+            let error = sidecar
+                .handle("scan", json!({"limit": 1}), 0)
+                .unwrap_err()
+                .to_string();
+
+            assert!(error.contains(expected_error), "{error}");
+            assert!(!sidecar.agent.handshake_complete());
+            let health = sidecar.remote_health(0);
+            assert_eq!(health["remote_available"], false);
+            assert_eq!(health["agent_status"], expected_status);
+            assert!(health["remote_error"]
+                .as_str()
+                .unwrap()
+                .contains(expected_error));
+        }
+    }
+
+    #[test]
     fn remote_agent_status_classifies_common_failures() {
         assert_eq!(
             classify_remote_agent_status(&json!({
@@ -8130,6 +8330,12 @@ mod tests {
                 "remote_error": "protocol version mismatch: agent=1 client=2"
             })),
             "protocol_mismatch"
+        );
+        assert_eq!(
+            classify_remote_agent_status(&json!({
+                "remote_error": "package version mismatch: sidecar=0.1.0 agent=0.0.9"
+            })),
+            "version_mismatch"
         );
         assert_eq!(
             classify_remote_agent_status(&json!({
@@ -8420,7 +8626,7 @@ mod tests {
         let state_dir = tempdir().unwrap();
         let remote_dir = tempdir().unwrap();
         let remote_root = remote_dir.path().join("repo");
-        let transport = RemoteTransport::from_ssh(Some("host".to_string()), 7);
+        let transport = RemoteTransport::from_ssh(Some("host".to_string()), 7).unwrap();
         let mut sidecar = Sidecar::new(
             remote_root.clone(),
             transport.clone(),
@@ -9866,7 +10072,7 @@ mod tests {
             mirror,
             vec![
                 AgentWorkerReply::Response(Response::Hello {
-                    agent_version: "test-agent".to_string(),
+                    agent_version: env!("CARGO_PKG_VERSION").to_string(),
                     protocol_version: PROTOCOL_VERSION,
                     capabilities: nrm_protocol::CapabilitySet::v1_agent(),
                 }),
@@ -9958,7 +10164,7 @@ mod tests {
             mirror,
             vec![
                 AgentWorkerReply::Response(Response::Hello {
-                    agent_version: "test-agent".to_string(),
+                    agent_version: env!("CARGO_PKG_VERSION").to_string(),
                     protocol_version: PROTOCOL_VERSION,
                     capabilities: nrm_protocol::CapabilitySet::v1_agent(),
                 }),
@@ -11895,11 +12101,11 @@ mod tests {
         let path = PathBuf::from("/repo");
         assert_ne!(
             workspace_key(
-                &RemoteTransport::from_ssh(Some("host-a".to_string()), 10),
+                &RemoteTransport::from_ssh(Some("host-a".to_string()), 10).unwrap(),
                 &path
             ),
             workspace_key(
-                &RemoteTransport::from_ssh(Some("host-b".to_string()), 10),
+                &RemoteTransport::from_ssh(Some("host-b".to_string()), 10).unwrap(),
                 &path
             )
         );
@@ -11914,18 +12120,18 @@ mod tests {
         );
         assert_eq!(
             workspace_key(
-                &RemoteTransport::from_ssh(Some("host".to_string()), 10),
+                &RemoteTransport::from_ssh(Some("host".to_string()), 10).unwrap(),
                 &path
             ),
             "d72defea26893914ac542b53"
         );
         assert_eq!(
             workspace_key(
-                &RemoteTransport::from_ssh(Some("host".to_string()), 5),
+                &RemoteTransport::from_ssh(Some("host".to_string()), 5).unwrap(),
                 &path
             ),
             workspace_key(
-                &RemoteTransport::from_ssh(Some("host".to_string()), 60),
+                &RemoteTransport::from_ssh(Some("host".to_string()), 60).unwrap(),
                 &path
             )
         );
@@ -11934,7 +12140,7 @@ mod tests {
         assert_eq!(
             workspace_key(&RemoteTransport::Local, &path),
             workspace_key(
-                &RemoteTransport::from_ssh(Some("local".to_string()), 10),
+                &RemoteTransport::from_ssh(Some("local".to_string()), 10).unwrap(),
                 &path
             )
         );
@@ -12143,6 +12349,7 @@ mod tests {
     #[test]
     fn agent_local_transport_launches_agent_directly() {
         let plan = RemoteTransport::from_ssh(None, 10)
+            .unwrap()
             .agent_plan("nrm-agent", Path::new("/tmp/repo with spaces"));
 
         assert_eq!(plan.program, "nrm-agent");
@@ -12153,6 +12360,7 @@ mod tests {
     #[test]
     fn agent_ssh_transport_uses_quoted_remote_command_and_connection_options() {
         let plan = RemoteTransport::from_ssh(Some("host".to_string()), 7)
+            .unwrap()
             .agent_plan("nrm-agent", Path::new("/tmp/repo with 'quote' ; x"));
 
         assert_eq!(plan.program, "ssh");
@@ -12168,6 +12376,7 @@ mod tests {
                 "ServerAliveInterval=15",
                 "-o",
                 "ServerAliveCountMax=2",
+                "--",
                 "host",
                 "'sh' '-lc' 'PATH=\"$HOME/.local/bin:$PATH\"; exec \"$@\"' 'nrm-agent-launch' 'nrm-agent' 'serve' '--root' '/tmp/repo with '\\''quote'\\'' ; x'"
             ]
@@ -12191,7 +12400,7 @@ mod tests {
     fn lsp_ssh_launch_uses_remote_root_and_connection_options() {
         let launch = LspLaunch::new(
             PathBuf::from("/tmp/repo with 'quote' ; x"),
-            RemoteTransport::from_ssh(Some("host".to_string()), 7),
+            RemoteTransport::from_ssh(Some("host".to_string()), 7).unwrap(),
             vec![
                 "rust-analyzer".to_string(),
                 "--config".to_string(),
@@ -12212,6 +12421,7 @@ mod tests {
                 "ServerAliveInterval=15",
                 "-o",
                 "ServerAliveCountMax=2",
+                "--",
                 "host",
                 "'sh' '-lc' 'cd \"$1\" && shift && exec \"$@\"' 'nrm-lsp-proxy' '/tmp/repo with '\\''quote'\\'' ; x' 'rust-analyzer' '--config' 'check.command=\"clippy\"; $(echo no)'"
             ]
