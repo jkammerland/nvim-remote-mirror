@@ -3,3 +3,22 @@
 /.nrm-state/
 *.swp
 *.swo
+
+# Machine-local operator context and environment files.
+/AGENTS.md
+.env
+.env.*
+!.env.example
+
+# Local release staging and generated signed-release outputs.
+/artifacts/
+/release-input/
+/release-output/
+/release-assets/
+/release-manifests/
+/release-signatures/
+/nrm-agent-manifest-v*.json
+/nrm-agent-manifest-v*.json.sig
+/nrm-registry-signing-keys*.json
+/nrm-registry-signing-seeds*.json
+/nrm-registry-signing-secret*.json
