@@ -1,0 +1,701 @@
+name: Signed agent release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing SemVer tag to publish (for example v0.1.0)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: signed-agent-release
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: "1.95.0"
+
+jobs:
+  prepare:
+    name: Validate release identity
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      version: ${{ steps.identity.outputs.version }}
+      protocol_version: ${{ steps.identity.outputs.protocol_version }}
+      source_commit: ${{ steps.identity.outputs.source_commit }}
+      prerelease: ${{ steps.identity.outputs.prerelease }}
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ inputs.tag }}
+
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+
+      - name: Validate tag, package version, protocol, and commit
+        id: identity
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+          WORKFLOW_COMMIT: ${{ github.sha }}
+          WORKFLOW_REF: ${{ github.ref }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9A-Za-z][0-9A-Za-z.+-]*$ ]]; then
+            echo "release tag must use a safe v-prefixed SemVer spelling" >&2
+            exit 1
+          fi
+          if [[ "$WORKFLOW_REF" != "refs/tags/$RELEASE_TAG" ]]; then
+            echo "dispatch this workflow from the same tag supplied as its input" >&2
+            exit 1
+          fi
+          if ! git show-ref --verify --quiet "refs/tags/$RELEASE_TAG"; then
+            echo "release tag does not exist: $RELEASE_TAG" >&2
+            exit 1
+          fi
+
+          source_commit="$(git rev-parse HEAD)"
+          tag_commit="$(git rev-list -n 1 "$RELEASE_TAG")"
+          if [[ "$source_commit" != "$tag_commit" || ! "$source_commit" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "checked-out commit is not the exact 40-character commit for $RELEASE_TAG" >&2
+            exit 1
+          fi
+          if [[ "$source_commit" != "$WORKFLOW_COMMIT" ]]; then
+            echo "dispatch this workflow from $RELEASE_TAG so provenance identifies the release commit" >&2
+            exit 1
+          fi
+
+          version="${RELEASE_TAG#v}"
+          package_version="$({
+            cargo metadata --locked --no-deps --format-version 1 |
+              jq -er '[.packages[] | select(.name == "nrm-agent") | .version] |
+                if length == 1 then .[0] else error("expected exactly one nrm-agent package") end'
+          })"
+          if [[ "$package_version" != "$version" ]]; then
+            echo "tag version $version does not match nrm-agent package version $package_version" >&2
+            exit 1
+          fi
+          version_without_build="${version%%+*}"
+          prerelease=false
+          if [[ "$version_without_build" == *-* ]]; then
+            prerelease=true
+          fi
+
+          mapfile -t protocol_versions < <(
+            sed -nE 's/^pub const PROTOCOL_VERSION: u16 = ([0-9]+);$/\1/p' \
+              crates/nrm-protocol/src/lib.rs
+          )
+          if [[ "${#protocol_versions[@]}" -ne 1 ]]; then
+            echo "could not identify exactly one nrm-protocol PROTOCOL_VERSION" >&2
+            exit 1
+          fi
+          protocol_version="${protocol_versions[0]}"
+
+          {
+            echo "version=$version"
+            echo "protocol_version=$protocol_version"
+            echo "source_commit=$source_commit"
+            echo "prerelease=$prerelease"
+          } >> "$GITHUB_OUTPUT"
+
+  linux:
+    name: Linux ${{ matrix.target }}
+    needs: prepare
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: write # Mint the Sigstore certificate for build provenance.
+      attestations: write # Persist the native binary attestation.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            runner_arch: x86_64
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            runner_arch: aarch64
+    env:
+      TARGET: ${{ matrix.target }}
+      EXPECTED_RUNNER_ARCH: ${{ matrix.runner_arch }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+      SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+          ref: ${{ needs.prepare.outputs.source_commit }}
+
+      - name: Require native runner architecture
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual="$(uname -m)"
+          if [[ "$actual" != "$EXPECTED_RUNNER_ARCH" ]]; then
+            echo "runner architecture $actual does not match $EXPECTED_RUNNER_ARCH" >&2
+            exit 1
+          fi
+          if [[ "$(git rev-parse HEAD)" != "$SOURCE_COMMIT" ]]; then
+            echo "checkout does not match the prepared source commit" >&2
+            exit 1
+          fi
+
+      - name: Install musl and pinned Rust target
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --target "$TARGET"
+          rustup default "$RUST_TOOLCHAIN"
+          rustc -vV
+
+      - name: Run native target tests
+        run: cargo test -p nrm-protocol -p nrm-agent --locked --target "$TARGET"
+
+      - name: Build, execute, and validate static agent
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build -p nrm-agent --release --locked --target "$TARGET"
+          binary="target/$TARGET/release/nrm-agent"
+          actual_version="$("$binary" --version)"
+          if [[ "$actual_version" != "nrm-agent $VERSION" ]]; then
+            echo "unexpected agent version: $actual_version" >&2
+            exit 1
+          fi
+          if readelf -l "$binary" | grep -q 'INTERP'; then
+            echo "$TARGET artifact contains a dynamic program interpreter" >&2
+            exit 1
+          fi
+          mkdir -p dist
+          install -m 0755 "$binary" "dist/nrm-agent-$VERSION-$TARGET"
+
+      - name: Attest native agent provenance
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          subject-path: dist/nrm-agent-${{ env.VERSION }}-${{ env.TARGET }}
+
+      - name: Upload native agent
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: agent-${{ matrix.target }}
+          path: dist/nrm-agent-${{ env.VERSION }}-${{ env.TARGET }}
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+          overwrite: true
+
+  macos:
+    name: macOS ${{ matrix.target }}
+    needs: prepare
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: write # Mint the Sigstore certificate for build provenance.
+      attestations: write # Persist the native binary attestation.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            runner_arch: x86_64
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            runner_arch: arm64
+    env:
+      TARGET: ${{ matrix.target }}
+      EXPECTED_RUNNER_ARCH: ${{ matrix.runner_arch }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+      SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+          ref: ${{ needs.prepare.outputs.source_commit }}
+
+      - name: Require native runner architecture
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual="$(uname -m)"
+          if [[ "$actual" != "$EXPECTED_RUNNER_ARCH" ]]; then
+            echo "runner architecture $actual does not match $EXPECTED_RUNNER_ARCH" >&2
+            exit 1
+          fi
+          if [[ "$(git rev-parse HEAD)" != "$SOURCE_COMMIT" ]]; then
+            echo "checkout does not match the prepared source commit" >&2
+            exit 1
+          fi
+
+      - name: Install pinned Rust target
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --target "$TARGET"
+          rustup default "$RUST_TOOLCHAIN"
+          rustc -vV
+
+      - name: Run native target tests
+        run: cargo test -p nrm-protocol -p nrm-agent --locked --target "$TARGET"
+
+      - name: Build and execute native agent
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build -p nrm-agent --release --locked --target "$TARGET"
+          binary="target/$TARGET/release/nrm-agent"
+          actual_version="$("$binary" --version)"
+          if [[ "$actual_version" != "nrm-agent $VERSION" ]]; then
+            echo "unexpected agent version: $actual_version" >&2
+            exit 1
+          fi
+          mkdir -p dist
+          install -m 0755 "$binary" "dist/nrm-agent-$VERSION-$TARGET"
+
+      - name: Attest native agent provenance
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          subject-path: dist/nrm-agent-${{ env.VERSION }}-${{ env.TARGET }}
+
+      - name: Upload native agent
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: agent-${{ matrix.target }}
+          path: dist/nrm-agent-${{ env.VERSION }}-${{ env.TARGET }}
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+          overwrite: true
+
+  windows:
+    name: Windows ${{ matrix.target }}
+    needs: prepare
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: write # Mint the Sigstore certificate for build provenance.
+      attestations: write # Persist the native binary attestation.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            runner_arch: X64
+          - runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            runner_arch: Arm64
+    env:
+      TARGET: ${{ matrix.target }}
+      EXPECTED_RUNNER_ARCH: ${{ matrix.runner_arch }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+      SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+          ref: ${{ needs.prepare.outputs.source_commit }}
+
+      - name: Require native runner architecture
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $actual = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+          if ($actual -cne $env:EXPECTED_RUNNER_ARCH) {
+            throw "runner architecture $actual does not match $env:EXPECTED_RUNNER_ARCH"
+          }
+          $actualCommit = ((git rev-parse HEAD) -join "`n").Trim()
+          if ($LASTEXITCODE -ne 0 -or $actualCommit -cne $env:SOURCE_COMMIT) {
+            throw "checkout does not match the prepared source commit"
+          }
+
+      - name: Install pinned Rust target
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          rustup toolchain install $env:RUST_TOOLCHAIN --profile minimal --target $env:TARGET
+          rustup default $env:RUST_TOOLCHAIN
+          rustc -vV
+
+      - name: Run native target tests
+        shell: pwsh
+        run: cargo test -p nrm-protocol -p nrm-agent --locked --target $env:TARGET
+
+      - name: Build and execute native agent
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          cargo build -p nrm-agent --release --locked --target $env:TARGET
+          $binary = "target/$env:TARGET/release/nrm-agent.exe"
+          $actualVersion = ((& $binary --version) -join "`n").Trim()
+          if ($LASTEXITCODE -ne 0 -or $actualVersion -cne "nrm-agent $env:VERSION") {
+            throw "unexpected agent version: $actualVersion"
+          }
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item -LiteralPath $binary -Destination "dist/nrm-agent-$env:VERSION-$env:TARGET.exe"
+
+      - name: Attest native agent provenance
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          subject-path: dist/nrm-agent-${{ env.VERSION }}-${{ env.TARGET }}.exe
+
+      - name: Upload native agent
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: agent-${{ matrix.target }}
+          path: dist/nrm-agent-${{ env.VERSION }}-${{ env.TARGET }}.exe
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+          overwrite: true
+
+  publish:
+    name: Verify and publish immutable release
+    needs: [prepare, linux, macos, windows]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: release
+    permissions:
+      contents: write # Create, populate, and publish the GitHub Release.
+      id-token: write # Mint the Sigstore certificate for release metadata.
+      attestations: write # Persist manifest and signature attestations.
+    env:
+      RELEASE_TAG: ${{ inputs.tag }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+      PROTOCOL_VERSION: ${{ needs.prepare.outputs.protocol_version }}
+      SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
+      PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          ref: ${{ needs.prepare.outputs.source_commit }}
+
+      - name: Require repository release immutability
+        env:
+          GH_TOKEN: ${{ secrets.NRM_RELEASE_POLICY_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${GH_TOKEN:-}" ]]; then
+            echo "the release environment is missing NRM_RELEASE_POLICY_TOKEN" >&2
+            exit 1
+          fi
+          policy="$(gh api \
+            --header 'Accept: application/vnd.github+json' \
+            --header 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY/immutable-releases")"
+          jq -e '.enabled == true' <<< "$policy" >/dev/null
+
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+
+      - name: Test and build release verifier
+        run: |
+          cargo test -p nrm-registry --bin nrm-registry-release --locked
+          cargo build -p nrm-registry --bin nrm-registry-release --release --locked
+
+      - name: Download all native agents
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: agent-*
+          path: release-input
+          merge-multiple: true
+
+      - name: Verify native build provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          artifacts=(
+            "nrm-agent-$VERSION-aarch64-apple-darwin"
+            "nrm-agent-$VERSION-aarch64-pc-windows-msvc.exe"
+            "nrm-agent-$VERSION-aarch64-unknown-linux-musl"
+            "nrm-agent-$VERSION-x86_64-apple-darwin"
+            "nrm-agent-$VERSION-x86_64-pc-windows-msvc.exe"
+            "nrm-agent-$VERSION-x86_64-unknown-linux-musl"
+          )
+          for artifact in "${artifacts[@]}"; do
+            path="release-input/$artifact"
+            if [[ ! -f "$path" || -L "$path" ]]; then
+              echo "missing regular native artifact: $artifact" >&2
+              exit 1
+            fi
+            gh attestation verify "$path" \
+              --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
+              --signer-digest "$SOURCE_COMMIT" \
+              --source-digest "$SOURCE_COMMIT" \
+              --source-ref "refs/tags/$RELEASE_TAG" \
+              --deny-self-hosted-runners
+          done
+
+      - name: Assemble, sign, and verify release locally
+        env:
+          NRM_REGISTRY_SIGNING_KEYS_JSON: ${{ secrets.NRM_REGISTRY_SIGNING_KEYS_JSON }}
+          NRM_REGISTRY_TRUSTED_PUBLIC_KEYS_JSON: ${{ vars.NRM_REGISTRY_TRUSTED_PUBLIC_KEYS_JSON }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${NRM_REGISTRY_SIGNING_KEYS_JSON:-}" ]]; then
+            echo "the release environment is missing NRM_REGISTRY_SIGNING_KEYS_JSON" >&2
+            exit 1
+          fi
+          if [[ -z "${NRM_REGISTRY_TRUSTED_PUBLIC_KEYS_JSON:-}" ]]; then
+            echo "the release environment is missing NRM_REGISTRY_TRUSTED_PUBLIC_KEYS_JSON" >&2
+            exit 1
+          fi
+
+          tool=target/release/nrm-registry-release
+          mkdir -p release-assets
+          "$tool" assemble \
+            --artifacts-dir release-input \
+            --version "$VERSION" \
+            --protocol-version "$PROTOCOL_VERSION" \
+            --source-commit "$SOURCE_COMMIT" \
+            --output release-assets/nrm-agent-manifest-v1.json
+          "$tool" sign \
+            --manifest release-assets/nrm-agent-manifest-v1.json \
+            --output release-assets/nrm-agent-manifest-v1.json.sig \
+            --expected-version "$VERSION" \
+            --expected-protocol-version "$PROTOCOL_VERSION" \
+            --expected-source-commit "$SOURCE_COMMIT"
+
+          "$tool" verify \
+            --manifest release-assets/nrm-agent-manifest-v1.json \
+            --signatures release-assets/nrm-agent-manifest-v1.json.sig \
+            --artifacts-dir release-input \
+            --expected-version "$VERSION" \
+            --expected-protocol-version "$PROTOCOL_VERSION" \
+            --expected-source-commit "$SOURCE_COMMIT"
+          cp release-input/* release-assets/
+
+      - name: Attest manifest and detached signatures
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          subject-path: |
+            release-assets/nrm-agent-manifest-v1.json
+            release-assets/nrm-agent-manifest-v1.json.sig
+
+      - name: Create and populate draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          resolve_remote_tag_commit() {
+            local response object_type object_sha depth
+            response="$(gh api \
+              --header 'Accept: application/vnd.github+json' \
+              --header 'X-GitHub-Api-Version: 2026-03-10' \
+              "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG")"
+            object_type="$(jq -er '.object.type' <<< "$response")"
+            object_sha="$(jq -er '.object.sha' <<< "$response")"
+            for ((depth = 0; depth <= 8; depth++)); do
+              if [[ "$object_type" == commit ]]; then
+                if [[ ! "$object_sha" =~ ^[0-9a-f]{40}$ ]]; then
+                  echo "remote tag resolved to an invalid commit ID" >&2
+                  return 1
+                fi
+                printf '%s\n' "$object_sha"
+                return 0
+              fi
+              if [[ "$object_type" != tag || ! "$object_sha" =~ ^[0-9a-f]{40}$ ]]; then
+                echo "remote tag points to unsupported object type: $object_type" >&2
+                return 1
+              fi
+              if ((depth == 8)); then
+                break
+              fi
+              response="$(gh api \
+                --header 'Accept: application/vnd.github+json' \
+                --header 'X-GitHub-Api-Version: 2026-03-10' \
+                "repos/$GITHUB_REPOSITORY/git/tags/$object_sha")"
+              object_type="$(jq -er '.object.type' <<< "$response")"
+              object_sha="$(jq -er '.object.sha' <<< "$response")"
+            done
+            echo "remote tag annotation nesting exceeds eight objects" >&2
+            return 1
+          }
+          remote_tag_commit="$(resolve_remote_tag_commit)"
+          if [[ "$remote_tag_commit" != "$SOURCE_COMMIT" ]]; then
+            echo "$RELEASE_TAG moved after release preparation" >&2
+            exit 1
+          fi
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "a release already exists for $RELEASE_TAG; refusing to replace it" >&2
+            exit 1
+          fi
+
+          release_flags=(
+            --draft
+            --verify-tag
+            --title "$RELEASE_TAG"
+            --generate-notes
+          )
+          if [[ "$PRERELEASE" == true ]]; then
+            release_flags+=(--prerelease --latest=false)
+          fi
+          gh release create "$RELEASE_TAG" "${release_flags[@]}"
+          mapfile -t assets < <(find release-assets -maxdepth 1 -type f -print | LC_ALL=C sort)
+          if [[ "${#assets[@]}" -ne 8 ]]; then
+            echo "expected exactly eight release assets, found ${#assets[@]}" >&2
+            exit 1
+          fi
+          gh release upload "$RELEASE_TAG" "${assets[@]}"
+
+      - name: Re-download and verify complete draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NRM_REGISTRY_TRUSTED_PUBLIC_KEYS_JSON: ${{ vars.NRM_REGISTRY_TRUSTED_PUBLIC_KEYS_JSON }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tool=target/release/nrm-registry-release
+          mkdir -p downloaded downloaded-artifacts
+
+          release_json="$(gh release view "$RELEASE_TAG" \
+            --json tagName,isDraft,isImmutable,assets)"
+          jq -e \
+            --arg tag "$RELEASE_TAG" \
+            '.tagName == $tag and .isDraft == true and .isImmutable == false' \
+            <<< "$release_json" >/dev/null
+
+          {
+            printf '%s\n' \
+              "nrm-agent-$VERSION-aarch64-apple-darwin" \
+              "nrm-agent-$VERSION-aarch64-pc-windows-msvc.exe" \
+              "nrm-agent-$VERSION-aarch64-unknown-linux-musl" \
+              "nrm-agent-$VERSION-x86_64-apple-darwin" \
+              "nrm-agent-$VERSION-x86_64-pc-windows-msvc.exe" \
+              "nrm-agent-$VERSION-x86_64-unknown-linux-musl" \
+              nrm-agent-manifest-v1.json \
+              nrm-agent-manifest-v1.json.sig
+          } | LC_ALL=C sort > expected-assets.txt
+          jq -r '.assets[].name' <<< "$release_json" | LC_ALL=C sort > draft-assets.txt
+          diff -u expected-assets.txt draft-assets.txt
+
+          gh release download "$RELEASE_TAG" --dir downloaded
+          find downloaded -maxdepth 1 -type f -printf '%f\n' | LC_ALL=C sort \
+            > downloaded-assets.txt
+          diff -u expected-assets.txt downloaded-assets.txt
+
+          while IFS= read -r asset; do
+            cmp "release-assets/$asset" "downloaded/$asset"
+          done < expected-assets.txt
+          find downloaded -maxdepth 1 -type f -name 'nrm-agent-*' \
+            ! -name 'nrm-agent-manifest-v1.json*' \
+            -exec cp '{}' downloaded-artifacts/ \;
+
+          "$tool" verify \
+            --manifest downloaded/nrm-agent-manifest-v1.json \
+            --signatures downloaded/nrm-agent-manifest-v1.json.sig \
+            --artifacts-dir downloaded-artifacts \
+            --expected-version "$VERSION" \
+            --expected-protocol-version "$PROTOCOL_VERSION" \
+            --expected-source-commit "$SOURCE_COMMIT"
+
+      - name: Publish immutable release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          resolve_remote_tag_commit() {
+            local response object_type object_sha depth
+            response="$(gh api \
+              --header 'Accept: application/vnd.github+json' \
+              --header 'X-GitHub-Api-Version: 2026-03-10' \
+              "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG")"
+            object_type="$(jq -er '.object.type' <<< "$response")"
+            object_sha="$(jq -er '.object.sha' <<< "$response")"
+            for ((depth = 0; depth <= 8; depth++)); do
+              if [[ "$object_type" == commit ]]; then
+                if [[ ! "$object_sha" =~ ^[0-9a-f]{40}$ ]]; then
+                  echo "remote tag resolved to an invalid commit ID" >&2
+                  return 1
+                fi
+                printf '%s\n' "$object_sha"
+                return 0
+              fi
+              if [[ "$object_type" != tag || ! "$object_sha" =~ ^[0-9a-f]{40}$ ]]; then
+                echo "remote tag points to unsupported object type: $object_type" >&2
+                return 1
+              fi
+              if ((depth == 8)); then
+                break
+              fi
+              response="$(gh api \
+                --header 'Accept: application/vnd.github+json' \
+                --header 'X-GitHub-Api-Version: 2026-03-10' \
+                "repos/$GITHUB_REPOSITORY/git/tags/$object_sha")"
+              object_type="$(jq -er '.object.type' <<< "$response")"
+              object_sha="$(jq -er '.object.sha' <<< "$response")"
+            done
+            echo "remote tag annotation nesting exceeds eight objects" >&2
+            return 1
+          }
+          remote_tag_commit="$(resolve_remote_tag_commit)"
+          if [[ "$remote_tag_commit" != "$SOURCE_COMMIT" ]]; then
+            echo "$RELEASE_TAG moved while the release was a draft" >&2
+            exit 1
+          fi
+          publish_flags=(--draft=false --tag "$RELEASE_TAG" --verify-tag)
+          if [[ "$PRERELEASE" == true ]]; then
+            publish_flags+=(--prerelease --latest=false)
+          else
+            publish_flags+=(--latest)
+          fi
+          gh release edit "$RELEASE_TAG" "${publish_flags[@]}"
+
+          verified=false
+          for attempt in {1..10}; do
+            if release_json="$(gh release view "$RELEASE_TAG" \
+              --json tagName,isDraft,isImmutable)" \
+              && jq -e \
+                --arg tag "$RELEASE_TAG" \
+                '.tagName == $tag and .isDraft == false and .isImmutable == true' \
+                <<< "$release_json" >/dev/null \
+              && gh release verify "$RELEASE_TAG"; then
+              verified=true
+              break
+            fi
+            if [[ "$attempt" -lt 10 ]]; then
+              sleep 3
+            fi
+          done
+          if [[ "$verified" != true ]]; then
+            echo "published release did not become immutable with a valid release attestation" >&2
+            exit 1
+          fi
+
+          remote_tag_commit="$(resolve_remote_tag_commit)"
+          if [[ "$remote_tag_commit" != "$SOURCE_COMMIT" ]]; then
+            echo "immutable release tag does not match the signed source commit" >&2
+            exit 1
+          fi

@@ -20,22 +20,23 @@ const MAX_KEY_ID_BYTES: usize = 128;
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum AgentTarget {
-    X86_64UnknownLinuxMusl,
+    Aarch64AppleDarwin,
+    Aarch64PcWindowsMsvc,
     Aarch64UnknownLinuxMusl,
     X86_64AppleDarwin,
-    Aarch64AppleDarwin,
     X86_64PcWindowsMsvc,
-    Aarch64PcWindowsMsvc,
+    X86_64UnknownLinuxMusl,
 }
 
 impl AgentTarget {
+    /// Every published target, ordered lexicographically by Rust target name.
     pub const ALL: [Self; 6] = [
-        Self::X86_64UnknownLinuxMusl,
+        Self::Aarch64AppleDarwin,
+        Self::Aarch64PcWindowsMsvc,
         Self::Aarch64UnknownLinuxMusl,
         Self::X86_64AppleDarwin,
-        Self::Aarch64AppleDarwin,
         Self::X86_64PcWindowsMsvc,
-        Self::Aarch64PcWindowsMsvc,
+        Self::X86_64UnknownLinuxMusl,
     ];
 
     #[must_use]
@@ -53,6 +54,13 @@ impl AgentTarget {
     #[must_use]
     pub const fn is_windows(self) -> bool {
         matches!(self, Self::X86_64PcWindowsMsvc | Self::Aarch64PcWindowsMsvc)
+    }
+
+    /// Return the only artifact filename accepted for this target and version.
+    #[must_use]
+    pub fn artifact_filename(self, version: &Version) -> String {
+        let extension = if self.is_windows() { ".exe" } else { "" };
+        format!("nrm-agent-{version}-{self}{extension}")
     }
 }
 
@@ -228,8 +236,7 @@ pub fn parse_manifest(
         if !targets.insert(target) {
             return Err(ManifestError::DuplicateTarget(target));
         }
-        let extension = if target.is_windows() { ".exe" } else { "" };
-        let expected_filename = format!("nrm-agent-{version}-{target}{extension}");
+        let expected_filename = target.artifact_filename(&version);
         if raw_artifact.filename != expected_filename {
             return Err(ManifestError::InvalidFilename {
                 actual: raw_artifact.filename,

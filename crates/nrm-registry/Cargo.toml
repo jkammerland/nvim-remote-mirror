@@ -6,6 +6,7 @@ version.workspace = true
 
 [dependencies]
 base64.workspace = true
+clap.workspace = true
 ed25519-dalek.workspace = true
 fs4.workspace = true
 semver.workspace = true
