@@ -1000,10 +1000,14 @@ fn failure_detail(stderr: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use std::fs;
+    #[cfg(unix)]
     use std::io::Write as _;
+    #[cfg(unix)]
     use std::process::{Command, Output, Stdio};
 
+    #[cfg(unix)]
     use tempfile::tempdir;
 
     use super::*;
@@ -1015,6 +1019,7 @@ mod tests {
         PosixInstallPlan::new(target, VERSION, PROTOCOL, force).unwrap()
     }
 
+    #[cfg(unix)]
     fn fake_agent(version: &str) -> Vec<u8> {
         format!(
             "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf 'nrm-agent {version}\\n'; exit 0; fi\nexit 0\n"
@@ -1022,10 +1027,12 @@ mod tests {
         .into_bytes()
     }
 
+    #[cfg(unix)]
     fn run(command: &str, stdin: &[u8]) -> Output {
         run_with_env(command, stdin, None)
     }
 
+    #[cfg(unix)]
     fn run_with_env(
         command: &str,
         stdin: &[u8],
@@ -1044,10 +1051,12 @@ mod tests {
         child.wait_with_output().unwrap()
     }
 
+    #[cfg(unix)]
     fn stdout(output: &Output) -> String {
         String::from_utf8(output.stdout.clone()).unwrap()
     }
 
+    #[cfg(unix)]
     fn stderr(output: &Output) -> String {
         String::from_utf8_lossy(&output.stderr).into_owned()
     }

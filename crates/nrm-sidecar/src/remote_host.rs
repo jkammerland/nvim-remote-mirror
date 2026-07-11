@@ -4,6 +4,9 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 const PROBE_SCHEMA_VERSION: u8 = 1;
+const WINDOWS_REMOTE_COMMAND_MAX_CHARS: usize = 8_191;
+const POWERSHELL_BOOTSTRAP_MAGIC: [u8; 4] = *b"NRM1";
+const POWERSHELL_BOOTSTRAP_MAX_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -38,10 +41,449 @@ struct PowerShellProbe {
 #[derive(Serialize)]
 struct ProcessPayload<'a> {
     program: &'a str,
-    arguments: String,
+    arguments: &'a [String],
+    command_line: String,
     cwd: Option<&'a str>,
     path_prepend: Option<&'a str>,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PowerShellProcessCommand {
+    pub(crate) command: String,
+    pub(crate) stdin_prefix: Vec<u8>,
+}
+
+// Keep this source synchronized with `POWERSHELL_PROCESS_SCRIPT_GZIP_BASE64`. The
+// compressed form keeps the UTF-16LE `-EncodedCommand` below Windows' command-line
+// limit while retaining an auditable, fixed script with no user interpolation.
+#[cfg(test)]
+pub(crate) const POWERSHELL_PROCESS_SCRIPT_SOURCE: &str = r#"param([byte[]]$payloadBytes)
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+$jobMethods = @'
+private const uint CREATE_SUSPENDED = 4;
+private const uint EXTENDED_STARTUPINFO_PRESENT = 0x00080000;
+private const uint CREATE_NO_WINDOW = 0x08000000;
+private const uint STARTF_USESTDHANDLES = 0x100;
+private const uint HANDLE_FLAG_INHERIT = 1;
+private const uint WAIT_OBJECT_0 = 0;
+private const uint WAIT_TIMEOUT = 0x102;
+private static readonly IntPtr PROC_THREAD_ATTRIBUTE_HANDLE_LIST = new IntPtr(0x00020002);
+private static readonly IntPtr PROC_THREAD_ATTRIBUTE_JOB_LIST = new IntPtr(0x0002000D);
+
+[StructLayout(LayoutKind.Sequential)]
+private struct PROCESS_INFORMATION
+{
+    public IntPtr Process;
+    public IntPtr Thread;
+    public uint ProcessId;
+    public uint ThreadId;
+}
+
+[DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+public static extern IntPtr CreateJobObject(IntPtr attributes, string name);
+[DllImport("kernel32.dll", SetLastError=true)]
+public static extern bool SetInformationJobObject(IntPtr job, int informationClass, byte[] information, uint informationLength);
+[DllImport("kernel32.dll")]
+public static extern bool CloseHandle(IntPtr handle);
+[DllImport("kernel32.dll", SetLastError=true)]
+private static extern bool SetHandleInformation(IntPtr handle, uint mask, uint flags);
+[DllImport("kernel32.dll", SetLastError=true)]
+private static extern bool InitializeProcThreadAttributeList(IntPtr list, int count, uint flags, ref IntPtr size);
+[DllImport("kernel32.dll", SetLastError=true)]
+private static extern bool UpdateProcThreadAttribute(IntPtr list, uint flags, IntPtr attribute, IntPtr value, IntPtr size, IntPtr previous, IntPtr returnSize);
+[DllImport("kernel32.dll")]
+private static extern void DeleteProcThreadAttributeList(IntPtr list);
+[DllImport("kernel32.dll", CharSet=CharSet.Unicode, SetLastError=true)]
+private static extern bool CreateProcess(
+    string applicationName,
+    System.Text.StringBuilder commandLine,
+    IntPtr processAttributes,
+    IntPtr threadAttributes,
+    bool inheritHandles,
+    uint creationFlags,
+    IntPtr environment,
+    string currentDirectory,
+    IntPtr startupInfo,
+    out PROCESS_INFORMATION information);
+[DllImport("kernel32.dll", SetLastError=true)]
+private static extern uint ResumeThread(IntPtr thread);
+[DllImport("kernel32.dll", SetLastError=true)]
+private static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
+[DllImport("kernel32.dll", SetLastError=true)]
+private static extern bool GetExitCodeProcess(IntPtr process, out uint exitCode);
+[DllImport("kernel32.dll", SetLastError=true)]
+private static extern bool TerminateProcess(IntPtr process, uint exitCode);
+[DllImport("kernel32.dll", SetLastError=true)]
+private static extern IntPtr GetStdHandle(int standardHandle);
+[DllImport("kernel32.dll", SetLastError=true)]
+private static extern bool ReadFile(IntPtr file, byte[] buffer, uint requested, out uint read, IntPtr overlapped);
+[DllImport("kernel32.dll", SetLastError=true)]
+private static extern bool WriteFile(IntPtr file, byte[] buffer, uint requested, out uint written, IntPtr overlapped);
+[DllImport("kernel32.dll", SetLastError=true)]
+private static extern bool FlushFileBuffers(IntPtr file);
+
+private static Exception Error(string operation)
+{
+    return new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), operation);
+}
+
+private static void Close(ref IntPtr handle)
+{
+    if (handle != IntPtr.Zero)
+    {
+        CloseHandle(handle);
+        handle = IntPtr.Zero;
+    }
+}
+
+private sealed class RelayState
+{
+    public IntPtr Process;
+    public readonly object Gate = new object();
+    public Exception Failure;
+    public bool Exited;
+
+    public void Fail(Exception error)
+    {
+        bool terminate = false;
+        lock (Gate)
+        {
+            if (Failure == null)
+                Failure = error;
+            if (!Exited)
+                terminate = true;
+        }
+        if (terminate)
+            TerminateProcess(Process, 1);
+    }
+
+    public void FailInput(Exception error)
+    {
+        bool terminate = false;
+        lock (Gate)
+        {
+            if (Exited)
+                return;
+            if (Failure == null)
+                Failure = error;
+            terminate = true;
+        }
+        if (terminate)
+            TerminateProcess(Process, 1);
+    }
+}
+
+private static void WriteStandard(IntPtr destination, byte[] buffer, uint count)
+{
+    uint written;
+    if (!WriteFile(destination, buffer, count, out written, IntPtr.Zero))
+        throw Error("standard stream write failed");
+    if (written != count)
+        throw new System.IO.IOException("standard stream write was incomplete");
+    if (!FlushFileBuffers(destination))
+        throw Error("standard stream flush failed");
+}
+
+private static void PumpInput(
+    System.IO.Pipes.AnonymousPipeServerStream destination,
+    RelayState state)
+{
+    byte[] buffer = new byte[16384];
+    try
+    {
+        IntPtr input = GetStdHandle(-10);
+        while (true)
+        {
+            uint count;
+            if (!ReadFile(input, buffer, (uint)buffer.Length, out count, IntPtr.Zero))
+            {
+                if (Marshal.GetLastWin32Error() == 109)
+                    break;
+                throw Error("standard input read failed");
+            }
+            if (count == 0)
+                break;
+            destination.Write(buffer, 0, (int)count);
+            destination.Flush();
+        }
+    }
+    catch (Exception error) { state.FailInput(error); }
+    finally { destination.Dispose(); }
+}
+
+private static void PumpOutput(
+    System.IO.Pipes.AnonymousPipeServerStream source,
+    int standardHandle,
+    RelayState state)
+{
+    byte[] buffer = new byte[16384];
+    try
+    {
+        IntPtr output = GetStdHandle(standardHandle);
+        int count;
+        while ((count = source.Read(buffer, 0, buffer.Length)) != 0)
+            WriteStandard(output, buffer, (uint)count);
+    }
+    catch (Exception error) { state.Fail(error); }
+    finally { source.Dispose(); }
+}
+
+private static void Zero(IntPtr memory, int length)
+{
+    for (int offset = 0; offset < length; offset++)
+        Marshal.WriteByte(memory, offset, 0);
+}
+
+private static void MakeParentHandlePrivate(
+    System.IO.Pipes.AnonymousPipeServerStream pipe)
+{
+    if (!SetHandleInformation(
+            pipe.SafePipeHandle.DangerousGetHandle(),
+            HANDLE_FLAG_INHERIT,
+            0))
+        throw Error("parent pipe inheritance clear failed");
+}
+
+public static int Run(IntPtr job, string applicationName, string commandLine, string directory)
+{
+    System.IO.Pipes.AnonymousPipeServerStream input = null;
+    System.IO.Pipes.AnonymousPipeServerStream output = null;
+    System.IO.Pipes.AnonymousPipeServerStream error = null;
+    IntPtr attributes = IntPtr.Zero;
+    IntPtr handles = IntPtr.Zero;
+    IntPtr jobValue = IntPtr.Zero;
+    IntPtr startup = IntPtr.Zero;
+    IntPtr process = IntPtr.Zero;
+    IntPtr thread = IntPtr.Zero;
+    System.Threading.Thread inputPump = null;
+    System.Threading.Thread outputPump = null;
+    System.Threading.Thread errorPump = null;
+    RelayState state = null;
+    try
+    {
+        input = new System.IO.Pipes.AnonymousPipeServerStream(
+            System.IO.Pipes.PipeDirection.Out,
+            System.IO.HandleInheritability.Inheritable);
+        output = new System.IO.Pipes.AnonymousPipeServerStream(
+            System.IO.Pipes.PipeDirection.In,
+            System.IO.HandleInheritability.Inheritable);
+        error = new System.IO.Pipes.AnonymousPipeServerStream(
+            System.IO.Pipes.PipeDirection.In,
+            System.IO.HandleInheritability.Inheritable);
+        MakeParentHandlePrivate(input);
+        MakeParentHandlePrivate(output);
+        MakeParentHandlePrivate(error);
+        IntPtr childInput = input.ClientSafePipeHandle.DangerousGetHandle();
+        IntPtr childOutput = output.ClientSafePipeHandle.DangerousGetHandle();
+        IntPtr childError = error.ClientSafePipeHandle.DangerousGetHandle();
+
+        IntPtr attributeSize = IntPtr.Zero;
+        InitializeProcThreadAttributeList(IntPtr.Zero, 2, 0, ref attributeSize);
+        if (attributeSize == IntPtr.Zero)
+            throw Error("attribute-list sizing failed");
+        attributes = Marshal.AllocHGlobal(attributeSize);
+        if (!InitializeProcThreadAttributeList(attributes, 2, 0, ref attributeSize))
+            throw Error("attribute-list initialization failed");
+
+        handles = Marshal.AllocHGlobal(IntPtr.Size * 3);
+        Marshal.WriteIntPtr(handles, 0, childInput);
+        Marshal.WriteIntPtr(handles, IntPtr.Size, childOutput);
+        Marshal.WriteIntPtr(handles, IntPtr.Size * 2, childError);
+        if (!UpdateProcThreadAttribute(
+                attributes, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, handles, new IntPtr(IntPtr.Size * 3),
+                IntPtr.Zero, IntPtr.Zero))
+            throw Error("handle-list attribute failed");
+        jobValue = Marshal.AllocHGlobal(IntPtr.Size);
+        Marshal.WriteIntPtr(jobValue, job);
+        if (!UpdateProcThreadAttribute(
+                attributes, 0, PROC_THREAD_ATTRIBUTE_JOB_LIST, jobValue, new IntPtr(IntPtr.Size),
+                IntPtr.Zero, IntPtr.Zero))
+            throw Error("job-list attribute failed");
+
+        // STARTUPINFOEX is 112 bytes on x64/ARM64. STARTUPINFO.dwFlags and
+        // its three standard handles are at offsets 60, 80, 88, and 96.
+        startup = Marshal.AllocHGlobal(112);
+        Zero(startup, 112);
+        Marshal.WriteInt32(startup, 0, 112);
+        Marshal.WriteInt32(startup, 60, (int)STARTF_USESTDHANDLES);
+        Marshal.WriteIntPtr(startup, 80, childInput);
+        Marshal.WriteIntPtr(startup, 88, childOutput);
+        Marshal.WriteIntPtr(startup, 96, childError);
+        Marshal.WriteIntPtr(startup, 104, attributes);
+
+        PROCESS_INFORMATION information;
+        if (!CreateProcess(
+                applicationName,
+                new System.Text.StringBuilder(commandLine),
+                IntPtr.Zero,
+                IntPtr.Zero,
+                true,
+                CREATE_SUSPENDED | CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT,
+                IntPtr.Zero,
+                String.IsNullOrEmpty(directory) ? null : directory,
+                startup,
+                out information))
+            throw Error("CreateProcessW failed");
+        process = information.Process;
+        thread = information.Thread;
+        input.DisposeLocalCopyOfClientHandle();
+        output.DisposeLocalCopyOfClientHandle();
+        error.DisposeLocalCopyOfClientHandle();
+
+        state = new RelayState();
+        state.Process = process;
+        inputPump = new System.Threading.Thread(
+            delegate() { PumpInput(input, state); });
+        outputPump = new System.Threading.Thread(
+            delegate() { PumpOutput(output, -11, state); });
+        errorPump = new System.Threading.Thread(
+            delegate() { PumpOutput(error, -12, state); });
+        inputPump.IsBackground = true;
+        outputPump.IsBackground = true;
+        errorPump.IsBackground = true;
+        outputPump.Start();
+        errorPump.Start();
+        inputPump.Start();
+
+        if (ResumeThread(thread) == UInt32.MaxValue)
+            throw Error("ResumeThread failed");
+        Close(ref thread);
+        if (WaitForSingleObject(process, UInt32.MaxValue) != WAIT_OBJECT_0)
+            throw Error("process wait failed");
+        lock (state.Gate)
+            state.Exited = true;
+        outputPump.Join();
+        errorPump.Join();
+        lock (state.Gate)
+        {
+            if (state.Failure != null)
+                throw new System.IO.IOException("standard stream relay failed", state.Failure);
+        }
+        uint exitCode;
+        if (!GetExitCodeProcess(process, out exitCode))
+            throw Error("exit-code read failed");
+        return unchecked((int)exitCode);
+    }
+    finally
+    {
+        if (process != IntPtr.Zero &&
+            WaitForSingleObject(process, 0) == WAIT_TIMEOUT)
+        {
+            TerminateProcess(process, 1);
+            WaitForSingleObject(process, UInt32.MaxValue);
+        }
+        if (outputPump != null && outputPump.IsAlive)
+            outputPump.Join();
+        if (errorPump != null && errorPump.IsAlive)
+            errorPump.Join();
+        Close(ref thread);
+        Close(ref process);
+        if (input != null) input.Dispose();
+        if (output != null) output.Dispose();
+        if (error != null) error.Dispose();
+        if (attributes != IntPtr.Zero)
+            DeleteProcThreadAttributeList(attributes);
+        if (handles != IntPtr.Zero) Marshal.FreeHGlobal(handles);
+        if (jobValue != IntPtr.Zero) Marshal.FreeHGlobal(jobValue);
+        if (startup != IntPtr.Zero) Marshal.FreeHGlobal(startup);
+        if (attributes != IntPtr.Zero) Marshal.FreeHGlobal(attributes);
+    }
+}
+'@
+Add-Type -MemberDefinition $jobMethods -Name Job -Namespace Nrm *> $null
+$payloadJson = [System.Text.Encoding]::UTF8.GetString($payloadBytes)
+$payload = $payloadJson | ConvertFrom-Json
+if ([IntPtr]::Size -ne 8) { throw 'nrm-agent requires 64-bit Windows' }
+$job = [IntPtr]::Zero
+$exitCode = 1
+$oldPath = $env:PATH
+try {
+  $job = [Nrm.Job]::CreateJobObject([IntPtr]::Zero, $null)
+  if ($job -eq [IntPtr]::Zero) {
+    throw "CreateJobObject failed: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())"
+  }
+  # On x64 and ARM64, JOBOBJECT_EXTENDED_LIMIT_INFORMATION is 144 bytes and
+  # BasicLimitInformation.LimitFlags is the uint32 at byte offset 16.
+  $limits = New-Object byte[] 144
+  [BitConverter]::GetBytes([uint32]0x2000).CopyTo($limits, 16)
+  if (-not [Nrm.Job]::SetInformationJobObject($job, 9, $limits, $limits.Length)) {
+    throw "SetInformationJobObject failed: $([Runtime.InteropServices.Marshal]::GetLastWin32Error())"
+  }
+  if ($null -ne $payload.path_prepend -and [string]$payload.path_prepend -ne '') {
+    $env:PATH = ([string]$payload.path_prepend) + ';' + $env:PATH
+  }
+  $program = [string]$payload.program
+  $directory = [string]$payload.cwd
+  $isDriveAbsolute = $program -match '^[A-Za-z]:[\\/]'
+  $isUncAbsolute = $program.StartsWith('\\') -or $program.StartsWith('//')
+  if ($isDriveAbsolute -or $isUncAbsolute) {
+    $applicationName = $program
+  } elseif ($program.StartsWith('\') -or $program.StartsWith('/')) {
+    throw 'root-relative executable paths are unsupported'
+  } elseif ($program -match '^[A-Za-z]:') {
+    throw 'drive-relative executable paths are unsupported'
+  } elseif ($program.Contains('\') -or $program.Contains('/')) {
+    if ([String]::IsNullOrEmpty($directory)) {
+      throw 'relative executable paths require a working directory'
+    }
+    $applicationName = [IO.Path]::GetFullPath([IO.Path]::Combine($directory, $program))
+  } else {
+    $resolved = Get-Command -Name $program -CommandType Application -ErrorAction Stop |
+      Select-Object -First 1
+    $applicationName = [string]$resolved.Source
+    if ([String]::IsNullOrEmpty($applicationName) -or
+        -not [IO.Path]::IsPathRooted($applicationName)) {
+      throw "Get-Command returned a non-absolute application path for $program"
+    }
+  }
+  $commandLine = [string]$payload.command_line
+  $extension = [IO.Path]::GetExtension($applicationName)
+  $isBatch = [string]::Equals($extension, '.cmd', [StringComparison]::OrdinalIgnoreCase) -or
+    [string]::Equals($extension, '.bat', [StringComparison]::OrdinalIgnoreCase)
+  if ($isBatch) {
+    # CreateProcessW cannot execute a batch file directly. Keep the resolved
+    # batch path and argv as data, quote every value, and reject the two cmd.exe
+    # expansion characters that cannot be represented safely in this fixed
+    # trampoline. Other metacharacters remain inert inside their own quotes.
+    $batchValues = @([string]$applicationName) + @($payload.arguments)
+    foreach ($value in $batchValues) {
+      $text = [string]$value
+      if ($text.IndexOf([char]34) -ge 0 -or $text.IndexOf('%') -ge 0) {
+        throw 'batch application paths and arguments must not contain double quotes or percent signs'
+      }
+    }
+    $cmdApplication = [IO.Path]::Combine([Environment]::SystemDirectory, 'cmd.exe')
+    if ([String]::IsNullOrEmpty($cmdApplication) -or
+        -not [IO.Path]::IsPathRooted($cmdApplication) -or
+        -not [IO.File]::Exists($cmdApplication)) {
+      throw 'could not resolve the absolute system cmd.exe path'
+    }
+    # Batch files commonly forward `%*` into a native executable. Apply the
+    # Windows argv rule for backslashes before the closing quote so that a
+    # trailing backslash survives that second parse, while force-quoting every
+    # value keeps cmd.exe metacharacters inert.
+    $batchCommand = '"' + ($applicationName -replace '(\\+)$', '$1$1') + '"'
+    foreach ($argument in @($payload.arguments)) {
+      $batchArgument = [string]$argument
+      $batchCommand += ' "' + ($batchArgument -replace '(\\+)$', '$1$1') + '"'
+    }
+    $commandLine = '"' + $cmdApplication + '" /d /s /v:off /c "' + $batchCommand + '"'
+    $applicationName = $cmdApplication
+  }
+  $exitCode = [Nrm.Job]::Run(
+    $job,
+    $applicationName,
+    $commandLine,
+    [string]$payload.cwd)
+} finally {
+  $env:PATH = $oldPath
+  if ($job -ne [IntPtr]::Zero) { [void][Nrm.Job]::CloseHandle($job) }
+}
+exit $exitCode"#;
+
+// Deterministic gzip (`mtime = 0`) of `POWERSHELL_PROCESS_SCRIPT_SOURCE`.
+const POWERSHELL_PROCESS_SCRIPT_GZIP_BASE64: &str = "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";
 
 pub(crate) fn local_host_info() -> Result<RemoteHostInfo> {
     let os = std::env::consts::OS;
@@ -199,10 +641,10 @@ pub(crate) fn powershell_process_command(
     args: &[String],
     cwd: Option<&str>,
     path_prepend: Option<&str>,
-) -> Result<String> {
+) -> Result<PowerShellProcessCommand> {
     reject_process_field("program", program)?;
     for arg in args {
-        reject_process_field("argument", arg)?;
+        reject_process_argument(arg)?;
     }
     if let Some(cwd) = cwd {
         reject_process_field("working directory", cwd)?;
@@ -211,49 +653,68 @@ pub(crate) fn powershell_process_command(
         reject_process_field("PATH prefix", path_prepend)?;
     }
 
+    let mut command_arguments = Vec::with_capacity(args.len() + 1);
+    command_arguments.push(program.to_string());
+    command_arguments.extend(args.iter().cloned());
     let payload = ProcessPayload {
         program,
-        arguments: windows_join_arguments(args),
+        arguments: args,
+        command_line: windows_join_arguments(&command_arguments),
         cwd,
         path_prepend,
     };
-    let payload = STANDARD.encode(serde_json::to_vec(&payload)?);
-    let script = format!(
-        r#"$ErrorActionPreference = 'Stop'
-$payloadJson = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('{payload}'))
-$payload = $payloadJson | ConvertFrom-Json
-$start = New-Object System.Diagnostics.ProcessStartInfo
-$start.FileName = [string]$payload.program
-$start.Arguments = [string]$payload.arguments
-$start.UseShellExecute = $false
-$start.CreateNoWindow = $true
-$start.RedirectStandardInput = $true
-$start.RedirectStandardOutput = $true
-$start.RedirectStandardError = $true
-if ($null -ne $payload.cwd -and [string]$payload.cwd -ne '') {{ $start.WorkingDirectory = [string]$payload.cwd }}
-if ($null -ne $payload.path_prepend -and [string]$payload.path_prepend -ne '') {{
-  $start.EnvironmentVariables['PATH'] = ([string]$payload.path_prepend) + ';' + $start.EnvironmentVariables['PATH']
-}}
-$process = New-Object System.Diagnostics.Process
-$process.StartInfo = $start
-if (-not $process.Start()) {{ throw 'failed to start remote process' }}
-$stdinTask = [Console]::OpenStandardInput().CopyToAsync($process.StandardInput.BaseStream)
-$stdoutTask = $process.StandardOutput.BaseStream.CopyToAsync([Console]::OpenStandardOutput())
-$stderrTask = $process.StandardError.BaseStream.CopyToAsync([Console]::OpenStandardError())
-$stdinClosed = $false
-while (-not $process.HasExited) {{
-  if (-not $stdinClosed -and $stdinTask.IsCompleted) {{
-    $process.StandardInput.Close()
-    $stdinClosed = $true
-  }}
-  if (-not $process.HasExited) {{ Start-Sleep -Milliseconds 10 }}
-}}
-$process.WaitForExit()
-if (-not $stdinClosed) {{ $process.StandardInput.Close() }}
-[System.Threading.Tasks.Task]::WaitAll([System.Threading.Tasks.Task[]]@($stdoutTask, $stderrTask))
-exit $process.ExitCode"#
-    );
-    Ok(powershell_encoded_command(&script))
+    let payload = serde_json::to_vec(&payload)?;
+    let compressed_script = STANDARD
+        .decode(POWERSHELL_PROCESS_SCRIPT_GZIP_BASE64)
+        .expect("embedded PowerShell process script must be valid base64");
+    if compressed_script.len() > POWERSHELL_BOOTSTRAP_MAX_BYTES
+        || payload.len() > POWERSHELL_BOOTSTRAP_MAX_BYTES
+    {
+        bail!(
+            "PowerShell process bootstrap exceeds the {POWERSHELL_BOOTSTRAP_MAX_BYTES}-byte document limit"
+        );
+    }
+    let bootstrap = r#"$ErrorActionPreference='Stop'
+$ProgressPreference='SilentlyContinue'
+[Console]::SetOut([IO.TextWriter]::Null)
+$stream=[Console]::OpenStandardInput(1)
+function Read-NrmBytes([int]$length) {
+  $bytes=New-Object byte[] $length
+  $offset=0
+  while($offset -lt $length) {
+    $count=$stream.Read($bytes,$offset,$length-$offset)
+    if($count -eq 0) { throw 'truncated nrm process bootstrap' }
+    $offset+=$count
+  }
+  return ,$bytes
+}
+[byte[]]$header=Read-NrmBytes 12
+if($header[0]-ne 78 -or $header[1]-ne 82 -or $header[2]-ne 77 -or $header[3]-ne 49) { throw 'invalid nrm process bootstrap' }
+$scriptLength=[BitConverter]::ToUInt32($header,4)
+$payloadLength=[BitConverter]::ToUInt32($header,8)
+if($scriptLength -gt 65536 -or $payloadLength -gt 65536) { throw 'oversized nrm process bootstrap' }
+[byte[]]$compressed=Read-NrmBytes ([int]$scriptLength)
+[byte[]]$payload=Read-NrmBytes ([int]$payloadLength)
+$memory=New-Object IO.MemoryStream(,$compressed)
+$gzip=New-Object IO.Compression.GZipStream($memory,[IO.Compression.CompressionMode]::Decompress)
+$reader=New-Object IO.StreamReader($gzip,[Text.Encoding]::UTF8)
+& ([ScriptBlock]::Create($reader.ReadToEnd())) $payload"#;
+    let command = powershell_encoded_command(bootstrap);
+    if command.len() > WINDOWS_REMOTE_COMMAND_MAX_CHARS {
+        bail!(
+            "PowerShell process command exceeds the {WINDOWS_REMOTE_COMMAND_MAX_CHARS}-character Windows command-line limit"
+        );
+    }
+    let mut stdin_prefix = Vec::with_capacity(12 + compressed_script.len() + payload.len());
+    stdin_prefix.extend_from_slice(&POWERSHELL_BOOTSTRAP_MAGIC);
+    stdin_prefix.extend_from_slice(&(compressed_script.len() as u32).to_le_bytes());
+    stdin_prefix.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    stdin_prefix.extend_from_slice(&compressed_script);
+    stdin_prefix.extend_from_slice(&payload);
+    Ok(PowerShellProcessCommand {
+        command,
+        stdin_prefix,
+    })
 }
 
 fn build_host_info(
@@ -323,7 +784,14 @@ fn reject_process_field(name: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-fn powershell_encoded_command(script: &str) -> String {
+fn reject_process_argument(value: &str) -> Result<()> {
+    if value.chars().any(char::is_control) {
+        bail!("PowerShell process argument must not contain control characters");
+    }
+    Ok(())
+}
+
+pub(crate) fn powershell_encoded_command(script: &str) -> String {
     let mut utf16le = Vec::with_capacity(script.len() * 2);
     for unit in script.encode_utf16() {
         utf16le.extend_from_slice(&unit.to_le_bytes());
@@ -384,6 +852,16 @@ mod tests {
             .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
             .collect();
         String::from_utf16(&units).unwrap()
+    }
+
+    fn bootstrap_documents(prefix: &[u8]) -> (&[u8], &[u8]) {
+        assert!(prefix.len() >= 12);
+        assert_eq!(&prefix[..4], &POWERSHELL_BOOTSTRAP_MAGIC);
+        let script_len = u32::from_le_bytes(prefix[4..8].try_into().unwrap()) as usize;
+        let payload_len = u32::from_le_bytes(prefix[8..12].try_into().unwrap()) as usize;
+        assert_eq!(prefix.len(), 12 + script_len + payload_len);
+        let script_end = 12 + script_len;
+        (&prefix[12..script_end], &prefix[script_end..])
     }
 
     #[test]
@@ -541,40 +1019,728 @@ mod tests {
     }
 
     #[test]
+    fn embedded_powershell_process_script_matches_audited_source() {
+        use std::io::Read as _;
+
+        let compressed = STANDARD
+            .decode(POWERSHELL_PROCESS_SCRIPT_GZIP_BASE64)
+            .unwrap();
+        let mut decoded = Vec::new();
+        flate2::read::GzDecoder::new(compressed.as_slice())
+            .read_to_end(&mut decoded)
+            .unwrap();
+        assert_eq!(decoded, POWERSHELL_PROCESS_SCRIPT_SOURCE.as_bytes());
+    }
+
+    #[test]
     fn powershell_process_payload_does_not_interpolate_user_input() {
         let program = r#"C:\Program Files\Agent ' ; Write-Output owned.exe"#;
         let args = vec![
             "serve".to_string(),
+            String::new(),
             "--root".to_string(),
-            r#"B:/repo ' ; $(owned) \"quoted\""#.to_string(),
+            r#"B:/repo ' ; $(owned) &|<>^()!% \"quoted\""#.to_string(),
         ];
-        let command = powershell_process_command(
+        let launch = powershell_process_command(
             program,
             &args,
             Some("B:/repo with space"),
             Some(r"C:\Users\me\AppData\Local\nrm\bin"),
         )
         .unwrap();
-        assert!(!command.contains("owned"));
-        let script = decode_encoded_command(&command);
-        assert!(!script.contains("Write-Output owned"));
-        assert!(!script.contains("$(owned)"));
-        assert!(script.contains("CopyToAsync"));
-        assert!(script.contains("RedirectStandardInput"));
-        assert!(script.contains("$stdinTask.IsCompleted"));
+        assert!(!launch.command.contains("owned"));
         assert!(
-            script.find("$stdinTask.IsCompleted").unwrap()
-                < script.find("$process.WaitForExit()").unwrap()
+            launch.command.encode_utf16().count() <= WINDOWS_REMOTE_COMMAND_MAX_CHARS,
+            "PowerShell process command exceeds the Windows command-line limit: {} UTF-16 code units",
+            launch.command.encode_utf16().count()
+        );
+        let bootstrap = decode_encoded_command(&launch.command);
+        assert!(!bootstrap.contains("Write-Output owned"));
+        assert!(!bootstrap.contains("$(owned)"));
+        assert!(bootstrap.contains("GZipStream"));
+        assert!(bootstrap.contains("$ProgressPreference='SilentlyContinue'"));
+        assert!(bootstrap.contains("OpenStandardInput(1)"));
+        assert!(bootstrap.contains("Read-NrmBytes"));
+        assert!(bootstrap.contains("ScriptBlock"));
+
+        let script = POWERSHELL_PROCESS_SCRIPT_SOURCE;
+        assert!(!script.contains("CopyToAsync"));
+        assert!(!script.contains("System.Diagnostics.Process"));
+        assert!(!script.contains("ReadAsync"));
+        assert!(!script.contains("WriteAsync"));
+        assert!(script.contains("CreateProcess("));
+        assert!(script.contains("AnonymousPipeServerStream"));
+        assert!(script.contains("PROC_THREAD_ATTRIBUTE_HANDLE_LIST"));
+        assert!(script.contains("PROC_THREAD_ATTRIBUTE_JOB_LIST"));
+        assert!(script.contains("EXTENDED_STARTUPINFO_PRESENT"));
+        assert!(script.contains("SetHandleInformation"));
+        assert!(script.contains("MakeParentHandlePrivate"));
+        assert!(script.contains("DisposeLocalCopyOfClientHandle"));
+        assert!(script.contains("ReadFile(input"));
+        assert!(script.contains("WriteFile(destination"));
+        assert!(script.contains("FlushFileBuffers(destination)"));
+        assert!(script.contains("GetStdHandle(-10)"));
+        assert!(script.contains("PumpOutput(output, -11"));
+        assert!(script.contains("PumpOutput(error, -12"));
+        assert!(script.contains("System.Threading.Thread"));
+        assert!(script.contains("STARTUPINFOEX is 112 bytes"));
+        assert!(script.contains("JOBOBJECT_EXTENDED_LIMIT_INFORMATION is 144 bytes"));
+        assert!(script.contains("CopyTo($limits, 16)"));
+        assert!(script.contains("CloseHandle($job)"));
+        assert!(script.contains("if (Failure == null)"));
+        assert!(script.contains("if (!Exited)"));
+        assert!(script.contains("CreateProcess(\n                applicationName,"));
+        assert!(script.contains("Get-Command -Name $program -CommandType Application"));
+        assert!(script.contains("[IO.Path]::GetFullPath([IO.Path]::Combine($directory, $program))"));
+        assert!(script.contains("[IO.Path]::GetExtension($applicationName)"));
+        assert!(script.contains("[string]::Equals($extension, '.cmd'"));
+        assert!(script.contains("[string]::Equals($extension, '.bat'"));
+        assert!(script.contains("[Environment]::SystemDirectory"));
+        assert!(script.contains("'cmd.exe'"));
+        assert!(script.contains(" /d /s /v:off /c "));
+        assert!(script.contains("$applicationName = $cmdApplication"));
+        assert!(script.contains("-replace '(\\\\+)$', '$1$1'"));
+        assert!(script.contains(
+            "batch application paths and arguments must not contain double quotes or percent signs"
+        ));
+
+        let (compressed, payload_bytes) = bootstrap_documents(&launch.stdin_prefix);
+        assert_eq!(
+            compressed,
+            STANDARD
+                .decode(POWERSHELL_PROCESS_SCRIPT_GZIP_BASE64)
+                .unwrap()
+        );
+        let payload: serde_json::Value = serde_json::from_slice(payload_bytes).unwrap();
+        assert_eq!(payload["program"], program);
+        assert_eq!(payload["arguments"], serde_json::json!(args));
+        assert!(payload["command_line"]
+            .as_str()
+            .unwrap()
+            .contains("$(owned)"));
+        assert!(payload["command_line"].as_str().unwrap().contains(program));
+        assert_eq!(payload["cwd"], "B:/repo with space");
+    }
+
+    #[test]
+    fn powershell_process_allows_empty_arguments_but_rejects_argument_controls() {
+        let launch = powershell_process_command(
+            "native.exe",
+            &[String::new(), "after-empty".to_string()],
+            None,
+            None,
+        )
+        .unwrap();
+        let (_, payload_bytes) = bootstrap_documents(&launch.stdin_prefix);
+        let payload: serde_json::Value = serde_json::from_slice(payload_bytes).unwrap();
+        assert_eq!(payload["arguments"], serde_json::json!(["", "after-empty"]));
+        assert_eq!(payload["command_line"], r#"native.exe "" after-empty"#);
+
+        for invalid in ["line\nbreak", "tab\tbreak", "nul\0break"] {
+            let error =
+                powershell_process_command("native.exe", &[invalid.to_string()], None, None)
+                    .unwrap_err()
+                    .to_string();
+            assert_eq!(
+                error,
+                "PowerShell process argument must not contain control characters"
+            );
+        }
+    }
+
+    #[test]
+    fn powershell_process_rejects_the_first_oversized_bootstrap_payload() {
+        let plan = |root_len: usize| {
+            let root = format!("B:/{}", "x".repeat(root_len));
+            powershell_process_command(
+                "nrm-agent.exe",
+                &["serve".to_string(), "--root".to_string(), root.clone()],
+                Some(&root),
+                None,
+            )
+        };
+
+        let mut passing = 0usize;
+        let mut failing = 100_000usize;
+        assert!(plan(passing).is_ok());
+        assert!(plan(failing).is_err());
+        while passing + 1 < failing {
+            let candidate = passing + (failing - passing) / 2;
+            if plan(candidate).is_ok() {
+                passing = candidate;
+            } else {
+                failing = candidate;
+            }
+        }
+
+        let launch = plan(passing).unwrap();
+        let code_units = launch.command.encode_utf16().count();
+        assert!(code_units <= WINDOWS_REMOTE_COMMAND_MAX_CHARS);
+        let (_, payload) = bootstrap_documents(&launch.stdin_prefix);
+        assert!(payload.len() <= POWERSHELL_BOOTSTRAP_MAX_BYTES);
+        assert!(payload.len() + 4 > POWERSHELL_BOOTSTRAP_MAX_BYTES);
+        let error = plan(failing).unwrap_err().to_string();
+        assert_eq!(failing, passing + 1);
+        assert_eq!(
+            error,
+            "PowerShell process bootstrap exceeds the 65536-byte document limit"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn powershell_process_resolves_path_and_flushes_binary_output_before_stdin_eof() {
+        use std::io::{Read, Write};
+        use std::process::{Command, Stdio};
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        let child_dir = tempfile::tempdir().unwrap();
+        let trusted_dir = child_dir.path().join("trusted");
+        let untrusted_cwd = child_dir.path().join("untrusted");
+        std::fs::create_dir_all(&trusted_dir).unwrap();
+        std::fs::create_dir_all(&untrusted_cwd).unwrap();
+        let child_source_path = trusted_dir.join("nrm-pump-child.rs");
+        let child_path = trusted_dir.join("nrm-pump-child.exe");
+        std::fs::write(
+            &child_source_path,
+            r#"use std::io::{Read, Write};
+fn main() {
+    let mut request = [0u8; 5];
+    std::io::stdin().read_exact(&mut request).unwrap();
+    std::io::stdout().write_all(&request).unwrap();
+    std::io::stdout().flush().unwrap();
+    std::io::stderr().write_all(&[255, 0, 13, 10]).unwrap();
+    std::io::stderr().flush().unwrap();
+    let mut rest = Vec::new();
+    std::io::stdin().read_to_end(&mut rest).unwrap();
+    std::process::exit(37);
+}"#,
+        )
+        .unwrap();
+        let compile = Command::new("rustc")
+            .arg(&child_source_path)
+            .arg("-o")
+            .arg(&child_path)
+            .output()
+            .unwrap();
+        assert!(
+            compile.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let shadow_source_path = untrusted_cwd.join("nrm-pump-child.rs");
+        let shadow_path = untrusted_cwd.join("nrm-pump-child.exe");
+        std::fs::write(
+            &shadow_source_path,
+            r#"fn main() {
+    std::io::Write::write_all(&mut std::io::stdout(), b"shadow").unwrap();
+    std::process::exit(91);
+}"#,
+        )
+        .unwrap();
+        let compile_shadow = Command::new("rustc")
+            .arg(&shadow_source_path)
+            .arg("-o")
+            .arg(&shadow_path)
+            .output()
+            .unwrap();
+        assert!(
+            compile_shadow.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compile_shadow.stderr)
+        );
+        let wrapper_launch = powershell_process_command(
+            "nrm-pump-child",
+            &[],
+            Some(&untrusted_cwd.to_string_lossy()),
+            Some(&trusted_dir.to_string_lossy()),
+        )
+        .unwrap();
+        let (_, payload) = bootstrap_documents(&wrapper_launch.stdin_prefix);
+        let payload: serde_json::Value = serde_json::from_slice(payload).unwrap();
+        assert_eq!(payload["command_line"], "nrm-pump-child");
+        assert!(!payload["command_line"]
+            .as_str()
+            .unwrap()
+            .contains(trusted_dir.to_string_lossy().as_ref()));
+        let wrapper_encoded = wrapper_launch.command.split_whitespace().last().unwrap();
+        let mut child = Command::new("powershell.exe")
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-EncodedCommand",
+                wrapper_encoded,
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+
+        let (stdout_tx, stdout_rx) = mpsc::channel();
+        let mut stdout = crate::bom_reader::LeadingBomReader::new(child.stdout.take().unwrap());
+        let stdout_reader = thread::spawn(move || {
+            let mut bytes = [0u8; 5];
+            let result = stdout.read_exact(&mut bytes).map(|()| bytes);
+            let _ = stdout_tx.send(result);
+        });
+        let (stderr_tx, stderr_rx) = mpsc::channel::<std::io::Result<()>>();
+        let mut stderr = child.stderr.take().unwrap();
+        let stderr_reader = thread::spawn(move || {
+            let marker = [255, 0, 13, 10];
+            let mut received = Vec::new();
+            let mut buffer = [0u8; 256];
+            let mut reported = false;
+            loop {
+                match stderr.read(&mut buffer) {
+                    Ok(0) => {
+                        if !reported {
+                            let _ = stderr_tx.send(Err(std::io::Error::new(
+                                std::io::ErrorKind::UnexpectedEof,
+                                "child stderr marker was not observed",
+                            )));
+                        }
+                        break;
+                    }
+                    Ok(count) => {
+                        received.extend_from_slice(&buffer[..count]);
+                        if !reported && received.windows(marker.len()).any(|item| item == marker) {
+                            reported = true;
+                            let _ = stderr_tx.send(Ok(()));
+                        }
+                        if received.len() > 4096 {
+                            received.drain(..received.len() - 4096);
+                        }
+                    }
+                    Err(error) => {
+                        if !reported {
+                            let _ = stderr_tx.send(Err(error));
+                        }
+                        break;
+                    }
+                }
+            }
+        });
+
+        let mut stdin = child.stdin.take().unwrap();
+        let request = [0, 1, 2, 255, 10];
+        stdin.write_all(&wrapper_launch.stdin_prefix).unwrap();
+        stdin.write_all(&request).unwrap();
+        stdin.flush().unwrap();
+
+        let timeout = Duration::from_secs(10);
+        let received_stdout = stdout_rx.recv_timeout(timeout).unwrap_or_else(|error| {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("stdout was not flushed before stdin EOF: {error}");
+        });
+        assert_eq!(received_stdout.unwrap(), request);
+        stderr_rx
+            .recv_timeout(timeout)
+            .expect("stderr was not flushed before stdin EOF")
+            .unwrap();
+
+        drop(stdin);
+        let deadline = Instant::now() + timeout;
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("PowerShell process pump did not exit after stdin EOF");
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+        stdout_reader.join().unwrap();
+        stderr_reader.join().unwrap();
+        assert_eq!(status.code(), Some(37));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn powershell_process_resolves_relative_program_against_working_directory_without_noise() {
+        use std::io::{Read as _, Write as _};
+        use std::process::{Command, Stdio};
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        let child_dir = tempfile::tempdir().unwrap();
+        let child_source_path = child_dir.path().join("nrm-relative-child.rs");
+        let child_path = child_dir.path().join("nrm-relative-child.exe");
+        std::fs::write(
+            &child_source_path,
+            r#"use std::io::Write;
+fn main() {
+    std::io::stdout().write_all(&[0, 255, 1, 10]).unwrap();
+    std::io::stdout().flush().unwrap();
+    std::process::exit(29);
+}"#,
+        )
+        .unwrap();
+        let compile = Command::new("rustc")
+            .arg(&child_source_path)
+            .arg("-o")
+            .arg(&child_path)
+            .output()
+            .unwrap();
+        assert!(
+            compile.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compile.stderr)
         );
 
-        let marker = "FromBase64String('";
-        let start = script.find(marker).unwrap() + marker.len();
-        let end = script[start..].find("')").unwrap() + start;
-        let payload: serde_json::Value =
-            serde_json::from_slice(&STANDARD.decode(&script[start..end]).unwrap()).unwrap();
-        assert_eq!(payload["program"], program);
-        assert!(payload["arguments"].as_str().unwrap().contains("$(owned)"));
-        assert_eq!(payload["cwd"], "B:/repo with space");
+        let launch = powershell_process_command(
+            r".\nrm-relative-child.exe",
+            &[],
+            Some(&child_dir.path().to_string_lossy()),
+            None,
+        )
+        .unwrap();
+        let encoded = launch.command.split_whitespace().last().unwrap();
+        let mut wrapper = Command::new("powershell.exe")
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-EncodedCommand",
+                encoded,
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut stdout = crate::bom_reader::LeadingBomReader::new(wrapper.stdout.take().unwrap());
+        let stdout_reader = thread::spawn(move || {
+            let mut bytes = Vec::new();
+            stdout.read_to_end(&mut bytes).map(|_| bytes)
+        });
+        let mut stderr = wrapper.stderr.take().unwrap();
+        let stderr_reader = thread::spawn(move || {
+            let mut bytes = Vec::new();
+            stderr.read_to_end(&mut bytes).map(|_| bytes)
+        });
+        let mut stdin = wrapper.stdin.take().unwrap();
+        stdin.write_all(&launch.stdin_prefix).unwrap();
+        stdin.flush().unwrap();
+        drop(stdin);
+
+        let timeout = Duration::from_secs(10);
+        let deadline = Instant::now() + timeout;
+        let status = loop {
+            if let Some(status) = wrapper.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = wrapper.kill();
+                let _ = wrapper.wait();
+                panic!("relative-path PowerShell process did not exit");
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+        let stdout = stdout_reader.join().unwrap().unwrap();
+        let stderr = stderr_reader.join().unwrap().unwrap();
+        assert_eq!(stdout, [0, 255, 1, 10]);
+        assert!(
+            stderr.is_empty(),
+            "unexpected PowerShell stderr: {}",
+            String::from_utf8_lossy(&stderr)
+        );
+        assert_eq!(status.code(), Some(29));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn powershell_process_job_kills_child_when_wrapper_is_terminated() {
+        use std::io::Write as _;
+        use std::process::{Command, Stdio};
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        let child_dir = tempfile::tempdir().unwrap();
+        let child_source_path = child_dir.path().join("nrm-job-child.rs");
+        let child_path = child_dir.path().join("nrm-job-child.exe");
+        let lock_path = child_dir.path().join("held.lock");
+        let ready_path = child_dir.path().join("ready.pid");
+        std::fs::write(
+            &child_source_path,
+            r#"use std::fs::OpenOptions;
+use std::os::windows::fs::OpenOptionsExt;
+use std::time::Duration;
+fn main() {
+    let mut args = std::env::args_os().skip(1);
+    let lock_path = args.next().unwrap();
+    let ready_path = args.next().unwrap();
+    let _lock = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .share_mode(0)
+        .open(lock_path)
+        .unwrap();
+    std::fs::write(ready_path, std::process::id().to_string()).unwrap();
+    loop { std::thread::sleep(Duration::from_secs(60)); }
+}"#,
+        )
+        .unwrap();
+        let compile = Command::new("rustc")
+            .arg(&child_source_path)
+            .arg("-o")
+            .arg(&child_path)
+            .output()
+            .unwrap();
+        assert!(
+            compile.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+
+        let launch = powershell_process_command(
+            &child_path.to_string_lossy(),
+            &[
+                lock_path.to_string_lossy().into_owned(),
+                ready_path.to_string_lossy().into_owned(),
+            ],
+            None,
+            None,
+        )
+        .unwrap();
+        let encoded = launch.command.split_whitespace().last().unwrap();
+        let mut wrapper = Command::new("powershell.exe")
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-EncodedCommand",
+                encoded,
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let mut stdin = wrapper.stdin.take().unwrap();
+        stdin.write_all(&launch.stdin_prefix).unwrap();
+        stdin.flush().unwrap();
+
+        let timeout = Duration::from_secs(15);
+        let ready_deadline = Instant::now() + timeout;
+        while !ready_path.exists() {
+            if let Some(status) = wrapper.try_wait().unwrap() {
+                panic!("PowerShell wrapper exited before child readiness: {status}");
+            }
+            assert!(
+                Instant::now() < ready_deadline,
+                "timed out waiting for child readiness"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        let child_pid = std::fs::read_to_string(&ready_path).unwrap();
+
+        wrapper.kill().unwrap();
+        wrapper.wait().unwrap();
+        drop(stdin);
+
+        let cleanup_deadline = Instant::now() + timeout;
+        loop {
+            match std::fs::remove_file(&lock_path) {
+                Ok(()) => break,
+                Err(error) if Instant::now() < cleanup_deadline => {
+                    thread::sleep(Duration::from_millis(10));
+                    let _ = error;
+                }
+                Err(error) => {
+                    let _ = Command::new("taskkill")
+                        .args(["/PID", child_pid.trim(), "/T", "/F"])
+                        .output();
+                    panic!("job child still held its lock after wrapper exit: {error}");
+                }
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn powershell_process_runs_batch_applications_without_cmd_injection() {
+        use std::io::{Read as _, Write as _};
+        use std::process::{Command, Stdio};
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        let directory = tempfile::tempdir().unwrap();
+        let capture_source = directory.path().join("nrm-batch-capture.rs");
+        let capture = directory.path().join("nrm-batch-capture.exe");
+        std::fs::write(
+            &capture_source,
+            r#"use std::io::Write as _;
+fn main() {
+    let arguments = std::env::args().skip(1).collect::<Vec<_>>();
+    let mut stdout = std::io::stdout().lock();
+    stdout.write_all(&(arguments.len() as u32).to_le_bytes()).unwrap();
+    for argument in arguments {
+        let bytes = argument.as_bytes();
+        stdout.write_all(&(bytes.len() as u32).to_le_bytes()).unwrap();
+        stdout.write_all(bytes).unwrap();
+    }
+    stdout.flush().unwrap();
+}"#,
+        )
+        .unwrap();
+        let compile = Command::new("rustc")
+            .arg(&capture_source)
+            .arg("-o")
+            .arg(&capture)
+            .output()
+            .unwrap();
+        assert!(
+            compile.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+
+        let batch = directory.path().join("nrm-batch-shim.CmD");
+        let capture_text = capture.to_string_lossy();
+        assert!(!capture_text.contains(['"', '%']));
+        std::fs::write(
+            &batch,
+            format!("@echo off\r\n\"{capture_text}\" %*\r\nexit /b %ERRORLEVEL%\r\n"),
+        )
+        .unwrap();
+
+        let run = |launch: &PowerShellProcessCommand| {
+            let encoded = launch.command.split_whitespace().last().unwrap();
+            let mut wrapper = Command::new("powershell.exe")
+                .args([
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-EncodedCommand",
+                    encoded,
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut stdin = wrapper.stdin.take().unwrap();
+            stdin.write_all(&launch.stdin_prefix).unwrap();
+            stdin.flush().unwrap();
+            drop(stdin);
+            let mut stdout = wrapper.stdout.take().unwrap();
+            let stdout_reader = thread::spawn(move || {
+                let mut bytes = Vec::new();
+                stdout.read_to_end(&mut bytes).map(|_| bytes)
+            });
+            let mut stderr = wrapper.stderr.take().unwrap();
+            let stderr_reader = thread::spawn(move || {
+                let mut bytes = Vec::new();
+                stderr.read_to_end(&mut bytes).map(|_| bytes)
+            });
+
+            let timeout = Duration::from_secs(15);
+            let deadline = Instant::now() + timeout;
+            let status = loop {
+                if let Some(status) = wrapper.try_wait().unwrap() {
+                    break status;
+                }
+                if Instant::now() >= deadline {
+                    let _ = wrapper.kill();
+                    let _ = wrapper.wait();
+                    let stdout = stdout_reader.join().unwrap().unwrap();
+                    let stderr = stderr_reader.join().unwrap().unwrap();
+                    panic!(
+                        "batch PowerShell process did not exit within {timeout:?}; stdout: {}; stderr: {}",
+                        String::from_utf8_lossy(&stdout),
+                        String::from_utf8_lossy(&stderr)
+                    );
+                }
+                thread::sleep(Duration::from_millis(10));
+            };
+            let stdout = stdout_reader.join().unwrap().unwrap();
+            let stderr = stderr_reader.join().unwrap().unwrap();
+            (status, stdout, stderr)
+        };
+
+        let arguments = vec![
+            String::new(),
+            "two words".to_string(),
+            "amp&pipe|less<than>parens()caret^bang!".to_string(),
+            "single'quote".to_string(),
+            r"trailing\".to_string(),
+        ];
+        let launch = powershell_process_command(
+            &batch.to_string_lossy(),
+            &arguments,
+            Some(&directory.path().to_string_lossy()),
+            None,
+        )
+        .unwrap();
+        let (status, stdout, stderr) = run(&launch);
+        assert!(
+            status.success(),
+            "batch trampoline failed with {status}: {}",
+            String::from_utf8_lossy(&stderr)
+        );
+        assert!(
+            stderr.is_empty(),
+            "unexpected batch trampoline stderr: {}",
+            String::from_utf8_lossy(&stderr)
+        );
+        let mut expected = (arguments.len() as u32).to_le_bytes().to_vec();
+        for argument in &arguments {
+            expected.extend_from_slice(&(argument.len() as u32).to_le_bytes());
+            expected.extend_from_slice(argument.as_bytes());
+        }
+        assert_eq!(stdout, expected);
+
+        let bare_launch = powershell_process_command(
+            "nrm-batch-shim",
+            &arguments,
+            Some(&directory.path().to_string_lossy()),
+            Some(&directory.path().to_string_lossy()),
+        )
+        .unwrap();
+        let (bare_status, bare_stdout, bare_stderr) = run(&bare_launch);
+        assert!(
+            bare_status.success(),
+            "bare batch shim failed with {bare_status}: {}",
+            String::from_utf8_lossy(&bare_stderr)
+        );
+        assert!(
+            bare_stderr.is_empty(),
+            "unexpected bare batch shim stderr: {}",
+            String::from_utf8_lossy(&bare_stderr)
+        );
+        assert_eq!(bare_stdout, expected);
+
+        for hostile in [r#"quote" & whoami"#, "%PATH% & whoami"] {
+            let launch = powershell_process_command(
+                &batch.to_string_lossy(),
+                &[hostile.to_string()],
+                Some(&directory.path().to_string_lossy()),
+                None,
+            )
+            .unwrap();
+            let (status, stdout, stderr) = run(&launch);
+            assert!(!status.success(), "hostile batch argument was accepted");
+            assert!(stdout.is_empty(), "rejected batch command unexpectedly ran");
+            assert!(String::from_utf8_lossy(&stderr).contains(
+                "batch application paths and arguments must not contain double quotes or percent signs"
+            ));
+        }
     }
 
     #[test]

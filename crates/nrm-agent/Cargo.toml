@@ -8,11 +8,19 @@ version.workspace = true
 anyhow.workspace = true
 blake3.workspace = true
 clap.workspace = true
+fs4.workspace = true
 ignore.workspace = true
 libc.workspace = true
 nrm-protocol = { path = "../nrm-protocol" }
 serde.workspace = true
 walkdir.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Globalization",
+    "Win32_Storage_FileSystem",
+] }
 
 [dev-dependencies]
 criterion.workspace = true

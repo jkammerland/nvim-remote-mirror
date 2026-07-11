@@ -12,7 +12,7 @@ pub use crate::core::{
 };
 pub use crate::fetch::{
     fetch_verified_artifact, validate_redirect_url, ArtifactSource, CacheState, FetchConfig,
-    FetchError, FetchedArtifact, ManifestSource, NetworkFailureKind,
+    FetchError, FetchErrorCode, FetchedArtifact, ManifestSource, NetworkFailureKind,
 };
 pub use crate::url_policy::{
     artifact_url, signature_url, validate_artifact_filename, validate_https_url,

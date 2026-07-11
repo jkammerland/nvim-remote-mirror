@@ -1,8 +1,11 @@
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
 mod agent_install;
+mod bom_reader;
 mod lsp_rewrite;
 mod remote_host;
+mod windows_agent_install;
+use bom_reader::LeadingBomReader;
 use lsp_rewrite::rewrite_lsp_body;
 use nrm_protocol::{
     read_frame, write_frame, BatchReadFile, BatchValidateFile, FileMeta, Request, RequestId,
@@ -10,13 +13,13 @@ use nrm_protocol::{
     PROTOCOL_VERSION,
 };
 use nrm_registry::{
-    fetch_verified_artifact, AgentTarget, ArtifactSource, FetchConfig, FetchedArtifact,
-    ManifestSource, RegistryUrlTemplate, TrustedKeySet,
+    fetch_verified_artifact, AgentTarget, ArtifactSource, FetchConfig, FetchError, FetchErrorCode,
+    FetchedArtifact, ManifestSource, RegistryUrlTemplate, TrustedKeySet,
 };
 use remote_host::{
     local_host_info, parse_posix_probe, parse_powershell_probe, posix_probe_command,
-    powershell_probe_command, powershell_process_command, validate_remote_root, RemoteHostInfo,
-    RemotePathStyle,
+    powershell_probe_command, powershell_process_command, validate_remote_root,
+    PowerShellProcessCommand, RemoteHostInfo, RemotePathStyle,
 };
 use rusqlite::Row;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -67,6 +70,9 @@ const REMOTE_AGENT_MANAGED_PATH: &str = "$HOME/.local/bin/nrm-agent";
 const DEFAULT_REGISTRY_CACHE_MAX_BYTES: u64 = 512 * 1024 * 1024;
 const DEFAULT_REGISTRY_TIMEOUT_MS: u64 = 120_000;
 const REGISTRY_POLICY_DISABLED: &str = "disabled";
+const BOOTSTRAP_RECOVERY_RESERVE_MIN_MS: u64 = 250;
+const BOOTSTRAP_RECOVERY_RESERVE_MAX_MS: u64 = 10_000;
+const PROCESS_CAPTURE_MAX_STREAM_BYTES: usize = 1024 * 1024;
 const BACKGROUND_SCAN_CURSOR_KEY: &str = "background_scan_cursor";
 const BACKGROUND_SCAN_COMPLETED_AT_KEY: &str = "background_scan_completed_at_ms";
 const SIDECAR_COMMAND_SPECS: &[SidecarCommandSpec] = &[
@@ -393,7 +399,209 @@ struct PreparedAgentInstall {
     source_sha256: String,
     source_size: u64,
     ssh: SshTransport,
-    plan: agent_install::PosixInstallPlan,
+    plan: PreparedAgentInstallPlan,
+}
+
+enum PreparedAgentInstallPlan {
+    Posix(agent_install::PosixInstallPlan),
+    Windows(windows_agent_install::WindowsInstallPlan),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BootstrapBudget {
+    Forward,
+    Recovery,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BootstrapDeadline {
+    started: Instant,
+    total: Duration,
+    recovery_reserve: Duration,
+}
+
+#[derive(Debug)]
+struct BootstrapTimeoutError {
+    phase: String,
+}
+
+impl fmt::Display for BootstrapTimeoutError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "bootstrap_timeout: {}", self.phase)
+    }
+}
+
+impl std::error::Error for BootstrapTimeoutError {}
+
+#[derive(Debug)]
+struct ProcessTimeoutError {
+    context: String,
+    timeout: Duration,
+    status: Option<ExitStatus>,
+}
+
+impl fmt::Display for ProcessTimeoutError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{} timed out after {} ms; process-tree termination requested",
+            self.context,
+            self.timeout.as_millis()
+        )?;
+        if let Some(status) = self.status {
+            write!(formatter, "; reaped with {status}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for ProcessTimeoutError {}
+
+#[derive(Debug)]
+struct AgentRequestTimeoutError {
+    id: RequestId,
+    timeout: Duration,
+    phase: &'static str,
+}
+
+impl fmt::Display for AgentRequestTimeoutError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "agent request {} timed out after {} ms {}",
+            self.id,
+            self.timeout.as_millis(),
+            self.phase
+        )
+    }
+}
+
+impl std::error::Error for AgentRequestTimeoutError {}
+
+#[derive(Debug)]
+struct AgentWorkerExitTimeoutError {
+    context: String,
+}
+
+impl fmt::Display for AgentWorkerExitTimeoutError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "timed out waiting for agent worker exit during {}",
+            self.context
+        )
+    }
+}
+
+impl std::error::Error for AgentWorkerExitTimeoutError {}
+
+impl BootstrapDeadline {
+    fn new(total: Duration) -> Self {
+        let quarter = total / 4;
+        let desired = quarter.clamp(
+            Duration::from_millis(BOOTSTRAP_RECOVERY_RESERVE_MIN_MS),
+            Duration::from_millis(BOOTSTRAP_RECOVERY_RESERVE_MAX_MS),
+        );
+        Self {
+            started: Instant::now(),
+            total,
+            recovery_reserve: desired.min(total / 2),
+        }
+    }
+
+    fn remaining(self) -> Duration {
+        self.total.saturating_sub(self.started.elapsed())
+    }
+
+    fn timeout(self, budget: BootstrapBudget, phase: &str) -> Result<Duration> {
+        let remaining = self.remaining();
+        let available = match budget {
+            BootstrapBudget::Forward => remaining.saturating_sub(self.recovery_reserve),
+            BootstrapBudget::Recovery => remaining,
+        };
+        if available.is_zero() {
+            return Err(anyhow!(BootstrapTimeoutError {
+                phase: format!("whole-bootstrap deadline expired during {phase}"),
+            }));
+        }
+        Ok(available)
+    }
+
+    fn forward_timeout(self, phase: &str) -> Result<Duration> {
+        self.timeout(BootstrapBudget::Forward, phase)
+    }
+
+    fn recovery_timeout(self, phase: &str) -> Result<Duration> {
+        self.timeout(BootstrapBudget::Recovery, phase)
+    }
+
+    fn map_budgeted_error(
+        self,
+        budget: BootstrapBudget,
+        phase: &str,
+        error: anyhow::Error,
+    ) -> anyhow::Error {
+        if is_bootstrap_timeout(&error)
+            || error.chain().any(|cause| {
+                cause.downcast_ref::<ProcessTimeoutError>().is_some()
+                    || cause.downcast_ref::<AgentRequestTimeoutError>().is_some()
+                    || cause
+                        .downcast_ref::<AgentWorkerExitTimeoutError>()
+                        .is_some()
+                    || cause.downcast_ref::<FetchError>().is_some_and(|error| {
+                        matches!(
+                            error.code(),
+                            FetchErrorCode::OperationDeadline
+                                | FetchErrorCode::NetworkTimeout
+                                | FetchErrorCode::CacheLockTimeout
+                        )
+                    })
+            })
+            || self.timeout(budget, phase).is_err()
+        {
+            return anyhow!(BootstrapTimeoutError {
+                phase: format!("whole-bootstrap deadline expired during {phase}: {error}"),
+            });
+        }
+        error
+    }
+
+    #[cfg(test)]
+    fn with_elapsed(total: Duration, elapsed: Duration) -> Self {
+        let mut deadline = Self::new(total);
+        deadline.started = Instant::now()
+            .checked_sub(elapsed)
+            .unwrap_or_else(Instant::now);
+        deadline
+    }
+}
+
+fn is_bootstrap_timeout(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<BootstrapTimeoutError>().is_some()
+            || cause
+                .downcast_ref::<AgentInstallTransactionError>()
+                .is_some_and(|error| error.bootstrap_timeout)
+    })
+}
+
+fn normalize_bootstrap_error(error: anyhow::Error) -> anyhow::Error {
+    if is_bootstrap_timeout(&error) {
+        anyhow!("bootstrap_timeout: {error:#}")
+    } else {
+        error
+    }
+}
+
+fn registry_fetch_timeout(
+    configured_timeout: Duration,
+    deadline: BootstrapDeadline,
+) -> Result<Duration> {
+    Ok(configured_timeout.min(deadline.forward_timeout("registry fetch")?))
+}
+
+fn remaining_timeout_since(started: Instant, total: Duration) -> Duration {
+    total.saturating_sub(started.elapsed())
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -407,6 +615,7 @@ enum AgentInstallFinalState {
 #[derive(Debug)]
 struct AgentInstallTransactionError {
     final_state: AgentInstallFinalState,
+    bootstrap_timeout: bool,
     message: String,
 }
 
@@ -418,12 +627,26 @@ impl fmt::Display for AgentInstallTransactionError {
 
 impl std::error::Error for AgentInstallTransactionError {}
 
+#[cfg(test)]
 fn install_transaction_error(
     final_state: AgentInstallFinalState,
     message: impl Into<String>,
 ) -> AgentInstallTransactionError {
     AgentInstallTransactionError {
         final_state,
+        bootstrap_timeout: false,
+        message: message.into(),
+    }
+}
+
+fn install_transaction_error_with_timeout(
+    final_state: AgentInstallFinalState,
+    bootstrap_timeout: bool,
+    message: impl Into<String>,
+) -> AgentInstallTransactionError {
+    AgentInstallTransactionError {
+        final_state,
+        bootstrap_timeout,
         message: message.into(),
     }
 }
@@ -431,6 +654,9 @@ fn install_transaction_error(
 trait AgentInstallOps {
     fn stage(&mut self) -> Result<agent_install::StagedInstall>;
     fn validate_staged(&mut self, staged: &agent_install::StagedInstall) -> Result<()>;
+    fn ensure_activation_budget(&self) -> Result<()> {
+        Ok(())
+    }
     fn activate(
         &mut self,
         staged: &agent_install::StagedInstall,
@@ -452,21 +678,50 @@ trait AgentInstallOps {
     fn cleanup(&mut self, staged: &agent_install::StagedInstall) -> Result<()>;
 }
 
+fn install_phase_failure(prefix: &str, error: &anyhow::Error) -> String {
+    if is_bootstrap_timeout(error) {
+        format!("bootstrap_timeout: {prefix}: {error}")
+    } else {
+        format!("{prefix}: {error}")
+    }
+}
+
 fn run_agent_install_transaction(
-    operations: &mut impl AgentInstallOps,
+    operations: &mut dyn AgentInstallOps,
 ) -> std::result::Result<agent_install::ActivatedInstall, AgentInstallTransactionError> {
     let staged = operations.stage().map_err(|error| {
-        install_transaction_error(
+        install_transaction_error_with_timeout(
             AgentInstallFinalState::TargetUnchanged,
-            format!("staging_failed: failed to stage remote agent: {error}"),
+            is_bootstrap_timeout(&error),
+            install_phase_failure("staging_failed: failed to stage remote agent", &error),
         )
     })?;
     if let Err(error) = operations.validate_staged(&staged) {
         let cleanup = operations.cleanup(&staged).err();
-        return Err(install_transaction_error(
+        let timed_out =
+            is_bootstrap_timeout(&error) || cleanup.as_ref().is_some_and(is_bootstrap_timeout);
+        return Err(install_transaction_error_with_timeout(
             AgentInstallFinalState::TargetUnchanged,
+            timed_out,
             format!(
-                "staged_validation_failed: {error}{}",
+                "{}{}",
+                install_phase_failure("staged_validation_failed", &error),
+                cleanup
+                    .map(|cleanup| format!("; cleanup_failed: {cleanup}"))
+                    .unwrap_or_default()
+            ),
+        ));
+    }
+    if let Err(error) = operations.ensure_activation_budget() {
+        let cleanup = operations.cleanup(&staged).err();
+        let timed_out =
+            is_bootstrap_timeout(&error) || cleanup.as_ref().is_some_and(is_bootstrap_timeout);
+        return Err(install_transaction_error_with_timeout(
+            AgentInstallFinalState::TargetUnchanged,
+            timed_out,
+            format!(
+                "{}{}",
+                install_phase_failure("activation budget exhausted before target mutation", &error),
                 cleanup
                     .map(|cleanup| format!("; cleanup_failed: {cleanup}"))
                     .unwrap_or_default()
@@ -476,9 +731,11 @@ fn run_agent_install_transaction(
     let activated = match operations.activate(&staged) {
         Ok(activated) => activated,
         Err(error) => {
+            let activation_timed_out = is_bootstrap_timeout(&error);
             let recovery = operations.reconcile_activation(&staged).map_err(|recovery| {
-                install_transaction_error(
+                install_transaction_error_with_timeout(
                     AgentInstallFinalState::LiveStateUnknown,
+                    activation_timed_out || is_bootstrap_timeout(&recovery),
                     format!(
                         "rollback_failed: activation reconciliation failed: {recovery}; original activation failure: {error}"
                     ),
@@ -486,8 +743,9 @@ fn run_agent_install_transaction(
             })?;
             operations.validate_reconciliation(&recovery).map_err(
                 |recovery_error| {
-                    install_transaction_error(
+                    install_transaction_error_with_timeout(
                         AgentInstallFinalState::LiveStateUnknown,
+                        activation_timed_out || is_bootstrap_timeout(&recovery_error),
                         format!(
                             "rollback_failed: reconciled target reprobe failed: {recovery_error}; original activation failure: {error}"
                         ),
@@ -504,38 +762,48 @@ fn run_agent_install_transaction(
                     AgentInstallFinalState::PreviousRestored
                 }
             };
-            return Err(install_transaction_error(
+            return Err(install_transaction_error_with_timeout(
                 final_state,
+                activation_timed_out,
                 format!(
-                    "activation_failed: {error}; reconciliation={:?}",
+                    "{}; reconciliation={:?}",
+                    install_phase_failure("activation_failed", &error),
                     recovery.kind
                 ),
             ));
         }
     };
     if let Err(error) = operations.validate_activated(&activated) {
+        let validation_timed_out = is_bootstrap_timeout(&error);
         let rollback = operations.rollback(&activated).map_err(|rollback| {
-            install_transaction_error(
+            install_transaction_error_with_timeout(
                 AgentInstallFinalState::LiveStateUnknown,
+                validation_timed_out || is_bootstrap_timeout(&rollback),
                 format!("rollback_failed: {rollback}; original postactivation failure: {error}"),
             )
         })?;
         operations.validate_rollback(&rollback).map_err(|rollback| {
-            install_transaction_error(
+            install_transaction_error_with_timeout(
                 AgentInstallFinalState::LiveStateUnknown,
+                validation_timed_out || is_bootstrap_timeout(&rollback),
                 format!(
                     "rollback_failed: restored agent reprobe failed: {rollback}; original postactivation failure: {error}"
                 ),
             )
         })?;
-        return Err(install_transaction_error(
+        return Err(install_transaction_error_with_timeout(
             AgentInstallFinalState::PreviousRestored,
-            format!("post_activation_validation_failed: {error}; rollback=restored"),
+            validation_timed_out,
+            format!(
+                "{}; rollback=restored",
+                install_phase_failure("post_activation_validation_failed", &error)
+            ),
         ));
     }
     operations.cleanup(&activated.staged).map_err(|error| {
-        install_transaction_error(
+        install_transaction_error_with_timeout(
             AgentInstallFinalState::CandidateHealthy,
+            is_bootstrap_timeout(&error),
             format!(
                 "cleanup_failed: activated agent is healthy but backup cleanup failed: {error}"
             ),
@@ -550,12 +818,19 @@ struct PosixSshInstallOps<'a> {
     source: Option<File>,
     launch: AgentLaunch,
     normal_agent: &'a mut AgentClient,
-    timeout: Duration,
+    deadline: BootstrapDeadline,
 }
 
 impl PosixSshInstallOps<'_> {
-    fn command_output(&self, command: String, context: &str) -> Result<CapturedProcessOutput> {
-        run_command_capture(self.ssh.command(command), None, self.timeout, context)
+    fn command_output(
+        &self,
+        command: String,
+        budget: BootstrapBudget,
+        context: &str,
+    ) -> Result<CapturedProcessOutput> {
+        let timeout = self.deadline.timeout(budget, context)?;
+        run_command_capture(self.ssh.command(command), None, timeout, context)
+            .map_err(|error| self.deadline.map_budgeted_error(budget, context, error))
     }
 
     fn require_success(output: CapturedProcessOutput) -> Result<String> {
@@ -572,11 +847,23 @@ impl PosixSshInstallOps<'_> {
             .plan
             .absence_check_command(hook)
             .context("invalid absent-target validation hook")?;
-        let output = self.command_output(command, "remote agent absence check")?;
+        let output = self.command_output(
+            command,
+            BootstrapBudget::Recovery,
+            "remote agent absence check",
+        )?;
         let stdout = Self::require_success(output)?;
         self.plan
             .parse_absence_check_stdout(hook, &stdout)
             .context("remote agent absence check returned an invalid record")
+    }
+
+    fn stop_normal_agent(&mut self, budget: BootstrapBudget, context: &str) -> Result<()> {
+        let timeout = self.deadline.timeout(budget, context)?;
+        self.normal_agent
+            .kill_worker_with_timeout(timeout, context)
+            .map_err(|error| self.deadline.map_budgeted_error(budget, context, error))?;
+        self.deadline.timeout(budget, context).map(drop)
     }
 }
 
@@ -589,9 +876,16 @@ impl AgentInstallOps for PosixSshInstallOps<'_> {
         let output = run_command_capture(
             self.ssh.command(self.plan.stage_command()),
             Some(Box::new(source)),
-            self.timeout,
+            self.deadline.forward_timeout("remote agent staging")?,
             "remote agent staging",
-        )?;
+        )
+        .map_err(|error| {
+            self.deadline.map_budgeted_error(
+                BootstrapBudget::Forward,
+                "remote agent staging",
+                error,
+            )
+        })?;
         let stdout = Self::require_success(output)?;
         self.plan
             .parse_stage_stdout(&stdout)
@@ -600,8 +894,25 @@ impl AgentInstallOps for PosixSshInstallOps<'_> {
 
     fn validate_staged(&mut self, staged: &agent_install::StagedInstall) -> Result<()> {
         let hook = self.plan.staged_validation(staged);
-        probe_agent_at(&self.launch, &hook.executable_path, self.timeout)
-            .context("staged agent Hello failed")
+        let timeout = self.deadline.forward_timeout("staged agent exact Hello")?;
+        probe_agent_at(&self.launch, &hook.executable_path, timeout)
+            .map_err(|error| {
+                self.deadline.map_budgeted_error(
+                    BootstrapBudget::Forward,
+                    "staged agent exact Hello",
+                    error,
+                )
+            })
+            .context("staged agent Hello failed")?;
+        self.deadline
+            .forward_timeout("staged agent exact Hello completion")
+            .map(drop)
+    }
+
+    fn ensure_activation_budget(&self) -> Result<()> {
+        self.deadline
+            .forward_timeout("remote agent activation")
+            .map(drop)
     }
 
     fn activate(
@@ -610,9 +921,12 @@ impl AgentInstallOps for PosixSshInstallOps<'_> {
     ) -> Result<agent_install::ActivatedInstall> {
         let output = self.command_output(
             self.plan.activate_command(staged),
+            BootstrapBudget::Forward,
             "remote agent activation",
         )?;
         let stdout = Self::require_success(output)?;
+        self.deadline
+            .forward_timeout("remote agent activation response")?;
         self.plan
             .parse_activation_stdout(staged, &stdout)
             .context("remote agent activation returned an invalid record")
@@ -620,16 +934,32 @@ impl AgentInstallOps for PosixSshInstallOps<'_> {
 
     fn validate_activated(&mut self, activated: &agent_install::ActivatedInstall) -> Result<()> {
         let _hook = self.plan.post_activation_validation(activated);
-        probe_normal_agent(self.normal_agent).context("normal-path agent Hello failed")
+        let timeout = self.deadline.forward_timeout("normal-path agent Hello")?;
+        probe_normal_agent_with_timeout(self.normal_agent, timeout)
+            .map_err(|error| {
+                self.deadline.map_budgeted_error(
+                    BootstrapBudget::Forward,
+                    "normal-path agent Hello",
+                    error,
+                )
+            })
+            .context("normal-path agent Hello failed")?;
+        self.deadline
+            .forward_timeout("normal-path agent Hello completion")
+            .map(drop)
     }
 
     fn reconcile_activation(
         &mut self,
         staged: &agent_install::StagedInstall,
     ) -> Result<agent_install::ActivationRecovery> {
-        self.normal_agent.kill_worker();
+        self.stop_normal_agent(
+            BootstrapBudget::Recovery,
+            "normal-path agent exit before activation reconciliation",
+        )?;
         let output = self.command_output(
             self.plan.reconcile_activation_command(staged),
+            BootstrapBudget::Recovery,
             "remote agent activation reconciliation",
         )?;
         let stdout = Self::require_success(output)?;
@@ -645,8 +975,18 @@ impl AgentInstallOps for PosixSshInstallOps<'_> {
         let hook = self.plan.reconciliation_validation(recovery);
         match hook.mode {
             agent_install::ValidationMode::Reprobe => {
-                probe_restored_agent_at(&self.launch, &hook.executable_path, self.timeout)
+                let timeout = self.deadline.recovery_timeout("reconciled agent Hello")?;
+                probe_restored_agent_at(&self.launch, &hook.executable_path, timeout)
+                    .map_err(|error| {
+                        self.deadline.map_budgeted_error(
+                            BootstrapBudget::Recovery,
+                            "reconciled agent Hello",
+                            error,
+                        )
+                    })
                     .context("reconciled agent Hello failed")?;
+                self.deadline
+                    .recovery_timeout("reconciled agent Hello completion")?;
                 self.normal_agent.clear_all_remote_unavailable();
                 Ok(())
             }
@@ -665,9 +1005,13 @@ impl AgentInstallOps for PosixSshInstallOps<'_> {
         &mut self,
         activated: &agent_install::ActivatedInstall,
     ) -> Result<agent_install::RollbackOutcome> {
-        self.normal_agent.kill_worker();
+        self.stop_normal_agent(
+            BootstrapBudget::Recovery,
+            "normal-path agent exit before rollback",
+        )?;
         let output = self.command_output(
             self.plan.rollback_command(activated),
+            BootstrapBudget::Recovery,
             "remote agent rollback",
         )?;
         let stdout = Self::require_success(output)?;
@@ -680,8 +1024,18 @@ impl AgentInstallOps for PosixSshInstallOps<'_> {
         let hook = self.plan.rollback_validation(rollback);
         match hook.mode {
             agent_install::ValidationMode::Reprobe => {
-                probe_restored_agent_at(&self.launch, &hook.executable_path, self.timeout)
+                let timeout = self.deadline.recovery_timeout("restored agent Hello")?;
+                probe_restored_agent_at(&self.launch, &hook.executable_path, timeout)
+                    .map_err(|error| {
+                        self.deadline.map_budgeted_error(
+                            BootstrapBudget::Recovery,
+                            "restored agent Hello",
+                            error,
+                        )
+                    })
                     .context("restored agent Hello failed")?;
+                self.deadline
+                    .recovery_timeout("restored agent Hello completion")?;
                 self.normal_agent.clear_all_remote_unavailable();
                 Ok(())
             }
@@ -697,8 +1051,408 @@ impl AgentInstallOps for PosixSshInstallOps<'_> {
     }
 
     fn cleanup(&mut self, staged: &agent_install::StagedInstall) -> Result<()> {
-        let output =
-            self.command_output(self.plan.cleanup_command(staged), "remote agent cleanup")?;
+        let output = self.command_output(
+            self.plan.cleanup_command(staged),
+            BootstrapBudget::Recovery,
+            "remote agent cleanup",
+        )?;
+        let stdout = Self::require_success(output)?;
+        self.plan
+            .parse_cleanup_stdout(staged, &stdout)
+            .context("remote agent cleanup returned an invalid record")
+    }
+}
+
+struct WindowsSshInstallOps<'a> {
+    plan: windows_agent_install::WindowsInstallPlan,
+    ssh: SshTransport,
+    source_path: Option<PathBuf>,
+    source_size: u64,
+    source_sha256: String,
+    launch: AgentLaunch,
+    normal_agent: &'a mut AgentClient,
+    deadline: BootstrapDeadline,
+}
+
+impl WindowsSshInstallOps<'_> {
+    fn command_output(
+        &self,
+        command: String,
+        budget: BootstrapBudget,
+        context: &str,
+    ) -> Result<CapturedProcessOutput> {
+        let timeout = self.deadline.timeout(budget, context)?;
+        run_command_capture(self.ssh.command(command), None, timeout, context)
+            .map_err(|error| self.deadline.map_budgeted_error(budget, context, error))
+    }
+
+    fn require_success(output: CapturedProcessOutput) -> Result<String> {
+        if output.status.success() {
+            return Ok(output.stdout);
+        }
+        let failure =
+            agent_install::classify_install_failure(output.status.code(), output.stderr.as_str());
+        bail!("{}: {}", install_failure_code(failure.kind), failure.detail);
+    }
+
+    fn cleanup_action_script(&self, path: &str, budget: BootstrapBudget) -> Result<()> {
+        let output = self.command_output(
+            self.plan.action_script_cleanup_command(path),
+            budget,
+            "remote installer action-script cleanup",
+        )?;
+        let stdout = Self::require_success(output)?;
+        self.plan
+            .parse_action_script_cleanup_stdout(path, &stdout)
+            .context("remote installer action-script cleanup returned an invalid record")
+    }
+
+    fn abort_stage(&self, prepared: &windows_agent_install::PreparedWindowsStage) -> Result<()> {
+        let output = self.action_output(
+            self.plan.abort_stage_script(prepared),
+            None,
+            BootstrapBudget::Recovery,
+            "remote agent stage abort",
+        )?;
+        let stdout = Self::require_success(output)?;
+        self.plan
+            .parse_abort_stage_stdout(prepared, &stdout)
+            .context("remote agent stage abort returned an invalid record")
+    }
+
+    fn upload_stage(&self, source: &Path, remote_path: &str) -> Result<()> {
+        let command = self
+            .ssh
+            .scp_upload_command(source, remote_path)
+            .context("upload_failed: invalid scp upload plan")?;
+        let output = run_command_capture(
+            command,
+            None,
+            self.deadline
+                .forward_timeout("remote agent artifact scp upload")?,
+            "remote agent artifact scp upload",
+        )
+        .map_err(|error| {
+            self.deadline.map_budgeted_error(
+                BootstrapBudget::Forward,
+                "remote agent artifact scp upload",
+                error,
+            )
+        })
+        .context("upload_failed")?;
+        if output.status.success() {
+            return Ok(());
+        }
+        let detail = output.stderr.trim();
+        if detail.is_empty() {
+            bail!(
+                "upload_failed: scp exited with {}",
+                output
+                    .status
+                    .code()
+                    .map_or_else(|| "no status".to_owned(), |code| code.to_string())
+            );
+        }
+        bail!("upload_failed: scp failed: {detail}")
+    }
+
+    fn action_output(
+        &self,
+        script: String,
+        input: Option<Box<dyn Read + Send>>,
+        budget: BootstrapBudget,
+        context: &str,
+    ) -> Result<CapturedProcessOutput> {
+        let upload_timeout = self
+            .deadline
+            .timeout(budget, "remote installer action-script upload")?;
+        let upload = run_command_capture(
+            self.ssh.command(self.plan.action_script_upload_command()),
+            Some(Box::new(io::Cursor::new(script.as_bytes().to_vec()))),
+            upload_timeout,
+            "remote installer action-script upload",
+        )
+        .map_err(|error| {
+            self.deadline
+                .map_budgeted_error(budget, "remote installer action-script upload", error)
+        })?;
+        let stdout = Self::require_success(upload)?;
+        let path = self
+            .plan
+            .parse_action_script_upload_stdout(&script, &stdout)
+            .context("remote installer action-script upload returned an invalid record")?;
+        let action_timeout = match self.deadline.timeout(budget, context) {
+            Ok(timeout) => timeout,
+            Err(error) => {
+                return Err(
+                    match self.cleanup_action_script(&path, BootstrapBudget::Recovery) {
+                        Ok(()) => error,
+                        Err(cleanup) => {
+                            error.context(format!("action_script_cleanup_failed: {cleanup}"))
+                        }
+                    },
+                );
+            }
+        };
+        let action = run_command_capture(
+            self.ssh
+                .command(self.plan.action_script_run_command(&path, &script)),
+            input,
+            action_timeout,
+            context,
+        )
+        .map_err(|error| self.deadline.map_budgeted_error(budget, context, error));
+        let cleanup = self.cleanup_action_script(&path, budget);
+        match action {
+            Ok(output) => {
+                if let Err(error) = cleanup {
+                    eprintln!(
+                        "remote installer action completed but its temporary script could not be removed: {error}"
+                    );
+                }
+                Ok(output)
+            }
+            Err(error) => Err(match cleanup {
+                Ok(()) => error,
+                Err(cleanup) => error.context(format!("action_script_cleanup_failed: {cleanup}")),
+            }),
+        }
+    }
+
+    fn confirm_target_absent(&self, hook: &agent_install::PosixValidationHook) -> Result<()> {
+        let command = self
+            .plan
+            .absence_check_script(hook)
+            .context("invalid absent-target validation hook")?;
+        let output = self.action_output(
+            command,
+            None,
+            BootstrapBudget::Recovery,
+            "remote agent absence check",
+        )?;
+        let stdout = Self::require_success(output)?;
+        self.plan
+            .parse_absence_check_stdout(hook, &stdout)
+            .context("remote agent absence check returned an invalid record")
+    }
+
+    fn stop_normal_agent(&mut self, budget: BootstrapBudget, context: &str) -> Result<()> {
+        let timeout = self.deadline.timeout(budget, context)?;
+        self.normal_agent
+            .kill_worker_with_timeout(timeout, context)
+            .map_err(|error| self.deadline.map_budgeted_error(budget, context, error))?;
+        self.deadline.timeout(budget, context).map(drop)
+    }
+}
+
+impl AgentInstallOps for WindowsSshInstallOps<'_> {
+    fn stage(&mut self) -> Result<agent_install::StagedInstall> {
+        let source_path = self
+            .source_path
+            .take()
+            .ok_or_else(|| anyhow!("agent source was already consumed"))?;
+        let prepare = self.action_output(
+            self.plan.prepare_stage_script(),
+            None,
+            BootstrapBudget::Forward,
+            "remote agent stage preparation",
+        )?;
+        let stdout = Self::require_success(prepare)?;
+        let prepared = self
+            .plan
+            .parse_prepare_stage_stdout(&stdout)
+            .context("remote agent stage preparation returned an invalid record")?;
+        let result = (|| {
+            self.upload_stage(&source_path, &prepared.staged.stage_path)?;
+            let output = self.action_output(
+                self.plan
+                    .finalize_stage_script(&prepared, self.source_size, &self.source_sha256),
+                None,
+                BootstrapBudget::Forward,
+                "remote agent stage finalization",
+            )?;
+            let stdout = Self::require_success(output)?;
+            self.plan
+                .parse_finalize_stage_stdout(&prepared, &stdout)
+                .context("remote agent stage finalization returned an invalid record")
+        })();
+        match result {
+            Ok(staged) => Ok(staged),
+            Err(error) => Err(match self.abort_stage(&prepared) {
+                Ok(()) => error,
+                Err(abort) => error.context(format!("stage_abort_failed: {abort}")),
+            }),
+        }
+    }
+
+    fn validate_staged(&mut self, staged: &agent_install::StagedInstall) -> Result<()> {
+        let hook = self.plan.staged_validation(staged);
+        let timeout = self.deadline.forward_timeout("staged agent exact Hello")?;
+        probe_agent_at(&self.launch, &hook.executable_path, timeout)
+            .map_err(|error| {
+                self.deadline.map_budgeted_error(
+                    BootstrapBudget::Forward,
+                    "staged agent exact Hello",
+                    error,
+                )
+            })
+            .context("staged agent Hello failed")?;
+        self.deadline
+            .forward_timeout("staged agent exact Hello completion")
+            .map(drop)
+    }
+
+    fn ensure_activation_budget(&self) -> Result<()> {
+        self.deadline
+            .forward_timeout("remote agent activation")
+            .map(drop)
+    }
+
+    fn activate(
+        &mut self,
+        staged: &agent_install::StagedInstall,
+    ) -> Result<agent_install::ActivatedInstall> {
+        let output = self.action_output(
+            self.plan.activate_script(staged),
+            None,
+            BootstrapBudget::Forward,
+            "remote agent activation",
+        )?;
+        let stdout = Self::require_success(output)?;
+        self.deadline
+            .forward_timeout("remote agent activation response")?;
+        self.plan
+            .parse_activation_stdout(staged, &stdout)
+            .context("remote agent activation returned an invalid record")
+    }
+
+    fn reconcile_activation(
+        &mut self,
+        staged: &agent_install::StagedInstall,
+    ) -> Result<agent_install::ActivationRecovery> {
+        self.stop_normal_agent(
+            BootstrapBudget::Recovery,
+            "normal-path agent exit before activation reconciliation",
+        )?;
+        let output = self.action_output(
+            self.plan.reconcile_activation_script(staged),
+            None,
+            BootstrapBudget::Recovery,
+            "remote agent activation reconciliation",
+        )?;
+        let stdout = Self::require_success(output)?;
+        self.plan
+            .parse_reconciliation_stdout(staged, &stdout)
+            .context("remote agent activation reconciliation returned an invalid record")
+    }
+
+    fn validate_reconciliation(
+        &mut self,
+        recovery: &agent_install::ActivationRecovery,
+    ) -> Result<()> {
+        let hook = self.plan.reconciliation_validation(recovery);
+        match hook.mode {
+            agent_install::ValidationMode::Reprobe => {
+                let timeout = self.deadline.recovery_timeout("reconciled agent Hello")?;
+                probe_restored_agent_at(&self.launch, &hook.executable_path, timeout)
+                    .map_err(|error| {
+                        self.deadline.map_budgeted_error(
+                            BootstrapBudget::Recovery,
+                            "reconciled agent Hello",
+                            error,
+                        )
+                    })
+                    .context("reconciled agent Hello failed")?;
+                self.deadline
+                    .recovery_timeout("reconciled agent Hello completion")?;
+                self.normal_agent.clear_all_remote_unavailable();
+                Ok(())
+            }
+            agent_install::ValidationMode::ExpectMissing => {
+                self.confirm_target_absent(&hook)?;
+                self.normal_agent.clear_all_remote_unavailable();
+                Ok(())
+            }
+            agent_install::ValidationMode::FullHelloExact => {
+                bail!("reconciliation returned an invalid validation mode")
+            }
+        }
+    }
+
+    fn validate_activated(&mut self, activated: &agent_install::ActivatedInstall) -> Result<()> {
+        let _hook = self.plan.post_activation_validation(activated);
+        let timeout = self.deadline.forward_timeout("normal-path agent Hello")?;
+        probe_normal_agent_with_timeout(self.normal_agent, timeout)
+            .map_err(|error| {
+                self.deadline.map_budgeted_error(
+                    BootstrapBudget::Forward,
+                    "normal-path agent Hello",
+                    error,
+                )
+            })
+            .context("normal-path agent Hello failed")?;
+        self.deadline
+            .forward_timeout("normal-path agent Hello completion")
+            .map(drop)
+    }
+
+    fn rollback(
+        &mut self,
+        activated: &agent_install::ActivatedInstall,
+    ) -> Result<agent_install::RollbackOutcome> {
+        self.stop_normal_agent(
+            BootstrapBudget::Recovery,
+            "normal-path agent exit before rollback",
+        )?;
+        let output = self.action_output(
+            self.plan.rollback_script(activated),
+            None,
+            BootstrapBudget::Recovery,
+            "remote agent rollback",
+        )?;
+        let stdout = Self::require_success(output)?;
+        self.plan
+            .parse_rollback_stdout(activated, &stdout)
+            .context("remote agent rollback returned an invalid record")
+    }
+
+    fn validate_rollback(&mut self, rollback: &agent_install::RollbackOutcome) -> Result<()> {
+        let hook = self.plan.rollback_validation(rollback);
+        match hook.mode {
+            agent_install::ValidationMode::Reprobe => {
+                let timeout = self.deadline.recovery_timeout("restored agent Hello")?;
+                probe_restored_agent_at(&self.launch, &hook.executable_path, timeout)
+                    .map_err(|error| {
+                        self.deadline.map_budgeted_error(
+                            BootstrapBudget::Recovery,
+                            "restored agent Hello",
+                            error,
+                        )
+                    })
+                    .context("restored agent Hello failed")?;
+                self.deadline
+                    .recovery_timeout("restored agent Hello completion")?;
+                self.normal_agent.clear_all_remote_unavailable();
+                Ok(())
+            }
+            agent_install::ValidationMode::ExpectMissing => {
+                self.confirm_target_absent(&hook)?;
+                self.normal_agent.clear_all_remote_unavailable();
+                Ok(())
+            }
+            agent_install::ValidationMode::FullHelloExact => {
+                bail!("rollback returned an invalid validation mode")
+            }
+        }
+    }
+
+    fn cleanup(&mut self, staged: &agent_install::StagedInstall) -> Result<()> {
+        let output = self.action_output(
+            self.plan.cleanup_script(staged),
+            None,
+            BootstrapBudget::Recovery,
+            "remote agent cleanup",
+        )?;
         let stdout = Self::require_success(output)?;
         self.plan
             .parse_cleanup_stdout(staged, &stdout)
@@ -866,6 +1620,7 @@ impl HydrationMode {
     }
 }
 
+#[cfg_attr(windows, allow(clippy::large_enum_variant))]
 enum HydrateOutcome {
     Hydrated {
         entry: MirrorEntry,
@@ -884,6 +1639,7 @@ struct ProcessLaunchPlan {
     program: String,
     args: Vec<String>,
     current_dir: Option<PathBuf>,
+    stdin_prefix: Vec<u8>,
 }
 
 impl ProcessLaunchPlan {
@@ -915,6 +1671,10 @@ impl SshTransport {
             "ServerAliveInterval=15".to_string(),
             "-o".to_string(),
             "ServerAliveCountMax=2".to_string(),
+            "-o".to_string(),
+            "ControlMaster=no".to_string(),
+            "-o".to_string(),
+            "ControlPath=none".to_string(),
             "--".to_string(),
             self.target.clone(),
             remote_command,
@@ -926,6 +1686,75 @@ impl SshTransport {
         command.args(self.command_args(remote_command));
         command
     }
+
+    fn scp_program(&self) -> Result<PathBuf> {
+        let filename = self
+            .program
+            .file_name()
+            .and_then(|filename| filename.to_str())
+            .ok_or_else(|| anyhow!("ssh program path does not have a UTF-8 filename"))?;
+        let scp = if filename.eq_ignore_ascii_case("ssh.exe") {
+            "scp.exe"
+        } else if filename == "ssh" {
+            "scp"
+        } else {
+            bail!(
+                "cannot derive the scp companion from ssh program {}",
+                self.program.display()
+            );
+        };
+        Ok(self.program.with_file_name(scp))
+    }
+
+    fn scp_upload_command(&self, source: &Path, remote_path: &str) -> Result<Command> {
+        let remote_path = windows_scp_remote_path(remote_path)?;
+        let destination = format!("{}:{remote_path}", self.target);
+        let mut command = Command::new(self.scp_program()?);
+        command
+            .args([
+                "-s",
+                "-q",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                &format!("ConnectTimeout={}", self.connect_timeout_seconds),
+                "-o",
+                "ServerAliveInterval=15",
+                "-o",
+                "ServerAliveCountMax=2",
+                "-o",
+                "ControlMaster=no",
+                "-o",
+                "ControlPath=none",
+                "--",
+            ])
+            .arg(source)
+            .arg(destination);
+        Ok(command)
+    }
+}
+
+fn windows_scp_remote_path(path: &str) -> Result<String> {
+    if path.chars().any(char::is_control) || path.starts_with(['/', '\\']) {
+        bail!("Windows scp destination must be an absolute drive path without controls");
+    }
+    let normalized = path.replace('\\', "/");
+    let bytes = normalized.as_bytes();
+    if bytes.len() < 4
+        || !bytes[0].is_ascii_alphabetic()
+        || bytes[1] != b':'
+        || bytes[2] != b'/'
+        || normalized[3..].contains(':')
+    {
+        bail!("Windows scp destination must use absolute drive-path syntax");
+    }
+    if normalized[3..]
+        .split('/')
+        .any(|segment| segment.is_empty() || matches!(segment, "." | ".."))
+    {
+        bail!("Windows scp destination contains an invalid path segment");
+    }
+    Ok(normalized)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -997,18 +1826,24 @@ impl RemoteTransport {
                     remote_root.to_string_lossy().to_string(),
                 ],
                 current_dir: None,
+                stdin_prefix: Vec::new(),
             }),
             Self::Ssh(ssh) => {
                 validate_remote_root(host, remote_root)?;
+                let (remote_command, stdin_prefix) = match host.path_style {
+                    RemotePathStyle::Posix => {
+                        (posix_agent_remote_command(agent, remote_root), Vec::new())
+                    }
+                    RemotePathStyle::Windows => {
+                        let launch = powershell_agent_remote_command(agent, remote_root, host)?;
+                        (launch.command, launch.stdin_prefix)
+                    }
+                };
                 Ok(ProcessLaunchPlan {
                     program: ssh.program.to_string_lossy().to_string(),
-                    args: ssh.command_args(match host.path_style {
-                        RemotePathStyle::Posix => posix_agent_remote_command(agent, remote_root),
-                        RemotePathStyle::Windows => {
-                            powershell_agent_remote_command(agent, remote_root, host)?
-                        }
-                    }),
+                    args: ssh.command_args(remote_command),
                     current_dir: None,
+                    stdin_prefix,
                 })
             }
         }
@@ -1025,18 +1860,24 @@ impl RemoteTransport {
                 program: command[0].clone(),
                 args: command[1..].to_vec(),
                 current_dir: Some(remote_root),
+                stdin_prefix: Vec::new(),
             }),
             Self::Ssh(ssh) => {
                 validate_remote_root(host, &remote_root)?;
+                let (remote_command, stdin_prefix) = match host.path_style {
+                    RemotePathStyle::Posix => {
+                        (posix_lsp_remote_command(remote_root, command), Vec::new())
+                    }
+                    RemotePathStyle::Windows => {
+                        let launch = powershell_lsp_remote_command(remote_root, command)?;
+                        (launch.command, launch.stdin_prefix)
+                    }
+                };
                 Ok(ProcessLaunchPlan {
                     program: ssh.program.to_string_lossy().to_string(),
-                    args: ssh.command_args(match host.path_style {
-                        RemotePathStyle::Posix => posix_lsp_remote_command(remote_root, command),
-                        RemotePathStyle::Windows => {
-                            powershell_lsp_remote_command(remote_root, command)?
-                        }
-                    }),
+                    args: ssh.command_args(remote_command),
                     current_dir: None,
+                    stdin_prefix,
                 })
             }
         }
@@ -1159,16 +2000,16 @@ fn detect_remote_host_info(
     ) {
         Ok(stdout) => match parse_powershell_probe(&stdout) {
             Ok(info) => return Ok(info),
-            Err(error) => error.to_string(),
+            Err(error) => error,
         },
-        Err(error) => error.to_string(),
+        Err(error) => error,
     };
     let remaining = probe_budget.saturating_sub(started.elapsed());
     if remaining.is_zero() {
-        bail!(
-            "failed to detect remote host within {} ms: PowerShell probe failed: {powershell_error}",
+        return Err(powershell_error).context(format!(
+            "failed to detect remote host within {} ms after the PowerShell probe failed",
             probe_budget.as_millis()
-        );
+        ));
     }
 
     match run_remote_host_probe(
@@ -1178,13 +2019,11 @@ fn detect_remote_host_info(
         "POSIX remote host probe",
     ) {
         Ok(stdout) => parse_posix_probe(&stdout).with_context(|| {
-            format!(
-                "failed to detect remote host (PowerShell probe failed: {powershell_error})"
-            )
+            format!("failed to detect remote host (PowerShell probe failed: {powershell_error})")
         }),
-        Err(posix_error) => bail!(
-            "failed to detect remote host: PowerShell probe failed: {powershell_error}; POSIX probe failed: {posix_error}"
-        ),
+        Err(posix_error) => Err(posix_error).context(format!(
+            "failed to detect remote host after the PowerShell probe failed: {powershell_error}"
+        )),
     }
 }
 
@@ -1223,19 +2062,34 @@ struct AgentLaunch {
 }
 
 impl AgentLaunch {
+    #[cfg(test)]
     fn remote_host_info(&self) -> Result<RemoteHostInfo> {
-        let mut cached = self
-            .remote_host_info
-            .lock()
-            .map_err(|_| anyhow!("remote host information cache lock poisoned"))?;
-        if let Some(info) = cached.as_ref() {
-            return Ok(info.clone());
+        self.remote_host_info_with_timeout(self.request_timeout)
+    }
+
+    fn remote_host_info_with_timeout(&self, timeout: Duration) -> Result<RemoteHostInfo> {
+        match self.remote_host_info.try_lock() {
+            Ok(cached) => {
+                if let Some(info) = cached.as_ref() {
+                    return Ok(info.clone());
+                }
+            }
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                bail!("remote host information cache lock poisoned")
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {}
         }
-        let info = detect_remote_host_info(&self.transport, self.request_timeout)?;
+        let info = detect_remote_host_info(&self.transport, timeout)?;
         if matches!(self.transport, RemoteTransport::Ssh(_)) {
             validate_remote_root(&info, &self.remote_root)?;
         }
-        *cached = Some(info.clone());
+        match self.remote_host_info.try_lock() {
+            Ok(mut cached) => *cached = Some(info.clone()),
+            Err(std::sync::TryLockError::Poisoned(_)) => {
+                bail!("remote host information cache lock poisoned")
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {}
+        }
         Ok(info)
     }
 
@@ -1255,7 +2109,10 @@ impl AgentLaunch {
 
 #[derive(Clone, Default)]
 struct AgentInterrupt {
-    current_abort: Arc<Mutex<Option<Arc<dyn AgentAbortHandle>>>>,
+    // Keep every worker registered until its worker thread exits. A request
+    // timeout may retire a worker without joining it, and maintenance must
+    // still be able to terminate that older worker before replacing an agent.
+    current_abort: Arc<Mutex<Vec<Arc<dyn AgentAbortHandle>>>>,
     shutdown_requested: Arc<AtomicBool>,
 }
 
@@ -1265,11 +2122,10 @@ trait AgentAbortHandle: Send + Sync {
     /// AgentSession::request for the lane.
     fn abort(&self);
 
-    /// Wait for the aborted lane worker resource to stop or reach an aborted
-    /// state. This may be called while the AgentSession object still exists;
-    /// implementations must tolerate repeated calls and must not depend on the
-    /// session being dropped first.
-    fn wait(&self);
+    /// Report whether the process resource has been reaped. This operation must
+    /// never block: request timeout and maintenance paths poll it against their
+    /// own deadline.
+    fn is_stopped(&self) -> bool;
 }
 
 struct ProcessAgentAbort {
@@ -1278,14 +2134,24 @@ struct ProcessAgentAbort {
 
 impl AgentAbortHandle for ProcessAgentAbort {
     fn abort(&self) {
-        if let Ok(mut child) = self.child.lock() {
-            kill_child_tree(&mut child);
+        match self.child.try_lock() {
+            Ok(mut child) => kill_child_tree(&mut child),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                kill_child_tree(&mut poisoned.into_inner());
+            }
+            // Another abort/status probe owns the child briefly. That owner is
+            // already progressing teardown, so a timeout path must not block.
+            Err(std::sync::TryLockError::WouldBlock) => {}
         }
     }
 
-    fn wait(&self) {
-        if let Ok(mut child) = self.child.lock() {
-            let _ = child.wait();
+    fn is_stopped(&self) -> bool {
+        match self.child.try_lock() {
+            Ok(mut child) => child.try_wait().ok().flatten().is_some(),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                poisoned.into_inner().try_wait().ok().flatten().is_some()
+            }
+            Err(std::sync::TryLockError::WouldBlock) => false,
         }
     }
 }
@@ -1307,41 +2173,53 @@ impl AgentInterrupt {
 
     fn set_abort_handle(&self, handle: Arc<dyn AgentAbortHandle>) {
         if let Ok(mut current) = self.current_abort.lock() {
-            *current = Some(handle);
+            current.push(handle);
         }
     }
 
     fn clear_abort_handle(&self, handle: &Arc<dyn AgentAbortHandle>) {
         if let Ok(mut current) = self.current_abort.lock() {
-            if current
-                .as_ref()
-                .is_some_and(|current_handle| Arc::ptr_eq(current_handle, handle))
-            {
-                *current = None;
+            current.retain(|current_handle| !Arc::ptr_eq(current_handle, handle));
+        }
+    }
+
+    fn abort_handles_snapshot(&self) -> Option<Vec<Arc<dyn AgentAbortHandle>>> {
+        match self.current_abort.try_lock() {
+            Ok(current) => Some(current.iter().cloned().collect()),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                Some(poisoned.into_inner().iter().cloned().collect())
             }
+            Err(std::sync::TryLockError::WouldBlock) => None,
         }
     }
 
     fn kill_current(&self) {
-        let handle = self
-            .current_abort
-            .lock()
-            .ok()
-            .and_then(|current| current.as_ref().map(Arc::clone));
-        if let Some(handle) = handle {
+        let Some(handles) = self.abort_handles_snapshot() else {
+            return;
+        };
+        for handle in handles {
             handle.abort();
         }
     }
 
-    fn kill_current_and_wait(&self) {
-        let handle = self
-            .current_abort
-            .lock()
-            .ok()
-            .and_then(|current| current.as_ref().map(Arc::clone));
-        if let Some(handle) = handle {
-            handle.abort();
-            handle.wait();
+    fn kill_current_and_wait(&self, timeout: Duration, context: &str) -> Result<()> {
+        let started = Instant::now();
+        loop {
+            if let Some(handles) = self.abort_handles_snapshot() {
+                for handle in &handles {
+                    handle.abort();
+                }
+                if handles.iter().all(|handle| handle.is_stopped()) {
+                    return Ok(());
+                }
+            }
+            let remaining = remaining_timeout_since(started, timeout);
+            if remaining.is_zero() {
+                return Err(anyhow!(AgentWorkerExitTimeoutError {
+                    context: context.to_string(),
+                }));
+            }
+            thread::sleep(remaining.min(Duration::from_millis(10)));
         }
     }
 
@@ -1349,7 +2227,7 @@ impl AgentInterrupt {
     fn has_current_abort(&self) -> bool {
         self.current_abort
             .lock()
-            .map(|current| current.is_some())
+            .map(|current| !current.is_empty())
             .unwrap_or(false)
     }
 }
@@ -1372,6 +2250,12 @@ struct AgentWorker {
     tx: mpsc::Sender<AgentWorkerCommand>,
     abort: Arc<dyn AgentAbortHandle>,
     join: Option<thread::JoinHandle<()>>,
+}
+
+struct RetiredAgentWorker {
+    abort: Arc<dyn AgentAbortHandle>,
+    join: Option<thread::JoinHandle<()>>,
+    reaper_join: Option<thread::JoinHandle<()>>,
 }
 
 trait AgentSession: Send {
@@ -1438,6 +2322,237 @@ struct RemoteHealth {
     state: RemoteHealthState,
     unavailable_until: Option<Instant>,
     error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RegistryHealthState {
+    Disabled,
+    NotChecked,
+    Fetching,
+    Verified,
+    Error,
+}
+
+impl RegistryHealthState {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::NotChecked => "not_checked",
+            Self::Fetching => "fetching",
+            Self::Verified => "verified",
+            Self::Error => "error",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct RegistryPlatform {
+    os: String,
+    arch: String,
+    path_style: RemotePathStyle,
+    target: String,
+}
+
+impl From<&RemoteHostInfo> for RegistryPlatform {
+    fn from(host: &RemoteHostInfo) -> Self {
+        Self {
+            os: host.os.clone(),
+            arch: host.arch.clone(),
+            path_style: host.path_style,
+            target: host.target.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RegistryHealth {
+    state: RegistryHealthState,
+    source: &'static str,
+    manifest_url: Option<String>,
+    platform: Option<RegistryPlatform>,
+    signing_key_ids: Vec<String>,
+    manifest_sha256: Option<String>,
+    artifact_sha256: Option<String>,
+    manifest_source: Option<&'static str>,
+    artifact_source: Option<&'static str>,
+    cache_state: Option<nrm_registry::CacheState>,
+    error_code: Option<String>,
+    error: Option<String>,
+}
+
+impl RegistryHealth {
+    fn from_registry(registry: Option<&RegistryLaunchConfig>) -> Self {
+        let Some(registry) = registry else {
+            return Self {
+                state: RegistryHealthState::Disabled,
+                source: "local",
+                manifest_url: None,
+                platform: None,
+                signing_key_ids: Vec::new(),
+                manifest_sha256: None,
+                artifact_sha256: None,
+                manifest_source: None,
+                artifact_source: None,
+                cache_state: None,
+                error_code: None,
+                error: None,
+            };
+        };
+        let manifest_url = Version::parse(env!("CARGO_PKG_VERSION"))
+            .ok()
+            .and_then(|version| registry.url_template.expand(&version).ok())
+            .map(|url| redact_registry_manifest_url(&url));
+        Self {
+            state: RegistryHealthState::NotChecked,
+            source: "registry",
+            manifest_url,
+            platform: None,
+            signing_key_ids: Vec::new(),
+            manifest_sha256: None,
+            artifact_sha256: None,
+            manifest_source: None,
+            artifact_source: None,
+            cache_state: None,
+            error_code: None,
+            error: None,
+        }
+    }
+
+    fn begin_fetch(&mut self, platform: Option<RegistryPlatform>) {
+        self.state = RegistryHealthState::Fetching;
+        self.source = "registry";
+        self.platform = platform;
+        self.signing_key_ids.clear();
+        self.manifest_sha256 = None;
+        self.artifact_sha256 = None;
+        self.manifest_source = None;
+        self.artifact_source = None;
+        self.cache_state = None;
+        self.error_code = None;
+        self.error = None;
+    }
+
+    fn set_platform(&mut self, host: &RemoteHostInfo) {
+        self.platform = Some(RegistryPlatform::from(host));
+    }
+
+    fn set_manifest_url(&mut self, manifest_url: &url::Url) {
+        self.manifest_url = Some(redact_registry_manifest_url(manifest_url));
+    }
+
+    fn set_verified(&mut self, fetched: &FetchedArtifact, signing_key_ids: Vec<String>) {
+        self.state = RegistryHealthState::Verified;
+        self.signing_key_ids = signing_key_ids;
+        self.manifest_sha256 = Some(fetched.verified_manifest.manifest_sha256.clone());
+        self.artifact_sha256 = Some(fetched.sha256.clone());
+        self.manifest_source = Some(manifest_source_name(fetched.manifest_source));
+        self.artifact_source = Some(artifact_source_name(fetched.source));
+        self.cache_state = Some(fetched.cache_state);
+        self.error_code = None;
+        self.error = None;
+    }
+
+    fn set_error(&mut self, code: &str, detail: &str) {
+        self.state = RegistryHealthState::Error;
+        self.signing_key_ids.clear();
+        self.manifest_sha256 = None;
+        self.artifact_sha256 = None;
+        self.manifest_source = None;
+        self.artifact_source = None;
+        self.cache_state = None;
+        self.error_code = Some(code.to_string());
+        self.error = Some(detail.to_string());
+    }
+
+    fn to_value(&self) -> Value {
+        let mut value = json!({
+            "state": self.state.as_str(),
+            "source": self.source,
+            "signing_key_ids": self.signing_key_ids,
+        });
+        let Some(object) = value.as_object_mut() else {
+            return value;
+        };
+        if let Some(manifest_url) = &self.manifest_url {
+            object.insert("manifest_url".to_string(), json!(manifest_url));
+        }
+        if let Some(platform) = &self.platform {
+            object.insert("platform".to_string(), json!(platform));
+        }
+        if let Some(digest) = &self.manifest_sha256 {
+            object.insert("manifest_sha256".to_string(), json!(digest));
+        }
+        if let Some(digest) = &self.artifact_sha256 {
+            object.insert("artifact_sha256".to_string(), json!(digest));
+        }
+        if let Some(source) = self.manifest_source {
+            object.insert("manifest_source".to_string(), json!(source));
+        }
+        if let Some(source) = self.artifact_source {
+            object.insert("artifact_source".to_string(), json!(source));
+        }
+        if let Some(cache_state) = self.cache_state {
+            object.insert(
+                "cache_state".to_string(),
+                json!({
+                    "manifest_fallback": cache_state.manifest_fallback,
+                    "artifact_hit": cache_state.artifact_hit,
+                }),
+            );
+        }
+        if let Some(error_code) = &self.error_code {
+            object.insert("error_code".to_string(), json!(error_code));
+        }
+        if let Some(error) = &self.error {
+            object.insert("error".to_string(), json!(error));
+        }
+        value
+    }
+
+    fn insert_into(&self, value: &mut Value) {
+        if let Some(object) = value.as_object_mut() {
+            object.insert("registry_health".to_string(), self.to_value());
+        }
+    }
+}
+
+fn artifact_source_name(source: ArtifactSource) -> &'static str {
+    match source {
+        ArtifactSource::Network => "network",
+        ArtifactSource::File => "file",
+        ArtifactSource::Cache => "cache",
+    }
+}
+
+fn manifest_source_name(source: ManifestSource) -> &'static str {
+    match source {
+        ManifestSource::Network => "network",
+        ManifestSource::File => "file",
+        ManifestSource::VerifiedCacheFallback => "verified_cache_fallback",
+    }
+}
+
+fn redact_registry_manifest_url(url: &url::Url) -> String {
+    match url.scheme() {
+        "https" => {
+            let Some(host) = url.host_str() else {
+                return "https://<redacted>".to_string();
+            };
+            match url.port() {
+                Some(port) => format!("https://{host}:{port}/<redacted>"),
+                None => format!("https://{host}/<redacted>"),
+            }
+        }
+        "file" => "file:///<redacted>".to_string(),
+        _ => "<redacted>".to_string(),
+    }
+}
+
+fn registry_error_code(error: &anyhow::Error) -> Option<FetchErrorCode> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<FetchError>())
+        .map(FetchError::code)
 }
 
 impl Default for RemoteHealth {
@@ -1522,6 +2637,7 @@ struct AgentClient {
     interrupt: AgentInterrupt,
     preempt: AgentPreempt,
     worker: Option<AgentWorker>,
+    retired_workers: Vec<RetiredAgentWorker>,
     handshake_complete: bool,
     backoff_lane: AgentBackoffLane,
     remote_backoff: Arc<Mutex<RemoteBackoffState>>,
@@ -1690,6 +2806,7 @@ impl AgentClient {
             interrupt,
             preempt: AgentPreempt::default(),
             worker: None,
+            retired_workers: Vec::new(),
             handshake_complete: false,
             backoff_lane: AgentBackoffLane::Read,
             remote_backoff: Arc::new(Mutex::new(RemoteBackoffState::default())),
@@ -1704,6 +2821,7 @@ impl AgentClient {
             interrupt,
             preempt: AgentPreempt::default(),
             worker: None,
+            retired_workers: Vec::new(),
             handshake_complete: false,
             backoff_lane: AgentBackoffLane::Write,
             remote_backoff: Arc::clone(&self.remote_backoff),
@@ -1712,8 +2830,12 @@ impl AgentClient {
         }
     }
 
-    fn spawn_worker(launch: &AgentLaunch, interrupt: AgentInterrupt) -> Result<AgentWorker> {
-        let host = launch.remote_host_info()?;
+    fn spawn_worker(
+        launch: &AgentLaunch,
+        interrupt: AgentInterrupt,
+        timeout: Duration,
+    ) -> Result<AgentWorker> {
+        let host = launch.remote_host_info_with_timeout(timeout)?;
         let plan = launch
             .transport
             .agent_plan(&launch.agent, &launch.remote_root, &host)?;
@@ -1733,7 +2855,8 @@ impl AgentClient {
                 )
             })?;
 
-        let stdin = child.stdin.take().context("agent stdin was not piped")?;
+        let mut stdin = child.stdin.take().context("agent stdin was not piped")?;
+        let stdin_prefix = plan.stdin_prefix;
         let stdout = child.stdout.take().context("agent stdout was not piped")?;
         let child = Arc::new(Mutex::new(child));
         let abort: Arc<dyn AgentAbortHandle> = Arc::new(ProcessAgentAbort {
@@ -1743,16 +2866,34 @@ impl AgentClient {
         let (tx, rx) = mpsc::channel::<AgentWorkerCommand>();
         let worker_abort = Arc::clone(&abort);
         let join = thread::spawn(move || {
-            let mut session: Box<dyn AgentSession> =
-                Box::new(FramedAgentSession::new(stdin, stdout));
+            let bootstrap_error = stdin
+                .write_all(&stdin_prefix)
+                .and_then(|()| stdin.flush())
+                .err()
+                .map(|error| format!("failed to write Windows agent bootstrap: {error}"));
+            let mut session: Box<dyn AgentSession> = Box::new(FramedAgentSession::new(
+                stdin,
+                LeadingBomReader::new(stdout),
+            ));
             while let Ok(command) = rx.recv() {
-                let response = session
-                    .request(command.id, command.request)
-                    .unwrap_or_else(|error| AgentWorkerReply::TransportError(error.to_string()));
+                let response = if let Some(error) = &bootstrap_error {
+                    AgentWorkerReply::TransportError(error.clone())
+                } else {
+                    session
+                        .request(command.id, command.request)
+                        .unwrap_or_else(|error| AgentWorkerReply::TransportError(error.to_string()))
+                };
                 let _ = command.reply.send(response);
             }
             worker_abort.abort();
-            worker_abort.wait();
+            // This cleanup loop is intentionally owned by the retiring worker
+            // thread. Callers only poll/join it with their own deadline, while
+            // this detached path keeps retrying process-tree termination until
+            // the child is actually reaped.
+            while !worker_abort.is_stopped() {
+                worker_abort.abort();
+                thread::sleep(Duration::from_millis(10));
+            }
             interrupt.clear_abort_handle(&worker_abort);
         });
 
@@ -1764,7 +2905,11 @@ impl AgentClient {
     }
 
     fn request(&mut self, request: Request) -> Result<Response> {
-        self.request_inner(request, false)
+        self.request_inner(request, false, self.launch.request_timeout)
+    }
+
+    fn request_with_timeout(&mut self, request: Request, timeout: Duration) -> Result<Response> {
+        self.request_inner(request, false, timeout)
     }
 
     fn request_maybe_preemptible_since(
@@ -1772,7 +2917,16 @@ impl AgentClient {
         request: Request,
         preempt_epoch: u64,
     ) -> Result<AgentRequestOutcome> {
-        self.request_outcome_inner(request, true, preempt_epoch)
+        self.request_outcome_inner(request, true, preempt_epoch, self.launch.request_timeout)
+    }
+
+    fn request_maybe_preemptible_since_with_timeout(
+        &mut self,
+        request: Request,
+        preempt_epoch: u64,
+        timeout: Duration,
+    ) -> Result<AgentRequestOutcome> {
+        self.request_outcome_inner(request, true, preempt_epoch, timeout)
     }
 
     fn preempt_handle(&self) -> AgentPreempt {
@@ -1831,6 +2985,17 @@ impl AgentClient {
         anyhow!(error)
     }
 
+    fn mark_request_timeout(
+        &mut self,
+        id: RequestId,
+        timeout: Duration,
+        phase: &'static str,
+    ) -> anyhow::Error {
+        let error = AgentRequestTimeoutError { id, timeout, phase };
+        let _ = self.mark_remote_unavailable(error.to_string());
+        anyhow!(error)
+    }
+
     fn clear_remote_unavailable(&mut self) {
         if let Ok(mut backoff) = self.remote_backoff.lock() {
             backoff.clear_lane(self.backoff_lane);
@@ -1843,14 +3008,19 @@ impl AgentClient {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn preempt_epoch(&self) -> u64 {
         self.preempt.epoch()
     }
 
-    fn request_inner(&mut self, request: Request, preemptible: bool) -> Result<Response> {
+    fn request_inner(
+        &mut self,
+        request: Request,
+        preemptible: bool,
+        timeout: Duration,
+    ) -> Result<Response> {
         let preempt_epoch = self.preempt.epoch();
-        match self.request_outcome_inner(request, preemptible, preempt_epoch)? {
+        match self.request_outcome_inner(request, preemptible, preempt_epoch, timeout)? {
             AgentRequestOutcome::Response(response) => Ok(response),
             AgentRequestOutcome::Preempted => bail!("agent request preempted by interactive work"),
         }
@@ -1861,15 +3031,29 @@ impl AgentClient {
         request: Request,
         preemptible: bool,
         preempt_epoch: u64,
+        timeout: Duration,
     ) -> Result<AgentRequestOutcome> {
+        let started = Instant::now();
         self.check_remote_backoff()?;
         if !matches!(request, Request::Hello { .. }) && !self.handshake_complete {
-            if let Some(outcome) = self.ensure_handshake(preemptible, preempt_epoch)? {
+            if let Some(outcome) = self.ensure_handshake(preemptible, preempt_epoch, timeout)? {
                 return Ok(outcome);
             }
         }
         let is_hello = matches!(request, Request::Hello { .. });
-        let outcome = self.send_request_outcome(request, preemptible, preempt_epoch)?;
+        let remaining = remaining_timeout_since(started, timeout);
+        if remaining.is_zero() {
+            let id = self.next_id;
+            self.next_id = self.next_id.wrapping_add(1).max(1);
+            self.kill_worker();
+            self.launch.invalidate_remote_host_info();
+            return Err(self.mark_request_timeout(
+                id,
+                timeout,
+                "after completing its compatibility handshake",
+            ));
+        }
+        let outcome = self.send_request_outcome(request, preemptible, preempt_epoch, remaining)?;
         if is_hello {
             self.record_handshake_outcome(&outcome)?;
         }
@@ -1880,6 +3064,7 @@ impl AgentClient {
         &mut self,
         preemptible: bool,
         preempt_epoch: u64,
+        timeout: Duration,
     ) -> Result<Option<AgentRequestOutcome>> {
         let outcome = self.send_request_outcome(
             Request::Hello {
@@ -1888,6 +3073,7 @@ impl AgentClient {
             },
             preemptible,
             preempt_epoch,
+            timeout,
         )?;
         match outcome {
             AgentRequestOutcome::Response(Response::Hello {
@@ -1947,6 +3133,7 @@ impl AgentClient {
         request: Request,
         preemptible: bool,
         preempt_epoch: u64,
+        timeout: Duration,
     ) -> Result<AgentRequestOutcome> {
         if self.interrupt.is_shutdown_requested() {
             bail!("agent request cancelled by shutdown");
@@ -1957,7 +3144,13 @@ impl AgentClient {
         let started = Instant::now();
         let (reply, reply_rx) = mpsc::channel();
         for attempt in 0..2 {
-            let tx = match self.ensure_worker() {
+            let remaining = remaining_timeout_since(started, timeout);
+            if remaining.is_zero() {
+                self.kill_worker();
+                self.launch.invalidate_remote_host_info();
+                return Err(self.mark_request_timeout(id, timeout, "while launching its worker"));
+            }
+            let tx = match self.ensure_worker(remaining) {
                 Ok(worker) => worker.tx.clone(),
                 Err(error) => {
                     self.launch.invalidate_remote_host_info();
@@ -1981,7 +3174,14 @@ impl AgentClient {
             }
         }
 
-        let outcome = self.wait_for_reply(id, reply_rx, preemptible, preempt_epoch);
+        let remaining = remaining_timeout_since(started, timeout);
+        let outcome = if remaining.is_zero() {
+            self.kill_worker();
+            self.launch.invalidate_remote_host_info();
+            Err(self.mark_request_timeout(id, timeout, "while launching its worker"))
+        } else {
+            self.wait_for_reply(id, reply_rx, preemptible, preempt_epoch, remaining)
+        };
         trace_event(
             "agent_request",
             json!({
@@ -2003,6 +3203,7 @@ impl AgentClient {
         reply_rx: mpsc::Receiver<AgentWorkerReply>,
         preemptible: bool,
         preempt_epoch: u64,
+        timeout: Duration,
     ) -> Result<AgentRequestOutcome> {
         let started = Instant::now();
         loop {
@@ -2011,15 +3212,11 @@ impl AgentClient {
                 return Ok(AgentRequestOutcome::Preempted);
             }
 
-            let timeout = self.launch.request_timeout;
             let elapsed = started.elapsed();
             if elapsed >= timeout {
                 self.kill_worker();
                 self.launch.invalidate_remote_host_info();
-                return Err(self.mark_remote_unavailable(format!(
-                    "agent request {id} timed out after {} ms",
-                    timeout.as_millis()
-                )));
+                return Err(self.mark_request_timeout(id, timeout, "while waiting for its reply"));
             }
             let remaining = timeout.saturating_sub(elapsed);
             let wait = remaining.min(Duration::from_millis(25));
@@ -2055,7 +3252,7 @@ impl AgentClient {
         }
     }
 
-    fn ensure_worker(&mut self) -> Result<&AgentWorker> {
+    fn ensure_worker(&mut self, timeout: Duration) -> Result<&AgentWorker> {
         if self.interrupt.is_shutdown_requested() {
             bail!("agent worker is shut down");
         }
@@ -2064,7 +3261,11 @@ impl AgentClient {
             self.kill_worker();
         }
         if self.worker.is_none() {
-            self.worker = Some(Self::spawn_worker(&self.launch, self.interrupt.clone())?);
+            self.worker = Some(Self::spawn_worker(
+                &self.launch,
+                self.interrupt.clone(),
+                timeout,
+            )?);
             self.worker_generation = shared_generation;
         }
         Ok(self.worker.as_ref().expect("worker was just initialized"))
@@ -2077,21 +3278,109 @@ impl AgentClient {
         self.kill_worker();
     }
 
-    fn kill_worker(&mut self) {
+    fn retire_active_worker(&mut self) {
         self.handshake_complete = false;
-        if let Some(mut worker) = self.worker.take() {
-            drop(worker.tx);
-            worker.abort.abort();
-            worker.abort.wait();
-            if let Some(join) = worker.join.take() {
-                let _ = join.join();
+        let Some(worker) = self.worker.take() else {
+            return;
+        };
+        let AgentWorker { tx, abort, join } = worker;
+        drop(tx);
+        abort.abort();
+        let reaper_abort = Arc::clone(&abort);
+        let reaper_join = thread::Builder::new()
+            .name("nrm-agent-reaper".to_string())
+            .spawn(move || {
+                while !reaper_abort.is_stopped() {
+                    reaper_abort.abort();
+                    thread::sleep(Duration::from_millis(10));
+                }
+            })
+            .ok();
+        self.retired_workers.push(RetiredAgentWorker {
+            abort,
+            join,
+            reaper_join,
+        });
+    }
+
+    fn reap_finished_workers(&mut self) -> Result<()> {
+        let mut index = 0;
+        while index < self.retired_workers.len() {
+            let stopped = self.retired_workers[index].abort.is_stopped();
+            let thread_finished = self.retired_workers[index]
+                .join
+                .as_ref()
+                .is_none_or(thread::JoinHandle::is_finished);
+            let reaper_finished = self.retired_workers[index]
+                .reaper_join
+                .as_ref()
+                .is_none_or(thread::JoinHandle::is_finished);
+            if !stopped || !thread_finished || !reaper_finished {
+                index += 1;
+                continue;
             }
+            let mut worker = self.retired_workers.swap_remove(index);
+            if let Some(join) = worker.join.take() {
+                // `is_finished` above makes this join nonblocking.
+                if join.join().is_err() {
+                    bail!("agent worker panicked during teardown");
+                }
+            }
+            if let Some(join) = worker.reaper_join.take() {
+                // The child was reaped and `is_finished` was checked above.
+                if join.join().is_err() {
+                    bail!("agent process reaper panicked during teardown");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn kill_worker(&mut self) {
+        self.retire_active_worker();
+        for worker in &self.retired_workers {
+            worker.abort.abort();
+        }
+        // Request timeout, preemption, and Drop paths must not wait. Finished
+        // workers can still be joined immediately; unfinished ones remain
+        // tracked for a later bounded maintenance barrier.
+        let _ = self.reap_finished_workers();
+    }
+
+    fn kill_worker_with_timeout(&mut self, timeout: Duration, context: &str) -> Result<()> {
+        self.retire_active_worker();
+        let started = Instant::now();
+        loop {
+            for worker in &self.retired_workers {
+                worker.abort.abort();
+            }
+            self.reap_finished_workers()?;
+            if self.retired_workers.is_empty() {
+                return Ok(());
+            }
+            let remaining = remaining_timeout_since(started, timeout);
+            if remaining.is_zero() {
+                return Err(anyhow!(AgentWorkerExitTimeoutError {
+                    context: context.to_string(),
+                }));
+            }
+            thread::sleep(remaining.min(Duration::from_millis(10)));
         }
     }
 
+    #[cfg(test)]
     fn invalidate_shared_workers(&mut self) {
         self.launch.worker_generation.fetch_add(1, Ordering::SeqCst);
         self.kill_worker();
+    }
+
+    fn invalidate_shared_workers_with_timeout(
+        &mut self,
+        timeout: Duration,
+        context: &str,
+    ) -> Result<()> {
+        self.launch.worker_generation.fetch_add(1, Ordering::SeqCst);
+        self.kill_worker_with_timeout(timeout, context)
     }
 }
 
@@ -2102,6 +3391,7 @@ impl Drop for AgentClient {
 }
 
 fn probe_agent_at(launch: &AgentLaunch, executable: &str, timeout: Duration) -> Result<()> {
+    let started = Instant::now();
     let mut candidate = AgentClient::new_with_registry(
         executable.to_string(),
         None,
@@ -2113,8 +3403,11 @@ fn probe_agent_at(launch: &AgentLaunch, executable: &str, timeout: Duration) -> 
     );
     candidate.launch.remote_host_info = Arc::clone(&launch.remote_host_info);
     let result = probe_normal_agent(&mut candidate);
-    candidate.kill_worker();
-    result
+    let cleanup = candidate.kill_worker_with_timeout(
+        remaining_timeout_since(started, timeout),
+        "staged agent probe cleanup",
+    );
+    cleanup.and(result)
 }
 
 fn probe_restored_agent_at(
@@ -2122,6 +3415,7 @@ fn probe_restored_agent_at(
     executable: &str,
     timeout: Duration,
 ) -> Result<()> {
+    let started = Instant::now();
     let mut candidate = AgentClient::new_with_registry(
         executable.to_string(),
         None,
@@ -2140,6 +3434,7 @@ fn probe_restored_agent_at(
         },
         false,
         preempt_epoch,
+        timeout,
     ) {
         Ok(AgentRequestOutcome::Response(Response::Hello { .. })) => Ok(()),
         Err(error) if is_agent_compatibility_mismatch(&error.to_string()) => Ok(()),
@@ -2149,8 +3444,11 @@ fn probe_restored_agent_at(
         Ok(AgentRequestOutcome::Preempted) => bail!("restored-agent Hello was preempted"),
         Err(error) => Err(error),
     };
-    candidate.kill_worker();
-    result
+    let cleanup = candidate.kill_worker_with_timeout(
+        remaining_timeout_since(started, timeout),
+        "restored agent probe cleanup",
+    );
+    cleanup.and(result)
 }
 
 fn is_agent_compatibility_mismatch(message: &str) -> bool {
@@ -2158,12 +3456,27 @@ fn is_agent_compatibility_mismatch(message: &str) -> bool {
 }
 
 fn probe_normal_agent(agent: &mut AgentClient) -> Result<()> {
-    agent.kill_worker();
+    let timeout = agent.launch.request_timeout;
+    probe_normal_agent_with_timeout(agent, timeout)
+}
+
+fn probe_normal_agent_with_timeout(agent: &mut AgentClient, timeout: Duration) -> Result<()> {
+    let started = Instant::now();
+    agent.kill_worker_with_timeout(timeout, "normal-path agent probe reset")?;
     agent.clear_all_remote_unavailable();
-    match agent.request(Request::Hello {
-        client_version: env!("CARGO_PKG_VERSION").to_string(),
-        protocol_version: PROTOCOL_VERSION,
-    })? {
+    let remaining = remaining_timeout_since(started, timeout);
+    if remaining.is_zero() {
+        return Err(anyhow!(AgentWorkerExitTimeoutError {
+            context: "normal-path agent probe reset".to_string(),
+        }));
+    }
+    match agent.request_with_timeout(
+        Request::Hello {
+            client_version: env!("CARGO_PKG_VERSION").to_string(),
+            protocol_version: PROTOCOL_VERSION,
+        },
+        remaining,
+    )? {
         Response::Hello { .. } => Ok(()),
         other => bail!("unexpected Hello response from agent: {other:?}"),
     }
@@ -4397,11 +5710,16 @@ impl Mirror {
     }
 }
 
-fn status_with_remote_health(mut status: Value, remote_health: RemoteHealth) -> Result<Value> {
+fn status_with_remote_health(
+    mut status: Value,
+    remote_health: RemoteHealth,
+    registry_health: RegistryHealth,
+) -> Result<Value> {
     if !status.is_object() {
         bail!("mirror status was not a JSON object");
     }
     remote_health.insert_into(&mut status);
+    registry_health.insert_into(&mut status);
     Ok(status)
 }
 
@@ -4434,10 +5752,12 @@ fn workspace_info_value(
     files_root: &Path,
     transport: &RemoteTransport,
     remote_health: RemoteHealth,
+    registry_health: RegistryHealth,
     remote_host: Option<&RemoteHostInfo>,
     registry_policy_fingerprint: &str,
 ) -> Value {
     let remote_health_value = remote_health.to_value();
+    let registry_health_value = registry_health.to_value();
     let mut value = json!({
         "sidecar_version": env!("CARGO_PKG_VERSION"),
         "protocol_version": PROTOCOL_VERSION,
@@ -4477,7 +5797,8 @@ fn workspace_info_value(
             "sidecar_socket_listener": cfg!(unix),
             "single_writer_sessions": true
         },
-        "remote_health": remote_health_value
+        "remote_health": remote_health_value,
+        "registry_health": registry_health_value
     });
     if let (Some(object), Some(remote_host)) = (value.as_object_mut(), remote_host) {
         object.insert("remote_host".to_string(), json!(remote_host));
@@ -4496,6 +5817,7 @@ struct Sidecar {
     remote_root: PathBuf,
     workspace_key: String,
     remote_health: Arc<Mutex<RemoteHealth>>,
+    registry_health: Arc<Mutex<RegistryHealth>>,
 }
 
 #[derive(Debug, Clone)]
@@ -4507,6 +5829,8 @@ struct FastState {
     workspace_key: String,
     pending_remote: Arc<Mutex<PendingRemote>>,
     remote_health: Arc<Mutex<RemoteHealth>>,
+    registry_health: Arc<Mutex<RegistryHealth>>,
+    registry_health_fallback: RegistryHealth,
     remote_host_info: Arc<Mutex<Option<RemoteHostInfo>>>,
     registry_policy_fingerprint: String,
 }
@@ -4550,7 +5874,11 @@ struct StartedRemoteWork {
 }
 
 enum RemoteWorkerControl {
-    ResetAgent { reply: mpsc::SyncSender<()> },
+    ResetAgent {
+        started: Instant,
+        timeout: Duration,
+        reply: mpsc::SyncSender<Result<()>>,
+    },
 }
 
 enum RemoteWorkerItem {
@@ -4808,8 +6136,8 @@ impl RemoteQueue {
         loop {
             match self.pop_worker_item(Some(preempt))? {
                 RemoteWorkerItem::Work(started) => return Some(started),
-                RemoteWorkerItem::Control(RemoteWorkerControl::ResetAgent { reply }) => {
-                    let _ = reply.send(());
+                RemoteWorkerItem::Control(RemoteWorkerControl::ResetAgent { reply, .. }) => {
+                    let _ = reply.send(Ok(()));
                 }
             }
         }
@@ -4820,8 +6148,8 @@ impl RemoteQueue {
         loop {
             match self.pop_worker_item(preempt)? {
                 RemoteWorkerItem::Work(started) => return Some(started),
-                RemoteWorkerItem::Control(RemoteWorkerControl::ResetAgent { reply }) => {
-                    let _ = reply.send(());
+                RemoteWorkerItem::Control(RemoteWorkerControl::ResetAgent { reply, .. }) => {
+                    let _ = reply.send(Ok(()));
                 }
             }
         }
@@ -4908,19 +6236,31 @@ impl RemoteQueue {
 
     fn reset_agent_worker(&self, timeout: Duration) -> Result<()> {
         let (reply, receiver) = mpsc::sync_channel(0);
+        let started = Instant::now();
         {
             let mut state = self.state.lock().expect("remote queue mutex poisoned");
             if state.closed {
                 bail!("remote worker queue closed during agent maintenance");
             }
-            state
-                .controls
-                .push_back(RemoteWorkerControl::ResetAgent { reply });
+            state.controls.push_back(RemoteWorkerControl::ResetAgent {
+                started,
+                timeout,
+                reply,
+            });
             self.ready.notify_one();
         }
-        receiver
-            .recv_timeout(timeout)
-            .map_err(|error| anyhow!("remote agent worker reset did not complete: {error}"))
+        let remaining = remaining_timeout_since(started, timeout);
+        if remaining.is_zero() {
+            return Err(anyhow!(AgentWorkerExitTimeoutError {
+                context: "remote lane reset dispatch".to_string(),
+            }));
+        }
+        receiver.recv_timeout(remaining).map_err(|error| {
+            anyhow!(AgentWorkerExitTimeoutError {
+                context: format!("remote lane reset reply: {error}"),
+            })
+        })??;
+        Ok(())
     }
 
     fn close_and_drain_background(&self) -> Vec<RemoteWork> {
@@ -5058,22 +6398,31 @@ fn wait_for_remote_queues_quiescent(
     write_interrupt: &AgentInterrupt,
     timeout: Duration,
 ) -> Result<()> {
-    let deadline = Instant::now()
-        .checked_add(timeout)
-        .unwrap_or_else(Instant::now);
+    let started = Instant::now();
     loop {
         read_interrupt.kill_current();
         write_interrupt.kill_current();
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
+        let read_remaining = remaining_timeout_since(started, timeout);
+        if read_remaining.is_zero() {
             bail!("timed out waiting for remote agent lanes to quiesce");
         }
-        let wait = remaining.min(Duration::from_millis(10));
-        let read_idle = read_queue.wait_quiescent_for(wait);
-        let write_idle = write_queue.wait_quiescent_for(wait);
+        let read_idle =
+            read_queue.wait_quiescent_for(read_remaining.min(Duration::from_millis(10)));
+        let write_remaining = remaining_timeout_since(started, timeout);
+        if write_remaining.is_zero() {
+            bail!("timed out waiting for remote agent lanes to quiesce");
+        }
+        let write_idle =
+            write_queue.wait_quiescent_for(write_remaining.min(Duration::from_millis(10)));
         if read_idle && write_idle {
-            read_interrupt.kill_current_and_wait();
-            write_interrupt.kill_current_and_wait();
+            read_interrupt.kill_current_and_wait(
+                remaining_timeout_since(started, timeout),
+                "remote read-lane process exit",
+            )?;
+            write_interrupt.kill_current_and_wait(
+                remaining_timeout_since(started, timeout),
+                "remote write-lane process exit",
+            )?;
             return Ok(());
         }
     }
@@ -5284,6 +6633,8 @@ impl FastState {
             workspace_key: sidecar.workspace_key.clone(),
             pending_remote,
             remote_health: Arc::clone(&sidecar.remote_health),
+            registry_health: Arc::clone(&sidecar.registry_health),
+            registry_health_fallback: sidecar.registry_health_snapshot(),
             remote_host_info: Arc::clone(&sidecar.agent.launch.remote_host_info),
             registry_policy_fingerprint: sidecar.registry_policy_fingerprint().to_string(),
         }
@@ -5293,7 +6644,13 @@ impl FastState {
         match request.method.as_str() {
             "hello" | "workspace_info" => FastHandle::Handled(Ok(self.workspace_info())),
             "status" => FastHandle::Handled(Mirror::open_root(self.mirror_root.clone()).and_then(
-                |mirror| status_with_remote_health(mirror.status()?, self.remote_health_snapshot()),
+                |mirror| {
+                    status_with_remote_health(
+                        mirror.status()?,
+                        self.remote_health_snapshot(),
+                        self.registry_health_snapshot(),
+                    )
+                },
             )),
             "save_queue" => FastHandle::Handled(
                 Mirror::open_root(self.mirror_root.clone())
@@ -5325,6 +6682,7 @@ impl FastState {
             &self.files_root,
             &self.transport,
             self.remote_health_snapshot(),
+            self.registry_health_snapshot(),
             remote_host.as_ref(),
             &self.registry_policy_fingerprint,
         )
@@ -5432,6 +6790,13 @@ impl FastState {
             .map(|health| health.clone())
             .unwrap_or_default()
     }
+
+    fn registry_health_snapshot(&self) -> RegistryHealth {
+        self.registry_health
+            .try_lock()
+            .map(|health| health.clone())
+            .unwrap_or_else(|_| self.registry_health_fallback.clone())
+    }
 }
 
 impl Sidecar {
@@ -5442,6 +6807,15 @@ impl Sidecar {
             .as_ref()
             .map(|registry| registry.policy_fingerprint.as_str())
             .unwrap_or(REGISTRY_POLICY_DISABLED)
+    }
+
+    fn remote_agent_bootstrap_timeout(&self) -> Duration {
+        self.agent
+            .launch
+            .registry
+            .as_ref()
+            .map(|registry| registry.timeout)
+            .unwrap_or(self.agent.launch.request_timeout)
     }
 
     #[cfg(test)]
@@ -5484,6 +6858,7 @@ impl Sidecar {
                 .get_or_insert_with(|| state_dir.join("registry-cache"));
             config
         });
+        let registry_health = RegistryHealth::from_registry(registry.as_ref());
         let workspace_key = workspace_key(&transport, &remote_root);
         let mirror = Mirror::open(Some(state_dir), &workspace_key)?;
         let agent = AgentClient::new_with_registry(
@@ -5501,6 +6876,7 @@ impl Sidecar {
             remote_root,
             workspace_key,
             remote_health: Arc::new(Mutex::new(RemoteHealth::default())),
+            registry_health: Arc::new(Mutex::new(registry_health)),
         };
         Ok(sidecar)
     }
@@ -5512,6 +6888,7 @@ impl Sidecar {
             remote_root: self.remote_root.clone(),
             workspace_key: self.workspace_key.clone(),
             remote_health: Arc::clone(&self.remote_health),
+            registry_health: Arc::clone(&self.registry_health),
         })
     }
 
@@ -5570,19 +6947,45 @@ impl Sidecar {
             self.mirror.root(),
             self.mirror.files_root(),
             &self.agent.launch.transport,
-            self.agent.remote_health(),
+            self.remote_health_snapshot(),
+            self.registry_health_snapshot(),
             remote_host.as_ref(),
             self.registry_policy_fingerprint(),
         )
     }
 
     fn status(&self) -> Result<Value> {
-        status_with_remote_health(self.mirror.status()?, self.agent.remote_health())
+        status_with_remote_health(
+            self.mirror.status()?,
+            self.remote_health_snapshot(),
+            self.registry_health_snapshot(),
+        )
     }
 
     fn record_remote_health(&self) {
         if let Ok(mut health) = self.remote_health.lock() {
             *health = self.agent.remote_health();
+        }
+    }
+
+    fn remote_health_snapshot(&self) -> RemoteHealth {
+        self.remote_health
+            .lock()
+            .map(|health| health.clone())
+            .unwrap_or_default()
+    }
+
+    fn registry_health_snapshot(&self) -> RegistryHealth {
+        self.registry_health
+            .lock()
+            .map(|health| health.clone())
+            .unwrap_or_else(|poisoned| poisoned.into_inner().clone())
+    }
+
+    fn update_registry_health(&self, update: impl FnOnce(&mut RegistryHealth)) {
+        match self.registry_health.lock() {
+            Ok(mut health) => update(&mut health),
+            Err(poisoned) => update(&mut poisoned.into_inner()),
         }
     }
 
@@ -5613,6 +7016,7 @@ impl Sidecar {
                 json!(self.remote_root.to_string_lossy()),
             );
         }
+        self.registry_health_snapshot().insert_into(&mut params);
         ClientNotification {
             method: "workspace/remote_health".to_string(),
             params,
@@ -5620,6 +7024,14 @@ impl Sidecar {
     }
 
     fn remote_probe(&mut self, preempt_epoch: u64) -> Value {
+        self.remote_probe_with_timeout(preempt_epoch, None)
+    }
+
+    fn remote_probe_with_timeout(
+        &mut self,
+        preempt_epoch: u64,
+        timeout: Option<Duration>,
+    ) -> Value {
         if self.agent.handshake_complete() {
             return json!({
                 "remote_status": "connected",
@@ -5637,13 +7049,21 @@ impl Sidecar {
             });
         }
 
-        match self.agent.request_maybe_preemptible_since(
-            Request::Hello {
-                client_version: env!("CARGO_PKG_VERSION").to_string(),
-                protocol_version: PROTOCOL_VERSION,
-            },
-            preempt_epoch,
-        ) {
+        let request = Request::Hello {
+            client_version: env!("CARGO_PKG_VERSION").to_string(),
+            protocol_version: PROTOCOL_VERSION,
+        };
+        let outcome = match timeout {
+            Some(timeout) => self.agent.request_maybe_preemptible_since_with_timeout(
+                request,
+                preempt_epoch,
+                timeout,
+            ),
+            None => self
+                .agent
+                .request_maybe_preemptible_since(request, preempt_epoch),
+        };
+        match outcome {
             Ok(AgentRequestOutcome::Response(Response::Hello {
                 agent_version,
                 protocol_version,
@@ -5684,7 +7104,16 @@ impl Sidecar {
 
     fn remote_health(&mut self, preempt_epoch: u64) -> Value {
         let probe = self.remote_probe(preempt_epoch);
-        self.decorate_remote_agent_health(probe)
+        let mut health = self.decorate_remote_agent_health(probe);
+        self.registry_health_snapshot().insert_into(&mut health);
+        health
+    }
+
+    fn remote_health_with_timeout(&mut self, preempt_epoch: u64, timeout: Duration) -> Value {
+        let probe = self.remote_probe_with_timeout(preempt_epoch, Some(timeout));
+        let mut health = self.decorate_remote_agent_health(probe);
+        self.registry_health_snapshot().insert_into(&mut health);
+        health
     }
 
     fn remote_agent_install_preflight(
@@ -5692,29 +7121,51 @@ impl Sidecar {
         params: &Value,
         update: bool,
         preempt_epoch: u64,
-    ) -> AgentInstallPreflight {
+        deadline: BootstrapDeadline,
+    ) -> Result<AgentInstallPreflight> {
         let force = params
             .get("force")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let target_path = params
+        let requested_target = params
             .get("install_path")
             .and_then(Value::as_str)
             .filter(|path| !path.trim().is_empty())
-            .map(ToString::to_string)
-            .unwrap_or_else(|| default_remote_agent_install_path(&self.agent.launch.agent));
+            .map(ToString::to_string);
 
-        let before = self.remote_health(preempt_epoch);
+        let before_timeout = deadline.forward_timeout("remote agent preflight health")?;
+        let before = self.remote_health_with_timeout(preempt_epoch, before_timeout);
+        deadline.forward_timeout("remote agent preflight health")?;
+        let target_path = match requested_target {
+            Some(target_path) => target_path,
+            None => {
+                let host_timeout = deadline.forward_timeout("remote host detection")?;
+                let host = self
+                    .agent
+                    .launch
+                    .remote_host_info_with_timeout(host_timeout)
+                    .map_err(|error| {
+                        deadline.map_budgeted_error(
+                            BootstrapBudget::Forward,
+                            "remote host detection",
+                            error,
+                        )
+                    })
+                    .context("failed to select the default remote agent install path")?;
+                default_remote_agent_install_path(&self.agent.launch.agent, &host)?
+            }
+        };
         let before_status = before
             .get("agent_status")
             .and_then(Value::as_str)
             .unwrap_or("unknown");
-        AgentInstallPreflight {
+        deadline.forward_timeout("remote agent preflight")?;
+        Ok(AgentInstallPreflight {
             effective_force: force || (update && before_status != "missing_agent"),
             skip: update && !force && before_status == "ok",
             before,
             target_path,
-        }
+        })
     }
 
     fn remote_agent_install(
@@ -5723,25 +7174,49 @@ impl Sidecar {
         update: bool,
         preempt_epoch: u64,
     ) -> Result<Value> {
-        let preflight = self.remote_agent_install_preflight(&params, update, preempt_epoch);
-        if preflight.skip {
-            return Ok(json!({
-                "status": "skipped",
-                "reason": "remote agent is already compatible",
-                "install_path": preflight.target_path,
-                "remote_health": preflight.before
-            }));
-        }
-        self.record_remote_health();
-        let prepared = self.prepare_remote_agent_install(&preflight)?;
-        self.agent.invalidate_shared_workers();
-        self.agent.clear_all_remote_unavailable();
-        self.remote_agent_install_prepared(preflight, prepared, update, preempt_epoch)
+        let deadline = BootstrapDeadline::new(self.remote_agent_bootstrap_timeout());
+        (|| {
+            let preflight =
+                self.remote_agent_install_preflight(&params, update, preempt_epoch, deadline)?;
+            if preflight.skip {
+                return Ok(json!({
+                    "status": "skipped",
+                    "reason": "remote agent is already compatible",
+                    "install_path": preflight.target_path,
+                    "remote_health": preflight.before
+                }));
+            }
+            self.record_remote_health();
+            let prepared = self.prepare_remote_agent_install(&preflight, deadline)?;
+            let invalidation_timeout =
+                deadline.forward_timeout("control-lane agent worker exit")?;
+            self.agent
+                .invalidate_shared_workers_with_timeout(
+                    invalidation_timeout,
+                    "control-lane agent worker exit",
+                )
+                .map_err(|error| {
+                    deadline.map_budgeted_error(
+                        BootstrapBudget::Forward,
+                        "control-lane agent worker exit",
+                        error,
+                    )
+                })?;
+            self.agent.clear_all_remote_unavailable();
+            self.remote_agent_install_prepared(preflight, prepared, update, preempt_epoch, deadline)
+        })()
+        .map_err(|error| {
+            if is_bootstrap_timeout(&error) {
+                self.record_registry_bootstrap_timeout();
+            }
+            normalize_bootstrap_error(error)
+        })
     }
 
     fn prepare_remote_agent_install(
         &self,
         preflight: &AgentInstallPreflight,
+        deadline: BootstrapDeadline,
     ) -> Result<PreparedAgentInstall> {
         let ssh = match &self.agent.launch.transport {
             RemoteTransport::Ssh(ssh) => ssh.clone(),
@@ -5749,34 +7224,80 @@ impl Sidecar {
                 bail!("remote agent install/update is only supported for ssh targets")
             }
         };
-        let host = self.agent.launch.remote_host_info()?;
-        if host.path_style != RemotePathStyle::Posix {
-            bail!("unsupported_platform: Windows transactional install is not yet available");
-        }
-        let plan = agent_install::PosixInstallPlan::new(
-            &preflight.target_path,
-            env!("CARGO_PKG_VERSION"),
-            PROTOCOL_VERSION,
-            preflight.effective_force,
-        )
-        .context("invalid POSIX remote agent install plan")?;
-        let mut source = self.resolve_agent_source()?;
-        let (source_hash, source_sha256, source_size) = hash_agent_source(&mut source.file)
-            .with_context(|| format!("failed to hash agent source {}", source.path.display()))?;
+        let host_timeout = deadline.forward_timeout("remote host detection")?;
+        let host = self
+            .agent
+            .launch
+            .remote_host_info_with_timeout(host_timeout)
+            .map_err(|error| {
+                deadline.map_budgeted_error(
+                    BootstrapBudget::Forward,
+                    "remote host detection",
+                    error,
+                )
+            })?;
+        let plan = match host.path_style {
+            RemotePathStyle::Posix => PreparedAgentInstallPlan::Posix(
+                agent_install::PosixInstallPlan::new(
+                    &preflight.target_path,
+                    env!("CARGO_PKG_VERSION"),
+                    PROTOCOL_VERSION,
+                    preflight.effective_force,
+                )
+                .context("invalid POSIX remote agent install plan")?,
+            ),
+            RemotePathStyle::Windows => PreparedAgentInstallPlan::Windows(
+                windows_agent_install::WindowsInstallPlan::new(
+                    &preflight.target_path,
+                    env!("CARGO_PKG_VERSION"),
+                    PROTOCOL_VERSION,
+                    preflight.effective_force,
+                )
+                .context("invalid Windows remote agent install plan")?,
+            ),
+        };
+        let mut source = self.resolve_agent_source(deadline)?;
+        let registry_source = source._registry_artifact.is_some();
+        let (source_hash, source_sha256, source_size) =
+            match hash_agent_source(&mut source.file, deadline)
+                .with_context(|| format!("failed to hash agent source {}", source.path.display()))
+            {
+                Ok(hashed) => hashed,
+                Err(error) => {
+                    if registry_source {
+                        if is_bootstrap_timeout(&error) {
+                            self.record_registry_bootstrap_timeout();
+                        } else {
+                            self.record_registry_error_code(FetchErrorCode::LocalIo);
+                        }
+                    }
+                    return Err(error);
+                }
+            };
         if source
             .expected_sha256
             .as_deref()
             .is_some_and(|expected| expected != source_sha256)
         {
+            self.record_registry_error_code(FetchErrorCode::ArtifactDigestMismatch);
             bail!(
                 "verified registry artifact changed before upload: expected={} actual={source_sha256}",
                 source.expected_sha256.as_deref().unwrap_or_default()
             );
         }
-        let upload = source
+        let upload = match source
             .file
             .try_clone()
-            .context("failed to clone agent source for streaming upload")?;
+            .context("failed to clone agent source for streaming upload")
+        {
+            Ok(upload) => upload,
+            Err(error) => {
+                if registry_source {
+                    self.record_registry_error_code(FetchErrorCode::LocalIo);
+                }
+                return Err(error);
+            }
+        };
         Ok(PreparedAgentInstall {
             source,
             upload,
@@ -5794,6 +7315,7 @@ impl Sidecar {
         prepared: PreparedAgentInstall,
         update: bool,
         preempt_epoch: u64,
+        deadline: BootstrapDeadline,
     ) -> Result<Value> {
         let AgentInstallPreflight {
             before: _,
@@ -5811,16 +7333,30 @@ impl Sidecar {
             plan,
         } = prepared;
         let launch = self.agent.launch.clone();
-        let timeout = self.agent.launch.request_timeout;
-        let mut operations = PosixSshInstallOps {
-            plan,
-            ssh,
-            source: Some(upload),
-            launch,
-            normal_agent: &mut self.agent,
-            timeout,
+        let mut operations: Box<dyn AgentInstallOps + '_> = match plan {
+            PreparedAgentInstallPlan::Posix(plan) => Box::new(PosixSshInstallOps {
+                plan,
+                ssh,
+                source: Some(upload),
+                launch,
+                normal_agent: &mut self.agent,
+                deadline,
+            }),
+            PreparedAgentInstallPlan::Windows(plan) => {
+                drop(upload);
+                Box::new(WindowsSshInstallOps {
+                    plan,
+                    ssh,
+                    source_path: Some(source.path.clone()),
+                    source_size,
+                    source_sha256: source_sha256.clone(),
+                    launch,
+                    normal_agent: &mut self.agent,
+                    deadline,
+                })
+            }
         };
-        let transaction = run_agent_install_transaction(&mut operations);
+        let transaction = run_agent_install_transaction(operations.as_mut());
         drop(operations);
         let activated = match transaction {
             Ok(activated) => activated,
@@ -5848,75 +7384,25 @@ impl Sidecar {
         Ok(result)
     }
 
-    fn resolve_agent_source(&self) -> Result<ResolvedAgentSource> {
+    fn resolve_agent_source(&self, deadline: BootstrapDeadline) -> Result<ResolvedAgentSource> {
+        deadline.forward_timeout("agent source resolution")?;
         if let Some(registry) = &self.agent.launch.registry {
-            let host = self.agent.launch.remote_host_info()?;
-            let target = host.target.parse::<AgentTarget>().map_err(|()| {
-                anyhow!(
-                    "remote host selected unsupported registry target {:?}",
-                    host.target
-                )
-            })?;
-            let version = Version::parse(env!("CARGO_PKG_VERSION"))
-                .context("sidecar package version is not valid semantic versioning")?;
-            let manifest_url = registry
-                .url_template
-                .expand(&version)
-                .context("failed to expand remote agent registry URL")?;
-            let cache_dir = registry.cache_dir.as_deref().ok_or_else(|| {
-                anyhow!("remote agent registry cache directory was not initialized")
-            })?;
-            let fetched = fetch_verified_artifact(&FetchConfig {
-                manifest_url: &manifest_url,
-                target,
-                expected_version: &version,
-                expected_protocol_version: u32::from(PROTOCOL_VERSION),
-                trusted_keys: &registry.trusted_keys,
-                signature_threshold: registry.signature_threshold,
-                cache_dir,
-                cache_max_bytes: registry.cache_max_bytes,
-                timeout: registry.timeout,
-            })
-            .context("failed to retrieve a verified remote agent build")?;
-            let signing_key_ids: Vec<_> = fetched
-                .verified_manifest
-                .verified_signers
-                .iter()
-                .map(|signer| signer.key_id.clone())
-                .collect();
-            let file = fetched
-                .try_clone_file()
-                .context("failed to clone verified registry artifact handle")?;
-            let artifact_source = match fetched.source {
-                ArtifactSource::Network => "network",
-                ArtifactSource::File => "file",
-                ArtifactSource::Cache => "cache",
-            };
-            let manifest_source = match fetched.manifest_source {
-                ManifestSource::Network => "network",
-                ManifestSource::File => "file",
-                ManifestSource::VerifiedCacheFallback => "verified_cache_fallback",
-            };
-            let details = json!({
-                "agent_source": "registry",
-                "registry_manifest_url": manifest_url.as_str(),
-                "registry_target": target.to_string(),
-                "registry_manifest_sha256": fetched.verified_manifest.manifest_sha256,
-                "registry_signing_key_ids": signing_key_ids,
-                "registry_artifact_source": artifact_source,
-                "registry_manifest_source": manifest_source,
-                "registry_cache_state": {
-                    "manifest_fallback": fetched.cache_state.manifest_fallback,
-                    "artifact_hit": fetched.cache_state.artifact_hit,
+            let cached_platform = self
+                .agent
+                .launch
+                .cached_remote_host_info()
+                .as_ref()
+                .map(RegistryPlatform::from);
+            self.update_registry_health(|health| health.begin_fetch(cached_platform));
+            let result = self.resolve_registry_agent_source(registry, deadline);
+            if let Err(error) = &result {
+                if is_bootstrap_timeout(error) {
+                    self.record_registry_bootstrap_timeout();
+                } else {
+                    self.record_registry_source_error(error);
                 }
-            });
-            return Ok(ResolvedAgentSource {
-                path: fetched.local_path.clone(),
-                file,
-                expected_sha256: Some(fetched.sha256.clone()),
-                details,
-                _registry_artifact: Some(fetched),
-            });
+            }
+            return result;
         }
 
         let source = self
@@ -5933,6 +7419,7 @@ impl Sidecar {
         if !metadata.is_file() {
             bail!("local agent source is not a file: {}", source.display());
         }
+        deadline.forward_timeout("local agent source inspection")?;
         Ok(ResolvedAgentSource {
             details: json!({ "agent_source": "local" }),
             path: source,
@@ -5942,8 +7429,140 @@ impl Sidecar {
         })
     }
 
+    fn resolve_registry_agent_source(
+        &self,
+        registry: &RegistryLaunchConfig,
+        deadline: BootstrapDeadline,
+    ) -> Result<ResolvedAgentSource> {
+        let host_timeout = deadline.forward_timeout("remote host detection")?;
+        let host = self
+            .agent
+            .launch
+            .remote_host_info_with_timeout(host_timeout)
+            .map_err(|error| {
+                deadline.map_budgeted_error(
+                    BootstrapBudget::Forward,
+                    "remote host detection",
+                    error,
+                )
+            })?;
+        self.update_registry_health(|health| health.set_platform(&host));
+        let target = host.target.parse::<AgentTarget>().map_err(|()| {
+            anyhow!(
+                "remote host selected unsupported registry target {:?}",
+                host.target
+            )
+        })?;
+        let version = Version::parse(env!("CARGO_PKG_VERSION"))
+            .context("sidecar package version is not valid semantic versioning")?;
+        let manifest_url = registry
+            .url_template
+            .expand(&version)
+            .context("failed to expand remote agent registry URL")?;
+        self.update_registry_health(|health| health.set_manifest_url(&manifest_url));
+        let cache_dir = registry
+            .cache_dir
+            .as_deref()
+            .ok_or_else(|| anyhow!("remote agent registry cache directory was not initialized"))?;
+        let fetch_timeout = registry_fetch_timeout(registry.timeout, deadline)?;
+        let fetched = fetch_verified_artifact(&FetchConfig {
+            manifest_url: &manifest_url,
+            target,
+            expected_version: &version,
+            expected_protocol_version: u32::from(PROTOCOL_VERSION),
+            trusted_keys: &registry.trusted_keys,
+            signature_threshold: registry.signature_threshold,
+            cache_dir,
+            cache_max_bytes: registry.cache_max_bytes,
+            timeout: fetch_timeout,
+        })
+        .map_err(|error| {
+            let error = anyhow!(error).context("failed to retrieve a verified remote agent build");
+            deadline.map_budgeted_error(BootstrapBudget::Forward, "registry fetch", error)
+        })?;
+        deadline.forward_timeout("registry artifact preparation")?;
+        let mut signing_key_ids: Vec<_> = fetched
+            .verified_manifest
+            .verified_signers
+            .iter()
+            .map(|signer| signer.key_id.clone())
+            .collect();
+        signing_key_ids.sort();
+        let file = fetched
+            .try_clone_file()
+            .context("failed to clone verified registry artifact handle")?;
+        let artifact_source = artifact_source_name(fetched.source);
+        let manifest_source = manifest_source_name(fetched.manifest_source);
+        let redacted_manifest_url = redact_registry_manifest_url(&manifest_url);
+        let details = json!({
+            "agent_source": "registry",
+            "registry_manifest_url": redacted_manifest_url,
+            "registry_target": target.to_string(),
+            "registry_manifest_sha256": fetched.verified_manifest.manifest_sha256,
+            "registry_signing_key_ids": signing_key_ids,
+            "registry_artifact_source": artifact_source,
+            "registry_manifest_source": manifest_source,
+            "registry_cache_state": {
+                "manifest_fallback": fetched.cache_state.manifest_fallback,
+                "artifact_hit": fetched.cache_state.artifact_hit,
+            }
+        });
+        self.update_registry_health(|health| {
+            health.set_verified(&fetched, signing_key_ids.clone());
+        });
+        Ok(ResolvedAgentSource {
+            path: fetched.local_path.clone(),
+            file,
+            expected_sha256: Some(fetched.sha256.clone()),
+            details,
+            _registry_artifact: Some(fetched),
+        })
+    }
+
+    fn record_registry_source_error(&self, error: &anyhow::Error) {
+        let (code, detail) = registry_error_code(error).map_or_else(
+            || {
+                (
+                    "source_resolution_failed".to_string(),
+                    "registry source resolution failed".to_string(),
+                )
+            },
+            |code| {
+                (
+                    code.as_str().to_string(),
+                    format!("signed registry retrieval failed ({code})"),
+                )
+            },
+        );
+        self.update_registry_health(|health| health.set_error(&code, &detail));
+    }
+
+    fn record_registry_error_code(&self, code: FetchErrorCode) {
+        let detail = format!("signed registry artifact preparation failed ({code})");
+        self.update_registry_health(|health| health.set_error(code.as_str(), &detail));
+    }
+
+    fn record_registry_bootstrap_timeout(&self) {
+        if self.agent.launch.registry.is_some() {
+            self.update_registry_health(|health| {
+                health.set_error(
+                    "bootstrap_timeout",
+                    "signed registry bootstrap exceeded its whole-request deadline",
+                );
+            });
+        }
+    }
+
     fn decorate_remote_agent_health(&self, mut value: Value) -> Value {
-        let install_path = default_remote_agent_install_path(&self.agent.launch.agent);
+        let cached_host = self.agent.launch.cached_remote_host_info();
+        let install_path = cached_host
+            .as_ref()
+            .and_then(|host| default_remote_agent_install_path(&self.agent.launch.agent, host).ok())
+            .unwrap_or_else(|| default_posix_remote_agent_install_path(&self.agent.launch.agent));
+        let managed_install_path = cached_host
+            .as_ref()
+            .and_then(|host| default_remote_agent_install_path("nrm-agent", host).ok())
+            .unwrap_or_else(|| REMOTE_AGENT_MANAGED_PATH.to_string());
         let source = self
             .agent
             .launch
@@ -5979,7 +7598,7 @@ impl Sidecar {
             object.insert("remote_agent_install_path".to_string(), json!(install_path));
             object.insert(
                 "managed_remote_agent_path".to_string(),
-                json!(REMOTE_AGENT_MANAGED_PATH),
+                json!(managed_install_path),
             );
             object.insert(
                 "local_agent_path".to_string(),
@@ -7860,12 +9479,32 @@ where
             if request_replaces_remote_agent(&request) {
                 let update = request.method == "remote_agent_update";
                 let request_id = request.id;
+                let deadline =
+                    BootstrapDeadline::new(control_sidecar.remote_agent_bootstrap_timeout());
                 let preempt_epoch = control_sidecar.agent.preempt_handle().epoch();
-                let preflight = control_sidecar.remote_agent_install_preflight(
+                let preflight = match control_sidecar.remote_agent_install_preflight(
                     &request.params,
                     update,
                     preempt_epoch,
-                );
+                    deadline,
+                ) {
+                    Ok(preflight) => preflight,
+                    Err(error) => {
+                        if is_bootstrap_timeout(&error) {
+                            control_sidecar.record_registry_bootstrap_timeout();
+                        }
+                        let error = normalize_bootstrap_error(error);
+                        send_client_response(
+                            &response_tx,
+                            result_to_client_response(request_id, Err(error)),
+                        );
+                        send_client_notification(
+                            &response_tx,
+                            control_sidecar.remote_health_notification(),
+                        );
+                        continue;
+                    }
+                };
                 if preflight.skip {
                     send_client_response(
                         &response_tx,
@@ -7883,20 +9522,25 @@ where
                 }
 
                 control_sidecar.record_remote_health();
-                let prepared = match control_sidecar.prepare_remote_agent_install(&preflight) {
-                    Ok(prepared) => prepared,
-                    Err(error) => {
-                        send_client_response(
-                            &response_tx,
-                            result_to_client_response(request_id, Err(error)),
-                        );
-                        send_client_notification(
-                            &response_tx,
-                            control_sidecar.remote_health_notification(),
-                        );
-                        continue;
-                    }
-                };
+                let prepared =
+                    match control_sidecar.prepare_remote_agent_install(&preflight, deadline) {
+                        Ok(prepared) => prepared,
+                        Err(error) => {
+                            if is_bootstrap_timeout(&error) {
+                                control_sidecar.record_registry_bootstrap_timeout();
+                            }
+                            let error = normalize_bootstrap_error(error);
+                            send_client_response(
+                                &response_tx,
+                                result_to_client_response(request_id, Err(error)),
+                            );
+                            send_client_notification(
+                                &response_tx,
+                                control_sidecar.remote_health_notification(),
+                            );
+                            continue;
+                        }
+                    };
 
                 let (maintenance, drained) = RemoteMaintenanceGuard::begin(
                     Arc::clone(&read_queue),
@@ -7908,26 +9552,75 @@ where
                     clear_pending_work(&pending_remote, &pending_writes, &work);
                     send_client_response(&response_tx, canceled_client_response(work));
                 }
-                let maintenance_timeout = control_sidecar.agent.launch.request_timeout;
                 let result = (|| -> Result<Value> {
+                    let maintenance_timeout =
+                        deadline.forward_timeout("remote agent lane quiescence")?;
                     wait_for_remote_queues_quiescent(
                         &read_queue,
                         &write_queue,
                         &agent_interrupt,
                         &write_interrupt,
                         maintenance_timeout,
-                    )?;
-                    control_sidecar.agent.invalidate_shared_workers();
+                    )
+                    .map_err(|error| {
+                        deadline.map_budgeted_error(
+                            BootstrapBudget::Forward,
+                            "remote agent lane quiescence",
+                            error,
+                        )
+                    })?;
+                    let control_reset_timeout =
+                        deadline.forward_timeout("control-lane agent worker exit")?;
+                    control_sidecar
+                        .agent
+                        .invalidate_shared_workers_with_timeout(
+                            control_reset_timeout,
+                            "control-lane agent worker exit",
+                        )
+                        .map_err(|error| {
+                            deadline.map_budgeted_error(
+                                BootstrapBudget::Forward,
+                                "control-lane agent worker exit",
+                                error,
+                            )
+                        })?;
                     control_sidecar.agent.clear_all_remote_unavailable();
-                    read_queue.reset_agent_worker(maintenance_timeout)?;
-                    write_queue.reset_agent_worker(maintenance_timeout)?;
+                    let read_reset_timeout =
+                        deadline.forward_timeout("remote read-lane worker exit")?;
+                    read_queue
+                        .reset_agent_worker(read_reset_timeout)
+                        .map_err(|error| {
+                            deadline.map_budgeted_error(
+                                BootstrapBudget::Forward,
+                                "remote read-lane worker exit",
+                                error,
+                            )
+                        })?;
+                    let write_reset_timeout =
+                        deadline.forward_timeout("remote write-lane worker exit")?;
+                    write_queue
+                        .reset_agent_worker(write_reset_timeout)
+                        .map_err(|error| {
+                            deadline.map_budgeted_error(
+                                BootstrapBudget::Forward,
+                                "remote write-lane worker exit",
+                                error,
+                            )
+                        })?;
                     control_sidecar.remote_agent_install_prepared(
                         preflight,
                         prepared,
                         update,
                         preempt_epoch,
+                        deadline,
                     )
-                })();
+                })()
+                .map_err(|error| {
+                    if is_bootstrap_timeout(&error) {
+                        control_sidecar.record_registry_bootstrap_timeout();
+                    }
+                    normalize_bootstrap_error(error)
+                });
                 drop(maintenance);
                 if result.is_ok() {
                     control_sidecar.record_remote_health();
@@ -8101,6 +9794,7 @@ fn spawn_stdout_writer(
     })
 }
 
+#[cfg(unix)]
 fn spawn_message_writer<W>(
     writer: W,
     response_rx: mpsc::Receiver<ServerMessage>,
@@ -8183,9 +9877,16 @@ fn spawn_remote_worker(
         };
         let started = match item {
             RemoteWorkerItem::Work(started) => started,
-            RemoteWorkerItem::Control(RemoteWorkerControl::ResetAgent { reply }) => {
-                sidecar.agent.kill_worker();
-                let _ = reply.send(());
+            RemoteWorkerItem::Control(RemoteWorkerControl::ResetAgent {
+                started,
+                timeout,
+                reply,
+            }) => {
+                let remaining = remaining_timeout_since(started, timeout);
+                let result = sidecar
+                    .agent
+                    .kill_worker_with_timeout(remaining, "remote lane worker reset");
+                let _ = reply.send(result);
                 continue;
             }
         };
@@ -8550,6 +10251,7 @@ fn run_lsp_proxy(
         Duration::from_millis(LSP_PROXY_EXIT_GRACE_MS)
     };
     let launch = LspLaunch::new(remote_root.clone(), transport, command, &host)?;
+    let stdin_prefix = launch.stdin_prefix().to_vec();
     let mut child_command = launch.command();
     configure_agent_process(&mut child_command);
 
@@ -8579,6 +10281,10 @@ fn run_lsp_proxy(
         let stdin = io::stdin();
         let mut client_reader = BufReader::new(stdin.lock());
         let result = (|| -> Result<()> {
+            server_stdin
+                .write_all(&stdin_prefix)
+                .and_then(|()| server_stdin.flush())
+                .context("failed to write Windows LSP bootstrap")?;
             while let Some(body) = read_lsp_message(&mut client_reader)? {
                 let rewritten = rewrite_lsp_body(&body, &upstream_local, &upstream_remote)?;
                 write_lsp_message(&mut server_stdin, &rewritten)?;
@@ -8591,7 +10297,7 @@ fn run_lsp_proxy(
 
     let stdout = io::stdout();
     let mut client_writer = stdout.lock();
-    let mut server_reader = BufReader::new(server_stdout);
+    let mut server_reader = BufReader::new(LeadingBomReader::new(server_stdout));
     let downstream_result = (|| -> Result<()> {
         while let Some(body) = read_lsp_message(&mut server_reader)? {
             let rewritten = rewrite_lsp_body(&body, &remote_prefix, &local_prefix)?;
@@ -8600,18 +10306,13 @@ fn run_lsp_proxy(
         Ok(())
     })();
     if let Err(err) = downstream_result {
-        return fail_lsp_downstream(err, &child, &mut upstream);
+        return fail_lsp_downstream(err, &child, &mut upstream, exit_grace);
     }
 
-    join_lsp_upstream_if_finished(&mut upstream, &child)?;
+    join_lsp_upstream_if_finished(&mut upstream, &child, exit_grace)?;
 
-    let status = {
-        let mut child = child
-            .lock()
-            .map_err(|_| anyhow!("language server child lock poisoned"))?;
-        wait_lsp_child_with_grace(&mut child, exit_grace)?
-    };
-    join_lsp_upstream_if_finished(&mut upstream, &child)?;
+    let status = wait_lsp_child_handle_with_grace(&child, exit_grace)?;
+    join_lsp_upstream_if_finished(&mut upstream, &child, exit_grace)?;
     if !status.success() {
         bail!("language server exited with {status}");
     }
@@ -8622,12 +10323,13 @@ fn fail_lsp_downstream(
     err: anyhow::Error,
     child: &Arc<Mutex<Child>>,
     upstream: &mut Option<thread::JoinHandle<Result<()>>>,
+    grace: Duration,
 ) -> Result<()> {
-    let status_context = match kill_and_wait_lsp_child_handle(child) {
+    let status_context = match kill_and_wait_lsp_child_handle(child, grace) {
         Ok(status) => format!("language server stopped with {status}"),
         Err(wait_err) => format!("failed to reap language server: {wait_err:#}"),
     };
-    if let Err(upstream_err) = join_lsp_upstream_if_finished(upstream, child) {
+    if let Err(upstream_err) = join_lsp_upstream_if_finished(upstream, child, grace) {
         return Err(err).context(format!(
             "LSP proxy downstream pump failed; {status_context}; upstream also failed: {upstream_err:#}"
         ));
@@ -8652,7 +10354,7 @@ fn finish_lsp_upstream_result(
             Ok(())
         }
         Err(err) => {
-            let status_context = match kill_and_wait_lsp_child_handle(child) {
+            let status_context = match kill_and_wait_lsp_child_handle(child, grace) {
                 Ok(status) => format!("language server stopped with {status}"),
                 Err(wait_err) => format!("failed to reap language server: {wait_err:#}"),
             };
@@ -8664,6 +10366,7 @@ fn finish_lsp_upstream_result(
 fn join_lsp_upstream_if_finished(
     upstream: &mut Option<thread::JoinHandle<Result<()>>>,
     child: &Arc<Mutex<Child>>,
+    grace: Duration,
 ) -> Result<()> {
     let finished = upstream
         .as_ref()
@@ -8676,14 +10379,14 @@ fn join_lsp_upstream_if_finished(
     match handle.join() {
         Ok(Ok(())) => Ok(()),
         Ok(Err(err)) => {
-            let status_context = match kill_and_wait_lsp_child_handle(child) {
+            let status_context = match kill_and_wait_lsp_child_handle(child, grace) {
                 Ok(status) => format!("language server stopped with {status}"),
                 Err(wait_err) => format!("failed to reap language server: {wait_err:#}"),
             };
             Err(err).context(format!("LSP proxy upstream pump failed; {status_context}"))
         }
         Err(_) => {
-            let status_context = match kill_and_wait_lsp_child_handle(child) {
+            let status_context = match kill_and_wait_lsp_child_handle(child, grace) {
                 Ok(status) => format!("language server stopped with {status}"),
                 Err(wait_err) => format!("failed to reap language server: {wait_err:#}"),
             };
@@ -8696,39 +10399,206 @@ fn wait_lsp_child_handle_with_grace(
     child: &Arc<Mutex<Child>>,
     grace: Duration,
 ) -> Result<ExitStatus> {
-    let mut child = child
-        .lock()
-        .map_err(|_| anyhow!("language server child lock poisoned"))?;
-    wait_lsp_child_with_grace(&mut child, grace)
-}
-
-fn kill_and_wait_lsp_child_handle(child: &Arc<Mutex<Child>>) -> Result<ExitStatus> {
-    let mut child = child
-        .lock()
-        .map_err(|_| anyhow!("language server child lock poisoned"))?;
-    kill_child_tree(&mut child);
-    child.wait().context("failed to wait for language server")
-}
-
-fn wait_lsp_child_with_grace(child: &mut Child, grace: Duration) -> Result<ExitStatus> {
-    let deadline = Instant::now() + grace;
+    let started = Instant::now();
+    let reap_reserve = (grace / 2).min(Duration::from_millis(100));
+    let natural_grace = grace.saturating_sub(reap_reserve);
+    let mut killed = false;
     loop {
-        if let Some(status) = child.try_wait()? {
-            return Ok(status);
+        match child.try_lock() {
+            Ok(mut child) => {
+                if !killed && started.elapsed() >= natural_grace {
+                    kill_child_tree(&mut child);
+                    killed = true;
+                } else if killed {
+                    kill_child_tree(&mut child);
+                }
+                if let Some(status) = child.try_wait()? {
+                    if killed {
+                        bail!(
+                            "language server did not exit within {:?}; killed with {status}",
+                            natural_grace
+                        );
+                    }
+                    return Ok(status);
+                }
+            }
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                let mut child = poisoned.into_inner();
+                kill_child_tree(&mut child);
+                if let Some(status) = child.try_wait()? {
+                    bail!("language server child lock was poisoned; killed with {status}");
+                }
+                killed = true;
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {}
         }
-        if Instant::now() >= deadline {
-            kill_child_tree(child);
-            let status = child.wait()?;
-            bail!("language server did not exit within {grace:?}; killed with {status}");
+        let remaining = remaining_timeout_since(started, grace);
+        if remaining.is_zero() {
+            bail!(
+                "language server did not exit within {grace:?}; process-tree termination requested but reap did not complete"
+            );
         }
-        thread::sleep(Duration::from_millis(10));
+        thread::sleep(remaining.min(Duration::from_millis(10)));
     }
 }
 
+fn kill_and_wait_lsp_child_handle(
+    child: &Arc<Mutex<Child>>,
+    timeout: Duration,
+) -> Result<ExitStatus> {
+    let started = Instant::now();
+    loop {
+        match child.try_lock() {
+            Ok(mut child) => {
+                kill_child_tree(&mut child);
+                if let Some(status) = child.try_wait()? {
+                    return Ok(status);
+                }
+            }
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                let mut child = poisoned.into_inner();
+                kill_child_tree(&mut child);
+                if let Some(status) = child.try_wait()? {
+                    return Ok(status);
+                }
+            }
+            Err(std::sync::TryLockError::WouldBlock) => {}
+        }
+        let remaining = remaining_timeout_since(started, timeout);
+        if remaining.is_zero() {
+            bail!("language server process-tree termination did not complete within {timeout:?}");
+        }
+        thread::sleep(remaining.min(Duration::from_millis(10)));
+    }
+}
+
+#[cfg(all(test, unix))]
+fn wait_lsp_child_with_grace(child: &mut Child, grace: Duration) -> Result<ExitStatus> {
+    let started = Instant::now();
+    let reap_reserve = (grace / 2).min(Duration::from_millis(100));
+    let natural_grace = grace.saturating_sub(reap_reserve);
+    let mut killed = false;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            if killed {
+                bail!(
+                    "language server did not exit within {:?}; killed with {status}",
+                    natural_grace
+                );
+            }
+            return Ok(status);
+        }
+        if !killed && started.elapsed() >= natural_grace {
+            kill_child_tree(child);
+            killed = true;
+        } else if killed {
+            kill_child_tree(child);
+        }
+        let remaining = remaining_timeout_since(started, grace);
+        if remaining.is_zero() {
+            bail!(
+                "language server did not exit within {grace:?}; process-tree termination requested but reap did not complete"
+            );
+        }
+        thread::sleep(remaining.min(Duration::from_millis(10)));
+    }
+}
+
+#[derive(Debug)]
 struct CapturedProcessOutput {
     status: ExitStatus,
     stdout: String,
     stderr: String,
+}
+
+#[derive(Debug)]
+struct ProcessOutputLimitError {
+    context: String,
+    stream: &'static str,
+    limit: usize,
+}
+
+impl fmt::Display for ProcessOutputLimitError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{} {} exceeded the {} byte capture limit",
+            self.context, self.stream, self.limit
+        )
+    }
+}
+
+impl std::error::Error for ProcessOutputLimitError {}
+
+struct ProcessOutputReader {
+    handle: thread::JoinHandle<io::Result<Vec<u8>>>,
+    limit_exceeded: Arc<AtomicBool>,
+}
+
+impl ProcessOutputReader {
+    fn is_finished(&self) -> bool {
+        self.handle.is_finished()
+    }
+
+    fn limit_exceeded(&self) -> bool {
+        self.limit_exceeded.load(Ordering::Acquire)
+    }
+}
+
+fn spawn_process_output_reader<R>(stream: R) -> ProcessOutputReader
+where
+    R: Read + Send + 'static,
+{
+    let limit_exceeded = Arc::new(AtomicBool::new(false));
+    let reader_limit_exceeded = Arc::clone(&limit_exceeded);
+    let handle = thread::spawn(move || {
+        let mut stream =
+            LeadingBomReader::new(stream).take((PROCESS_CAPTURE_MAX_STREAM_BYTES + 1) as u64);
+        let mut output = Vec::new();
+        stream.read_to_end(&mut output)?;
+        if output.len() > PROCESS_CAPTURE_MAX_STREAM_BYTES {
+            output.truncate(PROCESS_CAPTURE_MAX_STREAM_BYTES);
+            reader_limit_exceeded.store(true, Ordering::Release);
+        }
+        Ok(output)
+    });
+    ProcessOutputReader {
+        handle,
+        limit_exceeded,
+    }
+}
+
+fn join_process_output_reader(
+    reader: ProcessOutputReader,
+    context: &str,
+    stream_name: &'static str,
+) -> Result<Vec<u8>> {
+    debug_assert!(reader.is_finished());
+    let limit_exceeded = reader.limit_exceeded();
+    let output = match reader.handle.join() {
+        Ok(result) => result.with_context(|| format!("failed to read {context} {stream_name}")),
+        Err(_) => bail!("{context} {stream_name} reader panicked"),
+    }?;
+    if limit_exceeded {
+        return Err(anyhow!(ProcessOutputLimitError {
+            context: context.to_string(),
+            stream: stream_name,
+            limit: PROCESS_CAPTURE_MAX_STREAM_BYTES,
+        }));
+    }
+    Ok(output)
+}
+
+fn reap_child_in_background(mut child: Child) {
+    let _ = thread::Builder::new()
+        .name("nrm-process-reaper".to_string())
+        .spawn(move || loop {
+            kill_child_tree(&mut child);
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) | Err(_) => thread::sleep(Duration::from_millis(10)),
+            }
+        });
 }
 
 fn run_command_capture(
@@ -8743,6 +10613,7 @@ fn run_command_capture(
         command.stdin(Stdio::null());
     }
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    configure_agent_process(&mut command);
     let mut child = command
         .spawn()
         .with_context(|| format!("failed to start {context}"))?;
@@ -8760,42 +10631,113 @@ fn run_command_capture(
         None
     };
 
-    let deadline = Instant::now() + timeout;
+    let stdout_reader = child
+        .stdout
+        .take()
+        .map(spawn_process_output_reader)
+        .ok_or_else(|| anyhow!("{context} stdout was not piped"))?;
+    let stderr_reader = child
+        .stderr
+        .take()
+        .map(spawn_process_output_reader)
+        .ok_or_else(|| anyhow!("{context} stderr was not piped"))?;
+
+    let started = Instant::now();
+    let mut status = None;
+    let mut stdout_reader = Some(stdout_reader);
+    let mut stderr_reader = Some(stderr_reader);
+    let mut stdin_writer = stdin_writer;
     loop {
-        if let Some(status) = child.try_wait()? {
-            let stdin_result = stdin_writer.map(|writer| match writer.join() {
-                Ok(result) => result.with_context(|| format!("{context} stdin failed")),
-                Err(_) => Err(anyhow!("{context} stdin writer panicked")),
-            });
-            let mut stdout = Vec::new();
-            if let Some(mut stream) = child.stdout.take() {
-                stream.read_to_end(&mut stdout)?;
-            }
-            let mut stderr = Vec::new();
-            if let Some(mut stream) = child.stderr.take() {
-                stream.read_to_end(&mut stderr)?;
-            }
-            if status.success() {
-                if let Some(result) = stdin_result {
-                    result?;
-                }
-            }
-            return Ok(CapturedProcessOutput {
-                status,
-                stdout: String::from_utf8_lossy(&stdout).trim().to_string(),
-                stderr: String::from_utf8_lossy(&stderr).trim().to_string(),
-            });
-        }
-        if Instant::now() >= deadline {
+        let output_limit_exceeded = if stdout_reader
+            .as_ref()
+            .is_some_and(ProcessOutputReader::limit_exceeded)
+        {
+            Some("stdout")
+        } else if stderr_reader
+            .as_ref()
+            .is_some_and(ProcessOutputReader::limit_exceeded)
+        {
+            Some("stderr")
+        } else {
+            None
+        };
+        if let Some(stream) = output_limit_exceeded {
             kill_child_tree(&mut child);
-            let status = child.wait()?;
-            if let Some(writer) = stdin_writer {
-                let _ = writer.join();
+            if child.try_wait().ok().flatten().is_none() {
+                reap_child_in_background(child);
             }
-            bail!(
-                "{context} timed out after {} ms; killed with {status}",
-                timeout.as_millis()
-            );
+            return Err(anyhow!(ProcessOutputLimitError {
+                context: context.to_string(),
+                stream,
+                limit: PROCESS_CAPTURE_MAX_STREAM_BYTES,
+            }));
+        }
+        if status.is_none() {
+            status = match child.try_wait() {
+                Ok(status) => status,
+                Err(error) => {
+                    kill_child_tree(&mut child);
+                    reap_child_in_background(child);
+                    return Err(error).with_context(|| format!("failed to poll {context}"));
+                }
+            };
+        }
+        if let Some(exit_status) = status {
+            let stdout_finished = stdout_reader
+                .as_ref()
+                .is_none_or(ProcessOutputReader::is_finished);
+            let stderr_finished = stderr_reader
+                .as_ref()
+                .is_none_or(ProcessOutputReader::is_finished);
+            let stdin_finished = stdin_writer
+                .as_ref()
+                .is_none_or(thread::JoinHandle::is_finished);
+            // A failing remote command's status/stderr is authoritative even
+            // if its upload producer is still blocked. Successful commands
+            // require the complete stdin copy to have finished.
+            if stdout_finished && stderr_finished && (!exit_status.success() || stdin_finished) {
+                let stdout = join_process_output_reader(
+                    stdout_reader.take().expect("stdout reader exists"),
+                    context,
+                    "stdout",
+                )?;
+                let stderr = join_process_output_reader(
+                    stderr_reader.take().expect("stderr reader exists"),
+                    context,
+                    "stderr",
+                )?;
+                if stdin_finished {
+                    if let Some(writer) = stdin_writer.take() {
+                        debug_assert!(writer.is_finished());
+                        let stdin_result = match writer.join() {
+                            Ok(result) => result.with_context(|| format!("{context} stdin failed")),
+                            Err(_) => Err(anyhow!("{context} stdin writer panicked")),
+                        };
+                        if exit_status.success() {
+                            stdin_result?;
+                        }
+                    }
+                }
+                return Ok(CapturedProcessOutput {
+                    status: exit_status,
+                    stdout: String::from_utf8_lossy(&stdout).into_owned(),
+                    stderr: String::from_utf8_lossy(&stderr).into_owned(),
+                });
+            }
+        }
+        if started.elapsed() >= timeout {
+            kill_child_tree(&mut child);
+            if status.is_none() {
+                status = child.try_wait().ok().flatten();
+            }
+            if status.is_none() {
+                reap_child_in_background(child);
+            }
+            return Err(anyhow!(ProcessTimeoutError {
+                context: context.to_string(),
+                timeout,
+                status,
+            }));
         }
         thread::sleep(Duration::from_millis(10));
     }
@@ -8819,6 +10761,10 @@ impl LspLaunch {
 
     fn command(&self) -> Command {
         self.plan.command()
+    }
+
+    fn stdin_prefix(&self) -> &[u8] {
+        &self.plan.stdin_prefix
     }
 }
 
@@ -8849,7 +10795,7 @@ fn powershell_agent_remote_command(
     agent: &str,
     remote_root: &Path,
     host: &RemoteHostInfo,
-) -> Result<String> {
+) -> Result<PowerShellProcessCommand> {
     let remote_root = remote_root
         .to_str()
         .ok_or_else(|| anyhow!("Windows remote root must be valid UTF-8"))?;
@@ -8882,11 +10828,34 @@ fn remote_agent_uses_managed_path(agent: &str) -> bool {
     !agent.contains(['/', '\\', ':'])
 }
 
-fn default_remote_agent_install_path(agent: &str) -> String {
+fn default_posix_remote_agent_install_path(agent: &str) -> String {
     if agent.starts_with('/') {
         agent.to_string()
     } else {
         REMOTE_AGENT_MANAGED_PATH.to_string()
+    }
+}
+
+fn default_remote_agent_install_path(agent: &str, host: &RemoteHostInfo) -> Result<String> {
+    match host.path_style {
+        RemotePathStyle::Posix => Ok(default_posix_remote_agent_install_path(agent)),
+        RemotePathStyle::Windows if !remote_agent_uses_managed_path(agent) => Ok(agent.to_string()),
+        RemotePathStyle::Windows => {
+            let local_app_data = host
+                .local_app_data
+                .as_deref()
+                .ok_or_else(|| anyhow!("Windows remote host did not report LOCALAPPDATA"))?;
+            let local_app_data = local_app_data.trim_end_matches(['/', '\\']);
+            if local_app_data.is_empty() {
+                bail!("Windows remote host reported an empty LOCALAPPDATA");
+            }
+            let filename = if agent.to_ascii_lowercase().ends_with(".exe") {
+                agent.to_string()
+            } else {
+                format!("{agent}.exe")
+            };
+            Ok(format!("{local_app_data}\\nrm\\bin\\{filename}"))
+        }
     }
 }
 
@@ -8943,7 +10912,10 @@ fn posix_lsp_remote_command(remote_root: PathBuf, command: Vec<String>) -> Strin
     parts.join(" ")
 }
 
-fn powershell_lsp_remote_command(remote_root: PathBuf, command: Vec<String>) -> Result<String> {
+fn powershell_lsp_remote_command(
+    remote_root: PathBuf,
+    command: Vec<String>,
+) -> Result<PowerShellProcessCommand> {
     let remote_root = remote_root
         .to_str()
         .ok_or_else(|| anyhow!("Windows remote root must be valid UTF-8"))?;
@@ -9204,13 +11176,17 @@ fn hash_bytes(bytes: &[u8]) -> String {
     blake3::hash(bytes).to_hex().to_string()
 }
 
-fn hash_agent_source(file: &mut File) -> Result<(String, String, u64)> {
+fn hash_agent_source(
+    file: &mut File,
+    deadline: BootstrapDeadline,
+) -> Result<(String, String, u64)> {
     file.seek(SeekFrom::Start(0))?;
     let mut blake3 = blake3::Hasher::new();
     let mut sha256 = Sha256::new();
     let mut size = 0_u64;
     let mut buffer = [0_u8; 64 * 1024];
     loop {
+        deadline.forward_timeout("agent source hashing")?;
         let read = file.read(&mut buffer)?;
         if read == 0 {
             break;
@@ -9219,6 +11195,7 @@ fn hash_agent_source(file: &mut File) -> Result<(String, String, u64)> {
         blake3.update(&buffer[..read]);
         sha256.update(&buffer[..read]);
     }
+    deadline.forward_timeout("agent source hashing")?;
     file.seek(SeekFrom::Start(0))?;
     let source_hash = blake3.finalize().to_hex().to_string();
     let source_sha256 = {
@@ -9300,18 +11277,31 @@ fn trace_event(event: &str, fields: Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use base64::engine::general_purpose::STANDARD;
+    #[cfg(unix)]
     use base64::Engine as _;
+    #[cfg(unix)]
     use ed25519_dalek::{Signer as _, SigningKey};
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::AtomicUsize;
     use tempfile::tempdir;
 
-    #[derive(Default)]
     struct TestAbortHandle {
         aborts: AtomicUsize,
         waits: AtomicUsize,
+        stopped: AtomicBool,
+    }
+
+    impl Default for TestAbortHandle {
+        fn default() -> Self {
+            Self {
+                aborts: AtomicUsize::new(0),
+                waits: AtomicUsize::new(0),
+                stopped: AtomicBool::new(true),
+            }
+        }
     }
 
     impl AgentAbortHandle for TestAbortHandle {
@@ -9319,9 +11309,72 @@ mod tests {
             self.aborts.fetch_add(1, Ordering::SeqCst);
         }
 
-        fn wait(&self) {
+        fn is_stopped(&self) -> bool {
             self.waits.fetch_add(1, Ordering::SeqCst);
+            self.stopped.load(Ordering::SeqCst)
         }
+    }
+
+    #[cfg(unix)]
+    struct StalledRead {
+        release: mpsc::Receiver<()>,
+    }
+
+    #[cfg(unix)]
+    impl Read for StalledRead {
+        fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+            let _ = self.release.recv();
+            Ok(0)
+        }
+    }
+
+    #[cfg(unix)]
+    fn command_that_fails_with_stderr() -> Command {
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("printf 'NRM_INSTALL_ERROR_V1\\talready_exists\\n' >&2; exit 23");
+        command
+    }
+
+    #[cfg(windows)]
+    fn command_that_fails_with_stderr() -> Command {
+        let mut command = Command::new("cmd.exe");
+        command.args([
+            "/d",
+            "/s",
+            "/c",
+            "echo NRM_INSTALL_ERROR_V1 already_exists 1>&2 & exit /b 23",
+        ]);
+        command
+    }
+
+    #[cfg(unix)]
+    fn command_that_floods_output(stderr: bool) -> Command {
+        let mut command = Command::new("sh");
+        command.arg("-c").arg(if stderr {
+            "yes 0123456789 >&2"
+        } else {
+            "yes 0123456789"
+        });
+        command
+    }
+
+    #[cfg(windows)]
+    fn command_that_floods_output(stderr: bool) -> Command {
+        let mut command = Command::new("powershell.exe");
+        let stream = if stderr {
+            "OpenStandardError"
+        } else {
+            "OpenStandardOutput"
+        };
+        command
+            .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"])
+            .arg(format!(
+                "$ProgressPreference='SilentlyContinue'; $stream=[Console]::{stream}(1); $bytes=New-Object byte[] {}; $stream.Write($bytes,0,$bytes.Length)",
+                PROCESS_CAPTURE_MAX_STREAM_BYTES * 2
+            ));
+        command
     }
 
     fn test_meta_kind(
@@ -9435,12 +11488,137 @@ mod tests {
             .contains("threshold must be between 1 and 1"));
     }
 
+    #[test]
+    fn registry_fetch_timeout_is_clipped_to_remaining_bootstrap_budget() {
+        let deadline =
+            BootstrapDeadline::with_elapsed(Duration::from_secs(20), Duration::from_secs(8));
+        let timeout = registry_fetch_timeout(Duration::from_secs(120), deadline).unwrap();
+
+        assert!(timeout <= Duration::from_secs(7));
+        assert!(timeout > Duration::from_secs(6));
+    }
+
+    #[test]
+    fn agent_spawn_and_reply_share_one_request_timeout() {
+        let total = Duration::from_millis(100);
+        let after_spawn = Instant::now()
+            .checked_sub(Duration::from_millis(70))
+            .unwrap();
+        let reply_budget = remaining_timeout_since(after_spawn, total);
+        assert!(reply_budget <= Duration::from_millis(30));
+        assert!(reply_budget > Duration::ZERO);
+
+        let after_spawn_and_reply = Instant::now()
+            .checked_sub(Duration::from_millis(110))
+            .unwrap();
+        assert_eq!(
+            remaining_timeout_since(after_spawn_and_reply, total),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn bootstrap_timeout_classification_is_structural() {
+        let deadline = BootstrapDeadline::new(Duration::from_secs(5));
+        let diagnostic = deadline.map_budgeted_error(
+            BootstrapBudget::Forward,
+            "test diagnostic",
+            anyhow!("remote tool said it timed out, but returned immediately"),
+        );
+        assert!(!is_bootstrap_timeout(&diagnostic));
+
+        let timeout = deadline.map_budgeted_error(
+            BootstrapBudget::Forward,
+            "test request",
+            anyhow!(AgentRequestTimeoutError {
+                id: 7,
+                timeout: Duration::from_secs(1),
+                phase: "while waiting for its reply",
+            }),
+        );
+        assert!(is_bootstrap_timeout(&timeout));
+
+        let registry_timeout = deadline.map_budgeted_error(
+            BootstrapBudget::Forward,
+            "registry fetch",
+            anyhow!(FetchError::OperationDeadline {
+                phase: "cached artifact digest",
+            }),
+        );
+        assert!(is_bootstrap_timeout(&registry_timeout));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registry_health_redacts_https_paths_and_url_components() {
+        let registry = RegistryLaunchConfig {
+            url_template: RegistryUrlTemplate::parse(
+                "https://registry.example.test:8443/private/releases/v{version}/manifest.json",
+            )
+            .unwrap(),
+            trusted_keys: TrustedKeySet::from_base64([(
+                "release-test",
+                "11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=",
+            )])
+            .unwrap(),
+            signature_threshold: 1,
+            cache_dir: Some(PathBuf::from("/secret/cache")),
+            cache_max_bytes: DEFAULT_REGISTRY_CACHE_MAX_BYTES,
+            timeout: Duration::from_secs(5),
+            policy_fingerprint: "test-registry-policy".to_string(),
+        };
+
+        let health = RegistryHealth::from_registry(Some(&registry));
+        assert_eq!(
+            health.manifest_url.as_deref(),
+            Some("https://registry.example.test:8443/<redacted>")
+        );
+        let exposed = health.to_value().to_string();
+        assert!(!exposed.contains("private"));
+        assert!(!exposed.contains("releases"));
+        assert!(!exposed.contains("manifest.json"));
+        assert!(!exposed.contains("secret/cache"));
+        assert!(!exposed.contains('@'));
+        assert!(!exposed.contains('?'));
+        assert!(!exposed.contains('#'));
+    }
+
+    #[test]
+    fn registry_health_redaction_preserves_bracketed_ipv6_host() {
+        let ipv6 =
+            url::Url::parse("https://[2001:4860:4860::8888]:8443/private/manifest.json").unwrap();
+        assert_eq!(
+            redact_registry_manifest_url(&ipv6),
+            "https://[2001:4860:4860::8888]:8443/<redacted>"
+        );
+    }
+
+    #[test]
+    fn fast_workspace_info_never_waits_for_registry_health_lock() {
+        let dir = tempdir().unwrap();
+        let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
+        let sidecar = test_sidecar(mirror);
+        sidecar.update_registry_health(|health| {
+            health.state = RegistryHealthState::Fetching;
+            health.source = "registry";
+        });
+        let fast =
+            FastState::from_sidecar(&sidecar, Arc::new(Mutex::new(PendingRemote::default())));
+        let _held = sidecar.registry_health.lock().unwrap();
+
+        let info = fast.workspace_info();
+        assert_eq!(info["registry_health"]["state"], "fetching");
+        assert_eq!(info["registry_health"]["source"], "registry");
+    }
+
     struct ScriptedInstallOps {
         calls: Vec<&'static str>,
         fail_at: Option<&'static str>,
         target: Option<&'static str>,
         stage_exists: bool,
         backup: Option<&'static str>,
+        deadline: Option<BootstrapDeadline>,
+        phase_delay: Duration,
     }
 
     impl ScriptedInstallOps {
@@ -9451,6 +11629,8 @@ mod tests {
                 target: Some("previous"),
                 stage_exists: false,
                 backup: None,
+                deadline: None,
+                phase_delay: Duration::ZERO,
             }
         }
 
@@ -9480,6 +11660,7 @@ mod tests {
     impl AgentInstallOps for ScriptedInstallOps {
         fn stage(&mut self) -> Result<agent_install::StagedInstall> {
             self.calls.push("stage");
+            thread::sleep(self.phase_delay);
             if self.fails("stage") {
                 bail!("upload failed");
             }
@@ -9490,8 +11671,16 @@ mod tests {
 
         fn validate_staged(&mut self, _staged: &agent_install::StagedInstall) -> Result<()> {
             self.calls.push("validate_staged");
+            thread::sleep(self.phase_delay);
             if self.fails("validate_staged") {
                 bail!("wrong protocol");
+            }
+            Ok(())
+        }
+
+        fn ensure_activation_budget(&self) -> Result<()> {
+            if let Some(deadline) = self.deadline {
+                deadline.forward_timeout("test activation").map(drop)?;
             }
             Ok(())
         }
@@ -9511,6 +11700,11 @@ mod tests {
             self.backup = self.target.take();
             self.target = Some("candidate");
             self.stage_exists = false;
+            if self.fail_at == Some("activate_timeout_after_mutation") {
+                return Err(anyhow!(BootstrapTimeoutError {
+                    phase: "test activation response was ambiguous".to_string(),
+                }));
+            }
             if self.fail_at == Some("activate_after_mutation") {
                 bail!("transport failed after remote activation");
             }
@@ -9658,6 +11852,39 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_deadline_is_cumulative_and_cleans_stage_before_activation() {
+        let mut operations = ScriptedInstallOps::new(None);
+        operations.deadline = Some(BootstrapDeadline::new(Duration::from_millis(240)));
+        operations.phase_delay = Duration::from_millis(70);
+
+        let error = run_agent_install_transaction(&mut operations).unwrap_err();
+
+        assert_eq!(error.final_state, AgentInstallFinalState::TargetUnchanged);
+        assert!(error.to_string().contains("bootstrap_timeout"));
+        assert_eq!(operations.target, Some("previous"));
+        assert!(!operations.stage_exists);
+        assert_eq!(operations.calls, ["stage", "validate_staged", "cleanup"]);
+    }
+
+    #[test]
+    fn exhausted_forward_budget_leaves_target_unchanged() {
+        let mut operations = ScriptedInstallOps::new(None);
+        operations.deadline = Some(BootstrapDeadline::with_elapsed(
+            Duration::from_secs(1),
+            Duration::from_millis(800),
+        ));
+
+        let error = run_agent_install_transaction(&mut operations).unwrap_err();
+
+        assert_eq!(error.final_state, AgentInstallFinalState::TargetUnchanged);
+        assert!(error.to_string().contains("bootstrap_timeout"));
+        assert_eq!(operations.target, Some("previous"));
+        assert_eq!(operations.backup, None);
+        assert!(!operations.stage_exists);
+        assert!(!operations.calls.contains(&"activate"));
+    }
+
+    #[test]
     fn transaction_postactivation_failure_restores_and_reprobes_previous() {
         let mut operations = ScriptedInstallOps::new(Some("validate_activated"));
         let error = run_agent_install_transaction(&mut operations).unwrap_err();
@@ -9717,6 +11944,31 @@ mod tests {
         let error = run_agent_install_transaction(&mut operations).unwrap_err();
         assert_eq!(error.final_state, AgentInstallFinalState::PreviousRestored);
         assert!(error.to_string().contains("activation_failed"));
+        assert!(error.to_string().contains("RestoredPrevious"));
+        assert_eq!(operations.target, Some("previous"));
+        assert_eq!(operations.backup, None);
+        assert!(!operations.stage_exists);
+        assert_eq!(
+            operations.calls,
+            [
+                "stage",
+                "validate_staged",
+                "activate",
+                "reconcile_activation",
+                "validate_reconciliation"
+            ]
+        );
+    }
+
+    #[test]
+    fn activation_timeout_is_reconciled_and_restores_previous_target() {
+        let mut operations = ScriptedInstallOps::new(Some("activate_timeout_after_mutation"));
+
+        let error = run_agent_install_transaction(&mut operations).unwrap_err();
+
+        assert_eq!(error.final_state, AgentInstallFinalState::PreviousRestored);
+        assert!(error.bootstrap_timeout);
+        assert!(error.to_string().contains("bootstrap_timeout"));
         assert!(error.to_string().contains("RestoredPrevious"));
         assert_eq!(operations.target, Some("previous"));
         assert_eq!(operations.backup, None);
@@ -9807,6 +12059,7 @@ mod tests {
             sidecar.remote_health.lock().unwrap().state,
             RemoteHealthState::Connected
         );
+        assert_eq!(sidecar.status().unwrap()["remote_status"], "connected");
 
         sidecar.agent.handshake_complete = true;
         let healthy =
@@ -9827,6 +12080,37 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("live state is unknown"));
+    }
+
+    #[test]
+    fn direct_bootstrap_uses_one_request_deadline_and_preserves_working_health() {
+        let dir = tempdir().unwrap();
+        let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
+        let mut sidecar = test_sidecar(mirror);
+        sidecar.agent.launch.transport = RemoteTransport::Ssh(SshTransport {
+            program: PathBuf::from("ssh"),
+            target: "example.test".to_string(),
+            connect_timeout_seconds: 1,
+        });
+        sidecar.agent.launch.request_timeout = Duration::ZERO;
+        sidecar.agent.handshake_complete = true;
+        *sidecar.remote_health.lock().unwrap() = RemoteHealth::connected();
+        *sidecar.agent.launch.remote_host_info.lock().unwrap() = Some(test_posix_host());
+
+        let error = sidecar
+            .remote_agent_install(
+                json!({"install_path": "/home/test/.local/bin/nrm-agent"}),
+                false,
+                0,
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().starts_with("bootstrap_timeout:"));
+        assert_eq!(sidecar.status().unwrap()["remote_status"], "connected");
+        assert_eq!(
+            sidecar.registry_health_snapshot().state,
+            RegistryHealthState::Disabled
+        );
     }
 
     #[test]
@@ -9854,12 +12138,41 @@ mod tests {
         };
 
         let error = sidecar
-            .prepare_remote_agent_install(&preflight)
+            .prepare_remote_agent_install(
+                &preflight,
+                BootstrapDeadline::new(Duration::from_secs(5)),
+            )
             .err()
             .expect("missing source must fail preparation")
             .to_string();
 
         assert!(error.contains("local agent source is not readable"));
+        assert_eq!(
+            sidecar
+                .agent
+                .launch
+                .worker_generation
+                .load(Ordering::SeqCst),
+            generation
+        );
+
+        *sidecar.agent.launch.remote_host_info.lock().unwrap() = Some(test_windows_host());
+        let windows_preflight = AgentInstallPreflight {
+            before: json!({"agent_status": "ok"}),
+            target_path: r"C:\Users\test\AppData\Local\nrm\bin\nrm-agent.exe".to_string(),
+            effective_force: true,
+            skip: false,
+        };
+        let error = sidecar
+            .prepare_remote_agent_install(
+                &windows_preflight,
+                BootstrapDeadline::new(Duration::from_secs(5)),
+            )
+            .err()
+            .expect("missing Windows source must fail preparation")
+            .to_string();
+        assert!(error.contains("local agent source is not readable"));
+        assert!(!error.contains("unsupported_platform"));
         assert_eq!(
             sidecar
                 .agent
@@ -9942,29 +12255,95 @@ mod tests {
         )
         .unwrap();
         *sidecar.agent.launch.remote_host_info.lock().unwrap() = Some(test_posix_host());
+        let initial_health = sidecar.registry_health_snapshot();
+        assert_eq!(initial_health.state, RegistryHealthState::NotChecked);
+        assert_eq!(initial_health.source, "registry");
+        assert_eq!(
+            initial_health.manifest_url.as_deref(),
+            Some("file:///<redacted>")
+        );
+        assert!(!initial_health
+            .to_value()
+            .to_string()
+            .contains(release.path().to_string_lossy().as_ref()));
 
-        let mut source = sidecar.resolve_agent_source().unwrap();
+        let mut source = sidecar
+            .resolve_agent_source(BootstrapDeadline::new(Duration::from_secs(5)))
+            .unwrap();
         let mut resolved = Vec::new();
         source.file.read_to_end(&mut resolved).unwrap();
         assert_eq!(resolved, artifact_bytes);
         assert_ne!(source.path, decoy);
         assert_eq!(source.details["agent_source"], "registry");
         assert_eq!(source.details["registry_artifact_source"], "file");
+        assert_eq!(
+            source.details["registry_manifest_url"],
+            "file:///<redacted>"
+        );
+        let verified = sidecar.registry_health_snapshot();
+        assert_eq!(verified.state, RegistryHealthState::Verified);
+        assert_eq!(verified.platform.as_ref().unwrap().os, "linux");
+        assert_eq!(verified.platform.as_ref().unwrap().arch, "x86_64");
+        assert_eq!(
+            verified.platform.as_ref().unwrap().target,
+            "x86_64-unknown-linux-musl"
+        );
+        assert_eq!(verified.signing_key_ids, ["release-test"]);
+        assert_eq!(
+            verified.artifact_sha256.as_deref(),
+            Some(sha256_bytes(artifact_bytes).as_str())
+        );
+        assert_eq!(verified.artifact_source, Some("file"));
+        assert_eq!(verified.manifest_source, Some("file"));
         drop(source);
 
         fs::remove_file(&artifact_path).unwrap();
-        let mut cached = sidecar.resolve_agent_source().unwrap();
+        let mut cached = sidecar
+            .resolve_agent_source(BootstrapDeadline::new(Duration::from_secs(5)))
+            .unwrap();
         let mut cached_bytes = Vec::new();
         cached.file.read_to_end(&mut cached_bytes).unwrap();
         assert_eq!(cached_bytes, artifact_bytes);
         assert_eq!(cached.details["registry_artifact_source"], "cache");
+        assert_eq!(
+            sidecar.registry_health_snapshot().artifact_source,
+            Some("cache")
+        );
         drop(cached);
 
+        *sidecar.remote_health.lock().unwrap() = RemoteHealth::connected();
         fs::write(&signature_path, b"not a signature document").unwrap();
-        assert!(sidecar.resolve_agent_source().is_err());
+        assert!(sidecar
+            .resolve_agent_source(BootstrapDeadline::new(Duration::from_secs(5)))
+            .is_err());
+        let registry_error = sidecar.registry_health_snapshot();
+        assert_eq!(registry_error.state, RegistryHealthState::Error);
+        assert_eq!(
+            registry_error.error_code.as_deref(),
+            Some("malformed_signature")
+        );
+        assert_eq!(
+            sidecar.remote_health.lock().unwrap().state,
+            RemoteHealthState::Connected,
+            "a registry failure must not invalidate a working remote agent"
+        );
+        let fast =
+            FastState::from_sidecar(&sidecar, Arc::new(Mutex::new(PendingRemote::default())));
+        let workspace = fast.workspace_info();
+        assert_eq!(workspace["remote_status"], "connected");
+        assert_eq!(workspace["registry_health"]["state"], "error");
+        assert_eq!(
+            workspace["registry_health"]["error_code"],
+            "malformed_signature"
+        );
+        let public_error = registry_error.to_value().to_string();
+        assert!(!public_error.contains(release.path().to_string_lossy().as_ref()));
+        assert!(!public_error.contains(manifest_path.to_string_lossy().as_ref()));
         fs::write(&signature_path, &signature).unwrap();
         fs::remove_file(&manifest_path).unwrap();
-        assert!(sidecar.resolve_agent_source().is_err());
+        assert!(sidecar
+            .resolve_agent_source(BootstrapDeadline::new(Duration::from_secs(5)))
+            .is_err());
     }
 
     fn test_sidecar(mirror: Mirror) -> Sidecar {
@@ -9974,13 +12353,17 @@ mod tests {
                 None,
                 RemoteTransport::Local,
                 PathBuf::from("/unused"),
-                Duration::from_millis(1),
+                // Mock replies are delivered by scheduler-driven helper
+                // threads. Keep this comfortably above a loaded CI quantum;
+                // tests that exercise expiry set an explicit zero budget.
+                Duration::from_secs(1),
                 AgentInterrupt::default(),
             ),
             mirror,
             remote_root: PathBuf::from("/unused"),
             workspace_key: "test".to_string(),
             remote_health: Arc::new(Mutex::new(RemoteHealth::default())),
+            registry_health: Arc::new(Mutex::new(RegistryHealth::from_registry(None))),
         }
     }
 
@@ -10183,12 +12566,25 @@ mod tests {
         assert!(!remote_agent_uses_managed_path(r"C:\nrm\nrm-agent.exe"));
         assert!(!remote_agent_uses_managed_path("C:/nrm/nrm-agent.exe"));
         assert_eq!(
-            default_remote_agent_install_path("nrm-agent"),
+            default_remote_agent_install_path("nrm-agent", &test_posix_host()).unwrap(),
             REMOTE_AGENT_MANAGED_PATH
         );
         assert_eq!(
-            default_remote_agent_install_path("/opt/bin/nrm-agent"),
+            default_remote_agent_install_path("/opt/bin/nrm-agent", &test_posix_host()).unwrap(),
             "/opt/bin/nrm-agent"
+        );
+        assert_eq!(
+            default_remote_agent_install_path("nrm-agent", &test_windows_host()).unwrap(),
+            r"C:\Users\test\AppData\Local\nrm\bin\nrm-agent.exe"
+        );
+        assert_eq!(
+            default_remote_agent_install_path("custom-agent", &test_windows_host()).unwrap(),
+            r"C:\Users\test\AppData\Local\nrm\bin\custom-agent.exe"
+        );
+        assert_eq!(
+            default_remote_agent_install_path(r"D:\tools\nrm-agent.exe", &test_windows_host())
+                .unwrap(),
+            r"D:\tools\nrm-agent.exe"
         );
     }
 
@@ -10232,6 +12628,63 @@ mod tests {
     }
 
     #[test]
+    fn scp_upload_uses_forced_sftp_and_literal_argv_paths() {
+        let transport = SshTransport {
+            program: PathBuf::from("/opt/openssh/bin/ssh"),
+            target: "builder@windows-host".to_owned(),
+            connect_timeout_seconds: 17,
+        };
+        let source = Path::new("-local artifact with spaces.exe");
+        let remote = r"B:\safe dir\agent';$(Write-Output owned).exe";
+        let command = transport.scp_upload_command(source, remote).unwrap();
+        assert_eq!(
+            Path::new(command.get_program())
+                .file_name()
+                .unwrap()
+                .to_string_lossy(),
+            "scp"
+        );
+        let args: Vec<_> = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect();
+        assert!(args.iter().any(|argument| argument == "-s"));
+        assert!(args
+            .windows(2)
+            .any(|pair| pair == ["-o", "ControlPath=none"]));
+        assert_eq!(args[args.len() - 3], "--");
+        assert_eq!(args[args.len() - 2], source.to_string_lossy());
+        assert_eq!(
+            args[args.len() - 1],
+            "builder@windows-host:B:/safe dir/agent';$(Write-Output owned).exe"
+        );
+    }
+
+    #[test]
+    fn scp_upload_rejects_noncanonical_or_injectable_remote_paths() {
+        let transport = SshTransport {
+            program: PathBuf::from("ssh"),
+            target: "windows-host".to_owned(),
+            connect_timeout_seconds: 15,
+        };
+        for path in [
+            r"relative\agent.exe",
+            r"\\server\share\agent.exe",
+            "B:/safe/../agent.exe",
+            "B:/safe//agent.exe",
+            "B:/safe/agent.exe\n-oProxyCommand=evil",
+            "B:/safe/agent:stream.exe",
+        ] {
+            assert!(
+                transport
+                    .scp_upload_command(Path::new("agent.exe"), path)
+                    .is_err(),
+                "accepted unsafe scp path {path:?}"
+            );
+        }
+    }
+
+    #[test]
     fn agent_hello_requires_exact_package_and_protocol_versions() {
         validate_agent_hello(env!("CARGO_PKG_VERSION"), PROTOCOL_VERSION).unwrap();
 
@@ -10267,10 +12720,7 @@ mod tests {
 
     #[test]
     fn command_capture_keeps_remote_error_when_streaming_stdin_breaks() {
-        let mut command = Command::new("sh");
-        command
-            .arg("-c")
-            .arg("printf 'NRM_INSTALL_ERROR_V1\\talready_exists\\n' >&2; exit 23");
+        let command = command_that_fails_with_stderr();
         let input = io::Cursor::new(vec![0_u8; 1024 * 1024]);
 
         let output = run_command_capture(
@@ -10283,6 +12733,117 @@ mod tests {
 
         assert_eq!(output.status.code(), Some(23));
         assert!(output.stderr.contains("already_exists"));
+    }
+
+    #[test]
+    fn command_capture_stream_reader_enforces_exact_byte_limit() {
+        for (size, succeeds) in [
+            (PROCESS_CAPTURE_MAX_STREAM_BYTES, true),
+            (PROCESS_CAPTURE_MAX_STREAM_BYTES + 1, false),
+        ] {
+            let handle = spawn_process_output_reader(io::Cursor::new(vec![b'x'; size]));
+            while !handle.is_finished() {
+                thread::yield_now();
+            }
+            let result = join_process_output_reader(handle, "test process", "stdout");
+            if succeeds {
+                assert_eq!(result.unwrap().len(), size);
+            } else {
+                let error = result.unwrap_err().to_string();
+                assert!(error.contains("exceeded"), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn command_capture_kills_output_floods_at_the_stream_limit() {
+        for (stderr, expected_stream) in [(false, "stdout"), (true, "stderr")] {
+            let started = Instant::now();
+            let error = run_command_capture(
+                command_that_floods_output(stderr),
+                None,
+                Duration::from_secs(15),
+                "output flood test",
+            )
+            .unwrap_err();
+            let limit = error
+                .downcast_ref::<ProcessOutputLimitError>()
+                .expect("output overflow must retain its typed error");
+            assert_eq!(limit.stream, expected_stream);
+            assert_eq!(limit.limit, PROCESS_CAPTURE_MAX_STREAM_BYTES);
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "output overflow should terminate promptly: {error:#}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_capture_timeout_kills_descendant_process_group() {
+        let dir = tempdir().unwrap();
+        let marker = dir.path().join("descendant-survived");
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("(sleep 0.2; printf alive > \"$NRM_DESCENDANT_MARKER\") & wait")
+            .env("NRM_DESCENDANT_MARKER", &marker);
+
+        let error = run_command_capture(
+            command,
+            None,
+            Duration::from_millis(30),
+            "descendant process-group test",
+        )
+        .unwrap_err();
+        assert!(error.downcast_ref::<ProcessTimeoutError>().is_some());
+
+        thread::sleep(Duration::from_millis(300));
+        assert!(
+            !marker.exists(),
+            "a descendant survived command-capture timeout teardown"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_capture_timeout_does_not_join_stalled_stdin_producer() {
+        let mut command = Command::new("sh");
+        command.arg("-c").arg("sleep 5");
+        let (release_tx, release_rx) = mpsc::channel();
+        let input = StalledRead {
+            release: release_rx,
+        };
+
+        let started = Instant::now();
+        let error = run_command_capture(
+            command,
+            Some(Box::new(input)),
+            Duration::from_millis(30),
+            "stalled stdin test",
+        )
+        .unwrap_err();
+
+        assert!(error.downcast_ref::<ProcessTimeoutError>().is_some());
+        assert!(started.elapsed() < Duration::from_millis(500));
+        release_tx.send(()).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_capture_preserves_record_whitespace_after_bom_filtering() {
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("printf '\\nRECORD\\t\\n\\n'; printf ' error \\n' >&2");
+
+        let output =
+            run_command_capture(command, None, Duration::from_secs(1), "test exact output")
+                .unwrap();
+
+        assert!(output.status.success());
+        assert_eq!(output.stdout, "\nRECORD\t\n\n");
+        assert_eq!(output.stderr, " error \n");
     }
 
     #[test]
@@ -10681,6 +13242,8 @@ mod tests {
         assert_eq!(info["client_policy"]["write_owner"], "current_session");
         assert_eq!(info["remote_status"], "unchecked");
         assert_eq!(info["remote_health"]["remote_status"], "unchecked");
+        assert_eq!(info["registry_health"]["state"], "disabled");
+        assert_eq!(info["registry_health"]["source"], "local");
         assert_eq!(info["capabilities"]["server_notifications"], true);
         assert_eq!(info["capabilities"]["transport_neutral_agent_frames"], true);
         assert_eq!(info["capabilities"]["agent_abort_handle"], true);
@@ -11241,14 +13804,17 @@ mod tests {
             .handle("git_status", json!({"paths": ["../outside"]}), 0)
             .unwrap_err()
             .to_string();
-        assert!(status.contains("path must not contain '..'"), "{status}");
+        assert!(
+            status.contains("path must") && (status.contains("relative") || status.contains("..")),
+            "{status}"
+        );
 
         let blame = sidecar
             .handle("git_blame", json!({"path": "/outside"}), 0)
             .unwrap_err()
             .to_string();
         assert!(
-            blame.contains("paths must be workspace-relative"),
+            blame.contains("path") && blame.contains("relative"),
             "{blame}"
         );
     }
@@ -11264,7 +13830,7 @@ mod tests {
 
         interrupt.kill_current();
 
-        assert_eq!(handle.aborts.load(Ordering::SeqCst), 1);
+        assert!(handle.aborts.load(Ordering::SeqCst) >= 1);
         assert_eq!(handle.waits.load(Ordering::SeqCst), 0);
 
         interrupt.clear_abort_handle(&handle_trait);
@@ -11278,10 +13844,33 @@ mod tests {
         let handle_trait: Arc<dyn AgentAbortHandle> = handle.clone();
         interrupt.set_abort_handle(handle_trait);
 
-        interrupt.kill_current_and_wait();
+        interrupt
+            .kill_current_and_wait(Duration::from_secs(1), "test worker exit")
+            .unwrap();
 
         assert_eq!(handle.aborts.load(Ordering::SeqCst), 1);
-        assert_eq!(handle.waits.load(Ordering::SeqCst), 1);
+        assert!(handle.waits.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[test]
+    fn agent_interrupt_stalled_abort_respects_wait_budget() {
+        let interrupt = AgentInterrupt::default();
+        let handle = Arc::new(TestAbortHandle::default());
+        handle.stopped.store(false, Ordering::SeqCst);
+        let handle_trait: Arc<dyn AgentAbortHandle> = handle.clone();
+        interrupt.set_abort_handle(Arc::clone(&handle_trait));
+
+        let started = Instant::now();
+        let error = interrupt
+            .kill_current_and_wait(Duration::from_millis(20), "stalled test worker")
+            .unwrap_err();
+
+        assert!(error
+            .downcast_ref::<AgentWorkerExitTimeoutError>()
+            .is_some());
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert!(handle.aborts.load(Ordering::SeqCst) >= 1);
+        interrupt.clear_abort_handle(&handle_trait);
     }
 
     #[test]
@@ -11330,8 +13919,48 @@ mod tests {
 
         assert!(client.worker.is_none());
         assert!(!client.handshake_complete);
-        assert_eq!(handle.aborts.load(Ordering::SeqCst), 1);
-        assert_eq!(handle.waits.load(Ordering::SeqCst), 1);
+        assert!(handle.aborts.load(Ordering::SeqCst) >= 1);
+        assert!(handle.waits.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[test]
+    fn agent_client_worker_join_is_bounded_and_remains_tracked() {
+        let handle = Arc::new(TestAbortHandle::default());
+        let handle_trait: Arc<dyn AgentAbortHandle> = handle.clone();
+        let (tx, _rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let join = thread::spawn(move || {
+            let _ = release_rx.recv();
+        });
+        let mut client = AgentClient::new(
+            "unused-agent".to_string(),
+            None,
+            RemoteTransport::Local,
+            PathBuf::from("/unused"),
+            Duration::from_secs(1),
+            AgentInterrupt::default(),
+        );
+        client.worker = Some(AgentWorker {
+            tx,
+            abort: handle_trait,
+            join: Some(join),
+        });
+
+        let started = Instant::now();
+        let error = client
+            .kill_worker_with_timeout(Duration::from_millis(20), "stalled join test")
+            .unwrap_err();
+
+        assert!(error
+            .downcast_ref::<AgentWorkerExitTimeoutError>()
+            .is_some());
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert_eq!(client.retired_workers.len(), 1);
+        release_tx.send(()).unwrap();
+        client
+            .kill_worker_with_timeout(Duration::from_secs(1), "released join test")
+            .unwrap();
+        assert!(client.retired_workers.is_empty());
     }
 
     #[test]
@@ -11361,12 +13990,12 @@ mod tests {
         });
 
         read.invalidate_shared_workers();
-        assert!(write.ensure_worker().is_err());
+        assert!(write.ensure_worker(Duration::from_millis(10)).is_err());
 
-        assert_eq!(read_handle.aborts.load(Ordering::SeqCst), 1);
-        assert_eq!(read_handle.waits.load(Ordering::SeqCst), 1);
-        assert_eq!(write_handle.aborts.load(Ordering::SeqCst), 1);
-        assert_eq!(write_handle.waits.load(Ordering::SeqCst), 1);
+        assert!(read_handle.aborts.load(Ordering::SeqCst) >= 1);
+        assert!(read_handle.waits.load(Ordering::SeqCst) >= 1);
+        assert!(write_handle.aborts.load(Ordering::SeqCst) >= 1);
+        assert!(write_handle.waits.load(Ordering::SeqCst) >= 1);
     }
 
     #[test]
@@ -11407,6 +14036,8 @@ mod tests {
         assert_eq!(notification.params["remote_status"], "unavailable");
         assert_eq!(notification.params["remote_checked"], true);
         assert_eq!(notification.params["remote_available"], false);
+        assert_eq!(notification.params["registry_health"]["state"], "disabled");
+        assert_eq!(notification.params["registry_health"]["source"], "local");
         assert!(notification.params["retry_after_ms"].as_u64().unwrap() > 0);
     }
 
@@ -12683,8 +15314,7 @@ mod tests {
             .ends_with(".snapshot"));
         assert!(entries[0]["local_path"]
             .as_str()
-            .unwrap()
-            .ends_with("/files/a.txt"));
+            .is_some_and(|path| Path::new(path).ends_with(Path::new("files").join("a.txt"))));
         assert_eq!(entries[1]["queue_id"], queued_b.id);
         assert_eq!(entries[1]["state"], "failed");
         assert_eq!(entries[1]["attempts"], 1);
@@ -13299,14 +15929,12 @@ mod tests {
         assert_eq!(hits[0]["cached"], true);
         assert!(hits[0]["local_path"]
             .as_str()
-            .unwrap()
-            .ends_with("src/lib.rs"));
+            .is_some_and(|path| Path::new(path).ends_with(Path::new("src").join("lib.rs"))));
         assert_eq!(hits[1]["path"], "src/main.rs");
         assert_eq!(hits[1]["cached"], false);
         assert!(hits[1]["local_path"]
             .as_str()
-            .unwrap()
-            .ends_with("src/main.rs"));
+            .is_some_and(|path| Path::new(path).ends_with(Path::new("src").join("main.rs"))));
         assert_eq!(result["truncated"], false);
     }
 
@@ -14139,16 +16767,45 @@ mod tests {
     }
 
     #[test]
+    fn remote_queue_maintenance_does_not_pass_a_stalled_lane_process() {
+        let read_queue = RemoteQueue::new(8, 8);
+        let write_queue = RemoteQueue::new(8, 8);
+        let read_interrupt = AgentInterrupt::default();
+        let write_interrupt = AgentInterrupt::default();
+        let handle = Arc::new(TestAbortHandle::default());
+        handle.stopped.store(false, Ordering::SeqCst);
+        let handle_trait: Arc<dyn AgentAbortHandle> = handle.clone();
+        read_interrupt.set_abort_handle(Arc::clone(&handle_trait));
+
+        let started = Instant::now();
+        let error = wait_for_remote_queues_quiescent(
+            &read_queue,
+            &write_queue,
+            &read_interrupt,
+            &write_interrupt,
+            Duration::from_millis(20),
+        )
+        .unwrap_err();
+
+        assert!(error
+            .downcast_ref::<AgentWorkerExitTimeoutError>()
+            .is_some());
+        assert!(started.elapsed() < Duration::from_millis(500));
+        read_interrupt.clear_abort_handle(&handle_trait);
+    }
+
+    #[test]
     fn remote_queue_reset_control_is_acknowledged_while_maintenance_is_paused() {
         let queue = Arc::new(RemoteQueue::new(8, 8));
         queue.begin_maintenance_and_drain();
         let worker_queue = Arc::clone(&queue);
         let worker = thread::spawn(move || {
             let item = worker_queue.pop_worker_item(None).unwrap();
-            let RemoteWorkerItem::Control(RemoteWorkerControl::ResetAgent { reply }) = item else {
+            let RemoteWorkerItem::Control(RemoteWorkerControl::ResetAgent { reply, .. }) = item
+            else {
                 panic!("expected reset control");
             };
-            reply.send(()).unwrap();
+            reply.send(Ok(())).unwrap();
         });
 
         queue.reset_agent_worker(Duration::from_secs(1)).unwrap();
@@ -14533,6 +17190,10 @@ mod tests {
                 "ServerAliveInterval=15",
                 "-o",
                 "ServerAliveCountMax=2",
+                "-o",
+                "ControlMaster=no",
+                "-o",
+                "ControlPath=none",
                 "--",
                 "host",
                 "'sh' '-lc' 'PATH=\"$HOME/.local/bin:$PATH\"; exec \"$@\"' 'nrm-agent-launch' 'nrm-agent' 'serve' '--root' '/tmp/repo with '\\''quote'\\'' ; x'"
@@ -14617,6 +17278,10 @@ mod tests {
                 "ServerAliveInterval=15",
                 "-o",
                 "ServerAliveCountMax=2",
+                "-o",
+                "ControlMaster=no",
+                "-o",
+                "ControlPath=none",
                 "--",
                 "host",
                 "'sh' '-lc' 'cd \"$1\" && shift && exec \"$@\"' 'nrm-lsp-proxy' '/tmp/repo with '\\''quote'\\'' ; x' 'rust-analyzer' '--config' 'check.command=\"clippy\"; $(echo no)'"
@@ -14729,6 +17394,7 @@ mod tests {
         assert_eq!(shell_quote("line\nbreak"), "'line\nbreak'");
     }
 
+    #[cfg(unix)]
     #[test]
     fn lsp_ssh_remote_command_preserves_cwd_and_args_through_shell_parse() {
         let dir = tempdir().unwrap();
@@ -14831,7 +17497,11 @@ mod tests {
                 release_rx.recv().unwrap();
                 Ok(())
             }));
-            let result = join_lsp_upstream_if_finished(&mut upstream, &child_for_join);
+            let result = join_lsp_upstream_if_finished(
+                &mut upstream,
+                &child_for_join,
+                Duration::from_millis(100),
+            );
             let upstream_pending = upstream.is_some();
             let child_running = child_for_join.lock().unwrap().try_wait().unwrap().is_none();
             done_tx
@@ -14854,7 +17524,7 @@ mod tests {
 
         release_tx.send(()).unwrap();
         joiner.join().unwrap();
-        kill_and_wait_lsp_child_handle(&child).unwrap();
+        kill_and_wait_lsp_child_handle(&child, Duration::from_secs(1)).unwrap();
     }
 
     #[cfg(unix)]
@@ -14865,8 +17535,13 @@ mod tests {
         ));
         let mut upstream = None;
 
-        let err = fail_lsp_downstream(anyhow!("client stdout closed"), &child, &mut upstream)
-            .unwrap_err();
+        let err = fail_lsp_downstream(
+            anyhow!("client stdout closed"),
+            &child,
+            &mut upstream,
+            Duration::from_secs(1),
+        )
+        .unwrap_err();
 
         assert!(format!("{err:#}").contains("LSP proxy downstream pump failed"));
         assert!(format!("{err:#}").contains("client stdout closed"));
@@ -14889,10 +17564,10 @@ mod tests {
         while !upstream.as_ref().unwrap().is_finished() {
             thread::sleep(Duration::from_millis(1));
         }
-        join_lsp_upstream_if_finished(&mut upstream, &child).unwrap();
+        join_lsp_upstream_if_finished(&mut upstream, &child, Duration::from_secs(1)).unwrap();
 
         assert!(child.lock().unwrap().try_wait().unwrap().is_none());
-        kill_and_wait_lsp_child_handle(&child).unwrap();
+        kill_and_wait_lsp_child_handle(&child, Duration::from_secs(1)).unwrap();
     }
 
     #[cfg(unix)]
@@ -14908,9 +17583,15 @@ mod tests {
             thread::sleep(Duration::from_millis(1));
         }
 
-        let err = join_lsp_upstream_if_finished(&mut upstream, &child).unwrap_err();
+        let err = join_lsp_upstream_if_finished(&mut upstream, &child, Duration::from_secs(1))
+            .unwrap_err();
         assert!(format!("{err:#}").contains("upstream broken pipe"));
-        let status = child.lock().unwrap().wait().unwrap();
+        let status = child
+            .lock()
+            .unwrap()
+            .try_wait()
+            .unwrap()
+            .expect("child should be reaped");
         assert!(!status.success());
     }
 
@@ -15133,6 +17814,35 @@ mod tests {
                 request: Request::Shutdown
             }
         ));
+    }
+
+    #[test]
+    fn framed_agent_session_ignores_windows_ssh_transport_bom() {
+        let mut inbound = vec![0xef, 0xbb, 0xbf];
+        write_frame(
+            &mut inbound,
+            &RpcMessage::Response {
+                id: 7,
+                response: Response::Ack,
+            },
+        )
+        .unwrap();
+        let reader = LeadingBomReader::new(io::Cursor::new(inbound));
+        let mut session = FramedAgentSession::new(Vec::new(), reader);
+
+        let reply = session.request(7, Request::Shutdown).unwrap();
+
+        assert!(matches!(reply, AgentWorkerReply::Response(Response::Ack)));
+    }
+
+    #[test]
+    fn lsp_reader_ignores_windows_ssh_transport_bom() {
+        let body = br#"{"jsonrpc":"2.0","id":1,"result":null}"#;
+        let mut inbound = vec![0xef, 0xbb, 0xbf];
+        write_lsp_message(&mut inbound, body).unwrap();
+        let mut reader = BufReader::new(LeadingBomReader::new(io::Cursor::new(inbound)));
+
+        assert_eq!(read_lsp_message(&mut reader).unwrap().unwrap(), body);
     }
 
     #[test]

@@ -1,6 +1,7 @@
 //! Blocking, fail-closed retrieval and cache handling for signed agent builds.
 
 use std::collections::HashSet;
+use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -37,6 +38,8 @@ pub struct FetchConfig<'a> {
     pub signature_threshold: usize,
     pub cache_dir: &'a Path,
     pub cache_max_bytes: u64,
+    /// Whole-operation budget, including retrieval, verification, cache I/O,
+    /// artifact hashing/copying, and eviction.
     pub timeout: Duration,
 }
 
@@ -100,6 +103,93 @@ pub enum NetworkFailureKind {
     Protocol,
 }
 
+/// Stable, machine-readable classification for a registry fetch failure.
+///
+/// These codes intentionally describe the failure family rather than carrying
+/// any URL, path, or other potentially sensitive context. Callers should use
+/// [`Self::as_str`] for persistence and protocol fields, and keep
+/// [`FetchError`]'s display text for human-facing diagnostics only.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[non_exhaustive]
+pub enum FetchErrorCode {
+    UrlPolicy,
+    MalformedManifest,
+    MalformedSignature,
+    InvalidSignatureThreshold,
+    InsufficientSignatures,
+    VersionMismatch,
+    ProtocolVersionMismatch,
+    TargetNotPublished,
+    InvalidTimeout,
+    OperationDeadline,
+    InvalidCacheLimit,
+    CacheLockTimeout,
+    LocalIo,
+    NetworkTimeout,
+    NetworkConnection,
+    NetworkProtocol,
+    HttpRateLimited,
+    HttpServerError,
+    HttpClientError,
+    HttpUnexpectedStatus,
+    RedirectLocationMissing,
+    RedirectLimitExceeded,
+    RedirectPolicy,
+    BodyTooLarge,
+    ArtifactSizeMismatch,
+    ArtifactDigestMismatch,
+    FileArtifactEscapes,
+    NotRegularFile,
+    CacheBudgetExceeded,
+    CacheFallbackUnavailable,
+}
+
+impl FetchErrorCode {
+    /// Return the stable snake-case representation for health and protocol
+    /// reporting.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::UrlPolicy => "url_policy",
+            Self::MalformedManifest => "malformed_manifest",
+            Self::MalformedSignature => "malformed_signature",
+            Self::InvalidSignatureThreshold => "invalid_signature_threshold",
+            Self::InsufficientSignatures => "insufficient_signatures",
+            Self::VersionMismatch => "version_mismatch",
+            Self::ProtocolVersionMismatch => "protocol_version_mismatch",
+            Self::TargetNotPublished => "target_not_published",
+            Self::InvalidTimeout => "invalid_timeout",
+            Self::OperationDeadline => "operation_deadline",
+            Self::InvalidCacheLimit => "invalid_cache_limit",
+            Self::CacheLockTimeout => "cache_lock_timeout",
+            Self::LocalIo => "local_io",
+            Self::NetworkTimeout => "network_timeout",
+            Self::NetworkConnection => "network_connection",
+            Self::NetworkProtocol => "network_protocol",
+            Self::HttpRateLimited => "http_rate_limited",
+            Self::HttpServerError => "http_server_error",
+            Self::HttpClientError => "http_client_error",
+            Self::HttpUnexpectedStatus => "http_unexpected_status",
+            Self::RedirectLocationMissing => "redirect_location_missing",
+            Self::RedirectLimitExceeded => "redirect_limit_exceeded",
+            Self::RedirectPolicy => "redirect_policy",
+            Self::BodyTooLarge => "body_too_large",
+            Self::ArtifactSizeMismatch => "artifact_size_mismatch",
+            Self::ArtifactDigestMismatch => "artifact_digest_mismatch",
+            Self::FileArtifactEscapes => "file_artifact_escapes",
+            Self::NotRegularFile => "not_regular_file",
+            Self::CacheBudgetExceeded => "cache_budget_exceeded",
+            Self::CacheFallbackUnavailable => "cache_fallback_unavailable",
+        }
+    }
+}
+
+impl fmt::Display for FetchErrorCode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum FetchError {
     #[error(transparent)]
@@ -110,6 +200,8 @@ pub enum FetchError {
     TargetNotPublished(AgentTarget),
     #[error("registry timeout must be greater than zero")]
     InvalidTimeout,
+    #[error("registry operation deadline elapsed during {phase}")]
+    OperationDeadline { phase: &'static str },
     #[error("registry cache limit must be greater than zero")]
     InvalidCacheLimit,
     #[error("timed out waiting for registry cache lock {0}")]
@@ -174,6 +266,59 @@ pub enum FetchError {
 }
 
 impl FetchError {
+    /// Classify this failure without parsing its human-readable display text.
+    #[must_use]
+    pub const fn code(&self) -> FetchErrorCode {
+        match self {
+            Self::UrlPolicy(_) => FetchErrorCode::UrlPolicy,
+            Self::Verification(error) => match error {
+                VerificationError::SignatureDocument(_) => FetchErrorCode::MalformedSignature,
+                VerificationError::InvalidThreshold { .. } => {
+                    FetchErrorCode::InvalidSignatureThreshold
+                }
+                VerificationError::InsufficientSignatures { .. } => {
+                    FetchErrorCode::InsufficientSignatures
+                }
+                VerificationError::Manifest(error) => match error {
+                    crate::ManifestError::VersionMismatch { .. } => FetchErrorCode::VersionMismatch,
+                    crate::ManifestError::ProtocolVersionMismatch { .. } => {
+                        FetchErrorCode::ProtocolVersionMismatch
+                    }
+                    _ => FetchErrorCode::MalformedManifest,
+                },
+            },
+            Self::TargetNotPublished(_) => FetchErrorCode::TargetNotPublished,
+            Self::InvalidTimeout => FetchErrorCode::InvalidTimeout,
+            Self::OperationDeadline { .. } => FetchErrorCode::OperationDeadline,
+            Self::InvalidCacheLimit => FetchErrorCode::InvalidCacheLimit,
+            Self::CacheLockTimeout(_) => FetchErrorCode::CacheLockTimeout,
+            Self::Io { .. } => FetchErrorCode::LocalIo,
+            Self::Network { kind, .. } => match kind {
+                NetworkFailureKind::Timeout => FetchErrorCode::NetworkTimeout,
+                NetworkFailureKind::Connection => FetchErrorCode::NetworkConnection,
+                NetworkFailureKind::Protocol => FetchErrorCode::NetworkProtocol,
+            },
+            Self::HttpStatus { status: 429, .. } => FetchErrorCode::HttpRateLimited,
+            Self::HttpStatus { status, .. } if *status >= 500 && *status <= 599 => {
+                FetchErrorCode::HttpServerError
+            }
+            Self::HttpStatus { status, .. } if *status >= 400 && *status <= 499 => {
+                FetchErrorCode::HttpClientError
+            }
+            Self::HttpStatus { .. } => FetchErrorCode::HttpUnexpectedStatus,
+            Self::MissingRedirectLocation { .. } => FetchErrorCode::RedirectLocationMissing,
+            Self::TooManyRedirects { .. } => FetchErrorCode::RedirectLimitExceeded,
+            Self::RedirectPolicy { .. } => FetchErrorCode::RedirectPolicy,
+            Self::BodyTooLarge { .. } => FetchErrorCode::BodyTooLarge,
+            Self::ArtifactSize { .. } => FetchErrorCode::ArtifactSizeMismatch,
+            Self::ArtifactDigest { .. } => FetchErrorCode::ArtifactDigestMismatch,
+            Self::FileArtifactEscapes { .. } => FetchErrorCode::FileArtifactEscapes,
+            Self::NotRegularFile(_) => FetchErrorCode::NotRegularFile,
+            Self::CacheBudget { .. } => FetchErrorCode::CacheBudgetExceeded,
+            Self::CacheFallbackUnavailable { .. } => FetchErrorCode::CacheFallbackUnavailable,
+        }
+    }
+
     fn is_cache_fallback_eligible(&self) -> bool {
         match self {
             Self::Network {
@@ -182,6 +327,57 @@ impl FetchError {
             } => true,
             Self::HttpStatus { status, .. } => *status == 429 || (500..=599).contains(status),
             _ => false,
+        }
+    }
+}
+
+/// One monotonic deadline shared by every phase of a registry operation.
+///
+/// Individual filesystem calls cannot be preempted portably, so callers check
+/// immediately before and after each bounded syscall and between stream/hash
+/// chunks. This prevents later work or cache fallback once the budget expires.
+#[derive(Clone, Copy, Debug)]
+struct FetchDeadline {
+    started: Instant,
+    total: Duration,
+}
+
+impl FetchDeadline {
+    fn from_timeout(timeout: Duration) -> Self {
+        Self {
+            started: Instant::now(),
+            total: timeout,
+        }
+    }
+
+    fn check(self, phase: &'static str) -> Result<(), FetchError> {
+        if self.remaining_duration().is_zero() {
+            Err(FetchError::OperationDeadline { phase })
+        } else {
+            Ok(())
+        }
+    }
+
+    fn remaining(self, phase: &'static str) -> Result<Duration, FetchError> {
+        let remaining = self.remaining_duration();
+        if remaining.is_zero() {
+            Err(FetchError::OperationDeadline { phase })
+        } else {
+            Ok(remaining)
+        }
+    }
+
+    fn remaining_duration(self) -> Duration {
+        self.total.saturating_sub(self.started.elapsed())
+    }
+
+    #[cfg(test)]
+    fn expired() -> Self {
+        Self {
+            started: Instant::now()
+                .checked_sub(Duration::from_millis(1))
+                .unwrap_or_else(Instant::now),
+            total: Duration::from_nanos(1),
         }
     }
 }
@@ -201,6 +397,8 @@ pub fn validate_redirect_url(current: &Url, location: &str) -> Result<Url, Fetch
 /// failure, HTTP 429, or HTTP 5xx response. Regardless of their source,
 /// manifests are verified with the keys and threshold in `config`, and cached
 /// artifacts are rehashed before this function returns.
+/// `config.timeout` is one whole-operation budget; an elapsed budget is never
+/// converted into a cache fallback attempt.
 pub fn fetch_verified_artifact(config: &FetchConfig<'_>) -> Result<FetchedArtifact, FetchError> {
     fetch_verified_artifact_inner(config, RedirectPolicyMode::Production)
 }
@@ -216,23 +414,28 @@ fn fetch_verified_artifact_inner(
         return Err(FetchError::InvalidCacheLimit);
     }
 
+    let deadline = FetchDeadline::from_timeout(config.timeout);
+    deadline.check("registry URL resolution")?;
     let signature = sibling_url(config.manifest_url, Sibling::Signature, redirect_mode)?;
-    let deadline = Instant::now()
-        .checked_add(config.timeout)
-        .unwrap_or_else(Instant::now);
+    deadline.check("registry URL resolution")?;
     let cache = CacheGuard::open(config.cache_dir, config.cache_max_bytes, deadline)?;
     // Enforce a reduced cache limit before consulting any old entries.
     cache.evict_to_budget(&[])?;
-    let pair_paths = cache.manifest_paths(config.manifest_url);
+    let pair_paths = cache.manifest_paths(config.manifest_url)?;
 
     let (manifest_bytes, signature_bytes, manifest_source) = match config.manifest_url.scheme() {
         "file" => {
-            let manifest =
-                read_file_url_bounded(config.manifest_url, MANIFEST_MAX_BYTES as u64, "manifest")?;
+            let manifest = read_file_url_bounded(
+                config.manifest_url,
+                MANIFEST_MAX_BYTES as u64,
+                "manifest",
+                deadline,
+            )?;
             let signature_bytes = read_file_url_bounded(
                 &signature,
                 SIGNATURE_DOCUMENT_MAX_BYTES as u64,
                 "signature document",
+                deadline,
             )?;
             (manifest, signature_bytes, ManifestSource::File)
         }
@@ -244,22 +447,7 @@ fn fetch_verified_artifact_inner(
             redirect_mode,
         ) {
             Ok((manifest, signature_bytes)) => (manifest, signature_bytes, ManifestSource::Network),
-            Err(network_error) if network_error.is_cache_fallback_eligible() => {
-                match cache.read_manifest_pair(&pair_paths) {
-                    Ok((manifest, signature_bytes)) => (
-                        manifest,
-                        signature_bytes,
-                        ManifestSource::VerifiedCacheFallback,
-                    ),
-                    Err(cache_error) => {
-                        return Err(FetchError::CacheFallbackUnavailable {
-                            network: network_error.to_string(),
-                            cache: cache_error.to_string(),
-                        });
-                    }
-                }
-            }
-            Err(error) => return Err(error),
+            Err(error) => recover_cached_manifest_pair(&cache, &pair_paths, error)?,
         },
         // Only tests enter here. Production URLs are rejected by sibling_url.
         "http" if redirect_mode == RedirectPolicyMode::LocalTest => {
@@ -273,22 +461,7 @@ fn fetch_verified_artifact_inner(
                 Ok((manifest, signature_bytes)) => {
                     (manifest, signature_bytes, ManifestSource::Network)
                 }
-                Err(network_error) if network_error.is_cache_fallback_eligible() => {
-                    match cache.read_manifest_pair(&pair_paths) {
-                        Ok((manifest, signature_bytes)) => (
-                            manifest,
-                            signature_bytes,
-                            ManifestSource::VerifiedCacheFallback,
-                        ),
-                        Err(cache_error) => {
-                            return Err(FetchError::CacheFallbackUnavailable {
-                                network: network_error.to_string(),
-                                cache: cache_error.to_string(),
-                            });
-                        }
-                    }
-                }
-                Err(error) => return Err(error),
+                Err(error) => recover_cached_manifest_pair(&cache, &pair_paths, error)?,
             }
         }
         scheme => {
@@ -297,6 +470,7 @@ fn fetch_verified_artifact_inner(
     };
 
     // This is deliberately after every source selection, including cache.
+    deadline.check("manifest verification")?;
     let verified_manifest = verify_manifest(
         &manifest_bytes,
         &signature_bytes,
@@ -304,7 +478,10 @@ fn fetch_verified_artifact_inner(
         config.signature_threshold,
         config.expected_version,
         config.expected_protocol_version,
-    )?;
+    );
+    deadline.check("manifest verification")?;
+    let verified_manifest = verified_manifest?;
+    deadline.check("manifest target selection")?;
     let artifact = verified_manifest
         .manifest
         .artifacts
@@ -312,6 +489,7 @@ fn fetch_verified_artifact_inner(
         .find(|artifact| artifact.target == config.target)
         .cloned()
         .ok_or(FetchError::TargetNotPublished(config.target))?;
+    deadline.check("manifest target selection")?;
 
     // The content-addressed artifact is the only entry that must remain in the
     // cache when this function returns. The manifest pair may be evicted under
@@ -332,21 +510,22 @@ fn fetch_verified_artifact_inner(
         } else {
             // Do not leave a stale pair for this immutable URL when the newly
             // verified bytes cannot fit under the current cache policy.
-            remove_invalid_cache_entry(&pair_paths.manifest)?;
-            remove_invalid_cache_entry(&pair_paths.signature)?;
+            remove_invalid_cache_entry(&pair_paths.manifest, deadline)?;
+            remove_invalid_cache_entry(&pair_paths.signature, deadline)?;
         }
     }
 
-    let artifact_path = cache.artifact_path(&artifact.sha256);
+    let artifact_path = cache.artifact_path(&artifact.sha256)?;
     if let Some(artifact_lease) = cache.open_verified_cached_artifact(&artifact_path, &artifact)? {
-        cache.touch(&artifact_path);
-        cache.touch_manifest_pair(&pair_paths);
+        cache.touch(&artifact_path)?;
+        cache.touch_manifest_pair(&pair_paths)?;
         cache.evict_for_result(
             &artifact_path,
             &pair_paths,
             artifact.size,
             manifest_bytes.len() as u64 + signature_bytes.len() as u64,
         )?;
+        deadline.check("registry result preparation")?;
         return Ok(FetchedArtifact {
             local_path: artifact_path,
             sha256: artifact.sha256.clone(),
@@ -369,7 +548,8 @@ fn fetch_verified_artifact_inner(
                 Sibling::Artifact(&artifact.filename),
                 redirect_mode,
             )?;
-            let source = open_contained_file_artifact(config.manifest_url, &artifact_url)?;
+            let source =
+                open_contained_file_artifact(config.manifest_url, &artifact_url, deadline)?;
             cache.install_artifact_from_file(source, &artifact_path, &artifact)?;
             ArtifactSource::File
         }
@@ -384,7 +564,6 @@ fn fetch_verified_artifact_inner(
                 &artifact_path,
                 &artifact,
                 config.timeout,
-                deadline,
                 redirect_mode,
             )?;
             ArtifactSource::Network
@@ -402,8 +581,8 @@ fn fetch_verified_artifact_inner(
             actual: "cache changed after verified write".to_owned(),
         });
     };
-    cache.touch(&artifact_path);
-    cache.touch_manifest_pair(&pair_paths);
+    cache.touch(&artifact_path)?;
+    cache.touch_manifest_pair(&pair_paths)?;
     cache.evict_for_result(
         &artifact_path,
         &pair_paths,
@@ -411,6 +590,7 @@ fn fetch_verified_artifact_inner(
         manifest_bytes.len() as u64 + signature_bytes.len() as u64,
     )?;
 
+    deadline.check("registry result preparation")?;
     Ok(FetchedArtifact {
         local_path: artifact_path,
         sha256: artifact.sha256.clone(),
@@ -426,13 +606,71 @@ fn fetch_verified_artifact_inner(
     })
 }
 
+enum ManifestPairRetrievalError {
+    Manifest(FetchError),
+    Signature {
+        fresh_manifest: Vec<u8>,
+        error: FetchError,
+    },
+}
+
+fn recover_cached_manifest_pair(
+    cache: &CacheGuard,
+    pair_paths: &ManifestCachePaths,
+    retrieval_error: ManifestPairRetrievalError,
+) -> Result<(Vec<u8>, Vec<u8>, ManifestSource), FetchError> {
+    cache.deadline.check("manifest cache fallback")?;
+    let (fresh_manifest, network_error) = match retrieval_error {
+        ManifestPairRetrievalError::Manifest(error) => (None, error),
+        ManifestPairRetrievalError::Signature {
+            fresh_manifest,
+            error,
+        } => (Some(fresh_manifest), error),
+    };
+    if !network_error.is_cache_fallback_eligible() {
+        return Err(network_error);
+    }
+
+    let (cached_manifest, cached_signature) = match cache.read_manifest_pair(pair_paths) {
+        Ok(pair) => pair,
+        Err(error) if error.code() == FetchErrorCode::OperationDeadline => return Err(error),
+        Err(cache_error) => {
+            return Err(FetchError::CacheFallbackUnavailable {
+                network: network_error.to_string(),
+                cache: cache_error.to_string(),
+            });
+        }
+    };
+    if let Some(fresh_manifest) = fresh_manifest {
+        // A transient signature-endpoint failure must not hide a changed or
+        // malformed manifest response. Reusing the cached detached signature
+        // is safe only when it authenticates the exact bytes just retrieved.
+        if fresh_manifest != cached_manifest {
+            return Err(network_error);
+        }
+        cache.deadline.check("manifest cache fallback")?;
+        return Ok((
+            fresh_manifest,
+            cached_signature,
+            ManifestSource::VerifiedCacheFallback,
+        ));
+    }
+
+    cache.deadline.check("manifest cache fallback")?;
+    Ok((
+        cached_manifest,
+        cached_signature,
+        ManifestSource::VerifiedCacheFallback,
+    ))
+}
+
 fn retrieve_manifest_pair(
     manifest_url: &Url,
     signature_url: &Url,
     timeout: Duration,
-    deadline: Instant,
+    deadline: FetchDeadline,
     mode: RedirectPolicyMode,
-) -> Result<(Vec<u8>, Vec<u8>), FetchError> {
+) -> Result<(Vec<u8>, Vec<u8>), ManifestPairRetrievalError> {
     let agent = http_agent(timeout, mode);
     let manifest = get_bounded(
         &agent,
@@ -441,15 +679,24 @@ fn retrieve_manifest_pair(
         "manifest",
         deadline,
         mode,
-    )?;
-    let signature = get_bounded(
+    )
+    .map_err(ManifestPairRetrievalError::Manifest)?;
+    let signature = match get_bounded(
         &agent,
         signature_url,
         SIGNATURE_DOCUMENT_MAX_BYTES as u64,
         "signature document",
         deadline,
         mode,
-    )?;
+    ) {
+        Ok(signature) => signature,
+        Err(error) => {
+            return Err(ManifestPairRetrievalError::Signature {
+                fresh_manifest: manifest,
+                error,
+            });
+        }
+    };
     Ok((manifest, signature))
 }
 
@@ -472,16 +719,18 @@ fn get_bounded(
     url: &Url,
     max: u64,
     kind: &'static str,
-    deadline: Instant,
+    deadline: FetchDeadline,
     mode: RedirectPolicyMode,
 ) -> Result<Vec<u8>, FetchError> {
+    deadline.check("network response headers")?;
     let (final_url, mut response) = open_with_redirects(agent, url, deadline, mode)?;
-    if let Some(length) = response
+    let content_length = response
         .headers()
         .get("content-length")
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<u64>().ok())
-    {
+        .and_then(|value| value.parse::<u64>().ok());
+    deadline.check("network response headers")?;
+    if let Some(length) = content_length {
         if length > max {
             return Err(FetchError::BodyTooLarge {
                 kind,
@@ -490,35 +739,33 @@ fn get_bounded(
             });
         }
     }
-    read_bounded(response.body_mut().as_reader(), max, kind, final_url)
+    deadline.check("network response headers")?;
+    read_bounded(
+        response.body_mut().as_reader(),
+        max,
+        kind,
+        final_url,
+        deadline,
+    )
 }
 
 fn open_with_redirects(
     agent: &ureq::Agent,
     initial: &Url,
-    deadline: Instant,
+    deadline: FetchDeadline,
     mode: RedirectPolicyMode,
 ) -> Result<(Url, Response<ureq::Body>), FetchError> {
     let mut current = initial.clone();
     for redirects in 0..=MAX_REDIRECTS {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(FetchError::Network {
-                kind: NetworkFailureKind::Timeout,
-                url: redacted_url(current).to_string(),
-                source: Box::new(ureq::Error::Io(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "registry operation deadline elapsed",
-                ))),
-            });
-        }
+        let remaining = deadline.remaining("network request")?;
         let response = agent
             .get(current.as_str())
             .config()
             .timeout_global(Some(remaining))
             .build()
-            .call()
-            .map_err(|source| network_error(current.clone(), source))?;
+            .call();
+        deadline.check("network request")?;
+        let response = response.map_err(|source| network_error(current.clone(), source))?;
         let status = response.status().as_u16();
         if matches!(status, 301 | 302 | 303 | 307 | 308) {
             if redirects == MAX_REDIRECTS {
@@ -532,6 +779,7 @@ fn open_with_redirects(
                     url: redacted_url(current.clone()).to_string(),
                 })?;
             current = resolve_redirect(&current, location, mode)?;
+            deadline.check("network redirect")?;
             continue;
         }
         if !(200..=299).contains(&status) {
@@ -540,6 +788,7 @@ fn open_with_redirects(
                 status,
             });
         }
+        deadline.check("network response headers")?;
         return Ok((current, response));
     }
     unreachable!("redirect loop always returns at the configured limit")
@@ -724,13 +973,28 @@ fn read_bounded(
     max: u64,
     kind: &'static str,
     url: Url,
+    deadline: FetchDeadline,
 ) -> Result<Vec<u8>, FetchError> {
     let capacity = usize::try_from(max.min(64 * 1024)).unwrap_or(64 * 1024);
     let mut bytes = Vec::with_capacity(capacity);
-    let mut limited = reader.by_ref().take(max.saturating_add(1));
-    limited
-        .read_to_end(&mut bytes)
-        .map_err(|source| network_error(url.clone(), ureq::Error::Io(source)))?;
+    let mut remaining = max.saturating_add(1);
+    let mut buffer = [0_u8; COPY_BUFFER_BYTES];
+    while remaining > 0 {
+        deadline.check("network response read")?;
+        let limit = usize::try_from(remaining.min(buffer.len() as u64)).unwrap_or(buffer.len());
+        let read = reader.read(&mut buffer[..limit]);
+        deadline.check("network response read")?;
+        let read = match read {
+            Ok(read) => read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(source) => return Err(network_error(url.clone(), ureq::Error::Io(source))),
+        };
+        if read == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&buffer[..read]);
+        remaining = remaining.saturating_sub(read as u64);
+    }
     if bytes.len() as u64 > max {
         return Err(FetchError::BodyTooLarge {
             kind,
@@ -738,14 +1002,23 @@ fn read_bounded(
             max,
         });
     }
+    deadline.check("network response read")?;
     Ok(bytes)
 }
 
-fn read_file_url_bounded(url: &Url, max: u64, kind: &'static str) -> Result<Vec<u8>, FetchError> {
+fn read_file_url_bounded(
+    url: &Url,
+    max: u64,
+    kind: &'static str,
+    deadline: FetchDeadline,
+) -> Result<Vec<u8>, FetchError> {
+    deadline.check("file registry read")?;
     let path = url
         .to_file_path()
         .map_err(|()| UrlPolicyError::FileUrlNotLocalAbsolute)?;
-    let metadata = fs::metadata(&path).map_err(|source| io_error("stat", &path, source))?;
+    let metadata = fs::metadata(&path);
+    deadline.check("file registry stat")?;
+    let metadata = metadata.map_err(|source| io_error("stat", &path, source))?;
     if !metadata.is_file() {
         return Err(FetchError::NotRegularFile(path));
     }
@@ -756,11 +1029,28 @@ fn read_file_url_bounded(url: &Url, max: u64, kind: &'static str) -> Result<Vec<
             max,
         });
     }
-    let file = File::open(&path).map_err(|source| io_error("open", &path, source))?;
+    let file = File::open(&path);
+    deadline.check("file registry open")?;
+    let mut file = file.map_err(|source| io_error("open", &path, source))?;
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.take(max.saturating_add(1))
-        .read_to_end(&mut bytes)
-        .map_err(|source| io_error("read", &path, source))?;
+    let mut remaining = max.saturating_add(1);
+    let mut buffer = [0_u8; COPY_BUFFER_BYTES];
+    while remaining > 0 {
+        deadline.check("file registry read")?;
+        let limit = usize::try_from(remaining.min(buffer.len() as u64)).unwrap_or(buffer.len());
+        let read = file.read(&mut buffer[..limit]);
+        deadline.check("file registry read")?;
+        let read = match read {
+            Ok(read) => read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(source) => return Err(io_error("read", &path, source)),
+        };
+        if read == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&buffer[..read]);
+        remaining = remaining.saturating_sub(read as u64);
+    }
     if bytes.len() as u64 > max {
         return Err(FetchError::BodyTooLarge {
             kind,
@@ -768,36 +1058,46 @@ fn read_file_url_bounded(url: &Url, max: u64, kind: &'static str) -> Result<Vec<
             max,
         });
     }
+    deadline.check("file registry read")?;
     Ok(bytes)
 }
 
 fn open_contained_file_artifact(
     manifest_url: &Url,
     artifact_url: &Url,
+    deadline: FetchDeadline,
 ) -> Result<File, FetchError> {
+    deadline.check("file artifact containment")?;
     let manifest_path = manifest_url
         .to_file_path()
         .map_err(|()| UrlPolicyError::FileUrlNotLocalAbsolute)?;
     let manifest_parent = manifest_path
         .parent()
         .ok_or(UrlPolicyError::FileUrlNotLocalAbsolute)?;
-    let manifest_dir = fs::canonicalize(manifest_parent)
-        .map_err(|source| io_error("canonicalize", manifest_parent, source))?;
+    let manifest_dir = fs::canonicalize(manifest_parent);
+    deadline.check("file artifact containment")?;
+    let manifest_dir =
+        manifest_dir.map_err(|source| io_error("canonicalize", manifest_parent, source))?;
     let artifact_path = artifact_url
         .to_file_path()
         .map_err(|()| UrlPolicyError::FileUrlNotLocalAbsolute)?;
-    let canonical_artifact = fs::canonicalize(&artifact_path)
-        .map_err(|source| io_error("canonicalize", &artifact_path, source))?;
+    let canonical_artifact = fs::canonicalize(&artifact_path);
+    deadline.check("file artifact containment")?;
+    let canonical_artifact =
+        canonical_artifact.map_err(|source| io_error("canonicalize", &artifact_path, source))?;
     if !canonical_artifact.starts_with(&manifest_dir) {
         return Err(FetchError::FileArtifactEscapes {
             artifact: canonical_artifact,
             manifest_dir,
         });
     }
-    let file = File::open(&artifact_path)
-        .map_err(|source| io_error("open file registry artifact", &artifact_path, source))?;
-    let opened_metadata = file
-        .metadata()
+    let file = File::open(&artifact_path);
+    deadline.check("file artifact open")?;
+    let file =
+        file.map_err(|source| io_error("open file registry artifact", &artifact_path, source))?;
+    let opened_metadata = file.metadata();
+    deadline.check("file artifact stat")?;
+    let opened_metadata = opened_metadata
         .map_err(|source| io_error("stat open file registry artifact", &artifact_path, source))?;
     if !opened_metadata.is_file() {
         return Err(FetchError::NotRegularFile(canonical_artifact));
@@ -805,15 +1105,19 @@ fn open_contained_file_artifact(
     // Re-resolve after opening and compare the pinned handle with the resolved
     // entry. This closes the ordinary canonicalize-then-open swap window; the
     // bytes are subsequently copied from this handle, not by reopening a path.
-    let canonical_after = fs::canonicalize(&artifact_path)
-        .map_err(|source| io_error("canonicalize", &artifact_path, source))?;
+    let canonical_after = fs::canonicalize(&artifact_path);
+    deadline.check("file artifact containment")?;
+    let canonical_after =
+        canonical_after.map_err(|source| io_error("canonicalize", &artifact_path, source))?;
     if !canonical_after.starts_with(&manifest_dir) {
         return Err(FetchError::FileArtifactEscapes {
             artifact: canonical_after,
             manifest_dir,
         });
     }
-    if !same_file_identity(&file, &canonical_after)
+    let same_identity = same_file_identity(&file, &canonical_after);
+    deadline.check("file artifact identity")?;
+    if !same_identity
         .map_err(|source| io_error("identify file registry artifact", &artifact_path, source))?
     {
         return Err(io_error(
@@ -825,6 +1129,7 @@ fn open_contained_file_artifact(
             ),
         ));
     }
+    deadline.check("file artifact preparation")?;
     Ok(file)
 }
 
@@ -902,6 +1207,7 @@ struct CacheGuard {
     manifests: PathBuf,
     artifacts: PathBuf,
     max_bytes: u64,
+    deadline: FetchDeadline,
     _lock: File,
 }
 
@@ -910,27 +1216,53 @@ struct ManifestCachePaths {
     signature: PathBuf,
 }
 
+#[derive(Clone, Copy)]
+enum ArtifactReadSource<'a> {
+    File,
+    Network(&'a Url),
+}
+
+impl ArtifactReadSource<'_> {
+    fn error(self, destination: &Path, source: io::Error) -> FetchError {
+        match self {
+            Self::File => io_error("read artifact", destination, source),
+            Self::Network(url) => network_error(url.clone(), ureq::Error::Io(source)),
+        }
+    }
+}
+
 impl CacheGuard {
-    fn open(root: &Path, max_bytes: u64, deadline: Instant) -> Result<Self, FetchError> {
-        fs::create_dir_all(root)
-            .map_err(|source| io_error("create cache directory", root, source))?;
+    fn open(root: &Path, max_bytes: u64, deadline: FetchDeadline) -> Result<Self, FetchError> {
+        deadline.check("cache directory creation")?;
+        let created = fs::create_dir_all(root);
+        deadline.check("cache directory creation")?;
+        created.map_err(|source| io_error("create cache directory", root, source))?;
         let manifests = root.join("manifests");
         let artifacts = root.join("artifacts");
-        fs::create_dir_all(&manifests)
-            .map_err(|source| io_error("create cache directory", &manifests, source))?;
-        fs::create_dir_all(&artifacts)
-            .map_err(|source| io_error("create cache directory", &artifacts, source))?;
+        let created = fs::create_dir_all(&manifests);
+        deadline.check("cache directory creation")?;
+        created.map_err(|source| io_error("create cache directory", &manifests, source))?;
+        let created = fs::create_dir_all(&artifacts);
+        deadline.check("cache directory creation")?;
+        created.map_err(|source| io_error("create cache directory", &artifacts, source))?;
         let lock_path = root.join(".lock");
-        let lock = open_private(&lock_path, true, false)
-            .map_err(|source| io_error("open cache lock", &lock_path, source))?;
+        let lock = open_private(&lock_path, true, false);
+        deadline.check("cache lock open")?;
+        let lock = lock.map_err(|source| io_error("open cache lock", &lock_path, source))?;
         loop {
-            match fs4::FileExt::try_lock(&lock) {
+            if deadline.check("cache lock wait").is_err() {
+                return Err(FetchError::CacheLockTimeout(lock_path));
+            }
+            let attempt = fs4::FileExt::try_lock(&lock);
+            if deadline.check("cache lock wait").is_err() {
+                return Err(FetchError::CacheLockTimeout(lock_path));
+            }
+            match attempt {
                 Ok(()) => break,
                 Err(fs4::TryLockError::WouldBlock) => {
-                    let remaining = deadline.saturating_duration_since(Instant::now());
-                    if remaining.is_zero() {
-                        return Err(FetchError::CacheLockTimeout(lock_path));
-                    }
+                    let remaining = deadline
+                        .remaining("cache lock wait")
+                        .map_err(|_| FetchError::CacheLockTimeout(lock_path.clone()))?;
                     std::thread::sleep(remaining.min(Duration::from_millis(10)));
                 }
                 Err(fs4::TryLockError::Error(source)) => {
@@ -942,28 +1274,37 @@ impl CacheGuard {
             manifests,
             artifacts,
             max_bytes,
+            deadline,
             _lock: lock,
         })
     }
 
-    fn manifest_paths(&self, url: &Url) -> ManifestCachePaths {
+    fn manifest_paths(&self, url: &Url) -> Result<ManifestCachePaths, FetchError> {
+        self.deadline.check("manifest cache key")?;
         let key = sha256_hex(url.as_str().as_bytes());
-        ManifestCachePaths {
+        self.deadline.check("manifest cache key")?;
+        Ok(ManifestCachePaths {
             manifest: self.manifests.join(format!("{key}.json")),
             signature: self.manifests.join(format!("{key}.sig")),
-        }
+        })
     }
 
-    fn artifact_path(&self, digest: &str) -> PathBuf {
-        self.artifacts.join(digest)
+    fn artifact_path(&self, digest: &str) -> Result<PathBuf, FetchError> {
+        self.deadline.check("artifact cache path")?;
+        Ok(self.artifacts.join(digest))
     }
 
     fn read_manifest_pair(
         &self,
         paths: &ManifestCachePaths,
     ) -> Result<(Vec<u8>, Vec<u8>), FetchError> {
-        let manifest = read_cache_file(&paths.manifest, MANIFEST_MAX_BYTES as u64)?;
-        let signature = read_cache_file(&paths.signature, SIGNATURE_DOCUMENT_MAX_BYTES as u64)?;
+        let manifest = read_cache_file(&paths.manifest, MANIFEST_MAX_BYTES as u64, self.deadline)?;
+        let signature = read_cache_file(
+            &paths.signature,
+            SIGNATURE_DOCUMENT_MAX_BYTES as u64,
+            self.deadline,
+        )?;
+        self.deadline.check("manifest cache read")?;
         Ok((manifest, signature))
     }
 
@@ -973,16 +1314,16 @@ impl CacheGuard {
         manifest: &[u8],
         signature: &[u8],
     ) -> Result<(), FetchError> {
-        atomic_write(&paths.manifest, manifest)?;
-        atomic_write(&paths.signature, signature)?;
-        self.touch(&paths.manifest);
-        self.touch(&paths.signature);
+        atomic_write(&paths.manifest, manifest, self.deadline)?;
+        atomic_write(&paths.signature, signature, self.deadline)?;
+        self.touch(&paths.manifest)?;
+        self.touch(&paths.signature)?;
         Ok(())
     }
 
-    fn touch_manifest_pair(&self, paths: &ManifestCachePaths) {
-        self.touch(&paths.manifest);
-        self.touch(&paths.signature);
+    fn touch_manifest_pair(&self, paths: &ManifestCachePaths) -> Result<(), FetchError> {
+        self.touch(&paths.manifest)?;
+        self.touch(&paths.signature)
     }
 
     fn evict_for_result(
@@ -992,10 +1333,12 @@ impl CacheGuard {
         artifact_size: u64,
         pair_size: u64,
     ) -> Result<(), FetchError> {
-        if artifact_size.saturating_add(pair_size) <= self.max_bytes
+        self.deadline.check("cache result eviction")?;
+        let keep_pair = artifact_size.saturating_add(pair_size) <= self.max_bytes
             && pair_paths.manifest.is_file()
-            && pair_paths.signature.is_file()
-        {
+            && pair_paths.signature.is_file();
+        self.deadline.check("cache result eviction")?;
+        if keep_pair {
             self.evict_to_budget(&[artifact_path, &pair_paths.manifest, &pair_paths.signature])
         } else {
             self.evict_to_budget(&[artifact_path])
@@ -1007,18 +1350,26 @@ impl CacheGuard {
         path: &Path,
         artifact: &Artifact,
     ) -> Result<Option<Arc<File>>, FetchError> {
-        let metadata = match fs::symlink_metadata(path) {
+        self.deadline.check("cached artifact stat")?;
+        let metadata = fs::symlink_metadata(path);
+        self.deadline.check("cached artifact stat")?;
+        let metadata = match metadata {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(source) => return Err(io_error("stat cached artifact", path, source)),
         };
         if !metadata.file_type().is_file() || metadata.len() != artifact.size {
-            remove_invalid_cache_entry(path)?;
+            remove_invalid_cache_entry(path, self.deadline)?;
             return Ok(None);
         }
-        let file = File::open(path)
-            .map_err(|source| io_error("open verified cached artifact", path, source))?;
-        match fs4::FileExt::try_lock_shared(&file) {
+        let file = File::open(path);
+        self.deadline.check("cached artifact open")?;
+        let file =
+            file.map_err(|source| io_error("open verified cached artifact", path, source))?;
+        self.deadline.check("cached artifact lease")?;
+        let lease = fs4::FileExt::try_lock_shared(&file);
+        self.deadline.check("cached artifact lease")?;
+        match lease {
             Ok(()) => {}
             Err(fs4::TryLockError::WouldBlock) => {
                 return Err(io_error(
@@ -1031,12 +1382,15 @@ impl CacheGuard {
                 return Err(io_error("lease verified cached artifact", path, source));
             }
         }
-        let (actual_size, actual_digest) = digest_open_file(&file, path, ARTIFACT_MAX_BYTES)?;
+        self.deadline.check("cached artifact lease")?;
+        let (actual_size, actual_digest) =
+            digest_open_file(&file, path, ARTIFACT_MAX_BYTES, self.deadline)?;
         if actual_size != artifact.size || actual_digest != artifact.sha256 {
             drop(file);
-            remove_invalid_cache_entry(path)?;
+            remove_invalid_cache_entry(path, self.deadline)?;
             return Ok(None);
         }
+        self.deadline.check("cached artifact verification")?;
         Ok(Some(Arc::new(file)))
     }
 
@@ -1046,7 +1400,7 @@ impl CacheGuard {
         destination: &Path,
         artifact: &Artifact,
     ) -> Result<(), FetchError> {
-        self.install_artifact_reader(source, destination, artifact)
+        self.install_artifact_reader(source, destination, artifact, ArtifactReadSource::File)
     }
 
     fn install_artifact_from_network(
@@ -1055,17 +1409,18 @@ impl CacheGuard {
         destination: &Path,
         artifact: &Artifact,
         timeout: Duration,
-        deadline: Instant,
         mode: RedirectPolicyMode,
     ) -> Result<(), FetchError> {
+        self.deadline.check("artifact network request")?;
         let agent = http_agent(timeout, mode);
-        let (final_url, mut response) = open_with_redirects(&agent, url, deadline, mode)?;
-        if let Some(length) = response
+        let (final_url, mut response) = open_with_redirects(&agent, url, self.deadline, mode)?;
+        let content_length = response
             .headers()
             .get("content-length")
             .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.parse::<u64>().ok())
-        {
+            .and_then(|value| value.parse::<u64>().ok());
+        self.deadline.check("artifact response headers")?;
+        if let Some(length) = content_length {
             if length > ARTIFACT_MAX_BYTES {
                 return Err(FetchError::BodyTooLarge {
                     kind: "artifact",
@@ -1081,7 +1436,13 @@ impl CacheGuard {
                 });
             }
         }
-        self.install_artifact_reader(response.body_mut().as_reader(), destination, artifact)
+        self.deadline.check("artifact response headers")?;
+        self.install_artifact_reader(
+            response.body_mut().as_reader(),
+            destination,
+            artifact,
+            ArtifactReadSource::Network(&final_url),
+        )
     }
 
     fn install_artifact_reader(
@@ -1089,16 +1450,23 @@ impl CacheGuard {
         mut reader: impl Read,
         destination: &Path,
         artifact: &Artifact,
+        source_kind: ArtifactReadSource<'_>,
     ) -> Result<(), FetchError> {
-        let (temp_path, mut temp) = create_temp_for(destination)?;
+        self.deadline.check("artifact cache copy")?;
+        let (temp_path, mut temp) = create_temp_for(destination, self.deadline)?;
         let result = (|| {
             let mut hasher = Sha256::new();
             let mut total = 0_u64;
             let mut buffer = [0_u8; COPY_BUFFER_BYTES];
             loop {
-                let read = reader
-                    .read(&mut buffer)
-                    .map_err(|source| io_error("read artifact", destination, source))?;
+                self.deadline.check("artifact cache copy")?;
+                let read = reader.read(&mut buffer);
+                self.deadline.check("artifact cache copy")?;
+                let read = match read {
+                    Ok(read) => read,
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(source) => return Err(source_kind.error(destination, source)),
+                };
                 if read == 0 {
                     break;
                 }
@@ -1110,9 +1478,16 @@ impl CacheGuard {
                         actual: total,
                     });
                 }
-                temp.write_all(&buffer[..read])
-                    .map_err(|source| io_error("write artifact cache", &temp_path, source))?;
+                write_all_deadlined(
+                    &mut temp,
+                    &buffer[..read],
+                    self.deadline,
+                    "artifact cache write",
+                    "write artifact cache",
+                    &temp_path,
+                )?;
                 hasher.update(&buffer[..read]);
+                self.deadline.check("artifact digest")?;
             }
             if total != artifact.size {
                 return Err(FetchError::ArtifactSize {
@@ -1129,11 +1504,14 @@ impl CacheGuard {
                     actual: digest,
                 });
             }
-            temp.sync_all()
-                .map_err(|source| io_error("sync artifact cache", &temp_path, source))?;
+            self.deadline.check("artifact cache sync")?;
+            let synced = temp.sync_all();
+            self.deadline.check("artifact cache sync")?;
+            synced.map_err(|source| io_error("sync artifact cache", &temp_path, source))?;
             drop(temp);
-            replace_file(&temp_path, destination)?;
-            sync_parent(destination)?;
+            replace_file(&temp_path, destination, self.deadline)?;
+            sync_parent(destination, self.deadline)?;
+            self.deadline.check("artifact cache activation")?;
             Ok(())
         })();
         if result.is_err() {
@@ -1142,31 +1520,43 @@ impl CacheGuard {
         result
     }
 
-    fn touch(&self, path: &Path) {
-        if let Ok(file) = OpenOptions::new().write(true).open(path) {
+    fn touch(&self, path: &Path) -> Result<(), FetchError> {
+        self.deadline.check("cache recency update")?;
+        let opened = OpenOptions::new().write(true).open(path);
+        self.deadline.check("cache recency update")?;
+        if let Ok(file) = opened {
             let now = SystemTime::now();
-            let _ = file.set_times(
+            let updated = file.set_times(
                 std::fs::FileTimes::new()
                     .set_accessed(now)
                     .set_modified(now),
             );
+            self.deadline.check("cache recency update")?;
+            let _ = updated;
         }
+        Ok(())
     }
 
     fn evict_to_budget(&self, protected: &[&Path]) -> Result<(), FetchError> {
+        self.deadline.check("cache eviction")?;
         let protected: HashSet<PathBuf> = protected.iter().map(|path| path.to_path_buf()).collect();
         let mut files = Vec::new();
         let mut total = 0_u64;
         for directory in [&self.manifests, &self.artifacts] {
-            let entries = fs::read_dir(directory)
-                .map_err(|source| io_error("read cache directory", directory, source))?;
+            self.deadline.check("cache eviction scan")?;
+            let entries = fs::read_dir(directory);
+            self.deadline.check("cache eviction scan")?;
+            let entries =
+                entries.map_err(|source| io_error("read cache directory", directory, source))?;
             for entry in entries {
+                self.deadline.check("cache eviction scan")?;
                 let entry =
                     entry.map_err(|source| io_error("read cache directory", directory, source))?;
                 let path = entry.path();
-                let metadata = entry
-                    .metadata()
-                    .map_err(|source| io_error("stat cache entry", &path, source))?;
+                let metadata = entry.metadata();
+                self.deadline.check("cache eviction scan")?;
+                let metadata =
+                    metadata.map_err(|source| io_error("stat cache entry", &path, source))?;
                 if !metadata.is_file() {
                     continue;
                 }
@@ -1176,17 +1566,23 @@ impl CacheGuard {
             }
         }
         if total <= self.max_bytes {
+            self.deadline.check("cache eviction")?;
             return Ok(());
         }
+        self.deadline.check("cache eviction sort")?;
         files.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+        self.deadline.check("cache eviction sort")?;
         for (_, path, size) in files {
+            self.deadline.check("cache eviction")?;
             if total <= self.max_bytes {
                 break;
             }
             if protected.contains(&path) {
                 continue;
             }
-            let eviction_handle = match OpenOptions::new().read(true).write(true).open(&path) {
+            let eviction_handle = OpenOptions::new().read(true).write(true).open(&path);
+            self.deadline.check("cache eviction open")?;
+            let eviction_handle = match eviction_handle {
                 Ok(file) => file,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
                     total = total.saturating_sub(size);
@@ -1196,14 +1592,20 @@ impl CacheGuard {
                     return Err(io_error("open cache entry for eviction", &path, source))
                 }
             };
-            match fs4::FileExt::try_lock(&eviction_handle) {
+            self.deadline.check("cache eviction lock")?;
+            let locked = fs4::FileExt::try_lock(&eviction_handle);
+            self.deadline.check("cache eviction lock")?;
+            match locked {
                 Ok(()) => {}
                 Err(fs4::TryLockError::WouldBlock) => continue,
                 Err(fs4::TryLockError::Error(source)) => {
                     return Err(io_error("lock cache entry for eviction", &path, source));
                 }
             }
-            match fs::remove_file(&path) {
+            self.deadline.check("cache eviction lock")?;
+            let removed = fs::remove_file(&path);
+            self.deadline.check("cache eviction remove")?;
+            match removed {
                 Ok(()) => total = total.saturating_sub(size),
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
                     total = total.saturating_sub(size);
@@ -1217,13 +1619,17 @@ impl CacheGuard {
                 max: self.max_bytes,
             });
         }
+        self.deadline.check("cache eviction")?;
         Ok(())
     }
 }
 
-fn read_cache_file(path: &Path, max: u64) -> Result<Vec<u8>, FetchError> {
-    let metadata = fs::symlink_metadata(path)
-        .map_err(|source| io_error("stat cached registry data", path, source))?;
+fn read_cache_file(path: &Path, max: u64, deadline: FetchDeadline) -> Result<Vec<u8>, FetchError> {
+    deadline.check("registry cache read")?;
+    let metadata = fs::symlink_metadata(path);
+    deadline.check("registry cache stat")?;
+    let metadata =
+        metadata.map_err(|source| io_error("stat cached registry data", path, source))?;
     if !metadata.file_type().is_file() {
         return Err(FetchError::NotRegularFile(path.to_owned()));
     }
@@ -1234,12 +1640,28 @@ fn read_cache_file(path: &Path, max: u64) -> Result<Vec<u8>, FetchError> {
             source: io::Error::new(io::ErrorKind::InvalidData, "cache entry exceeds limit"),
         });
     }
-    let mut file = File::open(path).map_err(|source| io_error("open cache entry", path, source))?;
+    let file = File::open(path);
+    deadline.check("registry cache open")?;
+    let mut file = file.map_err(|source| io_error("open cache entry", path, source))?;
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    Read::by_ref(&mut file)
-        .take(max.saturating_add(1))
-        .read_to_end(&mut bytes)
-        .map_err(|source| io_error("read cache entry", path, source))?;
+    let mut remaining = max.saturating_add(1);
+    let mut buffer = [0_u8; COPY_BUFFER_BYTES];
+    while remaining > 0 {
+        deadline.check("registry cache read")?;
+        let limit = usize::try_from(remaining.min(buffer.len() as u64)).unwrap_or(buffer.len());
+        let read = file.read(&mut buffer[..limit]);
+        deadline.check("registry cache read")?;
+        let read = match read {
+            Ok(read) => read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(source) => return Err(io_error("read cache entry", path, source)),
+        };
+        if read == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&buffer[..read]);
+        remaining = remaining.saturating_sub(read as u64);
+    }
     if bytes.len() as u64 > max {
         return Err(FetchError::Io {
             operation: "read oversized cached registry data",
@@ -1247,22 +1669,34 @@ fn read_cache_file(path: &Path, max: u64) -> Result<Vec<u8>, FetchError> {
             source: io::Error::new(io::ErrorKind::InvalidData, "cache entry exceeds limit"),
         });
     }
+    deadline.check("registry cache read")?;
     Ok(bytes)
 }
 
-fn digest_open_file(file: &File, path: &Path, max: u64) -> Result<(u64, String), FetchError> {
+fn digest_open_file(
+    file: &File,
+    path: &Path,
+    max: u64,
+    deadline: FetchDeadline,
+) -> Result<(u64, String), FetchError> {
+    deadline.check("cached artifact digest")?;
     let mut reader = file;
-    reader
-        .seek(SeekFrom::Start(0))
-        .map_err(|source| io_error("seek cached artifact", path, source))?;
+    let sought = reader.seek(SeekFrom::Start(0));
+    deadline.check("cached artifact seek")?;
+    sought.map_err(|source| io_error("seek cached artifact", path, source))?;
     let result = (|| {
         let mut hasher = Sha256::new();
         let mut total = 0_u64;
         let mut buffer = [0_u8; COPY_BUFFER_BYTES];
         loop {
-            let read = reader
-                .read(&mut buffer)
-                .map_err(|source| io_error("read cached artifact", path, source))?;
+            deadline.check("cached artifact digest")?;
+            let read = reader.read(&mut buffer);
+            deadline.check("cached artifact digest")?;
+            let read = match read {
+                Ok(read) => read,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(source) => return Err(io_error("read cached artifact", path, source)),
+            };
             if read == 0 {
                 break;
             }
@@ -1271,25 +1705,44 @@ fn digest_open_file(file: &File, path: &Path, max: u64) -> Result<(u64, String),
                 return Ok((total, String::new()));
             }
             hasher.update(&buffer[..read]);
+            deadline.check("cached artifact digest")?;
         }
         Ok((total, hex_bytes(&hasher.finalize())))
     })();
-    reader
-        .seek(SeekFrom::Start(0))
-        .map_err(|source| io_error("rewind cached artifact", path, source))?;
+    if matches!(&result, Err(error) if error.code() == FetchErrorCode::OperationDeadline) {
+        return result;
+    }
+    let rewound = reader.seek(SeekFrom::Start(0));
+    deadline.check("cached artifact rewind")?;
+    rewound.map_err(|source| io_error("rewind cached artifact", path, source))?;
     result
 }
 
-fn atomic_write(destination: &Path, bytes: &[u8]) -> Result<(), FetchError> {
-    let (temp_path, mut temp) = create_temp_for(destination)?;
+fn atomic_write(
+    destination: &Path,
+    bytes: &[u8],
+    deadline: FetchDeadline,
+) -> Result<(), FetchError> {
+    deadline.check("cache entry write")?;
+    let (temp_path, mut temp) = create_temp_for(destination, deadline)?;
     let result = (|| {
-        temp.write_all(bytes)
-            .map_err(|source| io_error("write cache entry", &temp_path, source))?;
-        temp.sync_all()
-            .map_err(|source| io_error("sync cache entry", &temp_path, source))?;
+        for chunk in bytes.chunks(COPY_BUFFER_BYTES) {
+            write_all_deadlined(
+                &mut temp,
+                chunk,
+                deadline,
+                "cache entry write",
+                "write cache entry",
+                &temp_path,
+            )?;
+        }
+        deadline.check("cache entry sync")?;
+        let synced = temp.sync_all();
+        deadline.check("cache entry sync")?;
+        synced.map_err(|source| io_error("sync cache entry", &temp_path, source))?;
         drop(temp);
-        replace_file(&temp_path, destination)?;
-        sync_parent(destination)
+        replace_file(&temp_path, destination, deadline)?;
+        sync_parent(destination, deadline)
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temp_path);
@@ -1297,7 +1750,39 @@ fn atomic_write(destination: &Path, bytes: &[u8]) -> Result<(), FetchError> {
     result
 }
 
-fn create_temp_for(destination: &Path) -> Result<(PathBuf, File), FetchError> {
+fn write_all_deadlined(
+    writer: &mut impl Write,
+    mut bytes: &[u8],
+    deadline: FetchDeadline,
+    phase: &'static str,
+    operation: &'static str,
+    path: &Path,
+) -> Result<(), FetchError> {
+    while !bytes.is_empty() {
+        deadline.check(phase)?;
+        let written = writer.write(bytes);
+        deadline.check(phase)?;
+        match written {
+            Ok(0) => {
+                return Err(io_error(
+                    operation,
+                    path,
+                    io::Error::from(io::ErrorKind::WriteZero),
+                ));
+            }
+            Ok(written) => bytes = &bytes[written..],
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(source) => return Err(io_error(operation, path, source)),
+        }
+    }
+    Ok(())
+}
+
+fn create_temp_for(
+    destination: &Path,
+    deadline: FetchDeadline,
+) -> Result<(PathBuf, File), FetchError> {
+    deadline.check("cache temporary file creation")?;
     let parent = destination.parent().ok_or_else(|| FetchError::Io {
         operation: "create cache temporary file",
         path: destination.to_owned(),
@@ -1308,9 +1793,12 @@ fn create_temp_for(destination: &Path) -> Result<(PathBuf, File), FetchError> {
         .and_then(|name| name.to_str())
         .unwrap_or("entry");
     for _ in 0..128 {
+        deadline.check("cache temporary file creation")?;
         let sequence = TEMP_FILE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         let path = parent.join(format!(".{name}.{}.{}.tmp", std::process::id(), sequence));
-        match open_private(&path, true, true) {
+        let opened = open_private(&path, true, true);
+        deadline.check("cache temporary file creation")?;
+        match opened {
             Ok(file) => return Ok((path, file)),
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(source) => return Err(io_error("create cache temporary file", &path, source)),
@@ -1343,13 +1831,23 @@ fn open_private(path: &Path, write: bool, create_new: bool) -> io::Result<File> 
 }
 
 #[cfg(not(windows))]
-fn replace_file(source: &Path, destination: &Path) -> Result<(), FetchError> {
-    fs::rename(source, destination)
-        .map_err(|source| io_error("replace cache entry", destination, source))
+fn replace_file(
+    source: &Path,
+    destination: &Path,
+    deadline: FetchDeadline,
+) -> Result<(), FetchError> {
+    deadline.check("cache entry replacement")?;
+    let replaced = fs::rename(source, destination);
+    deadline.check("cache entry replacement")?;
+    replaced.map_err(|source| io_error("replace cache entry", destination, source))
 }
 
 #[cfg(windows)]
-fn replace_file(source: &Path, destination: &Path) -> Result<(), FetchError> {
+fn replace_file(
+    source: &Path,
+    destination: &Path,
+    deadline: FetchDeadline,
+) -> Result<(), FetchError> {
     use std::os::windows::ffi::OsStrExt as _;
 
     const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
@@ -1360,6 +1858,7 @@ fn replace_file(source: &Path, destination: &Path) -> Result<(), FetchError> {
         fn MoveFileExW(existing: *const u16, replacement: *const u16, flags: u32) -> i32;
     }
 
+    deadline.check("cache entry replacement")?;
     let existing: Vec<u16> = source.as_os_str().encode_wide().chain([0]).collect();
     let replacement: Vec<u16> = destination.as_os_str().encode_wide().chain([0]).collect();
     // SAFETY: both pointers refer to live, NUL-terminated UTF-16 buffers for
@@ -1371,6 +1870,7 @@ fn replace_file(source: &Path, destination: &Path) -> Result<(), FetchError> {
             MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
         )
     };
+    deadline.check("cache entry replacement")?;
     if replaced == 0 {
         return Err(io_error(
             "replace cache entry",
@@ -1381,8 +1881,11 @@ fn replace_file(source: &Path, destination: &Path) -> Result<(), FetchError> {
     Ok(())
 }
 
-fn remove_invalid_cache_entry(path: &Path) -> Result<(), FetchError> {
-    match fs::remove_file(path) {
+fn remove_invalid_cache_entry(path: &Path, deadline: FetchDeadline) -> Result<(), FetchError> {
+    deadline.check("invalid cache entry removal")?;
+    let removed = fs::remove_file(path);
+    deadline.check("invalid cache entry removal")?;
+    match removed {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(source) => Err(io_error("remove invalid cache entry", path, source)),
@@ -1390,22 +1893,24 @@ fn remove_invalid_cache_entry(path: &Path) -> Result<(), FetchError> {
 }
 
 #[cfg(unix)]
-fn sync_parent(path: &Path) -> Result<(), FetchError> {
+fn sync_parent(path: &Path, deadline: FetchDeadline) -> Result<(), FetchError> {
+    deadline.check("cache directory sync")?;
     let parent = path.parent().ok_or_else(|| FetchError::Io {
         operation: "sync cache directory",
         path: path.to_owned(),
         source: io::Error::new(io::ErrorKind::InvalidInput, "cache path has no parent"),
     })?;
-    let directory =
-        File::open(parent).map_err(|source| io_error("open cache directory", parent, source))?;
-    directory
-        .sync_all()
-        .map_err(|source| io_error("sync cache directory", parent, source))
+    let directory = File::open(parent);
+    deadline.check("cache directory sync")?;
+    let directory = directory.map_err(|source| io_error("open cache directory", parent, source))?;
+    let synced = directory.sync_all();
+    deadline.check("cache directory sync")?;
+    synced.map_err(|source| io_error("sync cache directory", parent, source))
 }
 
 #[cfg(not(unix))]
-fn sync_parent(_path: &Path) -> Result<(), FetchError> {
-    Ok(())
+fn sync_parent(_path: &Path, deadline: FetchDeadline) -> Result<(), FetchError> {
+    deadline.check("cache directory sync")
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -1476,6 +1981,287 @@ mod tests {
             STANDARD.encode(key.verifying_key().as_bytes()),
         )])
         .unwrap()
+    }
+
+    fn assert_code(error: FetchError, expected: FetchErrorCode) {
+        assert_eq!(error.code(), expected, "{error}");
+        assert_eq!(error.code().to_string(), expected.as_str());
+    }
+
+    fn test_network_error(kind: NetworkFailureKind) -> FetchError {
+        FetchError::Network {
+            kind,
+            url: "https://registry.example/manifest.json".to_owned(),
+            source: Box::new(ureq::Error::Io(io::Error::other("test failure"))),
+        }
+    }
+
+    #[test]
+    fn fetch_error_codes_are_stable_and_unique() {
+        let codes = [
+            FetchErrorCode::UrlPolicy,
+            FetchErrorCode::MalformedManifest,
+            FetchErrorCode::MalformedSignature,
+            FetchErrorCode::InvalidSignatureThreshold,
+            FetchErrorCode::InsufficientSignatures,
+            FetchErrorCode::VersionMismatch,
+            FetchErrorCode::ProtocolVersionMismatch,
+            FetchErrorCode::TargetNotPublished,
+            FetchErrorCode::InvalidTimeout,
+            FetchErrorCode::OperationDeadline,
+            FetchErrorCode::InvalidCacheLimit,
+            FetchErrorCode::CacheLockTimeout,
+            FetchErrorCode::LocalIo,
+            FetchErrorCode::NetworkTimeout,
+            FetchErrorCode::NetworkConnection,
+            FetchErrorCode::NetworkProtocol,
+            FetchErrorCode::HttpRateLimited,
+            FetchErrorCode::HttpServerError,
+            FetchErrorCode::HttpClientError,
+            FetchErrorCode::HttpUnexpectedStatus,
+            FetchErrorCode::RedirectLocationMissing,
+            FetchErrorCode::RedirectLimitExceeded,
+            FetchErrorCode::RedirectPolicy,
+            FetchErrorCode::BodyTooLarge,
+            FetchErrorCode::ArtifactSizeMismatch,
+            FetchErrorCode::ArtifactDigestMismatch,
+            FetchErrorCode::FileArtifactEscapes,
+            FetchErrorCode::NotRegularFile,
+            FetchErrorCode::CacheBudgetExceeded,
+            FetchErrorCode::CacheFallbackUnavailable,
+        ];
+        let strings: HashSet<_> = codes.into_iter().map(FetchErrorCode::as_str).collect();
+        assert_eq!(strings.len(), codes.len());
+        assert!(strings.iter().all(|code| {
+            !code.is_empty()
+                && code
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+        }));
+    }
+
+    #[test]
+    fn fetch_error_code_classifies_top_level_failure_families() {
+        assert_code(
+            FetchError::UrlPolicy(UrlPolicyError::VersionPlaceholderCount),
+            FetchErrorCode::UrlPolicy,
+        );
+        assert_code(
+            FetchError::TargetNotPublished(TARGET),
+            FetchErrorCode::TargetNotPublished,
+        );
+        assert_code(FetchError::InvalidTimeout, FetchErrorCode::InvalidTimeout);
+        assert_code(
+            FetchError::OperationDeadline { phase: "test" },
+            FetchErrorCode::OperationDeadline,
+        );
+        assert_code(
+            FetchError::InvalidCacheLimit,
+            FetchErrorCode::InvalidCacheLimit,
+        );
+        assert_code(
+            FetchError::CacheLockTimeout(PathBuf::from("cache.lock")),
+            FetchErrorCode::CacheLockTimeout,
+        );
+        assert_code(
+            FetchError::Io {
+                operation: "open",
+                path: PathBuf::from("cache"),
+                source: io::Error::from(io::ErrorKind::PermissionDenied),
+            },
+            FetchErrorCode::LocalIo,
+        );
+
+        for (kind, code) in [
+            (NetworkFailureKind::Timeout, FetchErrorCode::NetworkTimeout),
+            (
+                NetworkFailureKind::Connection,
+                FetchErrorCode::NetworkConnection,
+            ),
+            (
+                NetworkFailureKind::Protocol,
+                FetchErrorCode::NetworkProtocol,
+            ),
+        ] {
+            assert_code(test_network_error(kind), code);
+        }
+        for (status, code) in [
+            (429, FetchErrorCode::HttpRateLimited),
+            (500, FetchErrorCode::HttpServerError),
+            (599, FetchErrorCode::HttpServerError),
+            (400, FetchErrorCode::HttpClientError),
+            (499, FetchErrorCode::HttpClientError),
+            (304, FetchErrorCode::HttpUnexpectedStatus),
+            (600, FetchErrorCode::HttpUnexpectedStatus),
+        ] {
+            assert_code(
+                FetchError::HttpStatus {
+                    url: "https://registry.example/manifest.json".to_owned(),
+                    status,
+                },
+                code,
+            );
+        }
+
+        assert_code(
+            FetchError::MissingRedirectLocation {
+                url: "https://registry.example/manifest.json".to_owned(),
+            },
+            FetchErrorCode::RedirectLocationMissing,
+        );
+        assert_code(
+            FetchError::TooManyRedirects { max: 5 },
+            FetchErrorCode::RedirectLimitExceeded,
+        );
+        assert_code(
+            FetchError::RedirectPolicy {
+                from: "https://registry.example/manifest.json".to_owned(),
+                to: "http://registry.example/manifest.json".to_owned(),
+                reason: "test policy",
+            },
+            FetchErrorCode::RedirectPolicy,
+        );
+        assert_code(
+            FetchError::BodyTooLarge {
+                kind: "artifact",
+                url: "https://registry.example/artifact".to_owned(),
+                max: 1,
+            },
+            FetchErrorCode::BodyTooLarge,
+        );
+        assert_code(
+            FetchError::ArtifactSize {
+                filename: "artifact".to_owned(),
+                expected: 1,
+                actual: 2,
+            },
+            FetchErrorCode::ArtifactSizeMismatch,
+        );
+        assert_code(
+            FetchError::ArtifactDigest {
+                filename: "artifact".to_owned(),
+                expected: "00".to_owned(),
+                actual: "11".to_owned(),
+            },
+            FetchErrorCode::ArtifactDigestMismatch,
+        );
+        assert_code(
+            FetchError::FileArtifactEscapes {
+                artifact: PathBuf::from("artifact"),
+                manifest_dir: PathBuf::from("registry"),
+            },
+            FetchErrorCode::FileArtifactEscapes,
+        );
+        assert_code(
+            FetchError::NotRegularFile(PathBuf::from("manifest")),
+            FetchErrorCode::NotRegularFile,
+        );
+        assert_code(
+            FetchError::CacheBudget {
+                required: 2,
+                max: 1,
+            },
+            FetchErrorCode::CacheBudgetExceeded,
+        );
+        assert_code(
+            FetchError::CacheFallbackUnavailable {
+                network: "offline".to_owned(),
+                cache: "missing".to_owned(),
+            },
+            FetchErrorCode::CacheFallbackUnavailable,
+        );
+    }
+
+    #[test]
+    fn fetch_error_code_distinguishes_compatibility_from_malformed_manifests() {
+        let malformed = [
+            crate::ManifestError::TooLarge { actual: 2, max: 1 },
+            crate::ManifestError::Json(
+                serde_json::from_slice::<serde_json::Value>(b"{").unwrap_err(),
+            ),
+            crate::ManifestError::UnsupportedSchema(2),
+            crate::ManifestError::WrongPackage("other".to_owned()),
+            crate::ManifestError::InvalidVersion {
+                value: "not-semver".to_owned(),
+                source: Version::parse("not-semver").unwrap_err(),
+            },
+            crate::ManifestError::InvalidSourceCommit,
+            crate::ManifestError::ArtifactCount { actual: 0, max: 6 },
+            crate::ManifestError::UnsupportedTarget("other".to_owned()),
+            crate::ManifestError::DuplicateTarget(TARGET),
+            crate::ManifestError::InvalidFilename {
+                actual: "bad".to_owned(),
+                expected: FILENAME.to_owned(),
+            },
+            crate::ManifestError::InvalidSha256 { target: TARGET },
+            crate::ManifestError::InvalidSize {
+                target: TARGET,
+                actual: 0,
+                max: ARTIFACT_MAX_BYTES,
+            },
+        ];
+        for error in malformed {
+            assert_code(
+                FetchError::Verification(VerificationError::Manifest(error)),
+                FetchErrorCode::MalformedManifest,
+            );
+        }
+
+        assert_code(
+            FetchError::Verification(VerificationError::Manifest(
+                crate::ManifestError::VersionMismatch {
+                    actual: Version::new(0, 2, 0),
+                    expected: version(),
+                },
+            )),
+            FetchErrorCode::VersionMismatch,
+        );
+        assert_code(
+            FetchError::Verification(VerificationError::Manifest(
+                crate::ManifestError::ProtocolVersionMismatch {
+                    actual: PROTOCOL_VERSION + 1,
+                    expected: PROTOCOL_VERSION,
+                },
+            )),
+            FetchErrorCode::ProtocolVersionMismatch,
+        );
+    }
+
+    #[test]
+    fn fetch_error_code_classifies_all_signature_verification_families() {
+        let malformed = [
+            crate::SignatureError::TooLarge { actual: 2, max: 1 },
+            crate::SignatureError::Json(
+                serde_json::from_slice::<serde_json::Value>(b"{").unwrap_err(),
+            ),
+            crate::SignatureError::UnsupportedSchema(2),
+            crate::SignatureError::SignatureCount { actual: 0, max: 32 },
+            crate::SignatureError::InvalidKeyId("bad key".to_owned()),
+            crate::SignatureError::DuplicateKeyId("key".to_owned()),
+            crate::SignatureError::InvalidSignatureEncoding {
+                key_id: "key".to_owned(),
+            },
+        ];
+        for error in malformed {
+            assert_code(
+                FetchError::Verification(VerificationError::SignatureDocument(error)),
+                FetchErrorCode::MalformedSignature,
+            );
+        }
+        assert_code(
+            FetchError::Verification(VerificationError::InvalidThreshold {
+                threshold: 0,
+                trusted_keys: 1,
+            }),
+            FetchErrorCode::InvalidSignatureThreshold,
+        );
+        assert_code(
+            FetchError::Verification(VerificationError::InsufficientSignatures {
+                required: 2,
+                actual: 1,
+            }),
+            FetchErrorCode::InsufficientSignatures,
+        );
     }
 
     fn manifest_bytes(artifact: &[u8]) -> Vec<u8> {
@@ -1678,7 +2464,7 @@ mod tests {
         let error = open_with_redirects(
             &agent,
             &server.url("/loop"),
-            Instant::now() + Duration::from_secs(2),
+            FetchDeadline::from_timeout(Duration::from_secs(2)),
             RedirectPolicyMode::LocalTest,
         )
         .unwrap_err();
@@ -1704,7 +2490,7 @@ mod tests {
         let error = open_with_redirects(
             &agent,
             &server.url("/start"),
-            Instant::now() + Duration::from_secs(2),
+            FetchDeadline::from_timeout(Duration::from_secs(2)),
             RedirectPolicyMode::LocalTest,
         )
         .unwrap_err()
@@ -1753,6 +2539,11 @@ mod tests {
         Truncated,
         OversizedManifest,
         ArtifactFailure,
+        SignatureStatus(u16),
+        ChangedManifestSignatureStatus(u16),
+        MalformedManifestSignatureStatus(u16),
+        ArtifactTruncated,
+        ArtifactCorrupt,
     }
 
     struct NetworkFixture {
@@ -1770,6 +2561,8 @@ mod tests {
             let signature = signature_bytes(&manifest, key_id, key);
             let malformed = b"{".to_vec();
             let malformed_signature = signature_bytes(&malformed, key_id, key);
+            let mut changed_manifest = manifest.clone();
+            changed_manifest.push(b'\n');
             let mode = Arc::new(Mutex::new(ServerMode::Online));
             let handler_mode = Arc::clone(&mode);
             let handler_manifest = manifest.clone();
@@ -1779,7 +2572,13 @@ mod tests {
                 let selected = *handler_mode.lock().unwrap();
                 if path == "/manifest.json" {
                     return match selected {
-                        ServerMode::Online | ServerMode::ArtifactFailure => ok(&handler_manifest),
+                        ServerMode::Online
+                        | ServerMode::ArtifactFailure
+                        | ServerMode::SignatureStatus(_)
+                        | ServerMode::ArtifactTruncated
+                        | ServerMode::ArtifactCorrupt => ok(&handler_manifest),
+                        ServerMode::ChangedManifestSignatureStatus(_) => ok(&changed_manifest),
+                        ServerMode::MalformedManifestSignatureStatus(_) => ok(&malformed),
                         ServerMode::Status(code) => status(code),
                         ServerMode::Malformed => ok(&malformed),
                         ServerMode::Truncated => http_response(
@@ -1800,17 +2599,29 @@ mod tests {
                     };
                 }
                 if path == "/manifest.json.sig" {
-                    return if matches!(selected, ServerMode::Malformed) {
-                        ok(&malformed_signature)
-                    } else {
-                        ok(&handler_signature)
+                    return match selected {
+                        ServerMode::Malformed => ok(&malformed_signature),
+                        ServerMode::SignatureStatus(code)
+                        | ServerMode::ChangedManifestSignatureStatus(code)
+                        | ServerMode::MalformedManifestSignatureStatus(code) => status(code),
+                        _ => ok(&handler_signature),
                     };
                 }
                 if path == format!("/{FILENAME}") {
-                    return if matches!(selected, ServerMode::ArtifactFailure) {
-                        status(500)
-                    } else {
-                        ok(&handler_artifact)
+                    return match selected {
+                        ServerMode::ArtifactFailure => status(500),
+                        ServerMode::ArtifactTruncated => http_response(
+                            200,
+                            "OK",
+                            &[("Content-Length", handler_artifact.len().to_string())],
+                            &handler_artifact[..handler_artifact.len() / 2],
+                        ),
+                        ServerMode::ArtifactCorrupt => {
+                            let mut corrupt = handler_artifact.clone();
+                            corrupt[0] ^= 0xff;
+                            ok(&corrupt)
+                        }
+                        _ => ok(&handler_artifact),
                     };
                 }
                 status(404)
@@ -1915,6 +2726,51 @@ mod tests {
     }
 
     #[test]
+    fn signature_outage_uses_cache_only_for_the_exact_fresh_manifest() {
+        let temp = TempDir::new().unwrap();
+        let key = signing_key(12);
+        let trusted = trusted_key("release", &key);
+        let fixture = NetworkFixture::new(b"verified agent bytes".to_vec(), "release", &key);
+        let expected_version = version();
+        let config = config(
+            &fixture.url,
+            &expected_version,
+            &trusted,
+            temp.path(),
+            2 * 1024 * 1024,
+        );
+
+        fetch_verified_artifact_inner(&config, RedirectPolicyMode::LocalTest).unwrap();
+
+        fixture.set_mode(ServerMode::SignatureStatus(503));
+        let exact = fetch_verified_artifact_inner(&config, RedirectPolicyMode::LocalTest).unwrap();
+        assert_eq!(exact.manifest_source, ManifestSource::VerifiedCacheFallback);
+        assert!(exact.cache_state.manifest_fallback);
+
+        fixture.set_mode(ServerMode::ChangedManifestSignatureStatus(503));
+        assert!(matches!(
+            fetch_verified_artifact_inner(&config, RedirectPolicyMode::LocalTest),
+            Err(FetchError::HttpStatus { status: 503, .. })
+        ));
+
+        fixture.set_mode(ServerMode::MalformedManifestSignatureStatus(503));
+        assert!(matches!(
+            fetch_verified_artifact_inner(&config, RedirectPolicyMode::LocalTest),
+            Err(FetchError::HttpStatus { status: 503, .. })
+        ));
+
+        // Neither rejected response may replace or poison the exact cached
+        // pair used for a later signature-only outage.
+        fixture.set_mode(ServerMode::SignatureStatus(503));
+        let exact_again =
+            fetch_verified_artifact_inner(&config, RedirectPolicyMode::LocalTest).unwrap();
+        assert_eq!(
+            exact_again.manifest_source,
+            ManifestSource::VerifiedCacheFallback
+        );
+    }
+
+    #[test]
     fn poisoned_manifest_cache_is_never_used() {
         let temp = TempDir::new().unwrap();
         let key = signing_key(3);
@@ -1965,6 +2821,111 @@ mod tests {
         assert!(cached_bytes <= 300, "cache contains {cached_bytes} bytes");
     }
 
+    struct FailingReader(io::ErrorKind);
+
+    impl Read for FailingReader {
+        fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::from(self.0))
+        }
+    }
+
+    #[test]
+    fn artifact_stream_read_errors_keep_their_network_classification() {
+        let temp = TempDir::new().unwrap();
+        let cache = CacheGuard::open(
+            temp.path(),
+            1024,
+            FetchDeadline::from_timeout(Duration::from_secs(1)),
+        )
+        .unwrap();
+        let artifact = Artifact {
+            target: TARGET,
+            filename: FILENAME.to_owned(),
+            sha256: "00".repeat(32),
+            size: 1,
+        };
+        let url = Url::parse("https://registry.example/artifact").unwrap();
+        let destination = cache.artifact_path(&artifact.sha256).unwrap();
+
+        for (kind, expected) in [
+            (io::ErrorKind::TimedOut, FetchErrorCode::NetworkTimeout),
+            (
+                io::ErrorKind::ConnectionReset,
+                FetchErrorCode::NetworkConnection,
+            ),
+            (io::ErrorKind::InvalidData, FetchErrorCode::NetworkProtocol),
+        ] {
+            let error = cache
+                .install_artifact_reader(
+                    FailingReader(kind),
+                    &destination,
+                    &artifact,
+                    ArtifactReadSource::Network(&url),
+                )
+                .unwrap_err();
+            assert_eq!(error.code(), expected, "{kind:?}: {error}");
+            assert!(!destination.exists());
+        }
+
+        let local_error = cache
+            .install_artifact_reader(
+                FailingReader(io::ErrorKind::InvalidData),
+                &destination,
+                &artifact,
+                ArtifactReadSource::File,
+            )
+            .unwrap_err();
+        assert_eq!(local_error.code(), FetchErrorCode::LocalIo);
+    }
+
+    #[test]
+    fn artifact_body_truncation_and_hash_failure_never_use_manifest_cache_as_fallback() {
+        let temp = TempDir::new().unwrap();
+        let key = signing_key(13);
+        let trusted = trusted_key("release", &key);
+        let fixture = NetworkFixture::new(vec![42; 256], "release", &key);
+        let expected_version = version();
+        let config = config(
+            &fixture.url,
+            &expected_version,
+            &trusted,
+            temp.path(),
+            2 * 1024 * 1024,
+        );
+        let artifact_path = temp
+            .path()
+            .join("artifacts")
+            .join(sha256_hex(&fixture.artifact));
+
+        fixture.set_mode(ServerMode::ArtifactTruncated);
+        let truncated =
+            fetch_verified_artifact_inner(&config, RedirectPolicyMode::LocalTest).unwrap_err();
+        assert!(matches!(
+            truncated,
+            FetchError::Network {
+                kind: NetworkFailureKind::Connection,
+                ..
+            }
+        ));
+        assert!(!artifact_path.exists());
+
+        // The first attempt cached a verified manifest pair. A corrupt current
+        // artifact must still fail instead of treating that pair as a fallback
+        // for artifact bytes.
+        fixture.set_mode(ServerMode::ArtifactCorrupt);
+        let corrupt =
+            fetch_verified_artifact_inner(&config, RedirectPolicyMode::LocalTest).unwrap_err();
+        assert_eq!(corrupt.code(), FetchErrorCode::ArtifactDigestMismatch);
+        assert!(!artifact_path.exists());
+
+        fixture.set_mode(ServerMode::ArtifactFailure);
+        assert!(matches!(
+            fetch_verified_artifact_inner(&config, RedirectPolicyMode::LocalTest),
+            Err(FetchError::HttpStatus { status: 500, .. })
+        ));
+        assert!(!artifact_path.exists());
+    }
+
     #[test]
     fn file_registry_is_contained_and_cached_artifacts_are_rehashed() {
         let registry = TempDir::new().unwrap();
@@ -1995,8 +2956,12 @@ mod tests {
         assert_eq!(pinned_bytes, artifact);
 
         let artifact_path = repaired.local_path.clone();
-        let constrained =
-            CacheGuard::open(cache.path(), 1, Instant::now() + Duration::from_secs(1)).unwrap();
+        let constrained = CacheGuard::open(
+            cache.path(),
+            1,
+            FetchDeadline::from_timeout(Duration::from_secs(1)),
+        )
+        .unwrap();
         assert!(matches!(
             constrained.evict_to_budget(&[]),
             Err(FetchError::CacheBudget { .. })
@@ -2005,8 +2970,12 @@ mod tests {
         drop(constrained);
         drop(pinned);
         drop(repaired);
-        let unconstrained =
-            CacheGuard::open(cache.path(), 1, Instant::now() + Duration::from_secs(1)).unwrap();
+        let unconstrained = CacheGuard::open(
+            cache.path(),
+            1,
+            FetchDeadline::from_timeout(Duration::from_secs(1)),
+        )
+        .unwrap();
         unconstrained.evict_to_budget(&[]).unwrap();
         assert!(!artifact_path.exists());
     }
@@ -2041,6 +3010,116 @@ mod tests {
     }
 
     #[test]
+    fn expired_deadline_stops_file_registry_reads() {
+        let registry = TempDir::new().unwrap();
+        let manifest_path = registry.path().join("manifest.json");
+        fs::write(&manifest_path, b"signed bytes must not be read").unwrap();
+        let url = Url::from_file_path(&manifest_path).unwrap();
+
+        let error = read_file_url_bounded(
+            &url,
+            MANIFEST_MAX_BYTES as u64,
+            "manifest",
+            FetchDeadline::expired(),
+        )
+        .unwrap_err();
+
+        assert_code(error, FetchErrorCode::OperationDeadline);
+    }
+
+    #[test]
+    fn nonzero_maximum_duration_remains_a_valid_deadline() {
+        let deadline = FetchDeadline::from_timeout(Duration::MAX);
+
+        deadline.check("test").unwrap();
+        assert!(deadline.remaining("test").unwrap() > Duration::from_secs(60 * 60 * 24 * 365));
+    }
+
+    #[test]
+    fn expired_deadline_stops_cached_artifact_rehash() {
+        let cache = TempDir::new().unwrap();
+        let artifact_path = cache.path().join("artifact");
+        let bytes = vec![0x5a; COPY_BUFFER_BYTES * 2];
+        fs::write(&artifact_path, &bytes).unwrap();
+        let file = File::open(&artifact_path).unwrap();
+
+        let error = digest_open_file(
+            &file,
+            &artifact_path,
+            ARTIFACT_MAX_BYTES,
+            FetchDeadline::expired(),
+        )
+        .unwrap_err();
+
+        assert_code(error, FetchErrorCode::OperationDeadline);
+    }
+
+    #[test]
+    fn expired_deadline_never_enters_manifest_cache_fallback() {
+        let cache_dir = TempDir::new().unwrap();
+        let mut cache = CacheGuard::open(
+            cache_dir.path(),
+            1024 * 1024,
+            FetchDeadline::from_timeout(Duration::from_secs(1)),
+        )
+        .unwrap();
+        let url = Url::parse("https://registry.example/manifest.json").unwrap();
+        let paths = cache.manifest_paths(&url).unwrap();
+        cache
+            .write_manifest_pair(&paths, b"cached manifest", b"cached signatures")
+            .unwrap();
+        cache.deadline = FetchDeadline::expired();
+
+        let error = recover_cached_manifest_pair(
+            &cache,
+            &paths,
+            ManifestPairRetrievalError::Manifest(test_network_error(NetworkFailureKind::Timeout)),
+        )
+        .unwrap_err();
+
+        assert_code(error, FetchErrorCode::OperationDeadline);
+        assert!(paths.manifest.exists());
+        assert!(paths.signature.exists());
+    }
+
+    #[test]
+    fn expired_deadline_stops_artifact_copy_and_eviction() {
+        let cache_dir = TempDir::new().unwrap();
+        let mut cache = CacheGuard::open(
+            cache_dir.path(),
+            1,
+            FetchDeadline::from_timeout(Duration::from_secs(1)),
+        )
+        .unwrap();
+        let bytes = vec![0x2a; COPY_BUFFER_BYTES * 2];
+        let artifact = Artifact {
+            target: TARGET,
+            filename: FILENAME.to_owned(),
+            sha256: sha256_hex(&bytes),
+            size: bytes.len() as u64,
+        };
+        let destination = cache.artifacts.join(&artifact.sha256);
+        let eviction_candidate = cache.manifests.join("old.json");
+        fs::write(&eviction_candidate, b"too large for the cache").unwrap();
+        cache.deadline = FetchDeadline::expired();
+
+        let copy_error = cache
+            .install_artifact_reader(
+                io::Cursor::new(bytes),
+                &destination,
+                &artifact,
+                ArtifactReadSource::File,
+            )
+            .unwrap_err();
+        assert_code(copy_error, FetchErrorCode::OperationDeadline);
+        assert!(!destination.exists());
+
+        let eviction_error = cache.evict_to_budget(&[]).unwrap_err();
+        assert_code(eviction_error, FetchErrorCode::OperationDeadline);
+        assert!(eviction_candidate.exists());
+    }
+
+    #[test]
     fn cache_lock_wait_obeys_deadline() {
         let cache = TempDir::new().unwrap();
         let lock_path = cache.path().join(".lock");
@@ -2050,7 +3129,7 @@ mod tests {
         let result = CacheGuard::open(
             cache.path(),
             1024,
-            Instant::now() + Duration::from_millis(25),
+            FetchDeadline::from_timeout(Duration::from_millis(25)),
         );
         assert!(matches!(result, Err(FetchError::CacheLockTimeout(_))));
         assert!(start.elapsed() < Duration::from_secs(1));

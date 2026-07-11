@@ -10,11 +10,15 @@ use nrm_protocol::{
 #[cfg(test)]
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
+#[cfg(unix)]
+use std::ffi::CString;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::{
@@ -86,7 +90,7 @@ const MAX_GREP_SESSIONS: usize = 8;
 struct PendingUpload {
     path: String,
     target_abs: PathBuf,
-    target_key: String,
+    target_keys: Vec<String>,
     expected_hash: Option<String>,
     content_hash: String,
     size: u64,
@@ -101,13 +105,58 @@ struct PendingUpload {
 
 struct WriteTarget {
     abs: PathBuf,
+    #[cfg(any(unix, windows))]
     parent_abs: PathBuf,
 }
 
 struct WriteLock {
-    #[cfg(unix)]
-    _file: File,
+    _files: Vec<File>,
 }
+
+impl Drop for WriteLock {
+    fn drop(&mut self) {
+        // Closing a descriptor also releases an advisory lock, but explicitly
+        // unlock first so an immediate successor never depends on close timing
+        // differences between supported filesystems and operating systems.
+        for file in &self._files {
+            let _ = fs4::FileExt::unlock(file);
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TempFileIdentity {
+    #[cfg(windows)]
+    windows: WindowsFileIdentity,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WindowsFileIdentity {
+    volume_serial_number: u32,
+    file_index: u64,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy, Debug)]
+struct WindowsObjectInformation {
+    identity: WindowsFileIdentity,
+    attributes: u32,
+}
+
+#[cfg(any(windows, test))]
+#[derive(Debug)]
+struct ReplacementRollbackFailed(String);
+
+#[cfg(any(windows, test))]
+impl std::fmt::Display for ReplacementRollbackFailed {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "rollback_failed: {}", self.0)
+    }
+}
+
+#[cfg(any(windows, test))]
+impl std::error::Error for ReplacementRollbackFailed {}
 
 struct OpenedContentFile {
     file: File,
@@ -117,16 +166,29 @@ struct OpenedContentFile {
 struct WriteParent {
     #[cfg(unix)]
     dir: File,
+    #[cfg(windows)]
+    canonical_parent: PathBuf,
+    #[cfg(windows)]
+    pinned_directories: Vec<WindowsPinnedDirectory>,
+}
+
+#[cfg(windows)]
+struct WindowsPinnedDirectory {
+    path: PathBuf,
+    identity: WindowsFileIdentity,
+    _guard: File,
 }
 
 struct ActiveWriteRelease<'a> {
     active: &'a mut HashSet<String>,
-    key: String,
+    keys: Vec<String>,
 }
 
 impl Drop for ActiveWriteRelease<'_> {
     fn drop(&mut self) {
-        self.active.remove(&self.key);
+        for key in &self.keys {
+            self.active.remove(key);
+        }
     }
 }
 
@@ -1047,9 +1109,9 @@ fn write_file_cas_state(
     content: Vec<u8>,
 ) -> Result<Response> {
     let target = prepare_write_target(&state.root, &path)?;
-    let target_key = write_target_key(&state.root, &target.abs);
-    ensure_no_active_write(&state.active_write_targets, &target_key, &path)?;
-    let lock = acquire_write_lock(&target_key, &path)?;
+    let target_keys = write_target_keys(&state.root, &target.abs)?;
+    ensure_no_active_write(&state.active_write_targets, &target_keys, &path)?;
+    let lock = acquire_write_locks(&target_keys, &path)?;
     write_file_cas_prepared(
         &state.root,
         path,
@@ -1070,8 +1132,8 @@ fn write_file_cas_inner(
     before_rename: impl FnOnce() -> Result<()>,
 ) -> Result<Response> {
     let target = prepare_write_target(root, &path)?;
-    let target_key = write_target_key(root, &target.abs);
-    let lock = acquire_write_lock(&target_key, &path)?;
+    let target_keys = write_target_keys(root, &target.abs)?;
+    let lock = acquire_write_locks(&target_keys, &path)?;
     write_file_cas_prepared(
         root,
         path,
@@ -1137,13 +1199,16 @@ fn write_file_cas_prepared(
         let _ = remove_temp_file(&parent, &tmp, &tmp_name);
         return Err(error);
     }
-    if let Err(error) = verify_temp_file_identity(&file, &tmp) {
-        let _ = remove_temp_file(&parent, &tmp, &tmp_name);
-        return Err(error);
-    }
+    let temp_identity = match capture_temp_file_identity(&file, &tmp) {
+        Ok(identity) => identity,
+        Err(error) => {
+            let _ = remove_temp_file(&parent, &tmp, &tmp_name);
+            return Err(error);
+        }
+    };
     #[cfg(not(unix))]
     drop(file);
-    rename_temp_into_target(&parent, &tmp, &tmp_name, &target)?;
+    rename_temp_into_target(&parent, &tmp, &tmp_name, &target, temp_identity)?;
     sync_write_parent(&parent, &target.abs)?;
     let new_hash = hash_file(&target.abs)?;
     let meta = file_meta(root, &target.abs, true)?;
@@ -1168,9 +1233,9 @@ fn begin_write_file_cas(
     cleanup_expired_uploads(state);
     enforce_upload_limits(state, size)?;
     let target = prepare_write_target(&state.root, &path)?;
-    let target_key = write_target_key(&state.root, &target.abs);
-    ensure_no_active_write(&state.active_write_targets, &target_key, &path)?;
-    let lock = acquire_write_lock(&target_key, &path)?;
+    let target_keys = write_target_keys(&state.root, &target.abs)?;
+    ensure_no_active_write(&state.active_write_targets, &target_keys, &path)?;
+    let lock = acquire_write_locks(&target_keys, &path)?;
     let parent = open_write_parent(&state.root, &target)?;
     let actual_hash = current_regular_file_hash(&state.root, &path, &target.abs)?;
 
@@ -1197,13 +1262,15 @@ fn begin_write_file_cas(
     let tmp_name = temp_file_name(&tmp_path)?;
     verify_write_parent_current(&state.root, &parent, &target)?;
     let tmp_file = create_temp_file(&parent, &tmp_path, &tmp_name)?;
-    state.active_write_targets.insert(target_key.clone());
+    state
+        .active_write_targets
+        .extend(target_keys.iter().cloned());
     state.uploads.insert(
         upload_id.clone(),
         PendingUpload {
             path,
             target_abs: target.abs,
-            target_key,
+            target_keys,
             expected_hash,
             content_hash,
             size,
@@ -1266,7 +1333,7 @@ fn finish_write_file_cas(state: &mut AgentState, upload_id: String) -> Result<Re
     let PendingUpload {
         path,
         target_abs,
-        target_key,
+        target_keys,
         expected_hash,
         content_hash,
         size,
@@ -1282,7 +1349,7 @@ fn finish_write_file_cas(state: &mut AgentState, upload_id: String) -> Result<Re
     let root = state.root.clone();
     let _active_release = ActiveWriteRelease {
         active: &mut state.active_write_targets,
-        key: target_key,
+        keys: target_keys,
     };
     if written != size {
         let _ = remove_temp_file(&parent, &tmp_path, &tmp_name);
@@ -1332,13 +1399,16 @@ fn finish_write_file_cas(state: &mut AgentState, upload_id: String) -> Result<Re
         let _ = remove_temp_file(&parent, &tmp_path, &tmp_name);
         return Err(error);
     }
-    if let Err(error) = verify_temp_file_identity(&tmp_file, &tmp_path) {
-        let _ = remove_temp_file(&parent, &tmp_path, &tmp_name);
-        return Err(error);
-    }
+    let temp_identity = match capture_temp_file_identity(&tmp_file, &tmp_path) {
+        Ok(identity) => identity,
+        Err(error) => {
+            let _ = remove_temp_file(&parent, &tmp_path, &tmp_name);
+            return Err(error);
+        }
+    };
     #[cfg(not(unix))]
     drop(tmp_file);
-    rename_temp_into_path(&parent, &tmp_path, &tmp_name, &target_abs)?;
+    rename_temp_into_path(&parent, &tmp_path, &tmp_name, &target_abs, temp_identity)?;
     sync_write_parent(&parent, &target_abs)?;
     let meta = file_meta(&root, &target_abs, true)?;
 
@@ -1356,7 +1426,9 @@ fn abort_write_file_cas(state: &mut AgentState, upload_id: String) -> Result<Res
     cleanup_expired_uploads(state);
     if let Some(upload) = state.uploads.remove(&upload_id) {
         let _ = remove_temp_file(&upload.parent, &upload.tmp_path, &upload.tmp_name);
-        state.active_write_targets.remove(&upload.target_key);
+        for key in &upload.target_keys {
+            state.active_write_targets.remove(key);
+        }
     }
     Ok(Response::AbortWriteFileCas { upload_id })
 }
@@ -1375,7 +1447,9 @@ fn cleanup_expired_uploads(state: &mut AgentState) {
     for upload_id in expired {
         if let Some(upload) = state.uploads.remove(&upload_id) {
             let _ = remove_temp_file(&upload.parent, &upload.tmp_path, &upload.tmp_name);
-            state.active_write_targets.remove(&upload.target_key);
+            for key in &upload.target_keys {
+                state.active_write_targets.remove(key);
+            }
         }
     }
 }
@@ -1546,10 +1620,12 @@ fn prepare_write_target(root: &Path, path: &str) -> Result<WriteTarget> {
     ensure_path_within_root(root, &canonical_parent)?;
     Ok(WriteTarget {
         abs: canonical_parent.join(&file_name),
+        #[cfg(any(unix, windows))]
         parent_abs: canonical_parent,
     })
 }
 
+#[cfg(not(windows))]
 fn ensure_write_parent_inside_root(root: &Path, parent: &Path) -> Result<()> {
     let mut ancestor = parent;
     while !ancestor.exists() {
@@ -1562,6 +1638,15 @@ fn ensure_write_parent_inside_root(root: &Path, parent: &Path) -> Result<()> {
         .with_context(|| format!("failed to resolve {}", ancestor.display()))?;
     ensure_path_within_root(root, &canonical_ancestor)?;
     fs::create_dir_all(parent)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn ensure_write_parent_inside_root(root: &Path, parent: &Path) -> Result<()> {
+    // Pin every existing component while creating the next one. No pinned
+    // ancestor grants delete sharing, so it cannot be renamed into a junction
+    // or redirected while a descendant is created.
+    let _ = pin_windows_directory_chain(root, parent, true)?;
     Ok(())
 }
 
@@ -1612,7 +1697,23 @@ fn open_write_parent(root: &Path, target: &WriteTarget) -> Result<WriteParent> {
         verify_parent_dir_identity(&dir, &target.parent_abs)?;
         Ok(WriteParent { dir })
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        let (canonical_parent, pinned_directories) =
+            pin_windows_directory_chain(root, &target.parent_abs, false)?;
+        if canonical_parent != target.parent_abs {
+            bail!(
+                "Windows write parent changed from {} to {}",
+                target.parent_abs.display(),
+                canonical_parent.display()
+            );
+        }
+        Ok(WriteParent {
+            canonical_parent,
+            pinned_directories,
+        })
+    }
+    #[cfg(all(not(unix), not(windows)))]
     {
         Ok(WriteParent {})
     }
@@ -1674,7 +1775,14 @@ fn verify_write_parent_current_path(
             .ok_or_else(|| anyhow::anyhow!("remote path must have a parent directory"))?;
         verify_parent_dir_identity(&parent.dir, parent_abs)?;
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        let parent_abs = target_abs
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("remote path must have a parent directory"))?;
+        verify_windows_write_parent(parent, parent_abs)?;
+    }
+    #[cfg(all(not(unix), not(windows)))]
     {
         let _ = parent;
     }
@@ -1682,7 +1790,20 @@ fn verify_write_parent_current_path(
 }
 
 fn ensure_path_within_root(root: &Path, path: &Path) -> Result<()> {
-    if path == root || path.starts_with(root) {
+    #[cfg(windows)]
+    let contained = {
+        let root = root
+            .canonicalize()
+            .with_context(|| format!("failed to canonicalize remote root {}", root.display()))?;
+        let path = path
+            .canonicalize()
+            .with_context(|| format!("failed to canonicalize path {}", path.display()))?;
+        path == root || path.starts_with(&root)
+    };
+    #[cfg(not(windows))]
+    let contained = path == root || path.starts_with(root);
+
+    if contained {
         return Ok(());
     }
     bail!(
@@ -1692,45 +1813,443 @@ fn ensure_path_within_root(root: &Path, path: &Path) -> Result<()> {
     )
 }
 
-fn write_target_key(root: &Path, target_abs: &Path) -> String {
-    hash_bytes(format!("{}:{}", root.display(), target_abs.display()).as_bytes())
+#[cfg(windows)]
+fn windows_path_text(path: &Path) -> String {
+    let mut text = path.to_string_lossy().replace('/', "\\");
+    let lower = text.to_ascii_lowercase();
+    if lower.starts_with("\\\\?\\unc\\") {
+        text = format!("\\\\{}", &text[8..]);
+    } else if lower.starts_with("\\\\?\\") {
+        text.drain(..4);
+    }
+    text
 }
 
-fn ensure_no_active_write(active: &HashSet<String>, target_key: &str, path: &str) -> Result<()> {
-    if active.contains(target_key) {
+#[cfg(windows)]
+fn windows_ordinal_path_key_bytes(path: &Path) -> Result<Vec<u8>> {
+    use std::os::windows::ffi::OsStrExt as _;
+    use windows_sys::Win32::Globalization::{
+        LCMapStringEx, LCMAP_UPPERCASE, LOCALE_NAME_INVARIANT,
+    };
+
+    let mut source: Vec<u16> = path.as_os_str().encode_wide().collect();
+    if source.contains(&0) {
+        bail!(
+            "Windows lock path contains a NUL character: {}",
+            path.display()
+        );
+    }
+    for character in &mut source {
+        if *character == b'/' as u16 {
+            *character = b'\\' as u16;
+        }
+    }
+    let ascii_upper = |value: u16| {
+        if (b'a' as u16..=b'z' as u16).contains(&value) {
+            value - (b'a' - b'A') as u16
+        } else {
+            value
+        }
+    };
+    let starts_with_ascii_case = |value: &[u16], prefix: &[u8]| {
+        value.len() >= prefix.len()
+            && value
+                .iter()
+                .zip(prefix)
+                .all(|(left, right)| ascii_upper(*left) == ascii_upper(*right as u16))
+    };
+    if starts_with_ascii_case(&source, br"\\?\UNC\") {
+        source.splice(..8, [b'\\' as u16, b'\\' as u16]);
+    } else if starts_with_ascii_case(&source, br"\\?\") {
+        source.drain(..4);
+    }
+    let source_len = i32::try_from(source.len()).context("Windows lock path is too long")?;
+    // CompareStringOrdinal provides comparison but no reusable sort key.
+    // Invariant Win32 uppercasing gives absent targets a stable UTF-16 key
+    // using the platform's own Unicode tables; existing targets additionally
+    // lock by volume/file ID, so aliases do not depend on this path key alone.
+    // SAFETY: the source slice is valid for `source_len` UTF-16 code units and
+    // all optional mapping parameters are null as required for invariant case
+    // conversion. The first call only queries the destination length.
+    let mapped_len = unsafe {
+        LCMapStringEx(
+            LOCALE_NAME_INVARIANT,
+            LCMAP_UPPERCASE,
+            source.as_ptr(),
+            source_len,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+        )
+    };
+    if mapped_len == 0 {
+        return Err(io::Error::last_os_error()).context("failed to normalize Windows lock path");
+    }
+    let mut mapped = vec![0_u16; mapped_len as usize];
+    // SAFETY: `mapped` has the exact size returned by the query call and all
+    // other arguments are unchanged.
+    let written = unsafe {
+        LCMapStringEx(
+            LOCALE_NAME_INVARIANT,
+            LCMAP_UPPERCASE,
+            source.as_ptr(),
+            source_len,
+            mapped.as_mut_ptr(),
+            mapped_len,
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+        )
+    };
+    if written != mapped_len {
+        return Err(io::Error::last_os_error()).context("failed to normalize Windows lock path");
+    }
+    let mut bytes = Vec::with_capacity(mapped.len() * 2);
+    for character in mapped {
+        bytes.extend_from_slice(&character.to_le_bytes());
+    }
+    Ok(bytes)
+}
+
+fn write_target_keys(root: &Path, target_abs: &Path) -> Result<Vec<String>> {
+    #[cfg(windows)]
+    {
+        let root_key = windows_ordinal_path_key_bytes(root)?;
+        let target_key = windows_ordinal_path_key_bytes(target_abs)?;
+        let mut path_material = b"windows-path-v2\0".to_vec();
+        path_material.extend_from_slice(&(root_key.len() as u64).to_le_bytes());
+        path_material.extend_from_slice(&root_key);
+        path_material.extend_from_slice(&(target_key.len() as u64).to_le_bytes());
+        path_material.extend_from_slice(&target_key);
+        let mut keys = vec![hash_bytes(&path_material)];
+
+        let target_parent = target_abs
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("Windows lock target must have a parent"))?;
+        let target_name = target_abs
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("Windows lock target must name a file"))?;
+        let parent_identity = open_windows_directory_guard(target_parent)?.identity;
+        let name_key = windows_ordinal_path_key_bytes(Path::new(target_name))?;
+        let mut directory_entry_material = b"windows-directory-entry-v1\0".to_vec();
+        directory_entry_material
+            .extend_from_slice(&parent_identity.volume_serial_number.to_le_bytes());
+        directory_entry_material.extend_from_slice(&parent_identity.file_index.to_le_bytes());
+        directory_entry_material.extend_from_slice(&(name_key.len() as u64).to_le_bytes());
+        directory_entry_material.extend_from_slice(&name_key);
+        keys.push(hash_bytes(&directory_entry_material));
+
+        match fs::symlink_metadata(target_abs) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                bail!(
+                    "{} is a symlink and cannot be locked for writing",
+                    target_abs.display()
+                )
+            }
+            Ok(metadata) if metadata.is_file() => {
+                let identity = windows_existing_regular_identity(target_abs)?
+                    .ok_or_else(|| anyhow::anyhow!("target disappeared before write locking"))?;
+                let mut file_material = b"windows-file-v1\0".to_vec();
+                file_material.extend_from_slice(&identity.volume_serial_number.to_le_bytes());
+                file_material.extend_from_slice(&identity.file_index.to_le_bytes());
+                keys.push(hash_bytes(&file_material));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to identify lock target {}", target_abs.display())
+                })
+            }
+        }
+        keys.sort();
+        keys.dedup();
+        Ok(keys)
+    }
+    #[cfg(not(windows))]
+    {
+        let identity = format!("{}:{}", root.display(), target_abs.display());
+        Ok(vec![hash_bytes(identity.as_bytes())])
+    }
+}
+
+fn ensure_no_active_write(
+    active: &HashSet<String>,
+    target_keys: &[String],
+    path: &str,
+) -> Result<()> {
+    if target_keys.iter().any(|key| active.contains(key)) {
         bail!("remote write already in progress for {path}");
     }
     Ok(())
 }
 
 #[cfg(unix)]
-fn acquire_write_lock(target_key: &str, path: &str) -> Result<WriteLock> {
-    let lock_root = std::env::temp_dir().join("nrm-agent-locks");
-    fs::create_dir_all(&lock_root)?;
-    let lock_path = lock_root.join(format!("{target_key}.lock"));
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&lock_path)
-        .with_context(|| format!("failed to open write lock {}", lock_path.display()))?;
-    // SAFETY: flock only uses the valid file descriptor borrowed from `file`;
-    // the file is kept alive in WriteLock until the critical section ends.
-    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if result != 0 {
-        let error = io::Error::last_os_error();
-        if error.kind() == io::ErrorKind::WouldBlock {
-            bail!("remote write already in progress for {path}");
-        }
-        bail!("failed to lock remote write {}: {}", path, error);
-    }
-    Ok(WriteLock { _file: file })
+fn unix_effective_uid() -> u32 {
+    // SAFETY: `geteuid` has no preconditions and only returns process metadata.
+    unsafe { libc::geteuid() }
 }
 
-#[cfg(not(unix))]
-fn acquire_write_lock(_target_key: &str, _path: &str) -> Result<WriteLock> {
-    Ok(WriteLock {})
+fn write_lock_root_path() -> PathBuf {
+    let temporary = std::env::temp_dir();
+    #[cfg(unix)]
+    {
+        temporary.join(format!("nrm-agent-locks-v1-{}", unix_effective_uid()))
+    }
+    #[cfg(not(unix))]
+    {
+        temporary.join("nrm-agent-locks")
+    }
+}
+
+#[cfg(unix)]
+fn validate_unix_lock_root_metadata(
+    path: &Path,
+    metadata: &fs::Metadata,
+    expected_uid: u32,
+    require_private_mode: bool,
+) -> Result<()> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    if metadata.file_type().is_symlink() {
+        bail!(
+            "write lock directory must not be a symlink: {}",
+            path.display()
+        );
+    }
+    if !metadata.is_dir() {
+        bail!("write lock path is not a directory: {}", path.display());
+    }
+    if metadata.uid() != expected_uid {
+        bail!(
+            "write lock directory {} is owned by uid {}, expected uid {expected_uid}",
+            path.display(),
+            metadata.uid()
+        );
+    }
+    if require_private_mode && metadata.mode() & 0o7777 != 0o700 {
+        bail!(
+            "write lock directory {} has mode {:04o}, expected 0700",
+            path.display(),
+            metadata.mode() & 0o7777
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_private_unix_lock_root(path: &Path, expected_uid: u32) -> Result<File> {
+    use std::os::unix::fs::{
+        DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _,
+    };
+
+    let mut created = false;
+    match fs::symlink_metadata(path) {
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let mut builder = fs::DirBuilder::new();
+            builder.mode(0o700);
+            match builder.create(path) {
+                Ok(()) => created = true,
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("failed to create write lock directory {}", path.display())
+                    });
+                }
+            }
+        }
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("failed to inspect write lock directory {}", path.display())
+            });
+        }
+    }
+    if created {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).with_context(|| {
+            format!(
+                "failed to set private permissions on new write lock directory {}",
+                path.display()
+            )
+        })?;
+    }
+
+    let path_metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect write lock directory {}", path.display()))?;
+    validate_unix_lock_root_metadata(path, &path_metadata, expected_uid, false)?;
+
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(path)
+        .with_context(|| format!("failed to open write lock directory {}", path.display()))?;
+    let opened_metadata = directory.metadata().with_context(|| {
+        format!(
+            "failed to inspect opened write lock directory {}",
+            path.display()
+        )
+    })?;
+    validate_unix_lock_root_metadata(path, &opened_metadata, expected_uid, false)?;
+    if path_metadata.dev() != opened_metadata.dev() || path_metadata.ino() != opened_metadata.ino()
+    {
+        bail!(
+            "write lock directory {} changed while it was opened",
+            path.display()
+        );
+    }
+
+    if opened_metadata.mode() & 0o7777 != 0o700 {
+        directory
+            .set_permissions(fs::Permissions::from_mode(0o700))
+            .with_context(|| {
+                format!(
+                    "failed to make write lock directory private: {}",
+                    path.display()
+                )
+            })?;
+    }
+    let opened_metadata = directory.metadata().with_context(|| {
+        format!(
+            "failed to validate opened write lock directory {}",
+            path.display()
+        )
+    })?;
+    validate_unix_lock_root_metadata(path, &opened_metadata, expected_uid, true)?;
+    let current_metadata = fs::symlink_metadata(path).with_context(|| {
+        format!(
+            "failed to revalidate write lock directory {}",
+            path.display()
+        )
+    })?;
+    validate_unix_lock_root_metadata(path, &current_metadata, expected_uid, true)?;
+    if current_metadata.dev() != opened_metadata.dev()
+        || current_metadata.ino() != opened_metadata.ino()
+    {
+        bail!(
+            "write lock directory {} changed after it was secured",
+            path.display()
+        );
+    }
+    Ok(directory)
+}
+
+#[cfg(unix)]
+fn open_private_unix_lock_file(
+    directory: &File,
+    directory_path: &Path,
+    filename: &OsStr,
+    expected_uid: u32,
+) -> Result<File> {
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let filename = CString::new(filename.as_bytes())
+        .map_err(|_| anyhow::anyhow!("write lock filename contains a NUL byte"))?;
+    // SAFETY: `directory` is a live descriptor for the validated lock root,
+    // `filename` is NUL-terminated, and the flags/mode are valid for `openat`.
+    let descriptor = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            filename.as_ptr(),
+            libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            0o600,
+        )
+    };
+    if descriptor < 0 {
+        return Err(io::Error::last_os_error())
+            .with_context(|| format!("failed to open write lock in {}", directory_path.display()));
+    }
+    // SAFETY: successful `openat` returns a new owned descriptor.
+    let file = unsafe { File::from_raw_fd(descriptor) };
+    let metadata = file.metadata().with_context(|| {
+        format!(
+            "failed to inspect write lock in {}",
+            directory_path.display()
+        )
+    })?;
+    if !metadata.is_file() {
+        bail!(
+            "write lock entry in {} is not a regular file",
+            directory_path.display()
+        );
+    }
+    if metadata.uid() != expected_uid {
+        bail!(
+            "write lock entry in {} is owned by uid {}, expected uid {expected_uid}",
+            directory_path.display(),
+            metadata.uid()
+        );
+    }
+    if metadata.mode() & 0o7777 != 0o600 {
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .with_context(|| {
+                format!(
+                    "failed to make write lock private in {}",
+                    directory_path.display()
+                )
+            })?;
+        let secured = file.metadata().with_context(|| {
+            format!(
+                "failed to validate write lock in {}",
+                directory_path.display()
+            )
+        })?;
+        if secured.mode() & 0o7777 != 0o600 {
+            bail!(
+                "write lock entry in {} has mode {:04o}, expected 0600",
+                directory_path.display(),
+                secured.mode() & 0o7777
+            );
+        }
+    }
+    Ok(file)
+}
+
+fn acquire_write_locks(target_keys: &[String], path: &str) -> Result<WriteLock> {
+    let lock_root_path = write_lock_root_path();
+    #[cfg(unix)]
+    let lock_root = open_private_unix_lock_root(&lock_root_path, unix_effective_uid())?;
+    #[cfg(not(unix))]
+    let lock_root = {
+        fs::create_dir_all(&lock_root_path)?;
+        lock_root_path.clone()
+    };
+    let mut sorted_keys = target_keys.to_vec();
+    sorted_keys.sort();
+    sorted_keys.dedup();
+    let mut files = Vec::with_capacity(sorted_keys.len());
+    for target_key in sorted_keys {
+        let lock_name = OsString::from(format!("{target_key}.lock"));
+        #[cfg(unix)]
+        let file = open_private_unix_lock_file(
+            &lock_root,
+            &lock_root_path,
+            &lock_name,
+            unix_effective_uid(),
+        )?;
+        #[cfg(not(unix))]
+        let file = {
+            let lock_path = lock_root.join(&lock_name);
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&lock_path)
+                .with_context(|| format!("failed to open write lock {}", lock_path.display()))?
+        };
+        match fs4::FileExt::try_lock(&file) {
+            Ok(()) => files.push(file),
+            Err(fs4::TryLockError::WouldBlock) => {
+                bail!("remote write already in progress for {path}")
+            }
+            Err(fs4::TryLockError::Error(error)) => {
+                bail!("failed to lock remote write {path}: {error}")
+            }
+        }
+    }
+    Ok(WriteLock { _files: files })
 }
 
 fn resolve_remote_path(root: &Path, path: &str) -> Result<PathBuf> {
@@ -1746,7 +2265,15 @@ fn sync_write_parent(parent: &WriteParent, path: &Path) -> Result<()> {
         .with_context(|| format!("failed to sync directory for {}", path.display()))
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn sync_write_parent(parent: &WriteParent, path: &Path) -> Result<()> {
+    let path_parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("Windows target path must have a parent"))?;
+    verify_windows_write_parent(parent, path_parent)
+}
+
+#[cfg(all(not(unix), not(windows)))]
 fn sync_write_parent(_parent: &WriteParent, _path: &Path) -> Result<()> {
     Ok(())
 }
@@ -1779,7 +2306,31 @@ fn create_temp_file(parent: &WriteParent, path: &Path, name: &OsStr) -> Result<F
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn create_temp_file(parent: &WriteParent, path: &Path, _name: &OsStr) -> Result<File> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_DELETE, FILE_SHARE_READ};
+
+    // Readers and cleanup may access the staging file, but another process
+    // cannot open it for writing while its contents are being assembled.
+    // Delete sharing is required because error paths unlink the file before
+    // the owning File is dropped; final file-ID checks detect such a swap.
+    let path_parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("Windows temp path must have a parent"))?;
+    verify_windows_write_parent(parent, path_parent)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
+        .open(path)
+        .with_context(|| format!("failed to create temp file {}", path.display()))?;
+    verify_windows_write_parent(parent, path_parent)?;
+    Ok(file)
+}
+
+#[cfg(all(not(unix), not(windows)))]
 fn create_temp_file(_parent: &WriteParent, path: &Path, _name: &OsStr) -> Result<File> {
     OpenOptions::new()
         .read(true)
@@ -1801,7 +2352,18 @@ fn remove_temp_file(parent: &WriteParent, _path: &Path, name: &OsStr) -> Result<
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn remove_temp_file(parent: &WriteParent, path: &Path, _name: &OsStr) -> Result<()> {
+    let path_parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("Windows temp path must have a parent"))?;
+    verify_windows_write_parent(parent, path_parent)?;
+    fs::remove_file(path)
+        .with_context(|| format!("failed to remove temp file {}", path.display()))?;
+    verify_windows_write_parent(parent, path_parent)
+}
+
+#[cfg(all(not(unix), not(windows)))]
 fn remove_temp_file(_parent: &WriteParent, path: &Path, _name: &OsStr) -> Result<()> {
     fs::remove_file(path).with_context(|| format!("failed to remove temp file {}", path.display()))
 }
@@ -1811,16 +2373,63 @@ fn rename_temp_into_target(
     tmp_path: &Path,
     tmp_name: &OsStr,
     target: &WriteTarget,
+    temp_identity: TempFileIdentity,
 ) -> Result<()> {
-    rename_temp_into_path(parent, tmp_path, tmp_name, &target.abs)
+    rename_temp_into_path(parent, tmp_path, tmp_name, &target.abs, temp_identity)
 }
 
-#[cfg(unix)]
 fn rename_temp_into_path(
     parent: &WriteParent,
     tmp_path: &Path,
     tmp_name: &OsStr,
     target_abs: &Path,
+    temp_identity: TempFileIdentity,
+) -> Result<()> {
+    match replace_temp_into_path_raw(parent, tmp_path, tmp_name, target_abs, temp_identity) {
+        Ok(()) => Ok(()),
+        Err(replace_error) => cleanup_failed_replacement(parent, tmp_path, tmp_name, replace_error),
+    }
+}
+
+fn cleanup_failed_replacement(
+    parent: &WriteParent,
+    tmp_path: &Path,
+    tmp_name: &OsStr,
+    replace_error: anyhow::Error,
+) -> Result<()> {
+    // A failed rollback deliberately preserves both the candidate and backup
+    // for manual recovery. Ordinary failures are safe to clean because the
+    // replacement helper verified that the original target is still present.
+    #[cfg(any(windows, test))]
+    if replace_error
+        .downcast_ref::<ReplacementRollbackFailed>()
+        .is_some()
+    {
+        return Err(replace_error);
+    }
+    match remove_temp_file(parent, tmp_path, tmp_name) {
+        Ok(()) => Err(replace_error),
+        Err(cleanup_error)
+            if cleanup_error
+                .downcast_ref::<io::Error>()
+                .is_some_and(|error| error.kind() == io::ErrorKind::NotFound) =>
+        {
+            Err(replace_error)
+        }
+        Err(cleanup_error) => bail!(
+            "{replace_error:#}; additionally failed to remove temp file {}: {cleanup_error:#}",
+            tmp_path.display()
+        ),
+    }
+}
+
+#[cfg(unix)]
+fn replace_temp_into_path_raw(
+    parent: &WriteParent,
+    tmp_path: &Path,
+    tmp_name: &OsStr,
+    target_abs: &Path,
+    _temp_identity: TempFileIdentity,
 ) -> Result<()> {
     let tmp_name = c_path_name(tmp_name)?;
     let target_name = target_abs
@@ -1849,12 +2458,651 @@ fn rename_temp_into_path(
     Ok(())
 }
 
-#[cfg(not(unix))]
-fn rename_temp_into_path(
+#[cfg(windows)]
+fn windows_wide_path(path: &Path) -> Result<Vec<u16>> {
+    use std::os::windows::ffi::OsStrExt as _;
+
+    let mut wide: Vec<_> = path.as_os_str().encode_wide().collect();
+    if wide.contains(&0) {
+        bail!("Windows path contains a NUL character: {}", path.display());
+    }
+    wide.push(0);
+    Ok(wide)
+}
+
+#[cfg(windows)]
+fn windows_replace_backup_path(tmp_path: &Path) -> Result<PathBuf> {
+    let file_name = tmp_path
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("replacement temp path must name a file"))?;
+    let mut backup_name = file_name.to_os_string();
+    backup_name.push(".nrm-backup");
+    Ok(tmp_path.with_file_name(backup_name))
+}
+
+#[cfg(windows)]
+fn windows_object_information(file: &File, path: &Path) -> Result<WindowsObjectInformation> {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+
+    let mut information = BY_HANDLE_FILE_INFORMATION::default();
+    // SAFETY: `file` owns a valid handle and `information` is writable for the
+    // duration of the call.
+    let result =
+        unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), &mut information) };
+    if result == 0 {
+        return Err(io::Error::last_os_error()).with_context(|| {
+            format!(
+                "failed to read Windows file identity for {}",
+                path.display()
+            )
+        });
+    }
+    Ok(WindowsObjectInformation {
+        identity: WindowsFileIdentity {
+            volume_serial_number: information.dwVolumeSerialNumber,
+            file_index: ((information.nFileIndexHigh as u64) << 32)
+                | information.nFileIndexLow as u64,
+        },
+        attributes: information.dwFileAttributes,
+    })
+}
+
+#[cfg(windows)]
+fn windows_file_identity(file: &File, path: &Path) -> Result<WindowsFileIdentity> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+    };
+
+    let information = windows_object_information(file, path)?;
+    if information.attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+        bail!("{} is not a regular non-reparse file", path.display());
+    }
+    Ok(information.identity)
+}
+
+#[cfg(windows)]
+fn open_windows_directory_guard(path: &Path) -> Result<WindowsPinnedDirectory> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_READ,
+    };
+
+    let guard = OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        // Deny write and delete sharing so the component cannot be renamed,
+        // deleted, or converted into a reparse point while a CAS is active.
+        .share_mode(FILE_SHARE_READ)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .with_context(|| format!("failed to pin Windows directory {}", path.display()))?;
+    let information = windows_object_information(&guard, path)?;
+    if information.attributes & FILE_ATTRIBUTE_DIRECTORY == 0
+        || information.attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    {
+        bail!(
+            "Windows write directory {} is not a non-reparse directory",
+            path.display()
+        );
+    }
+    Ok(WindowsPinnedDirectory {
+        path: path.to_path_buf(),
+        identity: information.identity,
+        _guard: guard,
+    })
+}
+
+#[cfg(windows)]
+fn verify_windows_pinned_directory(directory: &WindowsPinnedDirectory) -> Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+    };
+
+    let handle_information = windows_object_information(&directory._guard, &directory.path)?;
+    if handle_information.identity != directory.identity
+        || handle_information.attributes & FILE_ATTRIBUTE_DIRECTORY == 0
+        || handle_information.attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    {
+        bail!(
+            "pinned Windows directory {} changed identity or type",
+            directory.path.display()
+        );
+    }
+    let current = open_windows_directory_guard(&directory.path)?;
+    if current.identity != directory.identity {
+        bail!(
+            "Windows directory path {} was redirected after pinning",
+            directory.path.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn pin_windows_directory_chain(
+    root: &Path,
+    parent: &Path,
+    create_missing: bool,
+) -> Result<(PathBuf, Vec<WindowsPinnedDirectory>)> {
+    let canonical_root = root
+        .canonicalize()
+        .with_context(|| format!("failed to canonicalize Windows root {}", root.display()))?;
+    let relative = parent
+        .strip_prefix(root)
+        .or_else(|_| parent.strip_prefix(&canonical_root))
+        .with_context(|| {
+            format!(
+                "Windows write parent {} is not lexically below root {}",
+                parent.display(),
+                root.display()
+            )
+        })?;
+    let mut current = canonical_root.clone();
+    let mut pinned = vec![open_windows_directory_guard(&canonical_root)?];
+    for component in relative.components() {
+        let Component::Normal(component) = component else {
+            bail!(
+                "Windows write parent {} contains a non-normal component",
+                parent.display()
+            );
+        };
+        current.push(component);
+        if create_missing {
+            match fs::symlink_metadata(&current) {
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    match fs::create_dir(&current) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                        Err(error) => {
+                            return Err(error).with_context(|| {
+                                format!("failed to create Windows directory {}", current.display())
+                            })
+                        }
+                    }
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("failed to inspect Windows directory {}", current.display())
+                    })
+                }
+            }
+        }
+        pinned.push(open_windows_directory_guard(&current)?);
+    }
+    let canonical_parent = current.canonicalize().with_context(|| {
+        format!(
+            "failed to canonicalize pinned Windows parent {}",
+            current.display()
+        )
+    })?;
+    ensure_path_within_root(&canonical_root, &canonical_parent)?;
+    let last = pinned
+        .last()
+        .ok_or_else(|| anyhow::anyhow!("Windows directory chain is empty"))?;
+    if open_windows_directory_guard(&canonical_parent)?.identity != last.identity {
+        bail!(
+            "Windows write parent {} changed during directory pinning",
+            canonical_parent.display()
+        );
+    }
+    Ok((canonical_parent, pinned))
+}
+
+#[cfg(windows)]
+fn verify_windows_write_parent(parent: &WriteParent, expected_parent: &Path) -> Result<()> {
+    let canonical_expected = expected_parent.canonicalize().with_context(|| {
+        format!(
+            "failed to canonicalize guarded Windows parent {}",
+            expected_parent.display()
+        )
+    })?;
+    if canonical_expected != parent.canonical_parent {
+        bail!(
+            "Windows write parent changed from {} to {}",
+            parent.canonical_parent.display(),
+            canonical_expected.display()
+        );
+    }
+    for directory in &parent.pinned_directories {
+        verify_windows_pinned_directory(directory)?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn open_windows_identity_guard(
+    path: &Path,
+    expected: Option<WindowsFileIdentity>,
+    share_mode: u32,
+) -> Result<(File, WindowsFileIdentity)> {
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
+
+    let file = OpenOptions::new()
+        .read(true)
+        .share_mode(share_mode)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .with_context(|| format!("failed to guard Windows file {}", path.display()))?;
+    let identity = windows_file_identity(&file, path)?;
+    if expected.is_some_and(|expected| expected != identity) {
+        bail!("{} was replaced before activation", path.display());
+    }
+    Ok((file, identity))
+}
+
+#[cfg(windows)]
+fn windows_existing_regular_identity(path: &Path) -> Result<Option<WindowsFileIdentity>> {
+    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => {
+            bail!("{} is not a regular non-reparse file", path.display())
+        }
+        Ok(_) => open_windows_identity_guard(path, None, FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .map(|(_, identity)| Some(identity)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("failed to stat {}", path.display())),
+    }
+}
+
+#[cfg(any(windows, test))]
+fn windows_replace_failure_label(raw_os_error: Option<i32>) -> &'static str {
+    match raw_os_error {
+        Some(1175) => "ERROR_UNABLE_TO_REMOVE_REPLACED (1175)",
+        Some(1176) => "ERROR_UNABLE_TO_MOVE_REPLACEMENT (1176)",
+        Some(1177) => "ERROR_UNABLE_TO_MOVE_REPLACEMENT_2 (1177)",
+        _ => "Windows replacement error",
+    }
+}
+
+#[cfg(windows)]
+fn describe_windows_identity_locations(
+    identity: WindowsFileIdentity,
+    locations: &[(&str, &Path)],
+) -> String {
+    let mut matches = Vec::new();
+    let mut inspection_errors = Vec::new();
+    for (label, path) in locations {
+        match windows_existing_regular_identity(path) {
+            Ok(Some(found)) if found == identity => {
+                matches.push(format!("{label}={}", path.display()));
+            }
+            Ok(_) => {}
+            Err(error) => inspection_errors.push(format!("{label}: {error:#}")),
+        }
+    }
+    if matches.is_empty() {
+        matches.push("not found at verified candidate locations".to_string());
+    }
+    if !inspection_errors.is_empty() {
+        matches.push(format!(
+            "inspection errors: {}",
+            inspection_errors.join("; ")
+        ));
+    }
+    matches.join(", ")
+}
+
+#[cfg(windows)]
+fn remove_windows_file_with_identity(
+    parent: &WriteParent,
+    path: &Path,
+    expected: WindowsFileIdentity,
+) -> Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+
+    let path_parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("Windows cleanup path must have a parent"))?;
+    verify_windows_write_parent(parent, path_parent)?;
+    let (guard, _) = open_windows_identity_guard(path, Some(expected), FILE_SHARE_READ)?;
+    verify_windows_write_parent(parent, path_parent)?;
+    drop(guard);
+    fs::remove_file(path)
+        .with_context(|| format!("failed to remove verified Windows file {}", path.display()))?;
+    verify_windows_write_parent(parent, path_parent)
+}
+
+#[cfg(windows)]
+fn recover_windows_replace_failure(
+    parent: &WriteParent,
+    target_abs: &Path,
+    candidate_path: &Path,
+    backup_path: &Path,
+    original_target_identity: WindowsFileIdentity,
+    candidate_identity: WindowsFileIdentity,
+    raw_os_error: Option<i32>,
+) -> std::result::Result<(), String> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, FILE_SHARE_READ, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let label = windows_replace_failure_label(raw_os_error);
+    verify_windows_write_parent(
+        parent,
+        target_abs
+            .parent()
+            .ok_or_else(|| format!("{label}: target has no parent"))?,
+    )
+    .map_err(|error| format!("{label}: parent chain is no longer trustworthy: {error:#}"))?;
+    let target_identity = windows_existing_regular_identity(target_abs)
+        .map_err(|error| format!("{label}: could not inspect target postcondition: {error:#}"))?;
+    let backup_identity = windows_existing_regular_identity(backup_path)
+        .map_err(|error| format!("{label}: could not inspect backup postcondition: {error:#}"))?;
+
+    if target_identity == Some(original_target_identity) {
+        match backup_identity {
+            None => return Ok(()),
+            Some(identity) if identity == original_target_identity => {
+                remove_windows_file_with_identity(parent, backup_path, original_target_identity)
+                    .map_err(|error| {
+                    format!(
+                        "{label}: original target is intact but backup {} could not be removed: {error}",
+                        backup_path.display()
+                    )
+                })?;
+                return Ok(());
+            }
+            Some(_) => {
+                return Err(format!(
+                    "{label}: original target is intact but backup {} has an unexpected identity",
+                    backup_path.display()
+                ));
+            }
+        }
+    }
+
+    if target_identity.is_some_and(|identity| {
+        identity != original_target_identity && identity != candidate_identity
+    }) {
+        return Err(format!(
+            "{label}: refusing to overwrite unknown target identity at {}; verified backup remains at {}; candidate location: {}",
+            target_abs.display(),
+            backup_path.display(),
+            describe_windows_identity_locations(
+                candidate_identity,
+                &[("staging", candidate_path), ("target", target_abs)]
+            )
+        ));
+    }
+
+    if backup_identity != Some(original_target_identity) {
+        return Err(format!(
+            "{label}: original target is not at {} and no verified backup exists at {}; candidate location: {}",
+            target_abs.display(),
+            backup_path.display(),
+            describe_windows_identity_locations(
+                candidate_identity,
+                &[("staging", candidate_path), ("target", target_abs)]
+            )
+        ));
+    }
+
+    let (backup_guard, _) = open_windows_identity_guard(
+        backup_path,
+        Some(original_target_identity),
+        FILE_SHARE_READ,
+    )
+    .map_err(|error| format!("{label}: failed to guard backup before rollback: {error:#}"))?;
+    let backup = windows_wide_path(backup_path)
+        .map_err(|error| format!("{label}: invalid backup path: {error:#}"))?;
+    let target = windows_wide_path(target_abs)
+        .map_err(|error| format!("{label}: invalid target path: {error:#}"))?;
+    let target_guard = if target_identity == Some(candidate_identity) {
+        Some(
+            open_windows_identity_guard(target_abs, Some(candidate_identity), FILE_SHARE_READ)
+                .map_err(|error| {
+                    format!(
+                        "{label}: failed to guard candidate at target before rollback: {error:#}"
+                    )
+                })?,
+        )
+    } else {
+        None
+    };
+    verify_windows_write_parent(
+        parent,
+        target_abs
+            .parent()
+            .ok_or_else(|| format!("{label}: target has no parent"))?,
+    )
+    .map_err(|error| format!("{label}: parent chain changed before rollback: {error:#}"))?;
+    drop(target_guard);
+    drop(backup_guard);
+    // The full directory chain remains pinned, so only the final target and
+    // backup names have a small same-user race after their guards are dropped.
+    // Closing that last window requires a handle-relative rename API.
+    // SAFETY: both buffers are valid NUL-terminated paths. The verified backup
+    // lives beside the target, so rollback cannot cross volumes.
+    let flags = if target_identity == Some(candidate_identity) {
+        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH
+    } else {
+        MOVEFILE_WRITE_THROUGH
+    };
+    // SAFETY: `backup` and `target` are valid NUL-terminated path buffers that
+    // remain alive for the call; the pinned parent chain keeps them on one
+    // volume throughout this rollback attempt.
+    let restored = unsafe { MoveFileExW(backup.as_ptr(), target.as_ptr(), flags) };
+    if restored == 0 {
+        return Err(format!(
+            "{label}: could not restore verified backup {} to {}: {}",
+            backup_path.display(),
+            target_abs.display(),
+            io::Error::last_os_error()
+        ));
+    }
+    verify_windows_write_parent(
+        parent,
+        target_abs
+            .parent()
+            .ok_or_else(|| format!("{label}: target has no parent"))?,
+    )
+    .map_err(|error| format!("{label}: parent chain changed after rollback: {error:#}"))?;
+    match windows_existing_regular_identity(target_abs) {
+        Ok(Some(identity)) if identity == original_target_identity => Ok(()),
+        Ok(_) => Err(format!(
+            "{label}: rollback returned success but {} does not identify the original target",
+            target_abs.display()
+        )),
+        Err(error) => Err(format!(
+            "{label}: failed to verify restored target {}: {error:#}",
+            target_abs.display()
+        )),
+    }
+}
+
+#[cfg(windows)]
+fn replace_temp_into_path_raw(
+    parent: &WriteParent,
+    tmp_path: &Path,
+    _tmp_name: &OsStr,
+    target_abs: &Path,
+    temp_identity: TempFileIdentity,
+) -> Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, ReplaceFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let target_parent = target_abs
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("Windows target path must have a parent"))?;
+    verify_windows_write_parent(parent, target_parent)?;
+    let target_exists = match fs::symlink_metadata(target_abs) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            bail!(
+                "target path {} became a symlink before replacement",
+                target_abs.display()
+            )
+        }
+        Ok(metadata) if !metadata.is_file() => {
+            bail!("target path {} is not a regular file", target_abs.display())
+        }
+        Ok(_) => true,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed to stat target {}", target_abs.display()))
+        }
+    };
+
+    let backup_path = windows_replace_backup_path(tmp_path)?;
+    match fs::symlink_metadata(&backup_path) {
+        Ok(_) => bail!(
+            "replacement backup path already exists: {}",
+            backup_path.display()
+        ),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to inspect replacement backup {}",
+                    backup_path.display()
+                )
+            })
+        }
+    }
+    let source = windows_wide_path(tmp_path)?;
+    let target = windows_wide_path(target_abs)?;
+    let backup = windows_wide_path(&backup_path)?;
+    let (source_guard, _) =
+        match open_windows_identity_guard(tmp_path, Some(temp_identity.windows), FILE_SHARE_READ) {
+            Ok(guard) => guard,
+            Err(error) if is_windows_sharing_violation(windows_error_raw_os_error(&error)) => {
+                bail!(
+                "process_in_use: replacement candidate {} is open by another process: {error:#}",
+                tmp_path.display()
+            )
+            }
+            Err(error) => return Err(error),
+        };
+    let target_guard = if target_exists {
+        match open_windows_identity_guard(target_abs, None, FILE_SHARE_READ | FILE_SHARE_WRITE) {
+            Ok(guard) => Some(guard),
+            Err(error) if is_windows_sharing_violation(windows_error_raw_os_error(&error)) => {
+                bail!(
+                    "process_in_use: target {} is open by another process: {error:#}",
+                    target_abs.display()
+                )
+            }
+            Err(error) => return Err(error),
+        }
+    } else {
+        None
+    };
+    let original_target_identity = target_guard.as_ref().map(|(_, identity)| *identity);
+    verify_windows_write_parent(parent, target_parent)?;
+    drop(target_guard);
+    drop(source_guard);
+    // ReplaceFileW opens the replacement with share mode 0, so the identity
+    // guards must be dropped immediately before this call. Every directory
+    // component remains pinned without delete sharing, leaving only a narrow
+    // same-user race on the final candidate/target names. Eliminating that
+    // final window requires a handle-relative rename API.
+    // SAFETY: all buffers are NUL-terminated and live through the call. Source,
+    // target, and backup are in one directory and therefore one volume.
+    let replaced = unsafe {
+        if target_exists {
+            ReplaceFileW(
+                target.as_ptr(),
+                source.as_ptr(),
+                backup.as_ptr(),
+                0,
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        } else {
+            MoveFileExW(source.as_ptr(), target.as_ptr(), MOVEFILE_WRITE_THROUGH)
+        }
+    };
+    if replaced == 0 {
+        let error = io::Error::last_os_error();
+        if let Some(original_target_identity) = original_target_identity {
+            if let Err(recovery_error) = recover_windows_replace_failure(
+                parent,
+                target_abs,
+                tmp_path,
+                &backup_path,
+                original_target_identity,
+                temp_identity.windows,
+                error.raw_os_error(),
+            ) {
+                let candidate_location = describe_windows_identity_locations(
+                    temp_identity.windows,
+                    &[("staging", tmp_path), ("target", target_abs)],
+                );
+                return Err(anyhow::Error::new(ReplacementRollbackFailed(format!(
+                    "replacement of {} failed with {error}; {recovery_error}; candidate location: {candidate_location}; any verified backup remains at {}",
+                    target_abs.display(),
+                    backup_path.display()
+                ))));
+            }
+        }
+        if is_windows_sharing_violation(error.raw_os_error()) {
+            bail!(
+                "process_in_use: target {} could not be replaced because it is open by another process: {error}",
+                target_abs.display()
+            );
+        }
+        return Err(error).with_context(|| {
+            format!(
+                "failed to replace {} from {}",
+                target_abs.display(),
+                tmp_path.display()
+            )
+        });
+    }
+    if let Some(original_target_identity) = original_target_identity {
+        verify_windows_write_parent(parent, target_parent)?;
+        match remove_windows_file_with_identity(parent, &backup_path, original_target_identity) {
+            Ok(()) => {}
+            Err(error)
+                if error
+                    .downcast_ref::<io::Error>()
+                    .is_some_and(|error| error.kind() == io::ErrorKind::NotFound) => {}
+            Err(cleanup_error) => {
+                if let Err(recovery_error) = recover_windows_replace_failure(
+                    parent,
+                    target_abs,
+                    tmp_path,
+                    &backup_path,
+                    original_target_identity,
+                    temp_identity.windows,
+                    None,
+                ) {
+                    let candidate_location = describe_windows_identity_locations(
+                        temp_identity.windows,
+                        &[("staging", tmp_path), ("target", target_abs)],
+                    );
+                    return Err(anyhow::Error::new(ReplacementRollbackFailed(format!(
+                        "replacement of {} committed but recovery backup {} could not be removed: {cleanup_error}; {recovery_error}; candidate location: {candidate_location}; target and backup were preserved",
+                        target_abs.display(),
+                        backup_path.display()
+                    ))));
+                }
+                bail!(
+                    "replacement of {} was rolled back because recovery backup {} could not be removed: {cleanup_error}",
+                    target_abs.display(),
+                    backup_path.display()
+                );
+            }
+        }
+    }
+    verify_windows_write_parent(parent, target_parent)?;
+    Ok(())
+}
+
+#[cfg(all(not(unix), not(windows)))]
+fn replace_temp_into_path_raw(
     _parent: &WriteParent,
     tmp_path: &Path,
     _tmp_name: &OsStr,
     target_abs: &Path,
+    _temp_identity: TempFileIdentity,
 ) -> Result<()> {
     fs::rename(tmp_path, target_abs).with_context(|| {
         format!(
@@ -1863,6 +3111,23 @@ fn rename_temp_into_path(
             tmp_path.display()
         )
     })
+}
+
+#[cfg(any(windows, test))]
+fn is_windows_sharing_violation(raw_os_error: Option<i32>) -> bool {
+    // ERROR_SHARING_VIOLATION, ERROR_LOCK_VIOLATION, and
+    // ERROR_USER_MAPPED_FILE are the Windows replacement failures that mean
+    // another process currently prevents replacement, rather than a path or
+    // permission policy failure.
+    matches!(raw_os_error, Some(32 | 33 | 1224))
+}
+
+#[cfg(windows)]
+fn windows_error_raw_os_error(error: &anyhow::Error) -> Option<i32> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<io::Error>())
+        .and_then(io::Error::raw_os_error)
 }
 
 #[cfg(unix)]
@@ -1884,7 +3149,25 @@ fn verify_temp_file_identity(file: &File, path: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn verify_temp_file_identity(file: &File, path: &Path) -> Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to stat temp path {}", path.display()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        bail!("temp path {} is not a regular file", path.display());
+    }
+    let handle_identity = windows_file_identity(file, path)?;
+    let (_, path_identity) =
+        open_windows_identity_guard(path, None, FILE_SHARE_READ | FILE_SHARE_WRITE)?;
+    if handle_identity != path_identity {
+        bail!("temp path {} was replaced during upload", path.display());
+    }
+    Ok(())
+}
+
+#[cfg(all(not(unix), not(windows)))]
 fn verify_temp_file_identity(_file: &File, path: &Path) -> Result<()> {
     let metadata = fs::symlink_metadata(path)
         .with_context(|| format!("failed to stat temp path {}", path.display()))?;
@@ -1892,6 +3175,14 @@ fn verify_temp_file_identity(_file: &File, path: &Path) -> Result<()> {
         bail!("temp path {} is not a regular file", path.display());
     }
     Ok(())
+}
+
+fn capture_temp_file_identity(file: &File, path: &Path) -> Result<TempFileIdentity> {
+    verify_temp_file_identity(file, path)?;
+    Ok(TempFileIdentity {
+        #[cfg(windows)]
+        windows: windows_file_identity(file, path)?,
+    })
 }
 
 fn normalize_relative_path(path: &str) -> Result<PathBuf> {
@@ -1953,8 +3244,33 @@ fn file_meta_from_metadata(
 }
 
 fn relative_path(root: &Path, path: &Path) -> Result<String> {
-    let relative = path.strip_prefix(root)?;
-    Ok(relative.to_string_lossy().replace('\\', "/"))
+    if let Ok(relative) = path.strip_prefix(root) {
+        return Ok(relative.to_string_lossy().replace('\\', "/"));
+    }
+    #[cfg(windows)]
+    {
+        let root = windows_path_text(root);
+        let path = windows_path_text(path);
+        let root = root.trim_end_matches('\\');
+        if path
+            .get(..root.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(root))
+            && path
+                .get(root.len()..)
+                .and_then(|suffix| suffix.chars().next())
+                .is_some_and(|character| character == '\\')
+        {
+            let relative = path
+                .get(root.len() + 1..)
+                .ok_or_else(|| anyhow::anyhow!("relative Windows path is not valid UTF-8"))?;
+            return Ok(relative.replace('\\', "/"));
+        }
+    }
+    bail!(
+        "{} cannot be expressed relative to remote root {}",
+        path.display(),
+        root.display()
+    )
 }
 
 fn hash_file(path: &Path) -> Result<String> {
@@ -2003,16 +3319,44 @@ fn platform_mode(_: &fs::Metadata) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
+
+    struct CanonicalTempDir {
+        _inner: tempfile::TempDir,
+        root: PathBuf,
+    }
+
+    impl CanonicalTempDir {
+        fn path(&self) -> &Path {
+            &self.root
+        }
+    }
+
+    fn tempdir() -> io::Result<CanonicalTempDir> {
+        let inner = tempfile::tempdir()?;
+        let root = inner.path().canonicalize()?;
+        Ok(CanonicalTempDir {
+            _inner: inner,
+            root,
+        })
+    }
 
     fn test_state(root: &Path) -> AgentState {
         AgentState {
-            root: root.to_path_buf(),
+            // Match the invariant established by `serve`. On macOS, temporary
+            // directories may be reported through `/var` while canonical
+            // descendants resolve through `/private/var`.
+            root: root.canonicalize().unwrap(),
             uploads: HashMap::new(),
             active_write_targets: HashSet::new(),
             grep_sessions: HashMap::new(),
             next_grep_session: 1,
         }
+    }
+
+    #[test]
+    fn temporary_roots_match_the_serving_root_invariant() {
+        let dir = tempdir().unwrap();
+        assert_eq!(dir.path(), dir.path().canonicalize().unwrap());
     }
 
     fn run_git_test_command(root: &Path, args: &[&str]) {
@@ -2099,27 +3443,23 @@ mod tests {
             &["config", "user.email", "test@example.invalid"],
         );
         run_git_test_command(dir.path(), &["config", "user.name", "Test User"]);
-        fs::write(dir.path().join("literal*.txt"), "base\n").unwrap();
-        fs::write(dir.path().join("literal-a.txt"), "base\n").unwrap();
+        fs::write(dir.path().join("literal[ab].txt"), "base\n").unwrap();
+        fs::write(dir.path().join("literala.txt"), "base\n").unwrap();
         run_git_test_command(dir.path(), &["add", "."]);
         run_git_test_command(dir.path(), &["commit", "-q", "-m", "base"]);
-        fs::write(dir.path().join("literal*.txt"), "changed\n").unwrap();
-        fs::write(dir.path().join("literal-a.txt"), "changed\n").unwrap();
+        fs::write(dir.path().join("literal[ab].txt"), "changed\n").unwrap();
+        fs::write(dir.path().join("literala.txt"), "changed\n").unwrap();
 
         let output =
-            git_output(git_status(dir.path(), vec!["literal*.txt".to_string()], 4096).unwrap());
+            git_output(git_status(dir.path(), vec!["literal[ab].txt".to_string()], 4096).unwrap());
 
         assert_eq!(output.status_code, Some(0));
         assert!(
-            output.stdout.contains(" M literal*.txt"),
+            output.stdout.contains(" M literal[ab].txt"),
             "{}",
             output.stdout
         );
-        assert!(
-            !output.stdout.contains("literal-a.txt"),
-            "{}",
-            output.stdout
-        );
+        assert!(!output.stdout.contains("literala.txt"), "{}", output.stdout);
     }
 
     #[test]
@@ -2220,12 +3560,16 @@ mod tests {
     #[test]
     fn git_status_reports_non_repo_error_without_panicking() {
         let dir = tempdir().unwrap();
+        // Prevent discovery of an unrelated repository above the platform's
+        // temporary directory (some Windows developer homes are Git roots).
+        fs::write(dir.path().join(".git"), "not-a-gitdir\n").unwrap();
 
         let output = git_output(git_status(dir.path(), Vec::new(), 4096).unwrap());
 
         assert_ne!(output.status_code, Some(0));
         assert!(
-            output.stderr.contains("not a git repository"),
+            output.stderr.contains("not a git repository")
+                || output.stderr.contains("invalid gitfile format"),
             "{}",
             output.stderr
         );
@@ -2554,6 +3898,688 @@ mod tests {
             other => panic!("unexpected response: {other:?}"),
         }
         assert_eq!(fs::read_to_string(root.join("a.txt")).unwrap(), "external");
+    }
+
+    #[test]
+    fn write_lock_is_exclusive_and_released_when_guard_drops() {
+        let dir = tempdir().unwrap();
+        let target_keys = write_target_keys(dir.path(), &dir.path().join("a.txt")).unwrap();
+        let first = acquire_write_locks(&target_keys, "a.txt").unwrap();
+
+        let error = acquire_write_locks(&target_keys, "a.txt")
+            .err()
+            .expect("a second writer must not acquire the same lock")
+            .to_string();
+        assert!(error.contains("write already in progress"));
+
+        let other_keys = write_target_keys(dir.path(), &dir.path().join("b.txt")).unwrap();
+        let _other = acquire_write_locks(&other_keys, "b.txt").unwrap();
+        drop(first);
+        let _reacquired = acquire_write_locks(&target_keys, "a.txt").unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_write_lock_root_rejects_symlinks_and_wrong_owners() {
+        use std::os::unix::fs::{symlink, PermissionsExt as _};
+
+        let dir = tempdir().unwrap();
+        let actual = dir.path().join("actual-lock-root");
+        fs::create_dir(&actual).unwrap();
+        fs::set_permissions(&actual, fs::Permissions::from_mode(0o700)).unwrap();
+        let link = dir.path().join("linked-lock-root");
+        symlink(&actual, &link).unwrap();
+
+        let symlink_error = open_private_unix_lock_root(&link, unix_effective_uid())
+            .unwrap_err()
+            .to_string();
+        assert!(symlink_error.contains("must not be a symlink"));
+
+        let other_uid = unix_effective_uid().wrapping_add(1);
+        let owner_error = open_private_unix_lock_root(&actual, other_uid)
+            .unwrap_err()
+            .to_string();
+        assert!(owner_error.contains("is owned by uid"));
+        assert!(owner_error.contains(&format!("expected uid {other_uid}")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_write_lock_root_and_entries_are_tightened_to_private_modes() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let dir = tempdir().unwrap();
+        let lock_root = dir.path().join("permissive-lock-root");
+        fs::create_dir(&lock_root).unwrap();
+        fs::set_permissions(&lock_root, fs::Permissions::from_mode(0o777)).unwrap();
+        let lock_path = lock_root.join("test.lock");
+        fs::write(&lock_path, []).unwrap();
+        fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o666)).unwrap();
+
+        let directory = open_private_unix_lock_root(&lock_root, unix_effective_uid()).unwrap();
+        assert_eq!(
+            fs::symlink_metadata(&lock_root).unwrap().mode() & 0o7777,
+            0o700
+        );
+        let lock = open_private_unix_lock_file(
+            &directory,
+            &lock_root,
+            OsStr::new("test.lock"),
+            unix_effective_uid(),
+        )
+        .unwrap();
+        assert_eq!(lock.metadata().unwrap().mode() & 0o7777, 0o600);
+        assert_eq!(
+            fs::symlink_metadata(&lock_path).unwrap().mode() & 0o7777,
+            0o600
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_write_lock_entry_rejects_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().unwrap();
+        let lock_root = dir.path().join("lock-root");
+        let directory = open_private_unix_lock_root(&lock_root, unix_effective_uid()).unwrap();
+        let outside = dir.path().join("outside");
+        fs::write(&outside, []).unwrap();
+        symlink(&outside, lock_root.join("hostile.lock")).unwrap();
+
+        let error = open_private_unix_lock_file(
+            &directory,
+            &lock_root,
+            OsStr::new("hostile.lock"),
+            unix_effective_uid(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("failed to open write lock"));
+        assert!(fs::symlink_metadata(lock_root.join("hostile.lock"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_write_lock_identity_normalizes_case_and_separators() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let target = root.join("Absent-Ångström.TXT");
+        let alias_root = PathBuf::from(windows_path_text(&root).to_lowercase().replace('\\', "/"));
+        let alias_target = alias_root.join("absent-ångström.txt");
+        let mixed_case_keys = write_target_keys(&root, &target).unwrap();
+        let alias_keys = write_target_keys(&alias_root, &alias_target).unwrap();
+        assert_eq!(mixed_case_keys, alias_keys);
+
+        let first = acquire_write_locks(&mixed_case_keys, "Foo.TXT").unwrap();
+        let error = acquire_write_locks(&alias_keys, "foo.txt")
+            .err()
+            .expect("Windows path aliases must contend on the same lock")
+            .to_string();
+        assert!(error.contains("write already in progress"), "{error}");
+        drop(first);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_existing_hardlink_aliases_share_file_identity_lock() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let target = root.join("a.txt");
+        let alias = root.join("alias.txt");
+        fs::write(&target, "content").unwrap();
+        fs::hard_link(&target, &alias).unwrap();
+
+        let target_keys = write_target_keys(&root, &target).unwrap();
+        let alias_keys = write_target_keys(&root, &alias).unwrap();
+
+        assert_eq!(target_keys.len(), 3);
+        assert_eq!(alias_keys.len(), 3);
+        assert_eq!(
+            target_keys
+                .iter()
+                .filter(|key| alias_keys.contains(key))
+                .count(),
+            1,
+            "hardlink aliases must share exactly the file-ID lock"
+        );
+        let first = acquire_write_locks(&target_keys, "a.txt").unwrap();
+        let error = acquire_write_locks(&alias_keys, "alias.txt")
+            .err()
+            .expect("hardlink alias lock must contend")
+            .to_string();
+        assert!(error.contains("write already in progress"), "{error}");
+        drop(first);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_lock_child_process_helper() {
+        let Some(encoded_keys) = std::env::var_os("NRM_TEST_LOCK_CHILD_KEYS") else {
+            return;
+        };
+        let ready = PathBuf::from(std::env::var_os("NRM_TEST_LOCK_CHILD_READY").unwrap());
+        let release = PathBuf::from(std::env::var_os("NRM_TEST_LOCK_CHILD_RELEASE").unwrap());
+        let keys: Vec<String> = encoded_keys
+            .to_string_lossy()
+            .split(',')
+            .map(str::to_string)
+            .collect();
+        let _lock = acquire_write_locks(&keys, "cross-process-child").unwrap();
+        fs::write(&ready, "ready").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !release.exists() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(release.exists(), "parent did not release lock child");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_hardlink_lock_contends_across_processes() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let target = root.join("target.txt");
+        let alias = root.join("alias.txt");
+        fs::write(&target, "content").unwrap();
+        fs::hard_link(&target, &alias).unwrap();
+        let child_keys = write_target_keys(&root, &target).unwrap();
+        let parent_keys = write_target_keys(&root, &alias).unwrap();
+        let ready = root.join("child-ready");
+        let release = root.join("child-release");
+        let mut child = ProcessCommand::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("tests::windows_lock_child_process_helper")
+            .arg("--nocapture")
+            .env("NRM_TEST_LOCK_CHILD_KEYS", child_keys.join(","))
+            .env("NRM_TEST_LOCK_CHILD_READY", &ready)
+            .env("NRM_TEST_LOCK_CHILD_RELEASE", &release)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ready.exists() && Instant::now() < deadline {
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "lock child exited early"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(ready.exists(), "lock child did not become ready");
+
+        let error = acquire_write_locks(&parent_keys, "cross-process-parent")
+            .err()
+            .expect("cross-process lock must contend")
+            .to_string();
+        assert!(error.contains("write already in progress"), "{error}");
+        fs::write(&release, "release").unwrap();
+        assert!(child.wait().unwrap().success());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_verbatim_paths_compare_and_rebase_under_drive_roots() {
+        let root = tempdir().unwrap();
+        let source = root.path().join("Src");
+        fs::create_dir(&source).unwrap();
+        let child = source.join("Main.rs");
+        fs::write(&child, "test").unwrap();
+        let canonical_child = child.canonicalize().unwrap();
+
+        ensure_path_within_root(root.path(), &canonical_child).unwrap();
+        assert_eq!(
+            relative_path(root.path(), &canonical_child).unwrap(),
+            "Src/Main.rs"
+        );
+
+        let outside = tempdir().unwrap();
+        assert!(ensure_path_within_root(root.path(), outside.path()).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_write_parent_pins_every_component_against_rename() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let ancestor = root.join("ancestor");
+        let parent_path = ancestor.join("parent");
+        let moved = root.join("moved-ancestor");
+        fs::create_dir_all(&parent_path).unwrap();
+        let target = WriteTarget {
+            abs: parent_path.join("a.txt"),
+            parent_abs: parent_path.clone(),
+        };
+
+        let parent = open_write_parent(&root, &target).unwrap();
+
+        assert_eq!(parent.pinned_directories.len(), 3);
+        let rename_error = fs::rename(&ancestor, &moved).unwrap_err();
+        assert!(
+            is_windows_sharing_violation(rename_error.raw_os_error())
+                || rename_error.raw_os_error() == Some(5),
+            "{rename_error}"
+        );
+        verify_windows_write_parent(&parent, &parent_path).unwrap();
+        drop(parent);
+        fs::rename(&ancestor, &moved).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_cas_blocks_ancestor_swap_and_leaves_no_staging_files() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let ancestor = root.join("ancestor");
+        let parent_path = ancestor.join("parent");
+        let moved = root.join("moved-ancestor");
+        let target = parent_path.join("a.txt");
+        fs::create_dir_all(&parent_path).unwrap();
+        fs::write(&target, "old").unwrap();
+        let old_hash = hash_file(&target).unwrap();
+
+        let response = write_file_cas_inner(
+            &root,
+            "ancestor/parent/a.txt".to_string(),
+            Some(old_hash),
+            b"new".to_vec(),
+            || {
+                let error = fs::rename(&ancestor, &moved).unwrap_err();
+                assert!(
+                    is_windows_sharing_violation(error.raw_os_error())
+                        || error.raw_os_error() == Some(5),
+                    "{error}"
+                );
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(
+            response,
+            Response::WriteFileCas {
+                outcome: SaveOutcome::Applied(_)
+            }
+        ));
+        assert_eq!(fs::read_to_string(&target).unwrap(), "new");
+        let leftovers: Vec<_> = fs::read_dir(&parent_path)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains("nrm-tmp") || name.contains("nrm-backup"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "leftover staging files: {leftovers:?}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_cas_creates_and_pins_missing_parent_chain() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+
+        let response = write_file_cas(
+            &root,
+            "new/deep/a.txt".to_string(),
+            None,
+            b"content".to_vec(),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            response,
+            Response::WriteFileCas {
+                outcome: SaveOutcome::Applied(_)
+            }
+        ));
+        assert_eq!(
+            fs::read_to_string(root.join("new/deep/a.txt")).unwrap(),
+            "content"
+        );
+    }
+
+    #[test]
+    fn replacement_abstraction_replaces_existing_file_and_consumes_temp() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let target_abs = root.join("a.txt");
+        let tmp_path = root.join("a.nrm-replace-test");
+        fs::write(&target_abs, "old").unwrap();
+        fs::write(&tmp_path, "new").unwrap();
+        let target = WriteTarget {
+            abs: target_abs.clone(),
+            #[cfg(any(unix, windows))]
+            parent_abs: root.clone(),
+        };
+        let parent = open_write_parent(&root, &target).unwrap();
+        let tmp_name = temp_file_name(&tmp_path).unwrap();
+        let tmp_file = File::open(&tmp_path).unwrap();
+        let temp_identity = capture_temp_file_identity(&tmp_file, &tmp_path).unwrap();
+        drop(tmp_file);
+
+        rename_temp_into_path(&parent, &tmp_path, &tmp_name, &target_abs, temp_identity).unwrap();
+
+        assert_eq!(fs::read_to_string(&target_abs).unwrap(), "new");
+        assert!(!tmp_path.exists());
+        #[cfg(windows)]
+        assert!(!windows_replace_backup_path(&tmp_path).unwrap().exists());
+    }
+
+    #[test]
+    fn failed_replacement_cleans_temp_and_preserves_target() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let target_abs = root.join("target-directory");
+        let tmp_path = root.join("a.nrm-replace-test");
+        fs::create_dir(&target_abs).unwrap();
+        fs::write(&tmp_path, "new").unwrap();
+        let target = WriteTarget {
+            abs: target_abs.clone(),
+            #[cfg(any(unix, windows))]
+            parent_abs: root.clone(),
+        };
+        let parent = open_write_parent(&root, &target).unwrap();
+        let tmp_name = temp_file_name(&tmp_path).unwrap();
+        let tmp_file = File::open(&tmp_path).unwrap();
+        let temp_identity = capture_temp_file_identity(&tmp_file, &tmp_path).unwrap();
+        drop(tmp_file);
+
+        assert!(
+            rename_temp_into_path(&parent, &tmp_path, &tmp_name, &target_abs, temp_identity,)
+                .is_err()
+        );
+
+        assert!(target_abs.is_dir());
+        assert!(!tmp_path.exists());
+    }
+
+    #[test]
+    fn windows_sharing_violation_codes_are_classified_narrowly() {
+        assert!(is_windows_sharing_violation(Some(32)));
+        assert!(is_windows_sharing_violation(Some(33)));
+        assert!(is_windows_sharing_violation(Some(1224)));
+        assert!(!is_windows_sharing_violation(Some(5)));
+        assert!(!is_windows_sharing_violation(None));
+    }
+
+    #[test]
+    fn windows_partial_replace_failure_codes_have_stable_labels() {
+        assert_eq!(
+            windows_replace_failure_label(Some(1175)),
+            "ERROR_UNABLE_TO_REMOVE_REPLACED (1175)"
+        );
+        assert_eq!(
+            windows_replace_failure_label(Some(1176)),
+            "ERROR_UNABLE_TO_MOVE_REPLACEMENT (1176)"
+        );
+        assert_eq!(
+            windows_replace_failure_label(Some(1177)),
+            "ERROR_UNABLE_TO_MOVE_REPLACEMENT_2 (1177)"
+        );
+        assert_eq!(
+            windows_replace_failure_label(Some(5)),
+            "Windows replacement error"
+        );
+    }
+
+    #[test]
+    fn rollback_failed_preserves_candidate_and_backup_artifacts() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let target_abs = root.join("a.txt");
+        let tmp_path = root.join("a.nrm-recovery-test");
+        let backup_path = root.join("a.nrm-recovery-test.nrm-backup");
+        fs::write(&tmp_path, "candidate").unwrap();
+        fs::write(&backup_path, "original").unwrap();
+        let target = WriteTarget {
+            abs: target_abs,
+            #[cfg(any(unix, windows))]
+            parent_abs: root.clone(),
+        };
+        let parent = open_write_parent(&root, &target).unwrap();
+        let tmp_name = temp_file_name(&tmp_path).unwrap();
+
+        let error = cleanup_failed_replacement(
+            &parent,
+            &tmp_path,
+            &tmp_name,
+            anyhow::Error::new(ReplacementRollbackFailed(
+                "simulated recovery failure".to_string(),
+            )),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("rollback_failed"), "{error}");
+        assert_eq!(fs::read_to_string(&tmp_path).unwrap(), "candidate");
+        assert_eq!(fs::read_to_string(&backup_path).unwrap(), "original");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_1175_and_1176_confirm_intact_original_postcondition() {
+        for error_code in [1175, 1176] {
+            let dir = tempdir().unwrap();
+            let root = dir.path().canonicalize().unwrap();
+            let target = root.join("a.txt");
+            let candidate = root.join("a.nrm-recovery-test");
+            let backup = windows_replace_backup_path(&candidate).unwrap();
+            fs::write(&target, "original").unwrap();
+            fs::write(&candidate, "candidate").unwrap();
+            let write_target = WriteTarget {
+                abs: target.clone(),
+                parent_abs: root.clone(),
+            };
+            let parent = open_write_parent(&root, &write_target).unwrap();
+            let original_identity = windows_existing_regular_identity(&target).unwrap().unwrap();
+            let candidate_identity = windows_existing_regular_identity(&candidate)
+                .unwrap()
+                .unwrap();
+
+            recover_windows_replace_failure(
+                &parent,
+                &target,
+                &candidate,
+                &backup,
+                original_identity,
+                candidate_identity,
+                Some(error_code),
+            )
+            .unwrap();
+
+            assert_eq!(fs::read_to_string(&target).unwrap(), "original");
+            assert_eq!(fs::read_to_string(&candidate).unwrap(), "candidate");
+            assert!(!backup.exists());
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_1177_restores_verified_backup() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let target = root.join("a.txt");
+        let candidate = root.join("a.nrm-recovery-test");
+        let backup = windows_replace_backup_path(&candidate).unwrap();
+        fs::write(&target, "original").unwrap();
+        fs::write(&candidate, "candidate").unwrap();
+        let write_target = WriteTarget {
+            abs: target.clone(),
+            parent_abs: root.clone(),
+        };
+        let parent = open_write_parent(&root, &write_target).unwrap();
+        let original_identity = windows_existing_regular_identity(&target).unwrap().unwrap();
+        let candidate_identity = windows_existing_regular_identity(&candidate)
+            .unwrap()
+            .unwrap();
+        fs::rename(&target, &backup).unwrap();
+
+        recover_windows_replace_failure(
+            &parent,
+            &target,
+            &candidate,
+            &backup,
+            original_identity,
+            candidate_identity,
+            Some(1177),
+        )
+        .unwrap();
+
+        assert_eq!(fs::read_to_string(&target).unwrap(), "original");
+        assert_eq!(fs::read_to_string(&candidate).unwrap(), "candidate");
+        assert!(!backup.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_1177_rejects_unverified_backup_without_deleting_artifacts() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let target = root.join("a.txt");
+        let original = root.join("original-recovery-copy");
+        let candidate = root.join("a.nrm-recovery-test");
+        let backup = windows_replace_backup_path(&candidate).unwrap();
+        fs::write(&target, "original").unwrap();
+        fs::write(&candidate, "candidate").unwrap();
+        let write_target = WriteTarget {
+            abs: target.clone(),
+            parent_abs: root.clone(),
+        };
+        let parent = open_write_parent(&root, &write_target).unwrap();
+        let original_identity = windows_existing_regular_identity(&target).unwrap().unwrap();
+        let candidate_identity = windows_existing_regular_identity(&candidate)
+            .unwrap()
+            .unwrap();
+        fs::rename(&target, &original).unwrap();
+        fs::write(&backup, "impostor").unwrap();
+
+        let error = recover_windows_replace_failure(
+            &parent,
+            &target,
+            &candidate,
+            &backup,
+            original_identity,
+            candidate_identity,
+            Some(1177),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("no verified backup"), "{error}");
+        assert!(error.contains("candidate location: staging="), "{error}");
+        assert_eq!(fs::read_to_string(&original).unwrap(), "original");
+        assert_eq!(fs::read_to_string(&candidate).unwrap(), "candidate");
+        assert_eq!(fs::read_to_string(&backup).unwrap(), "impostor");
+        assert!(!target.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_1177_preserves_unknown_target_and_verified_backup() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let target = root.join("a.txt");
+        let candidate = root.join("a.nrm-recovery-test");
+        let backup = windows_replace_backup_path(&candidate).unwrap();
+        fs::write(&target, "original").unwrap();
+        fs::write(&candidate, "candidate").unwrap();
+        let write_target = WriteTarget {
+            abs: target.clone(),
+            parent_abs: root.clone(),
+        };
+        let parent = open_write_parent(&root, &write_target).unwrap();
+        let original_identity = windows_existing_regular_identity(&target).unwrap().unwrap();
+        let candidate_identity = windows_existing_regular_identity(&candidate)
+            .unwrap()
+            .unwrap();
+        fs::rename(&target, &backup).unwrap();
+        fs::write(&target, "unknown-writer").unwrap();
+
+        let error = recover_windows_replace_failure(
+            &parent,
+            &target,
+            &candidate,
+            &backup,
+            original_identity,
+            candidate_identity,
+            Some(1177),
+        )
+        .unwrap_err();
+
+        assert!(
+            error.contains("refusing to overwrite unknown target"),
+            "{error}"
+        );
+        assert_eq!(fs::read_to_string(&target).unwrap(), "unknown-writer");
+        assert_eq!(fs::read_to_string(&backup).unwrap(), "original");
+        assert_eq!(fs::read_to_string(&candidate).unwrap(), "candidate");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_temp_identity_rejects_path_replacement() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let target = WriteTarget {
+            abs: root.join("a.txt"),
+            parent_abs: root.clone(),
+        };
+        let parent = open_write_parent(&root, &target).unwrap();
+        let tmp_path = root.join("a.nrm-identity-test");
+        let moved_path = root.join("moved-original-temp");
+        let tmp_name = temp_file_name(&tmp_path).unwrap();
+        let mut file = create_temp_file(&parent, &tmp_path, &tmp_name).unwrap();
+        file.write_all(b"candidate").unwrap();
+        fs::rename(&tmp_path, &moved_path).unwrap();
+        fs::write(&tmp_path, "impostor").unwrap();
+
+        let error = verify_temp_file_identity(&file, &tmp_path)
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("replaced during upload"), "{error}");
+        assert_eq!(fs::read_to_string(&moved_path).unwrap(), "candidate");
+        assert_eq!(fs::read_to_string(&tmp_path).unwrap(), "impostor");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn write_cas_reports_process_in_use_and_cleans_temp_on_windows() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let target = root.join("a.txt");
+        fs::write(&target, "old").unwrap();
+        let old_hash = hash_file(&target).unwrap();
+        let _held_without_delete_sharing = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(&target)
+            .unwrap();
+
+        let error = write_file_cas(root, "a.txt".to_string(), Some(old_hash), b"new".to_vec())
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("process_in_use"), "{error}");
+        assert_eq!(fs::read_to_string(&target).unwrap(), "old");
+        let leftovers: Vec<_> = fs::read_dir(root)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name())
+            .filter(|name| {
+                let name = name.to_string_lossy();
+                name.contains("nrm-tmp") || name.contains("nrm-backup")
+            })
+            .collect();
+        assert!(leftovers.is_empty(), "leftover temp files: {leftovers:?}");
     }
 
     #[test]
@@ -3436,6 +5462,11 @@ mod tests {
         ));
         assert!(!state.uploads.contains_key(&upload_id));
         assert!(!tmp_path.exists());
-        assert_eq!(state.active_write_targets.len(), 1);
+        let expected_active: HashSet<_> = state
+            .uploads
+            .values()
+            .flat_map(|upload| upload.target_keys.iter().cloned())
+            .collect();
+        assert_eq!(state.active_write_targets, expected_active);
     }
 }
