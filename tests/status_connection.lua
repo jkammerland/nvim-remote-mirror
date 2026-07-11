@@ -52,6 +52,13 @@ local function status_result()
     remote_available = false,
     remote_error = "ssh connect failed",
     retry_after_ms = 1500,
+    registry_health = {
+      state = "error",
+      source = "registry",
+      platform = { target = "x86_64-unknown-linux-musl" },
+      error_code = "network_timeout",
+      error = "signed registry retrieval failed (network_timeout)",
+    },
     background_scan_state = "completed",
     background_scan_completed_at_ms = os.time() * 1000,
   }
@@ -102,6 +109,9 @@ local function main()
   assert_contains(message, "remote=unavailable")
   assert_contains(message, "retry_after_ms=1500")
   assert_contains(message, "error=ssh connect failed")
+  assert_contains(message, "registry=error")
+  assert_contains(message, "registry_target=x86_64-unknown-linux-musl")
+  assert_contains(message, "registry_error=network_timeout")
   assert_contains(message, "scan=completed")
   assert_contains(message, "rescan_due_ms=")
 end

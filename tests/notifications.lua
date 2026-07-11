@@ -28,6 +28,7 @@ end
 
 local function main()
   local client = fake_client()
+  nrm.client = client
   local callback_result = nil
   client.pending[7] = {
     timer = nil,
@@ -49,6 +50,13 @@ local function main()
         remote_available = false,
         remote_error = "ssh connect failed",
         retry_after_ms = 1500,
+        registry_health = {
+          state = "error",
+          source = "registry",
+          manifest_url = "https://registry.example.test/<redacted>",
+          error_code = "insufficient_signatures",
+          error = "signed registry retrieval failed (insufficient_signatures)",
+        },
       },
     }),
     json_line({
@@ -66,8 +74,35 @@ local function main()
   assert_eq(client.hello.remote_available, false)
   assert_eq(client.hello.remote_error, "ssh connect failed")
   assert_eq(client.hello.retry_after_ms, 1500)
+  assert_eq(client.hello.registry_health.state, "error")
+  assert_eq(client.hello.registry_health.error_code, "insufficient_signatures")
+  assert_eq(nrm.connection_state().registry_health.error_code, "insufficient_signatures")
   assert_eq(callback_result.value, 42)
   assert_eq(client.pending[7], nil)
+
+  nrm._test_handle_stdout(client, {
+    json_line({
+      method = "workspace/remote_health",
+      params = {
+        workspace_key = "workspace",
+        remote_status = "connected",
+        remote_checked = true,
+        remote_available = true,
+        registry_health = {
+          state = "error",
+          source = "registry",
+          error_code = "network_timeout",
+          error = "signed registry retrieval failed (network_timeout)",
+        },
+      },
+    }),
+    "",
+  })
+  assert_eq(client.hello.remote_status, "connected")
+  assert_eq(client.hello.remote_available, true)
+  assert_eq(client.hello.registry_health.state, "error")
+  assert_eq(client.hello.registry_health.error_code, "network_timeout")
+  nrm.client = nil
 end
 
 local ok, err = xpcall(main, debug.traceback)

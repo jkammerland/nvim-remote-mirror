@@ -50,6 +50,47 @@ local function command_text(command)
   return table.concat(command, " ")
 end
 
+local function joined_values(values)
+  if type(values) ~= "table" or #values == 0 then
+    return nil
+  end
+  local result = {}
+  for _, item in ipairs(values) do
+    table.insert(result, tostring(item))
+  end
+  return table.concat(result, ", ")
+end
+
+local function registry_platform_text(platform)
+  if type(platform) ~= "table" then
+    return nil
+  end
+  local os = optional_path(platform.os)
+  local arch = optional_path(platform.arch)
+  local style = optional_path(platform.path_style)
+  local parts = {}
+  if os and arch then
+    table.insert(parts, os .. "/" .. arch)
+  elseif os or arch then
+    table.insert(parts, os or arch)
+  end
+  if style then
+    table.insert(parts, "paths=" .. style)
+  end
+  return #parts > 0 and table.concat(parts, " ") or nil
+end
+
+local function registry_cache_text(cache)
+  if type(cache) ~= "table" then
+    return nil
+  end
+  return string.format(
+    "manifest=%s artifact=%s",
+    cache.manifest_fallback == true and "fallback" or "fresh",
+    cache.artifact_hit == true and "hit" or "miss"
+  )
+end
+
 local function scan_text(status)
   local scan = value(status.background_scan_state, "not_started")
   if scan == "completed" and status.background_scan_summary then
@@ -101,8 +142,26 @@ local function format_dashboard_lines(status, err)
   add_line(lines, "Install Path", status.remote_agent_install_path or connection.remote_agent_install_path)
   add_line(lines, "Local Source", status.local_agent_path or connection.local_agent_path)
   add_line(lines, "Local Ready", tostring(status.local_agent_available or connection.local_agent_available or false))
+  add_line(lines, "Source", status.agent_source or connection.agent_source)
   add_line(lines, "Repair", status.repair_command or connection.repair_command)
   add_line(lines, "Local Error", status.local_agent_error or connection.local_agent_error)
+
+  local registry = status.registry_health or connection.registry_health or {}
+  local platform = registry.platform or {}
+  add_section(lines, "Registry")
+  add_line(lines, "State", registry.state)
+  add_line(lines, "Source", registry.source)
+  add_line(lines, "Manifest URL", registry.manifest_url)
+  add_line(lines, "Platform", registry_platform_text(platform))
+  add_line(lines, "Target", platform.target)
+  add_line(lines, "Signing Keys", joined_values(registry.signing_key_ids))
+  add_line(lines, "Artifact SHA", registry.artifact_sha256)
+  add_line(lines, "Manifest SHA", registry.manifest_sha256)
+  add_line(lines, "Manifest Via", registry.manifest_source)
+  add_line(lines, "Artifact Via", registry.artifact_source)
+  add_line(lines, "Cache", registry_cache_text(registry.cache_state))
+  add_line(lines, "Error Code", registry.error_code)
+  add_line(lines, "Error", registry.error)
 
   local lsp = status.lsp or {}
   add_section(lines, "LSP")

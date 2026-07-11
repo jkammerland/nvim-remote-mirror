@@ -8,8 +8,9 @@ CONTENTS                                      *nvim-remote-mirror-contents*
 3. UI                                        |nvim-remote-mirror-ui|
 4. Commands                                  |nvim-remote-mirror-commands|
 5. Configuration                             |nvim-remote-mirror-config|
-6. Limits                                    |nvim-remote-mirror-limits|
-7. LSP                                       |nvim-remote-mirror-lsp|
+6. Signed agent registry                     |nvim-remote-mirror-registry|
+7. Limits                                    |nvim-remote-mirror-limits|
+8. LSP                                       |nvim-remote-mirror-lsp|
 
 ==============================================================================
 GOAL                                            *nvim-remote-mirror-goal*
@@ -32,7 +33,7 @@ INSTALL                                      *nvim-remote-mirror-install*
 Requirements:
     - Neovim 0.10+, with Neovim 0.11+ preferred.
     - Rust toolchain on the local machine.
-    - SSH access for ssh://host/path targets.
+    - SSH access for POSIX ssh://host/path or Windows ssh://host/B:/path targets.
     - nrm-agent installed and executable on each remote host, or installable
       with :RemoteInstallAgent after connecting.
 
@@ -41,7 +42,7 @@ Build the binaries from the checkout:
   cargo build --release
 <
 
-Install nrm-agent on each remote host:
+For example, install nrm-agent manually on a POSIX host:
 >
   scp target/release/nrm-agent myhost:~/.local/bin/nrm-agent
   ssh myhost 'chmod +x ~/.local/bin/nrm-agent'
@@ -54,6 +55,16 @@ Or connect and run the explicit repair flow:
   :RemoteInstallAgent
 <
 Connect does not silently install or update remote binaries.
+Without a signed registry, install/update uploads the configured local agent.
+With registry mode configured, the sidecar selects and verifies a native Linux,
+macOS, or Windows x64/ARM64 artifact locally and never falls back to an unsigned
+local binary.
+
+Windows OpenSSH targets use an absolute drive root and forward slashes:
+>
+  :RemoteConnect ssh://windows-host/B:/repos/project
+<
+UNC paths, drive-relative paths, and backslash target syntax are unsupported.
 
 Non-interactive SSH may not load ~/.profile or shell rc files. If this fails:
 >
@@ -84,10 +95,12 @@ UI                                                *nvim-remote-mirror-ui*
 :RemoteWorkspace
     Open the remote workspace dashboard. The dashboard shows connection state,
     remote health, mirror root, files root, mirror counts, background scan
-    state, and save queue counts.
+    state, save queue counts, and signed-registry platform, source, cache,
+    digest, signing-key, and stable error-code diagnostics.
 
 :RemoteConnectUI
-    Prompt for a local path or ssh://host/absolute/path target and connect.
+    Prompt for a local path, POSIX ssh://host/absolute/path, or Windows
+    ssh://host/B:/absolute/path target and connect.
 
 :RemoteFiles
     Prompt for a path query, show known mirror paths with vim.ui.select(), and
@@ -114,7 +127,8 @@ Dashboard keys:
 COMMANDS                                      *nvim-remote-mirror-commands*
 
 :RemoteConnect [target]
-    Connect to a local path or ssh://host/absolute/path target. Startup uses
+    Connect to a local path, POSIX ssh://host/absolute/path, or Windows
+    ssh://host/B:/absolute/path target. Startup uses
     the durable local mirror first; the remote agent handshake is lazy, so
     cached opens, cached grep, and status can work while SSH is unreachable.
     Failed remote attempts use a capped adaptive lane backoff before trying SSH
@@ -181,11 +195,11 @@ COMMANDS                                      *nvim-remote-mirror-commands*
     sidecar is connected, the path is marked for replay after reconnect. Buffers
     are tagged with the workspace that opened them; if another target is active,
     the save is deferred until the original workspace is reconnected.
-    On Unix, the remote agent uses a cooperative write lock keyed by the
-    canonical target for nrm writers, then rechecks the remote base hash in the
-    install path before rename. Non-Unix builds still rely on the hash recheck
-    without the advisory lock. Non-cooperating remote writers can still race at
-    the filesystem boundary.
+    The remote agent uses a cross-platform cooperative write lock keyed by the
+    canonical target for nrm writers, then rechecks the remote base hash before
+    replacement. Windows uses native replacement APIs for existing-file CAS
+    writes. Non-cooperating remote writers can still race at the filesystem
+    boundary.
     Automatic BufWritePost flushing uses the actual write target, but untracked
     mirror-root paths are skipped by default. Use :RemoteAdopt for intentional
     new remote files, or set adoption_policy="auto" for legacy auto-adoption.
@@ -238,19 +252,20 @@ COMMANDS                                      *nvim-remote-mirror-commands*
     remote_root_missing when the sidecar can classify the failure.
 
 :RemoteInstallAgent[!] [path]
-    Upload the configured local agent binary to an SSH target. Without [path],
-    a bare remote_agent such as nrm-agent installs to
-    $HOME/.local/bin/nrm-agent; an absolute remote_agent installs to that
-    absolute path. [!] overwrites an existing target.
-    This is a POSIX SSH installer. Linux/Unix remotes are supported, and macOS
-    remotes are supported when the local agent path points to a Darwin binary
-    for the remote CPU. Windows OpenSSH/PowerShell remotes are not supported by
-    this installer yet.
+    Transactionally install an agent on an SSH target. Registry mode downloads
+    and verifies the matching native build locally; otherwise the command uses
+    the configured local agent bytes. Without [path], POSIX defaults to
+    $HOME/.local/bin/nrm-agent and Windows defaults to
+    %LOCALAPPDATA%\nrm\bin\nrm-agent.exe. [!] permits replacing an existing
+    target. The candidate passes exact --version and staged Hello checks before
+    activation, then a normal-path Hello; failures restore and reprobe the
+    previous executable.
 
 :RemoteUpdateAgent[!] [path]
-    Upload the configured local agent binary when :RemoteHealth reports a
-    missing, incompatible, or non-executable remote agent. Without [!], a
-    compatible agent is skipped.
+    Use the same transactional flow when :RemoteHealth reports a missing,
+    incompatible, or non-executable remote agent. Without [!], a compatible
+    agent is skipped. Registry mode fails closed and never falls back to the
+    configured local agent.
 
 :RemoteGitStatus [path...]
     Run remote `git status --porcelain=v1 -z --branch --untracked-files=all`
@@ -292,6 +307,12 @@ CONFIGURATION                                  *nvim-remote-mirror-config*
     agent = "/path/to/local/nrm-agent",
     remote_agent = "nrm-agent",
     remote_agent_install_path = nil,
+    remote_agent_registry_url = nil,
+    remote_agent_registry_public_keys = {},
+    remote_agent_registry_signature_threshold = 1,
+    remote_agent_registry_cache_dir = nil,
+    remote_agent_registry_cache_max_bytes = 512 * 1024 * 1024,
+    remote_agent_registry_timeout_ms = 120000,
     connection = "stdio",
     socket_path = nil,
     socket_dir = nil,
@@ -338,23 +359,20 @@ CONFIGURATION                                  *nvim-remote-mirror-config*
   })
 <
 
-For ssh:// targets, remote_agent is executed on the remote host. The local
-agent path is used for local targets and as the upload source for explicit
-:RemoteInstallAgent and :RemoteUpdateAgent commands. It is not silently copied
-on connect.
-If remote_agent is a bare command such as nrm-agent, SSH agent launches prepend
-$HOME/.local/bin to PATH and explicit install defaults to
-$HOME/.local/bin/nrm-agent. If remote_agent is absolute, explicit install
-defaults to that absolute path. remote_agent_install_path or an optional command
-argument overrides the default.
+For ssh:// targets, remote_agent is executed on the remote host. With registry
+mode disabled, the local agent path is the explicit install/update source. With
+registry mode enabled, only the matching signed artifact is used; the local
+agent is not a fallback. Neither source is installed on connect.
+On POSIX, a bare remote_agent installs to $HOME/.local/bin/nrm-agent and SSH
+launch prepends $HOME/.local/bin to PATH. On Windows it installs to
+%LOCALAPPDATA%\nrm\bin\nrm-agent.exe. An absolute remote_agent,
+remote_agent_install_path, or optional command path overrides the default.
 Non-interactive SSH may not load the same PATH as an interactive login shell.
 If :RemoteHealth reports missing_agent, run :RemoteInstallAgent or set
 remote_agent to an absolute remote path.
-Remote install copies the configured local agent bytes as-is; it does not
-cross-compile. When installing from Linux to macOS, build nrm-agent on macOS and
-copy that artifact back to a Linux-local path, then point agent at that artifact
-for the macOS SSH session. Switch agent back before using local workspaces or
-targets with a different OS/CPU.
+Local-binary install copies the configured bytes as-is and does not
+cross-compile. Registry mode detects Linux, macOS, or Windows x64/ARM64 and
+selects one of six fixed native release targets.
 Set connection = "socket" to connect through a reusable Unix-domain sidecar
 listener. If socket_path is unset, the plugin derives a stable path under
 socket_dir, state_dir/sockets, or the system temp directory from the target and
@@ -368,8 +386,15 @@ When state_dir is unset, durable mirror state uses the platform state directory,
 typically ~/.local/state/nvim-remote-mirror on Linux. Use :RemoteWorkspace to
 inspect the active mirror root and files root before cleaning mirror data.
 
-request_timeout_ms bounds both sidecar/agent work and pending Neovim-side
-callbacks waiting for sidecar JSON replies.
+request_timeout_ms bounds ordinary sidecar/agent work and is the whole
+install/update deadline in local-binary mode.
+remote_agent_registry_timeout_ms is the whole install/update deadline in
+registry mode. It starts when the sidecar accepts the request and covers host
+detection, retrieval, queue drain, staging, probes, activation, rollback, and
+cleanup. Nested work receives only the remaining budget, with a bounded reserve
+for recovery. The Neovim bootstrap callback adds one second for reply delivery.
+Timeout and registry policy are fixed for the lifetime of a connection; after
+changing them with setup(), reconnect before install or update.
 When a callback times out, the plugin sends a best-effort sidecar cancel for
 queued remote work. Matching active read-only/background work is preempted by
 restarting the serial SSH/agent worker. Newer interactive remote requests can
@@ -478,6 +503,37 @@ selection.
 <
 
 ==============================================================================
+SIGNED AGENT REGISTRY                       *nvim-remote-mirror-registry*
+
+The registry is opt-in. remote_agent_registry_url must use https:// or a local
+absolute file:// URL and contain exactly one {version} placeholder. Configure
+trusted 32-byte Ed25519 public keys with out-of-band key IDs; the default
+signature threshold is one. Registry responses can never add trusted keys.
+
+Explicit install/update detects Linux, macOS, or Windows x64/ARM64, verifies
+detached signatures and the strict manifest locally, rechecks the selected
+artifact size and SHA-256, and then uploads it through SSH. Registry mode fails
+closed: it never falls back to the configured local agent. Connect remains
+local-first and never fetches, installs, or updates an agent automatically.
+
+The default 512 MiB cache lives below sidecar state unless
+remote_agent_registry_cache_dir is set. Current keys, signature threshold,
+manifest policy, artifact size, and digest are reverified on every use. A cached
+manifest/signature pair is eligible only after timeout, connection, rate-limit,
+or 5xx failures; malformed data, invalid signatures or hashes, other 4xx
+responses, and policy violations never use that fallback. Content-addressed
+artifacts can be normal cache hits after fresh manifest verification. Budget
+eviction means offline fallback is best-effort, not guaranteed.
+
+Install/update results and the Registry section of :RemoteWorkspace include
+selected platform/target, redacted manifest URL, verified key IDs, digests,
+source/cache state, and stable error codes. Registry state remains separate
+from the health of an already working remote agent.
+
+See docs/agent-registry.md in the project checkout for the exact manifest,
+redirect, cache, trust, and key-rotation policy.
+
+==============================================================================
 LIMITS                                        *nvim-remote-mirror-limits*
 
 This is dogfooding software. The local mirror, SSH workspaces, background
@@ -514,8 +570,11 @@ starts are ignored when the active workspace changes.
 The proxy rewrites file:// URI values, workspace-edit URI object keys, and known
 path fields between local mirror and remote workspace prefixes. Plain path
 prose strings are left untouched and path boundaries are checked before
-rewriting. Prose strings that begin with a matching file:// URI prefix are a
-known rewrite-hardening follow-up.
+rewriting. Windows remote prefixes accept B:/..., B:\..., and file:///B:/...
+forms and emit canonical drive paths/URIs while PowerShell relays preserve raw
+LSP stdio bytes. Native executables and .cmd/.bat shims resolve from PATH.
+Batch arguments containing " or % are rejected rather than passed through
+unsafe cmd.exe expansion; use a native executable or fixed wrapper instead.
 
 >
   local nrm = require("nvim_remote_mirror")

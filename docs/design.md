@@ -16,6 +16,7 @@ changing Neovim commands.
 | --- | --- | --- |
 | Neovim plugin | local | UI, commands, buffers, quickfix, LSP client setup |
 | `nrm-sidecar` | local | Mirror database, save queue, caching, scheduling |
+| `nrm-registry` | local library | Strict manifest/signature policy, HTTPS/file retrieval, verified cache |
 | `nrm-agent` | remote or local | Filesystem reads, scans, hashes, grep, writes |
 | Mirror directory | local | Hydrated file bytes and conflict/snapshot files |
 | SQLite state | local | Metadata, indexes, queue state, scan progress |
@@ -31,6 +32,31 @@ changing Neovim commands.
 | Conflict | Keep local save as truth and preserve remote copy |
 | Background mirror | Scan, prefetch, and validate in small idle batches |
 | Reconnect | Reuse mirror state and retry queued saves |
+| Agent install/update | Explicit only; verify locally, stage and activate transactionally, roll back failures |
+
+## Remote Host and Agent Distribution
+
+SSH host detection is lazy and shared across agent lanes. Linux, macOS, and
+Windows hosts are normalized to x64 or ARM64 and one of six fixed Rust release
+targets. POSIX launch/install uses shell scripts; Windows uses PowerShell 5.1
+encoded commands and binary-safe stdio. Canonical Windows workspace targets use
+`ssh://host/B:/repos/project`; UNC and drive-relative roots are outside the
+supported model.
+
+Agent distribution has two mutually exclusive sources:
+
+- With no registry URL, explicit install/update streams the configured local
+  `agent` file. The caller owns OS/architecture selection.
+- With a registry URL, the local sidecar verifies a detached Ed25519 signature,
+  strict manifest policy, target, size, and SHA-256 before upload. Registry mode
+  fails closed and cannot fall back to the local file.
+
+Connect remains local-first in both modes and never installs or updates. The
+registry cache is a performance/reliability layer, not a trust anchor: current
+keys, signatures, manifest policy, size, and digest are reverified on every use.
+Only transient network/rate-limit/server failures may use a verified cached
+manifest pair. See [agent-registry.md](agent-registry.md) for the full trust and
+key-rotation model.
 
 ## Current Limits
 

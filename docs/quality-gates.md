@@ -38,6 +38,7 @@ just lint-extra
 just audit-strict
 just miri-protocol
 just fuzz-protocol
+just fuzz-registry
 ```
 
 `just lint-extra` runs:
@@ -70,6 +71,11 @@ If it fails while linking sanitizer-instrumented build scripts, verify the local
 nightly sanitizer/linker setup before treating the result as a fuzz target
 failure.
 
+`just fuzz-registry` runs the strict manifest parser, detached-signature parser,
+and URL-policy fuzz targets for 30 seconds each. It has the same nightly,
+`cargo-fuzz`, and `clang` requirements as `just fuzz-protocol`. Use longer runs
+before changing trust, redirect, containment, or cache-fallback policy.
+
 ## Sanitizer Position
 
 Do not add blanket sanitizer runs to `just check` yet.
@@ -92,4 +98,5 @@ rename, subprocess shutdown, and queue hazard ordering.
 - Decide whether to pin/install a specific Neovim release in CI instead of
   relying on the runner's apt package.
 - Add longer scheduled fuzzing if the sidecar-agent boundary becomes exposed to
-  untrusted peers or if frame parsing grows more complex.
+  untrusted peers, if frame parsing grows more complex, or when registry policy
+  changes substantially.

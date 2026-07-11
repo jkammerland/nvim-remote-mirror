@@ -32,7 +32,7 @@ but it is not a polished replacement for SSHFS or VS Code Remote yet.
 | Neovim 0.10+ | local | Neovim 0.11+ is preferred |
 | Rust toolchain | local | Builds `nrm-sidecar` and `nrm-agent` |
 | SSH | local and remote | Used for `ssh://host/path` targets |
-| `nrm-agent` | remote | Must be executable on the remote host; can be installed with `:RemoteInstallAgent` |
+| `nrm-agent` | remote | Must be executable on the remote host; explicit install can use a configured local binary or signed registry |
 
 ## Install
 
@@ -42,7 +42,7 @@ Build the local binaries:
 cargo build --release
 ```
 
-Install the remote agent on each remote host manually:
+For example, install the remote agent manually on a POSIX host:
 
 ```sh
 scp target/release/nrm-agent myhost:~/.local/bin/nrm-agent
@@ -58,24 +58,61 @@ Or connect and run an explicit repair command from Neovim:
 ```
 
 The plugin does not silently install or update the remote agent during connect.
-`:RemoteInstallAgent[!]` and `:RemoteUpdateAgent[!]` upload the configured local
-`agent` binary to the remote host over SSH. For a bare `remote_agent =
-"nrm-agent"`, the managed install path defaults to
-`$HOME/.local/bin/nrm-agent`, and SSH launches prepend `$HOME/.local/bin` to
-`PATH` so non-interactive sessions can find it.
+`:RemoteInstallAgent[!]` and `:RemoteUpdateAgent[!]` are always explicit. With
+no registry configured they upload the configured local `agent` binary. With a
+signed registry configured they detect the remote platform, download and verify
+the matching build locally, and fail closed instead of falling back to an
+unsigned local binary.
 
-Remote install is POSIX SSH only today:
+Installation is transactional: the sidecar stages a unique same-directory
+candidate, checks its exact version and full Hello compatibility, preserves the
+previous executable, activates the candidate, and checks Hello again through
+the normal launch path. A failed post-activation check restores and reprobes the
+previous executable. `process_in_use` and `rollback_failed` remain distinct
+errors.
 
 | Remote OS | Install support | Notes |
 | --- | --- | --- |
-| Linux/Unix | Supported | The remote needs `sh`, `dirname`, `mkdir`, `chmod`, and `mv` |
-| macOS | Supported with a macOS agent binary | Build `nrm-agent` for the remote Mac architecture; the installer does not cross-compile |
-| Windows OpenSSH/PowerShell | Not supported yet | The SSH planner and installer currently assume POSIX paths and `sh -lc` |
+| Linux | x64 and ARM64 | POSIX shell; registry builds use static musl targets |
+| macOS | x64 and ARM64 | POSIX shell and a matching Darwin binary |
+| Windows | x64 and ARM64 | Windows OpenSSH with PowerShell 5.1; defaults to `%LOCALAPPDATA%\nrm\bin\nrm-agent.exe` |
 
-The installer uploads bytes from the local `agent` path exactly as configured.
-If Neovim is running on Linux and the SSH target is macOS, build a Darwin
-`nrm-agent` natively and make that binary available on the local machine before
-running `:RemoteInstallAgent`. Otherwise the remote will receive a Linux binary.
+For local-binary mode, the installer uploads bytes from the local `agent` path
+exactly as configured; it does not cross-compile. A Linux editor targeting
+macOS or Windows must point `agent` at a binary built for that remote OS and
+architecture. Registry mode selects one of the six supported native targets
+automatically.
+
+For a bare `remote_agent = "nrm-agent"`, POSIX installs default to
+`$HOME/.local/bin/nrm-agent` and SSH launch prepends that directory to `PATH`.
+Windows installs default to `%LOCALAPPDATA%\nrm\bin\nrm-agent.exe`. Use canonical
+Windows targets such as `ssh://host/B:/repos/project`; UNC paths, drive-relative
+paths, and backslashes in the target URL are unsupported.
+Native Windows transport also covers agent/LSP launch, cross-platform mirror
+locking and replacement, and LSP rewriting for drive paths and `file:///B:/...`
+URIs. LSP launch resolves native executables and `.cmd`/`.bat` shims from
+`PATH`; batch arguments containing `"` or `%` are rejected instead of being
+passed through unsafe `cmd.exe` expansion.
+
+To opt into signed native builds, configure a versioned manifest URL and
+out-of-band trusted key:
+
+```lua
+require("nvim_remote_mirror").setup({
+  remote_agent_registry_url =
+    "https://github.com/owner/repo/releases/download/v{version}/nrm-agent-manifest-v1.json",
+  remote_agent_registry_public_keys = {
+    ["release-2026-q3"] = "<standard-base64-encoded-32-byte-Ed25519-key>",
+  },
+})
+```
+
+See [signed agent registry operations](docs/agent-registry.md) for verification,
+cache fallback, trust bootstrap, and key rotation.
+Install/update results and `:RemoteWorkspace` expose the selected platform and
+target, redacted manifest URL, signing key IDs, digests, cache source, and stable
+registry error codes. A registry failure is tracked separately and does not
+replace the health of an already working agent.
 
 Non-interactive SSH often skips shell startup files. If this fails:
 
@@ -124,6 +161,12 @@ Connect to a remote workspace:
 :RemoteConnect ssh://myhost/home/me/project
 ```
 
+For a native Windows SSH host, use the drive-root form:
+
+```vim
+:RemoteConnect ssh://windows-host/B:/repos/project
+```
+
 For cwd-based local plugins, switch the current tab to the mirror files root:
 
 ```vim
@@ -163,7 +206,7 @@ Dashboard keys:
 
 | Command | Purpose |
 | --- | --- |
-| `:RemoteConnect [target]` | Connect to local path or `ssh://host/absolute/path` |
+| `:RemoteConnect [target]` | Connect to a local path, POSIX `ssh://host/absolute/path`, or Windows `ssh://host/B:/absolute/path` |
 | `:RemoteDisconnect` | Close the current client session |
 | `:RemoteReconnect` | Reconnect to the last target |
 | `:RemoteCd` | Set the current tab cwd to the mirror files root |
@@ -175,8 +218,8 @@ Dashboard keys:
 | `:RemotePrefetch {path...}` | Hydrate files into the mirror |
 | `:RemoteStatus` | Print a status summary |
 | `:RemoteHealth` | Probe remote agent health and compatibility |
-| `:RemoteInstallAgent[!] [path]` | Upload the local `agent` binary to the remote host |
-| `:RemoteUpdateAgent[!] [path]` | Replace the remote agent when health reports mismatch |
+| `:RemoteInstallAgent[!] [path]` | Transactionally install from the signed registry, or from local `agent` when registry mode is disabled |
+| `:RemoteUpdateAgent[!] [path]` | Transactionally replace an incompatible remote agent; skip a compatible agent unless forced |
 | `:RemoteGitStatus [path...]` | Put remote git status entries in quickfix |
 | `:RemoteGitDiff [path]` | Open a remote git diff scratch buffer |
 | `:RemoteGitBlame [path]` | Put remote git blame output in quickfix |
@@ -201,10 +244,16 @@ Dashboard keys:
 | --- | --- | --- |
 | `connection` | `"stdio"` | Set to `"socket"` for reusable sidecar mode |
 | `state_dir` | `nil` | Durable mirror state root; default is Neovim state data |
-| `agent` | local checkout/debug path or `"nrm-agent"` | Local agent and SSH upload source |
+| `agent` | local checkout/debug path or `"nrm-agent"` | Local agent and SSH upload source when registry mode is disabled |
 | `remote_agent` | `"nrm-agent"` | Remote command run over SSH |
 | `remote_agent_install_path` | `nil` | Optional default remote path for `:RemoteInstallAgent` and `:RemoteUpdateAgent` |
-| `request_timeout_ms` | `30000` | Neovim-to-sidecar request timeout |
+| `remote_agent_registry_url` | `nil` | Opt-in `https://` or absolute `file://` manifest URL with one `{version}` placeholder |
+| `remote_agent_registry_public_keys` | `{}` | Trusted key-ID to standard-base64 Ed25519 public-key map |
+| `remote_agent_registry_signature_threshold` | `1` | Required distinct trusted signatures |
+| `remote_agent_registry_cache_dir` | `nil` | Verified-cache directory; defaults below sidecar state |
+| `remote_agent_registry_cache_max_bytes` | `536870912` | Registry cache budget |
+| `remote_agent_registry_timeout_ms` | `120000` | Whole install/update deadline in registry mode |
+| `request_timeout_ms` | `30000` | Ordinary request timeout and whole local-binary install/update deadline |
 | `ssh_connect_timeout_seconds` | `10` | SSH connection timeout |
 | `find_limit` | `200` | Max file picker results |
 | `grep_limit` | `200` | Max grep results |
@@ -247,7 +296,9 @@ Mirror files live under the sidecar state directory, typically below
 | --- | --- |
 | `not connected` | Run `:RemoteWorkspace` or `:RemoteConnect ...` |
 | SSH target fails | Confirm `ssh myhost` works without prompts |
-| Remote agent missing | Run `:RemoteHealth`, then `:RemoteInstallAgent`; or confirm `ssh myhost 'command -v nrm-agent'` |
+| Remote agent missing | Run `:RemoteHealth`, then `:RemoteInstallAgent`; inspect remote resolution with POSIX `command -v` or PowerShell `Get-Command` |
+| Registry install fails | Check `:RemoteWorkspace` Registry state/error code; unsigned fallback remains forbidden |
+| Windows target is rejected | Use `ssh://host/B:/absolute/path`, not UNC, drive-relative, or backslash syntax |
 | Opens are stale | Use `:RemoteValidate` or `:RemoteOpen! path` |
 | Saves are queued | Open `:RemoteQueue`, then retry with `:RemoteFlushQueue` |
 | Save conflict | Open `:RemoteConflicts`; accept-local uploads the saved local snapshot, accept-remote is blocked for partial remote copies |
@@ -263,6 +314,7 @@ just lint-extra
 just audit
 just audit-strict
 just fuzz-protocol
+just fuzz-registry
 cargo bench --workspace --no-run --locked
 scripts/perf_smoke.sh --small
 NRM_PERF_LARGE=1 scripts/perf_smoke.sh --large
@@ -274,9 +326,9 @@ benchmarks cover protocol frames and agent scan/grep paths; run them without
 `--no-run` for manual before/after measurements. The small perf smoke runs in
 CI and through `just ci`; the large mode is intended for local before/after
 timing on bigger synthetic workspaces.
-`just lint-extra`, `just audit-strict`, `just miri-protocol`, and
-`just fuzz-protocol` are local quality gates for release or riskier changes; see
-[docs/quality-gates.md](docs/quality-gates.md).
+`just lint-extra`, `just audit-strict`, `just miri-protocol`,
+`just fuzz-protocol`, and `just fuzz-registry` are local quality gates for
+release or riskier changes; see [docs/quality-gates.md](docs/quality-gates.md).
 
 Set `NRM_TRACE=1` when starting the sidecar to emit JSON trace events for
 request queueing, agent round trips, preemption, truncation, and remote backoff
@@ -289,6 +341,8 @@ to stderr.
 | [docs/design.md](docs/design.md) | Goal, architecture, and next milestones |
 | [docs/v1-roadmap.md](docs/v1-roadmap.md) | Daily-driver v1 sprint plan and acceptance gates |
 | [docs/configuration.md](docs/configuration.md) | Configuration options |
+| [docs/agent-registry.md](docs/agent-registry.md) | Signed manifests, cache policy, and key rotation |
+| [docs/releasing.md](docs/releasing.md) | Protected six-target build, signing, provenance, and release procedure |
 | [docs/plugin-compatibility.md](docs/plugin-compatibility.md) | How normal plugins should interact with mirror paths |
 | [docs/save-recovery.md](docs/save-recovery.md) | Save queue and conflict behavior |
 | [docs/protocol.md](docs/protocol.md) | Sidecar and agent protocol notes |

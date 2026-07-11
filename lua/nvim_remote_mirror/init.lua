@@ -172,6 +172,220 @@ local function decode_standard_base64(value)
   return table.concat(decoded)
 end
 
+local REGISTRY_MAX_TRUSTED_KEYS = 32
+local LUA_MAX_SAFE_INTEGER = 9007199254740991
+
+-- Canonical compressed encodings of the eight small-order Edwards points.
+-- Rust remains authoritative for complete Ed25519 point validation.
+local WEAK_ED25519_PUBLIC_KEYS = {
+  ["AQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="] = true,
+  ["xxdqcD1N2E+6PAt2DRBnDyogU/osOczGTsf9d5KsA3o="] = true,
+  ["AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIA="] = true,
+  ["JuiVj8KyJ7BFw/SJ8u+Y8NXfrAXTxjM5sTgCiG1T/AU="] = true,
+  ["7P///////////////////////////////////////38="] = true,
+  ["JuiVj8KyJ7BFw/SJ8u+Y8NXfrAXTxjM5sTgCiG1T/IU="] = true,
+  ["AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="] = true,
+  ["xxdqcD1N2E+6PAt2DRBnDyogU/osOczGTsf9d5KsA/o="] = true,
+}
+
+local function parse_ipv4_literal(host)
+  local parts = {}
+  for part in host:gmatch("[^.]+") do
+    table.insert(parts, part)
+  end
+  local numeric = #parts > 0 and table.concat(parts, ".") == host
+  for _, part in ipairs(parts) do
+    numeric = numeric and (part:match("^[0-9]+$") ~= nil or part:match("^0[xX][0-9A-Fa-f]+$") ~= nil)
+  end
+  if not numeric then
+    return nil
+  end
+  if #parts ~= 4 then
+    return false
+  end
+
+  local octets = {}
+  for _, part in ipairs(parts) do
+    if (#part > 1 and part:sub(1, 1) == "0") or not part:match("^[0-9]+$") then
+      return false
+    end
+    local octet = tonumber(part)
+    if not octet or octet > 255 then
+      return false
+    end
+    table.insert(octets, octet)
+  end
+  if table.concat(octets, ".") ~= host then
+    return false
+  end
+  return octets
+end
+
+local function ipv4_is_globally_routable(octets)
+  local a, b, c = octets[1], octets[2], octets[3]
+  return not (
+    a == 0
+    or a == 10
+    or (a == 100 and b >= 64 and b <= 127)
+    or a == 127
+    or (a == 169 and b == 254)
+    or (a == 172 and b >= 16 and b <= 31)
+    or (a == 192 and b == 0 and c == 0)
+    or (a == 192 and b == 0 and c == 2)
+    or (a == 192 and b == 88 and c == 99)
+    or (a == 192 and b == 168)
+    or (a == 198 and b >= 18 and b <= 19)
+    or (a == 198 and b == 51 and c == 100)
+    or (a == 203 and b == 0 and c == 113)
+    or a >= 224
+  )
+end
+
+local function ipv6_tokens(part)
+  if part == "" then
+    return {}
+  end
+  if part:sub(1, 1) == ":" or part:sub(-1) == ":" then
+    return nil
+  end
+  local tokens = {}
+  for token in part:gmatch("[^:]+") do
+    table.insert(tokens, token)
+  end
+  return tokens
+end
+
+local function parse_ipv6_literal(host)
+  local compression = host:find("::", 1, true)
+  if compression and host:find("::", compression + 2, true) then
+    return nil
+  end
+  local left_text = compression and host:sub(1, compression - 1) or host
+  local right_text = compression and host:sub(compression + 2) or ""
+  local left = ipv6_tokens(left_text)
+  local right = ipv6_tokens(right_text)
+  if not left or not right then
+    return nil
+  end
+
+  local tokens = {}
+  vim.list_extend(tokens, left)
+  vim.list_extend(tokens, right)
+  local segments = {}
+  for index, token in ipairs(tokens) do
+    if token:find(".", 1, true) then
+      if index ~= #tokens or (compression and index <= #left) then
+        return nil
+      end
+      local octets = parse_ipv4_literal(token)
+      if type(octets) ~= "table" then
+        return nil
+      end
+      table.insert(segments, octets[1] * 256 + octets[2])
+      table.insert(segments, octets[3] * 256 + octets[4])
+    else
+      if #token == 0 or #token > 4 or not token:match("^[0-9A-Fa-f]+$") then
+        return nil
+      end
+      table.insert(segments, tonumber(token, 16))
+    end
+  end
+
+  local missing = 8 - #segments
+  if (compression and missing < 1) or (not compression and missing ~= 0) then
+    return nil
+  end
+  if compression then
+    local insertion = #left + 1
+    if #left > 0 and left[#left]:find(".", 1, true) then
+      insertion = insertion + 1
+    end
+    for _ = 1, missing do
+      table.insert(segments, insertion, 0)
+    end
+  end
+  return #segments == 8 and segments or nil
+end
+
+local function ipv6_is_globally_routable(segments)
+  local embeds_ipv4 = true
+  for index = 1, 6 do
+    embeds_ipv4 = embeds_ipv4 and segments[index] == 0
+  end
+  local mapped_ipv4 = true
+  for index = 1, 5 do
+    mapped_ipv4 = mapped_ipv4 and segments[index] == 0
+  end
+  mapped_ipv4 = mapped_ipv4 and segments[6] == 0xFFFF
+
+  local first, second = segments[1], segments[2]
+  local global_unicast = first >= 0x2000 and first <= 0x3FFF
+  local special_purpose = (
+    first == 0x2001 and (second == 0 or second == 2 or (second >= 0x10 and second <= 0x2F) or second == 0x0DB8)
+  )
+    or first == 0x2002
+    or (first == 0x3FFF and second <= 0x0FFF)
+  return global_unicast and not special_purpose and not embeds_ipv4 and not mapped_ipv4
+end
+
+local function validate_https_registry_host(authority)
+  local function valid_port_suffix(suffix)
+    if suffix == "" then
+      return true
+    end
+    local digits = suffix:match("^:([0-9]+)$")
+    local port = digits and tonumber(digits) or nil
+    return port ~= nil and port <= 65535
+  end
+
+  local host
+  if authority:find("\\", 1, true) or authority:find("%", 1, true) then
+    error("remote_agent_registry_url must contain a valid HTTPS host")
+  end
+  if authority:sub(1, 1) == "[" then
+    local close = authority:find("]", 2, true)
+    if not close then
+      error("remote_agent_registry_url must contain a valid HTTPS host")
+    end
+    local suffix = authority:sub(close + 1)
+    if not valid_port_suffix(suffix) then
+      error("remote_agent_registry_url must contain a valid HTTPS host")
+    end
+    host = authority:sub(2, close - 1)
+    local segments = parse_ipv6_literal(host)
+    if not segments then
+      error("remote_agent_registry_url must contain a valid IPv6 host")
+    end
+    if not ipv6_is_globally_routable(segments) then
+      error("remote_agent_registry_url must not use localhost or a non-global literal host")
+    end
+    return
+  end
+
+  local colon = authority:find(":", 1, true)
+  host = colon and authority:sub(1, colon - 1) or authority
+  if host == "" or (colon and not valid_port_suffix(authority:sub(colon))) then
+    error("remote_agent_registry_url must contain a valid HTTPS host")
+  end
+  if host:find("[", 1, true) or host:find("]", 1, true) then
+    error("remote_agent_registry_url must contain a valid HTTPS host")
+  end
+  host = host:lower():gsub("%.+$", "")
+  if host == "" or host:sub(1, 1) == "." or host:find("..", 1, true) then
+    error("remote_agent_registry_url must contain a valid HTTPS host")
+  end
+  if host == "localhost" or host:sub(-10) == ".localhost" then
+    error("remote_agent_registry_url must not use localhost or a non-global literal host")
+  end
+  local octets = parse_ipv4_literal(host)
+  if octets == false then
+    error("remote_agent_registry_url must contain a canonical IPv4 host")
+  end
+  if octets and not ipv4_is_globally_routable(octets) then
+    error("remote_agent_registry_url must not use localhost or a non-global literal host")
+  end
+end
+
 local function validate_registry_config(config)
   local url = config.remote_agent_registry_url
   if url ~= nil then
@@ -191,12 +405,18 @@ local function validate_registry_config(config)
     if url:find("[?#]") or url:find("%s") then
       error("remote_agent_registry_url must not contain queries, fragments, or whitespace")
     end
+    if url:sub(-1) == "/" then
+      error("remote_agent_registry_url must name a manifest file")
+    end
     local authority = url:match("^https://([^/]+)")
     if url:match("^https://") and not authority then
       error("remote_agent_registry_url must contain an HTTPS host")
     end
     if authority and authority:find("@", 1, true) then
       error("remote_agent_registry_url must not contain credentials")
+    end
+    if authority then
+      validate_https_registry_host(authority)
     end
     if url:match("^file:////") then
       error("remote_agent_registry_url file paths must be local absolute paths")
@@ -206,6 +426,13 @@ local function validate_registry_config(config)
   local keys = config.remote_agent_registry_public_keys
   if type(keys) ~= "table" then
     error("remote_agent_registry_public_keys must be a key-id table")
+  end
+  local configured_key_count = 0
+  for _ in pairs(keys) do
+    configured_key_count = configured_key_count + 1
+  end
+  if configured_key_count > REGISTRY_MAX_TRUSTED_KEYS then
+    error("remote agent registry public keys must contain at most 32 keys")
   end
   local key_count = 0
   local key_material = {}
@@ -219,6 +446,9 @@ local function validate_registry_config(config)
     end
     if key_material[decoded] then
       error("remote agent registry public keys must contain distinct key material")
+    end
+    if WEAK_ED25519_PUBLIC_KEYS[encoded] then
+      error("remote agent registry public keys must not use weak Ed25519 points")
     end
     key_material[decoded] = key_id
     key_count = key_count + 1
@@ -238,6 +468,9 @@ local function validate_registry_config(config)
     local value = config[field]
     if type(value) ~= "number" or value % 1 ~= 0 or value < 1 then
       error(field .. " must be a positive integer")
+    end
+    if value > LUA_MAX_SAFE_INTEGER then
+      error(field .. " must not exceed Lua's maximum safe integer")
     end
   end
   if
@@ -265,6 +498,10 @@ local function sorted_registry_keys(config)
   return entries
 end
 
+local function registry_integer_string(value)
+  return string.format("%.0f", value)
+end
+
 local function registry_policy_fingerprint(config)
   if not config.remote_agent_registry_url then
     return "disabled"
@@ -272,10 +509,10 @@ local function registry_policy_fingerprint(config)
   local parts = {
     "nrm-registry-policy-v1",
     config.remote_agent_registry_url,
-    tostring(config.remote_agent_registry_signature_threshold),
+    registry_integer_string(config.remote_agent_registry_signature_threshold),
     config.remote_agent_registry_cache_dir or "",
-    tostring(config.remote_agent_registry_cache_max_bytes),
-    tostring(config.remote_agent_registry_timeout_ms),
+    registry_integer_string(config.remote_agent_registry_cache_max_bytes),
+    registry_integer_string(config.remote_agent_registry_timeout_ms),
   }
   for _, entry in ipairs(sorted_registry_keys(config)) do
     table.insert(parts, entry.id .. "=" .. vim.fn.sha256(entry.key))
@@ -690,15 +927,15 @@ local function sidecar_args(target)
       table.insert(args, entry.id .. "=" .. entry.key)
     end
     table.insert(args, "--remote-agent-registry-signature-threshold")
-    table.insert(args, tostring(M.config.remote_agent_registry_signature_threshold))
+    table.insert(args, registry_integer_string(M.config.remote_agent_registry_signature_threshold))
     if M.config.remote_agent_registry_cache_dir then
       table.insert(args, "--remote-agent-registry-cache-dir")
       table.insert(args, M.config.remote_agent_registry_cache_dir)
     end
     table.insert(args, "--remote-agent-registry-cache-max-bytes")
-    table.insert(args, tostring(M.config.remote_agent_registry_cache_max_bytes))
+    table.insert(args, registry_integer_string(M.config.remote_agent_registry_cache_max_bytes))
     table.insert(args, "--remote-agent-registry-timeout-ms")
-    table.insert(args, tostring(M.config.remote_agent_registry_timeout_ms))
+    table.insert(args, registry_integer_string(M.config.remote_agent_registry_timeout_ms))
   end
   table.insert(args, "--request-timeout-ms")
   table.insert(args, tostring(M.config.request_timeout_ms))
@@ -1039,6 +1276,9 @@ update_remote_state = function(client, result)
   client.hello.remote_available = result.remote_available
   client.hello.remote_error = result.remote_error
   client.hello.retry_after_ms = result.retry_after_ms
+  if type(result.registry_health) == "table" then
+    client.hello.registry_health = result.registry_health
+  end
   for _, field in ipairs({
     "agent_status",
     "agent_version",
@@ -1051,6 +1291,8 @@ update_remote_state = function(client, result)
     "local_agent_path",
     "local_agent_available",
     "local_agent_error",
+    "agent_source",
+    "registry_configured",
     "install_available",
     "update_available",
     "repair_command",
@@ -1059,6 +1301,26 @@ update_remote_state = function(client, result)
       client.hello[field] = result[field]
     end
   end
+end
+
+local function registry_summary(result)
+  local registry = result and result.registry_health or nil
+  if type(registry) ~= "table" then
+    return "registry=unknown"
+  end
+  local parts = { "registry=" .. (optional_string(registry.state) or "unknown") }
+  local platform = registry.platform
+  if type(platform) == "table" then
+    local target = optional_string(platform.target)
+    if target then
+      table.insert(parts, "registry_target=" .. target)
+    end
+  end
+  local error_code = optional_string(registry.error_code)
+  if error_code then
+    table.insert(parts, "registry_error=" .. error_code)
+  end
+  return table.concat(parts, " ")
 end
 
 local function status_remote_summary(result)
@@ -1181,6 +1443,9 @@ function M.connection_state()
     local_agent_path = optional_string(hello.local_agent_path),
     local_agent_available = hello.local_agent_available,
     local_agent_error = optional_string(hello.local_agent_error),
+    agent_source = optional_string(hello.agent_source),
+    registry_configured = hello.registry_configured,
+    registry_health = type(hello.registry_health) == "table" and hello.registry_health or nil,
     install_available = hello.install_available,
     update_available = hello.update_available,
     repair_command = optional_string(hello.repair_command),
@@ -1206,6 +1471,7 @@ function M.current_workspace()
     remote_available = hello.remote_available,
     remote_error = optional_string(hello.remote_error),
     retry_after_ms = hello.retry_after_ms,
+    registry_health = type(hello.registry_health) == "table" and hello.registry_health or nil,
   }
 end
 
@@ -1300,6 +1566,10 @@ local function decorate_status_result(result)
   result.connected = result.connection.has_client == true
   result.connection_summary = connection_summary()
   result.remote_summary = status_remote_summary(result)
+  if type(result.registry_health) ~= "table" then
+    result.registry_health = result.connection.registry_health
+  end
+  result.registry_summary = registry_summary(result)
   result.background_scan_summary = background_scan_summary(result)
   if lsp_status_result then
     result.lsp = lsp_status_result({ notify = false })
@@ -1781,6 +2051,13 @@ function M.connect(target, opts)
     target_arg = target_arg,
     closing = false,
     expected_registry_policy_fingerprint = registry_policy_fingerprint(M.config),
+    -- Requests must use the same timeout policy that was passed to this
+    -- sidecar. A later setup() call only applies after reconnecting.
+    timeout_config = {
+      request_timeout_ms = M.config.request_timeout_ms,
+      remote_agent_registry_timeout_ms = M.config.remote_agent_registry_timeout_ms,
+      registry_enabled = optional_string(M.config.remote_agent_registry_url) ~= nil,
+    },
   }
 
   local connection = opts.connection or M.config.connection or "stdio"
@@ -1963,6 +2240,29 @@ function M.reconnect()
   M.connect(M.last_target, { reconnect = true })
 end
 
+local BOOTSTRAP_TIMER_GRACE_MS = 1000
+
+local function request_timeout_ms(method, client)
+  local bootstrap = method == "remote_agent_install" or method == "remote_agent_update"
+  local timeout_config = client and client.timeout_config or nil
+  local configured = timeout_config and timeout_config.request_timeout_ms or M.config.request_timeout_ms
+  local registry_enabled
+  if timeout_config then
+    registry_enabled = timeout_config.registry_enabled == true
+  else
+    registry_enabled = optional_string(M.config.remote_agent_registry_url) ~= nil
+  end
+  if bootstrap and registry_enabled then
+    configured = timeout_config and timeout_config.remote_agent_registry_timeout_ms
+      or M.config.remote_agent_registry_timeout_ms
+  end
+  local timeout_ms = math.max(tonumber(configured) or 0, 0)
+  if bootstrap then
+    timeout_ms = math.min(timeout_ms + BOOTSTRAP_TIMER_GRACE_MS, LUA_MAX_SAFE_INTEGER)
+  end
+  return timeout_ms
+end
+
 function M.request(method, params, callback)
   local client = M.client
   if not client or not client.job_id then
@@ -1976,7 +2276,7 @@ function M.request(method, params, callback)
     callback = callback,
     timer = nil,
   }
-  local timeout_ms = math.max(tonumber(M.config.request_timeout_ms) or 0, 0)
+  local timeout_ms = request_timeout_ms(method, client)
   if timeout_ms > 0 then
     local timer = uv.new_timer()
     pending.timer = timer
@@ -2002,6 +2302,11 @@ function M.request(method, params, callback)
     local reason = ok and "sidecar channel closed" or ("sidecar channel send failed: " .. tostring(sent))
     fail_sidecar_send(client, reason)
   end
+end
+
+if vim.g.nvim_remote_mirror_test then
+  M._test_request_timeout_ms = request_timeout_ms
+  M._test_clear_pending = clear_pending
 end
 
 local function request_async(method, params, callback)
@@ -2066,7 +2371,15 @@ function M.remote_health(callback)
       notify(err, vim.log.levels.ERROR)
       return
     end
-    notify(vim.trim(status_remote_summary(result or {}) .. " " .. agent_summary(result or {})))
+    notify(
+      vim.trim(
+        status_remote_summary(result or {})
+          .. " "
+          .. agent_summary(result or {})
+          .. " "
+          .. registry_summary(result or {})
+      )
+    )
   end)
 end
 
@@ -2111,6 +2424,9 @@ local function remote_agent_bootstrap(method, opts, callback)
     end
     if health_summary ~= "" then
       message = message .. " " .. health_summary
+    end
+    if health then
+      message = message .. " " .. registry_summary(health)
     end
     notify(message)
   end)
@@ -3409,7 +3725,10 @@ end
 
 function M.status()
   if not M.client or not M.client.job_id then
-    notify(connection_summary() .. " " .. status_lsp_summary(), vim.log.levels.WARN)
+    notify(
+      connection_summary() .. " " .. registry_summary(M.connection_state()) .. " " .. status_lsp_summary(),
+      vim.log.levels.WARN
+    )
     return
   end
   M.request("status", {}, function(err, result)
@@ -3421,7 +3740,7 @@ function M.status()
     local scan_summary = background_scan_summary(result)
     notify(
       string.format(
-        "known=%d cached=%d indexed=%d dirty=%d pending=%d failed=%d unreplayable=%d conflicts=%d stale=%d deleted=%d %s %s %s %s%s",
+        "known=%d cached=%d indexed=%d dirty=%d pending=%d failed=%d unreplayable=%d conflicts=%d stale=%d deleted=%d %s %s %s %s %s%s",
         result.known_files,
         result.cached_files,
         result.indexed_files or 0,
@@ -3435,6 +3754,7 @@ function M.status()
         connection_summary(),
         status_remote_summary(result),
         agent_summary(result),
+        registry_summary(result),
         status_lsp_summary(),
         scan_summary and (" " .. scan_summary) or ""
       )

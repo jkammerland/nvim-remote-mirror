@@ -118,6 +118,26 @@ local function main()
         remote_status = "available",
         remote_checked = true,
         remote_available = true,
+        registry_health = {
+          state = "verified",
+          source = "registry",
+          manifest_url = "https://registry.example.test/<redacted>",
+          platform = {
+            os = "windows",
+            arch = "aarch64",
+            path_style = "windows",
+            target = "aarch64-pc-windows-msvc",
+          },
+          signing_key_ids = { "release-a", "release-b" },
+          artifact_sha256 = string.rep("a", 64),
+          manifest_sha256 = string.rep("b", 64),
+          artifact_source = "cache",
+          manifest_source = "verified_cache_fallback",
+          cache_state = {
+            manifest_fallback = true,
+            artifact_hit = true,
+          },
+        },
         background_scan_state = "in_progress",
         background_scan_cursor = "src/main.rs",
       })
@@ -173,6 +193,8 @@ local function main()
   assert_eq(status.connection.transport, "socket")
   assert_eq(status.connection.remote_root, "/remote/repo")
   assert_eq(status.remote_summary, "remote=available")
+  assert_eq(status.registry_summary, "registry=verified registry_target=aarch64-pc-windows-msvc")
+  assert_eq(nrm.connection_state().registry_health.state, "verified")
 
   local lines = ui._format_dashboard_lines(status)
   assert_line_contains(lines, "Connection")
@@ -183,9 +205,32 @@ local function main()
   assert_line_contains(lines, "Mirror Root")
   assert_line_contains(lines, "/mirror/workspace")
   assert_line_contains(lines, "Save Queue")
+  assert_line_contains(lines, "Registry")
+  assert_line_contains(lines, "https://registry.example.test/<redacted>")
+  assert_line_contains(lines, "windows/aarch64 paths=windows")
+  assert_line_contains(lines, "aarch64-pc-windows-msvc")
+  assert_line_contains(lines, "release-a, release-b")
+  assert_line_contains(lines, "manifest=fallback artifact=hit")
   assert_line_contains(lines, "z cwd")
   assert_line_contains(lines, "F flush")
   assert_line_contains(lines, "src/main.rs")
+
+  local registry_error_lines = ui._format_dashboard_lines({
+    connection = {
+      status = "connected",
+      remote_status = "connected",
+    },
+    remote_status = "connected",
+    registry_health = {
+      state = "error",
+      source = "registry",
+      error_code = "insufficient_signatures",
+      error = "signed registry retrieval failed (insufficient_signatures)",
+    },
+  })
+  assert_line_contains(registry_error_lines, "Remote           connected")
+  assert_line_contains(registry_error_lines, "insufficient_signatures")
+  assert_line_contains(registry_error_lines, "signed registry retrieval failed")
 
   local find_result = nil
   nrm.find_paths_async("readme", { limit = 5 }, function(err, result)

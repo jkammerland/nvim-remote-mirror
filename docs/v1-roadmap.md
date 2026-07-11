@@ -277,7 +277,8 @@ performance checks that make failures diagnosable before data is at risk.
 - Add explicit health and remote agent repair commands. Implemented:
   `:RemoteHealth`, `:RemoteInstallAgent[!]`, and `:RemoteUpdateAgent[!]`
   classify missing, incompatible, non-executable, and missing-root failures and
-  can upload the configured local agent over SSH.
+  originally uploaded the configured local agent over SSH. Signed registry mode
+  later added verified native artifact selection without changing the commands.
 - Sync configuration docs and help with Lua defaults, including prefetch,
   autohydrate, and queue replay delay options.
 - Add failure-injection coverage for sidecar restart, agent kill, SSH drop,
@@ -287,8 +288,9 @@ performance checks that make failures diagnosable before data is at risk.
 - Document required and optional quality gates, including Lua lint/format,
   dependency audit, and narrow Miri coverage for protocol parsing.
 - Package release docs for local binary build and remote agent install.
-- Decide the v1 support matrix explicitly. The default is Ubuntu CI plus manual
-  local/SSH dogfood; macOS and Windows CI remain post-v1 unless promoted.
+- Decide the v1 support matrix explicitly. This was the original Ubuntu-only CI
+  baseline; the current signed six-target release work supersedes it with
+  native Linux, macOS, and Windows jobs.
 
 **Code example:**
 

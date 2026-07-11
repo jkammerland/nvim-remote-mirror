@@ -37,6 +37,11 @@ local function main()
         agent_status = "ok",
         agent_version = "0.1.0",
         expected_agent_version = "0.1.0",
+        registry_health = {
+          state = "not_checked",
+          source = "registry",
+          manifest_url = "https://registry.example.test/<redacted>",
+        },
       })
       return
     end
@@ -51,6 +56,13 @@ local function main()
           agent_status = "ok",
           agent_version = "0.1.0",
           expected_agent_version = "0.1.0",
+          registry_health = {
+            state = "verified",
+            source = "registry",
+            platform = { target = "x86_64-unknown-linux-musl" },
+            signing_key_ids = { "release-a" },
+            artifact_sha256 = string.rep("a", 64),
+          },
         },
       })
       return
@@ -66,6 +78,7 @@ local function main()
   assert_eq(requests[#requests].method, "remote_health")
   assert_eq(health_result.agent_status, "ok")
   assert_eq(nrm.connection_state().agent_status, "ok")
+  assert_eq(nrm.connection_state().registry_health.state, "not_checked")
 
   nrm.setup({ remote_agent_install_path = "$HOME/.local/bin/nrm-agent" })
   local install_result
@@ -77,6 +90,7 @@ local function main()
   assert_eq(requests[#requests].params.force, true)
   assert_eq(requests[#requests].params.install_path, "$HOME/.local/bin/nrm-agent")
   assert_eq(install_result.status, "installed")
+  assert_eq(nrm.connection_state().registry_health.state, "verified")
 
   local update_result
   nrm.update_agent({ install_path = "/opt/nrm-agent" }, function(err, result)

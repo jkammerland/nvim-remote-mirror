@@ -16,22 +16,23 @@ require("nvim_remote_mirror").setup({
 | Option | Default | Notes |
 | --- | --- | --- |
 | `sidecar` | `target/debug/nrm-sidecar` or `nrm-sidecar` | Local sidecar binary |
-| `agent` | `target/debug/nrm-agent` or `nrm-agent` | Agent for local targets and SSH install/update source |
+| `agent` | `target/debug/nrm-agent` or `nrm-agent` | Agent for local targets and SSH install/update source when registry mode is disabled |
 | `remote_agent` | `nrm-agent` | Command executed on SSH hosts |
 | `remote_agent_install_path` | `nil` | Optional default target path for explicit SSH agent install/update |
 
-For `ssh://` targets, `remote_agent` is the remote command and `agent` remains
-the local binary used by `:RemoteInstallAgent` and `:RemoteUpdateAgent`. Connect
-does not silently install or update remote binaries. Run `:RemoteHealth` after
-connecting to classify remote failures, then run `:RemoteInstallAgent[!]` or
-`:RemoteUpdateAgent[!]` when you want the sidecar to upload the local `agent`
-binary over SSH.
+For `ssh://` targets, `remote_agent` is the remote command. Connect is
+local-first and never installs or updates it. Run `:RemoteHealth` to classify a
+failure, then run `:RemoteInstallAgent[!]` or `:RemoteUpdateAgent[!]` explicitly.
+When no registry URL is configured, those commands use the local `agent` file.
+When registry mode is configured, they use only a verified registry artifact
+and never fall back to the local file.
 
-If `remote_agent` is a bare command such as `nrm-agent`, SSH launches prepend
-`$HOME/.local/bin` to `PATH`, and the default managed install target is
-`$HOME/.local/bin/nrm-agent`. If `remote_agent` is absolute, explicit install
-defaults to that absolute path. `remote_agent_install_path` or the optional
-command argument overrides either default:
+On POSIX, a bare `remote_agent` such as `nrm-agent` installs to
+`$HOME/.local/bin/nrm-agent`, and SSH launch prepends `$HOME/.local/bin` to
+`PATH`. On Windows it installs to
+`%LOCALAPPDATA%\nrm\bin\nrm-agent.exe`. An absolute `remote_agent`,
+`remote_agent_install_path`, or the optional command argument overrides the
+platform default:
 
 ```vim
 :RemoteInstallAgent /opt/nrm/bin/nrm-agent
@@ -40,20 +41,21 @@ command argument overrides either default:
 
 Non-interactive SSH may not load the same PATH as your login shell. If
 `:RemoteHealth` reports `missing_agent`, either run `:RemoteInstallAgent` or set
-`remote_agent` to an absolute remote path such as
-`/home/me/.local/bin/nrm-agent`.
+`remote_agent` to an absolute remote path.
 
 ### Remote Install Platform Support
 
-`:RemoteInstallAgent` is an upload/install command, not a build command. It
-copies the local `agent` binary bytes over SSH and verifies the remote binary
-with `--version`.
+`:RemoteInstallAgent` is an upload/install command, not a build command. The
+sidecar detects the host, stages the candidate beside the destination, verifies
+its exact `--version` and full Hello, preserves the old executable, activates
+the candidate, and performs a second Hello through the normal launch path. A
+post-activation failure restores and reprobes the previous executable.
 
 | Remote OS | Status | Details |
 | --- | --- | --- |
-| Linux/Unix | Supported | Requires a POSIX SSH session with `sh`, `dirname`, `mkdir`, `chmod`, and `mv` |
-| macOS | Supported when binary matches | Use a Darwin `nrm-agent` for the target CPU, such as arm64 on Apple Silicon |
-| Windows OpenSSH/PowerShell | Not supported yet | SSH launch/install assumes POSIX paths and `sh -lc`; Windows path parsing and PowerShell install are future work |
+| Linux x64/ARM64 | Supported | POSIX shell; signed releases select static musl artifacts |
+| macOS x64/ARM64 | Supported | POSIX shell and matching Darwin artifacts |
+| Windows x64/ARM64 | Supported | Windows OpenSSH and PowerShell 5.1; binary-safe forced-SFTP staging |
 
 If your local editor is Linux but the remote target is macOS, build the agent on
 the Mac and copy the artifact back to a Linux-local path that the sidecar can
@@ -75,8 +77,101 @@ require("nvim_remote_mirror").setup({
 })
 ```
 
-Because `agent` is currently global, switch it back to your local-platform
-binary before using local workspaces or SSH targets with a different OS/CPU.
+Because `agent` is global in local-binary mode, switch it back before using a
+local workspace or a target with a different OS/CPU. Registry mode avoids that
+manual selection by mapping detected hosts to one of six fixed Rust targets.
+
+Windows SSH targets use forward slashes and an absolute drive root, for
+example:
+
+```vim
+:RemoteConnect ssh://windows-host/B:/repos/project
+```
+
+UNC paths, drive-relative paths, and backslash target syntax are unsupported.
+The Windows planner is shared by agent and LSP launch. Mirror writes use
+cross-platform cooperative locks and native replacement, while LSP rewriting
+recognizes drive paths and `file:///B:/...` URIs. Native executables and
+`.cmd`/`.bat` LSP shims are resolved from `PATH`. Batch arguments containing
+`"` or `%` are rejected because those characters cannot be represented safely
+through `cmd.exe`; use a native executable or a fixed wrapper for such values.
+
+## Signed Agent Registry
+
+Registry mode is disabled unless `remote_agent_registry_url` is set. Trusted
+keys are bootstrapped out of band; a registry response cannot add trust.
+
+```lua
+require("nvim_remote_mirror").setup({
+  remote_agent_registry_url =
+    "https://github.com/owner/repo/releases/download/v{version}/nrm-agent-manifest-v1.json",
+  remote_agent_registry_public_keys = {
+    ["release-2026-q3"] = "<standard-base64-encoded-32-byte-Ed25519-key>",
+  },
+  remote_agent_registry_signature_threshold = 1,
+  remote_agent_registry_cache_dir = nil,
+  remote_agent_registry_cache_max_bytes = 512 * 1024 * 1024,
+  remote_agent_registry_timeout_ms = 120000,
+})
+```
+
+| Option | Default | Notes |
+| --- | --- | --- |
+| `remote_agent_registry_url` | `nil` | Exactly one `{version}` placeholder; only `https://` or a local absolute `file://` URL |
+| `remote_agent_registry_public_keys` | `{}` | At most 32 distinct key IDs mapped to canonical standard-base64 32-byte Ed25519 keys |
+| `remote_agent_registry_signature_threshold` | `1` | Number of distinct trusted signatures required |
+| `remote_agent_registry_cache_dir` | `nil` | Defaults to `registry-cache` below sidecar state |
+| `remote_agent_registry_cache_max_bytes` | `512 MiB` | Cache budget for verified registry data |
+| `remote_agent_registry_timeout_ms` | `120000` | Whole explicit install/update deadline in registry mode |
+
+HTTPS templates must name a manifest file and cannot contain credentials,
+queries, fragments, localhost, or non-global literal hosts. Public-key IDs and
+key material must be distinct, and the threshold cannot exceed the trusted key
+count. Lua performs early encoding and known-small-order checks; the Rust
+sidecar is authoritative for Ed25519 curve-point validation and refuses to
+start with any noncanonical, invalid, or weak trusted key.
+
+The expanded URL, trust policy, cache policy, and timeout are part of socket
+daemon identity, so a differently configured Neovim refuses to reuse a stale
+daemon. Manifest and signature bytes are verified on every use. A cached raw
+manifest/signature pair is eligible as fallback only after a timeout,
+connection failure, rate limit, or 5xx response; malformed data, bad signatures
+or hashes, other 4xx responses, and policy violations never use that fallback.
+Content-addressed artifacts can be normal cache hits after a fresh manifest is
+verified. Cache fallback is best-effort: budget eviction, or a budget too small
+for both an artifact and its manifest/signature pair, can make later offline
+fallback unavailable. An absolute `file://` registry is read by the local
+sidecar, and its artifacts must remain inside the manifest directory.
+
+An explicit install/update has one sidecar deadline from request acceptance
+through host detection, retrieval, queue drain, staging, validation, activation,
+rollback, and cleanup. Registry mode uses
+`remote_agent_registry_timeout_ms`; local-binary mode uses
+`request_timeout_ms`. Each nested operation receives only the remaining budget,
+and the sidecar reserves part of it for recovery after activation. Neovim's
+bootstrap callback timer uses the same configured deadline plus a one-second
+delivery grace. A `bootstrap_timeout` failure therefore cannot start new forward
+work, although recovery may continue within its reserved part of the same
+deadline.
+Portable Rust cannot interrupt an individual filesystem syscall already inside
+the kernel. Local registry/cache work checks the deadline immediately before
+and after each syscall and between 64 KiB chunks, so a kernel-stalled call can
+delay timeout observation but no later phase is started after expiry.
+
+Timeout and registry policy are snapshotted when a client connects. Calling
+`setup()` again changes the next connection; reconnect before installing or
+updating if those settings changed.
+
+The install/update response and `registry_health` in health, workspace, hello,
+and remote-health notifications report the selected platform/target, source,
+redacted manifest URL, verified signing key IDs, artifact and manifest digests,
+cache state, and stable error code. Registry state is one of `disabled`,
+`not_checked`, `fetching`, `verified`, or `error`. It remains separate from
+working-agent health, so a failed explicit update does not make an unchanged
+agent appear unavailable.
+
+See [Signed agent registry operations](agent-registry.md) for cache policy,
+manifest format, trust limitations, and safe key rotation.
 
 ## Transport
 
@@ -87,7 +182,7 @@ binary before using local workspaces or SSH targets with a different OS/CPU.
 | `socket_dir` | `nil` | Directory for derived socket paths |
 | `state_dir` | `nil` | Durable mirror state root |
 | `daemon_start_timeout_ms` | `1000` | Wait for socket daemon startup |
-| `request_timeout_ms` | `30000` | Neovim request timeout |
+| `request_timeout_ms` | `30000` | Ordinary request timeout and whole local-binary bootstrap deadline |
 | `ssh_connect_timeout_seconds` | `10` | SSH connect timeout |
 
 Socket listener sessions are single-writer and sequential today. The sidecar
