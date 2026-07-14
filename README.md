@@ -348,3 +348,12 @@ to stderr.
 | [docs/protocol.md](docs/protocol.md) | Sidecar and agent protocol notes |
 | [docs/quality-gates.md](docs/quality-gates.md) | Required and optional checks for local and release validation |
 | [doc/nvim-remote-mirror.txt](doc/nvim-remote-mirror.txt) | Vim help |
+
+## License
+
+Copyright (C) 2026 Jonathan Kammerland.
+
+This project is free software: you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation, either version 2 of the License, or (at your option) any later
+version. See [LICENSE](LICENSE).
