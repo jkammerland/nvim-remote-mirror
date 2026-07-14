@@ -9,6 +9,8 @@ permissions:
 
 env:
   CARGO_AUDIT_VERSION: "0.22.1"
+  NEOVIM_SHA256: "95aaa8e89473f5421114f2787c13ae0ec6e11ebbd1a13a1bd6fcf63420f8073f"
+  NEOVIM_VERSION: "0.10.4"
   SELENE_VERSION: "0.31.0"
   SHELLCHECK_SHA256: "6c881ab0698e4e6ea235245f22832860544f17ba386442fe7e9d629f8cbedf87"
   SHELLCHECK_VERSION: "0.10.0"
@@ -29,7 +31,16 @@ jobs:
       - name: Install Neovim and Lua
         run: |
           sudo apt-get update
-          sudo apt-get install -y lua5.1 neovim
+          sudo apt-get install -y lua5.1
+          curl --fail --silent --show-error --location \
+            --proto '=https' --proto-redir '=https' --tlsv1.2 \
+            --retry 5 --retry-all-errors \
+            --output /tmp/nvim.tar.gz \
+            "https://github.com/neovim/neovim/releases/download/v${NEOVIM_VERSION}/nvim-linux-x86_64.tar.gz"
+          printf '%s  %s\n' "${NEOVIM_SHA256}" /tmp/nvim.tar.gz | sha256sum --check --strict
+          sudo tar -C /opt -xzf /tmp/nvim.tar.gz
+          printf '%s\n' /opt/nvim-linux-x86_64/bin >> "${GITHUB_PATH}"
+          /opt/nvim-linux-x86_64/bin/nvim --version
       - name: Install ShellCheck
         run: |
           curl --fail --silent --show-error --location \
@@ -46,7 +57,7 @@ jobs:
           cargo install stylua --version "${STYLUA_VERSION}" --locked
           cargo install selene --version "${SELENE_VERSION}" --locked
       - name: Check Neovim version
-        run: nvim --headless --clean +'lua local v = vim.version(); if v.major == 0 and v.minor < 10 then error(string.format("nvim-remote-mirror requires Neovim 0.10+, got %d.%d.%d", v.major, v.minor, v.patch or 0)) end; if vim.fn.exists("*readblob") ~= 1 then error("nvim-remote-mirror requires readblob()") end' +qa
+        run: nvim --headless --clean +'lua local v = vim.version(); if v.major == 0 and v.minor < 10 then vim.api.nvim_err_writeln(string.format("nvim-remote-mirror requires Neovim 0.10+, got %d.%d.%d", v.major, v.minor, v.patch or 0)); vim.cmd("cquit 1") end; if vim.fn.exists("*readblob") ~= 1 then vim.api.nvim_err_writeln("nvim-remote-mirror requires readblob()"); vim.cmd("cquit 1") end' +qa
       - name: Rust format
         run: cargo fmt --all --check
       - name: Rust clippy
