@@ -76,6 +76,22 @@ and URL-policy fuzz targets for 30 seconds each. It has the same nightly,
 `cargo-fuzz`, and `clang` requirements as `just fuzz-protocol`. Use longer runs
 before changing trust, redirect, containment, or cache-fallback policy.
 
+## Native release dry run
+
+Manually dispatch `.github/workflows/release-dry-run.yml` when changing agent,
+protocol, registry release-tool, target, runner, or production release logic.
+It runs native tests and `nrm-agent --version` on all six Linux, macOS, and
+Windows x64/ARM64 targets, including the sidecar's platform-specific install
+and rollback planners, attests each build, and verifies deterministic
+six-artifact manifest assembly. Missing preview ARM64 runner capacity fails the
+gate.
+
+Its seven-file Actions bundle and manifest are prominently unsigned and
+test-only. The workflow neither reads production signing material nor creates a
+GitHub Release, and its output is not a valid client registry. See
+[releasing.md](releasing.md#github-unsigned-release-dry-run) for the exact
+scope, retention, and monitoring expectations.
+
 ## Sanitizer Position
 
 Do not add blanket sanitizer runs to `just check` yet.
@@ -95,8 +111,6 @@ rename, subprocess shutdown, and queue hazard ordering.
 ## Current Follow-Ups
 
 - Keep `cargo audit -D warnings` clean as dependencies change.
-- Decide whether to pin/install a specific Neovim release in CI instead of
-  relying on the runner's apt package.
 - Add longer scheduled fuzzing if the sidecar-agent boundary becomes exposed to
   untrusted peers, if frame parsing grows more complex, or when registry policy
   changes substantially.

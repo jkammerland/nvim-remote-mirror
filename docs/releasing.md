@@ -1,5 +1,9 @@
 # Publishing signed native agents
 
+> [!WARNING]
+> The release automation is work in progress. Use the unsigned dry run to test
+> native builders and assembly; do not treat its output as a trusted registry.
+
 The signed-agent workflow publishes one immutable release containing six native
 `nrm-agent` executables, the exact manifest bytes, and detached Ed25519
 signatures. It is intentionally manual: an operator starts the workflow for an
@@ -77,10 +81,12 @@ GitHub currently labels `ubuntu-24.04-arm` and `windows-11-arm` as public
 preview, so those labels have no hosted runner availability SLA; this workflow
 intentionally fails instead of omitting either target when its runner is
 unavailable.
-Each runner executes the protocol and agent tests for its target, builds the
-release agent, and executes `nrm-agent --version`. Linux jobs additionally
-reject binaries with a dynamic program interpreter, keeping the published
-musl executables static.
+Each runner executes the protocol, agent, and sidecar tests for its native
+target, builds the release agent, and executes `nrm-agent --version`. This puts
+the POSIX and PowerShell installer/rollback planners under native x64 and ARM64
+coverage even though only `nrm-agent` is published. Linux jobs additionally
+reject binaries with a dynamic program interpreter, keeping the published musl
+executables static.
 
 Only after all six jobs pass does the protected job:
 
@@ -99,10 +105,52 @@ Only after all six jobs pass does the protected job:
 8. publish the draft, verify GitHub's immutable-release attestation, and
    re-resolve the now-locked tag to the signed source commit.
 
-If a run fails after draft creation, inspect the failure and delete only that
-unpublished draft before rerunning. The workflow refuses to replace any
-existing draft or release. A published release must never be edited, replaced,
-or recreated under the same version.
+The six production build artifacts are retained for 30 days so protected
+environment review does not normally outlive them. If a run fails after draft
+creation, the workflow deletes only the exact release ID it created, and only
+while that release is still an unpublished, mutable draft. If cleanup cannot
+prove all of those conditions, inspect the draft manually before rerunning.
+The workflow refuses to replace any existing draft or release. A published
+release must never be edited, replaced, or recreated under the same version.
+After publication it allows up to five minutes for immutable-release and
+attestation verification to converge; a timeout message explicitly warns when
+the release is already immutable and must not be rerun or replaced.
+
+## GitHub unsigned release dry run
+
+The manually dispatched **UNSIGNED six-target release dry run** workflow
+validates the native build and assembly path without accessing the protected
+`release` environment, signing keys, or release-write permissions. Run it from
+the exact branch or tag commit to test:
+
+```sh
+gh workflow run release-dry-run.yml --ref master
+```
+
+The workflow pins its source identity to the dispatched commit, then uses the
+same six native runner/target pairs listed above. Each target runs the protocol
+agent, and sidecar tests, builds and executes `nrm-agent --version`, and records
+GitHub build provenance. Linux additionally rejects a dynamic program
+interpreter.
+The aggregate job verifies all six attestations against the exact source
+commit, requires exactly the expected target set, runs the release-tool tests,
+and assembles a deterministic manifest.
+
+The only combined output is a seven-file Actions artifact named
+`UNSIGNED-TEST-ONLY-agent-release-<source-commit>`, retained for seven days. It
+contains the six native binaries and
+`UNSIGNED-nrm-agent-manifest-v1.json`. Individual per-target build artifacts are
+retained for one day. The workflow deliberately does not create a detached
+signature, GitHub Release, tag, or trusted registry endpoint. Consequently its
+bundle cannot satisfy client registry verification and must not be renamed or
+published as a production release. It is useful for runner availability,
+native execution, provenance, format/architecture checks, deterministic
+assembly, and downstream test-fixture experiments that explicitly treat the
+bytes as unsigned.
+
+Preview ARM64 runner unavailability is a dry-run failure, just as it is for the
+production workflow. Monitor every matrix job rather than interpreting the
+aggregate bundle job alone.
 
 ## Local release-tool dry run
 

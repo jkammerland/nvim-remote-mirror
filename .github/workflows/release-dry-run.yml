@@ -1,0 +1,531 @@
+name: UNSIGNED six-target release dry run
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: unsigned-release-dry-run-${{ github.ref }}-${{ github.sha }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_TOOLCHAIN: "1.95.0"
+
+jobs:
+  prepare:
+    name: Derive exact test release identity
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    outputs:
+      version: ${{ steps.identity.outputs.version }}
+      protocol_version: ${{ steps.identity.outputs.protocol_version }}
+      source_commit: ${{ steps.identity.outputs.source_commit }}
+      source_ref: ${{ steps.identity.outputs.source_ref }}
+    steps:
+      - name: Check out the dispatched commit
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Install pinned Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+
+      - name: Derive version, protocol, and source commit
+        id: identity
+        env:
+          WORKFLOW_COMMIT: ${{ github.sha }}
+          WORKFLOW_REF: ${{ github.ref }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$WORKFLOW_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "workflow commit is not an exact 40-character Git commit ID" >&2
+            exit 1
+          fi
+          source_commit="$(git rev-parse --verify 'HEAD^{commit}')"
+          if [[ "$source_commit" != "$WORKFLOW_COMMIT" ]]; then
+            echo "checkout does not match the exact workflow dispatch commit" >&2
+            exit 1
+          fi
+          if [[ ! "$WORKFLOW_REF" =~ ^refs/(heads|tags)/.+$ ]]; then
+            echo "workflow dispatch ref is not a branch or tag ref" >&2
+            exit 1
+          fi
+
+          metadata="$(cargo metadata --locked --no-deps --format-version 1)"
+          version="$({
+            jq -er '[.packages[] | select(.name == "nrm-agent") | .version] |
+              if length == 1 then .[0] else error("expected exactly one nrm-agent package") end' \
+              <<< "$metadata"
+          })"
+
+          mapfile -t protocol_versions < <(
+            sed -nE 's/^pub const PROTOCOL_VERSION: u16 = ([0-9]+);$/\1/p' \
+              crates/nrm-protocol/src/lib.rs
+          )
+          if [[ "${#protocol_versions[@]}" -ne 1 ]]; then
+            echo "could not identify exactly one nrm-protocol PROTOCOL_VERSION" >&2
+            exit 1
+          fi
+          protocol_version="${protocol_versions[0]}"
+
+          {
+            echo "version=$version"
+            echo "protocol_version=$protocol_version"
+            echo "source_commit=$source_commit"
+            echo "source_ref=$WORKFLOW_REF"
+          } >> "$GITHUB_OUTPUT"
+
+  linux:
+    name: Linux ${{ matrix.target }} (UNSIGNED dry run)
+    needs: prepare
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: write # Mint a short-lived Sigstore certificate for provenance only.
+      attestations: write # Persist provenance for this test binary; no release is created.
+      artifact-metadata: write # Record the attested binary in GitHub's artifact metadata store.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            runner_arch: x86_64
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            runner_arch: aarch64
+    env:
+      TARGET: ${{ matrix.target }}
+      EXPECTED_RUNNER_ARCH: ${{ matrix.runner_arch }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+      SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
+    steps:
+      - name: Check out the exact source commit
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+          ref: ${{ needs.prepare.outputs.source_commit }}
+
+      - name: Require native runner architecture and exact checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual="$(uname -m)"
+          if [[ "$actual" != "$EXPECTED_RUNNER_ARCH" ]]; then
+            echo "runner architecture $actual does not match $EXPECTED_RUNNER_ARCH" >&2
+            exit 1
+          fi
+          if [[ "$(git rev-parse --verify 'HEAD^{commit}')" != "$SOURCE_COMMIT" ]]; then
+            echo "checkout does not match the prepared source commit" >&2
+            exit 1
+          fi
+
+      - name: Install musl and pinned Rust target
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --target "$TARGET"
+          rustup default "$RUST_TOOLCHAIN"
+          rustc -vV
+
+      - name: Run native protocol, agent, and sidecar tests
+        shell: bash
+        run: cargo test -p nrm-protocol -p nrm-agent -p nrm-sidecar --locked --target "$TARGET"
+
+      - name: Build, execute, and reject dynamic Linux agents
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build -p nrm-agent --release --locked --target "$TARGET"
+          binary="target/$TARGET/release/nrm-agent"
+          actual_version="$("$binary" --version)"
+          if [[ "$actual_version" != "nrm-agent $VERSION" ]]; then
+            echo "unexpected agent version: $actual_version" >&2
+            exit 1
+          fi
+          if readelf -l "$binary" | grep -q 'INTERP'; then
+            echo "$TARGET artifact contains a dynamic program interpreter" >&2
+            exit 1
+          fi
+          mkdir -p dist
+          install -m 0755 "$binary" "dist/nrm-agent-$VERSION-$TARGET"
+
+      - name: Attest dry-run agent provenance
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          subject-path: dist/nrm-agent-${{ env.VERSION }}-${{ env.TARGET }}
+
+      - name: Upload dry-run native agent
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: unsigned-agent-${{ matrix.target }}
+          path: dist/nrm-agent-${{ env.VERSION }}-${{ env.TARGET }}
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+          overwrite: true
+
+  macos:
+    name: macOS ${{ matrix.target }} (UNSIGNED dry run)
+    needs: prepare
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: write # Mint a short-lived Sigstore certificate for provenance only.
+      attestations: write # Persist provenance for this test binary; no release is created.
+      artifact-metadata: write # Record the attested binary in GitHub's artifact metadata store.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            runner_arch: x86_64
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            runner_arch: arm64
+    env:
+      TARGET: ${{ matrix.target }}
+      EXPECTED_RUNNER_ARCH: ${{ matrix.runner_arch }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+      SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
+    steps:
+      - name: Check out the exact source commit
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+          ref: ${{ needs.prepare.outputs.source_commit }}
+
+      - name: Require native runner architecture and exact checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual="$(uname -m)"
+          if [[ "$actual" != "$EXPECTED_RUNNER_ARCH" ]]; then
+            echo "runner architecture $actual does not match $EXPECTED_RUNNER_ARCH" >&2
+            exit 1
+          fi
+          if [[ "$(git rev-parse --verify 'HEAD^{commit}')" != "$SOURCE_COMMIT" ]]; then
+            echo "checkout does not match the prepared source commit" >&2
+            exit 1
+          fi
+
+      - name: Install pinned Rust target
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --target "$TARGET"
+          rustup default "$RUST_TOOLCHAIN"
+          rustc -vV
+
+      - name: Run native protocol, agent, and sidecar tests
+        shell: bash
+        run: cargo test -p nrm-protocol -p nrm-agent -p nrm-sidecar --locked --target "$TARGET"
+
+      - name: Build and execute native agent
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build -p nrm-agent --release --locked --target "$TARGET"
+          binary="target/$TARGET/release/nrm-agent"
+          actual_version="$("$binary" --version)"
+          if [[ "$actual_version" != "nrm-agent $VERSION" ]]; then
+            echo "unexpected agent version: $actual_version" >&2
+            exit 1
+          fi
+          mkdir -p dist
+          install -m 0755 "$binary" "dist/nrm-agent-$VERSION-$TARGET"
+
+      - name: Attest dry-run agent provenance
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          subject-path: dist/nrm-agent-${{ env.VERSION }}-${{ env.TARGET }}
+
+      - name: Upload dry-run native agent
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: unsigned-agent-${{ matrix.target }}
+          path: dist/nrm-agent-${{ env.VERSION }}-${{ env.TARGET }}
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+          overwrite: true
+
+  windows:
+    name: Windows ${{ matrix.target }} (UNSIGNED dry run)
+    needs: prepare
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: write # Mint a short-lived Sigstore certificate for provenance only.
+      attestations: write # Persist provenance for this test binary; no release is created.
+      artifact-metadata: write # Record the attested binary in GitHub's artifact metadata store.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2025
+            target: x86_64-pc-windows-msvc
+            runner_arch: X64
+          - runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            runner_arch: Arm64
+    env:
+      TARGET: ${{ matrix.target }}
+      EXPECTED_RUNNER_ARCH: ${{ matrix.runner_arch }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+      SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
+    steps:
+      - name: Check out the exact source commit
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+          ref: ${{ needs.prepare.outputs.source_commit }}
+
+      - name: Require native runner architecture and exact checkout
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+          $actual = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+          if ($actual -cne $env:EXPECTED_RUNNER_ARCH) {
+            throw "runner architecture $actual does not match $env:EXPECTED_RUNNER_ARCH"
+          }
+          $actualCommit = ((git rev-parse --verify 'HEAD^{commit}') -join "`n").Trim()
+          if ($actualCommit -cne $env:SOURCE_COMMIT) {
+            throw "checkout does not match the prepared source commit"
+          }
+
+      - name: Install pinned Rust target
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+          rustup toolchain install $env:RUST_TOOLCHAIN --profile minimal --target $env:TARGET
+          rustup default $env:RUST_TOOLCHAIN
+          rustc -vV
+
+      - name: Run native protocol, agent, and sidecar tests
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+          cargo test -p nrm-protocol -p nrm-agent -p nrm-sidecar --locked --target $env:TARGET
+
+      - name: Build and execute native agent
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+          cargo build -p nrm-agent --release --locked --target $env:TARGET
+          $binary = "target/$env:TARGET/release/nrm-agent.exe"
+          $actualVersion = ((& $binary --version) -join "`n").Trim()
+          if ($actualVersion -cne "nrm-agent $env:VERSION") {
+            throw "unexpected agent version: $actualVersion"
+          }
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item -LiteralPath $binary -Destination "dist/nrm-agent-$env:VERSION-$env:TARGET.exe"
+
+      - name: Attest dry-run agent provenance
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          subject-path: dist/nrm-agent-${{ env.VERSION }}-${{ env.TARGET }}.exe
+
+      - name: Upload dry-run native agent
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: unsigned-agent-${{ matrix.target }}
+          path: dist/nrm-agent-${{ env.VERSION }}-${{ env.TARGET }}.exe
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+          overwrite: true
+
+  bundle:
+    name: Assemble UNSIGNED test-only bundle
+    needs: [prepare, linux, macos, windows]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      attestations: read # Verify native build provenance without publishing anything.
+    env:
+      VERSION: ${{ needs.prepare.outputs.version }}
+      PROTOCOL_VERSION: ${{ needs.prepare.outputs.protocol_version }}
+      SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
+      SOURCE_REF: ${{ needs.prepare.outputs.source_ref }}
+    steps:
+      - name: Check out the exact source commit
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          persist-credentials: false
+          ref: ${{ needs.prepare.outputs.source_commit }}
+
+      - name: Require exact checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$(git rev-parse --verify 'HEAD^{commit}')" != "$SOURCE_COMMIT" ]]; then
+            echo "checkout does not match the prepared source commit" >&2
+            exit 1
+          fi
+
+      - name: Install pinned Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+
+      - name: Require compatible GitHub CLI attestation policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          minimum=2.94.0
+          version="$(gh --version | sed -nE '1s/^gh version ([0-9]+\.[0-9]+\.[0-9]+).*/\1/p')"
+          if [[ -z "$version" || "$(printf '%s\n%s\n' "$minimum" "$version" | sort -V | head -n 1)" != "$minimum" ]]; then
+            echo "GitHub CLI $minimum or newer is required, found ${version:-unknown}" >&2
+            exit 1
+          fi
+          help="$(gh attestation verify --help)"
+          for flag in --deny-self-hosted-runners --signer-digest --source-digest --source-ref; do
+            grep -F -- "$flag" <<< "$help" >/dev/null || {
+              echo "GitHub CLI attestation verification is missing $flag" >&2
+              exit 1
+            }
+          done
+
+      - name: Test and build release assembler
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p nrm-registry --bin nrm-registry-release --locked
+          cargo build -p nrm-registry --bin nrm-registry-release --release --locked
+
+      - name: Download all dry-run native agents
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: unsigned-agent-*
+          path: release-input
+          merge-multiple: true
+
+      - name: Require exactly six regular artifacts and verify provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            printf '%s\n' \
+              "nrm-agent-$VERSION-aarch64-apple-darwin" \
+              "nrm-agent-$VERSION-aarch64-pc-windows-msvc.exe" \
+              "nrm-agent-$VERSION-aarch64-unknown-linux-musl" \
+              "nrm-agent-$VERSION-x86_64-apple-darwin" \
+              "nrm-agent-$VERSION-x86_64-pc-windows-msvc.exe" \
+              "nrm-agent-$VERSION-x86_64-unknown-linux-musl"
+          } | LC_ALL=C sort > expected-artifacts.txt
+          find release-input -mindepth 1 -maxdepth 1 -printf '%f\n' \
+            | LC_ALL=C sort > actual-artifacts.txt
+          diff -u expected-artifacts.txt actual-artifacts.txt
+
+          while IFS= read -r artifact; do
+            path="release-input/$artifact"
+            if [[ ! -f "$path" || -L "$path" ]]; then
+              echo "artifact is not a regular non-symlink file: $artifact" >&2
+              exit 1
+            fi
+            gh attestation verify "$path" \
+              --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release-dry-run.yml" \
+              --signer-digest "$SOURCE_COMMIT" \
+              --source-digest "$SOURCE_COMMIT" \
+              --source-ref "$SOURCE_REF" \
+              --deny-self-hosted-runners
+          done < expected-artifacts.txt
+
+      - name: Assemble and verify the UNSIGNED bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          tool=target/release/nrm-registry-release
+          manifest=UNSIGNED-nrm-agent-manifest-v1.json
+          bundle=unsigned-test-only-release
+          mkdir -p "$bundle"
+
+          "$tool" assemble \
+            --artifacts-dir release-input \
+            --version "$VERSION" \
+            --protocol-version "$PROTOCOL_VERSION" \
+            --source-commit "$SOURCE_COMMIT" \
+            --output "$manifest"
+
+          jq -e \
+            --arg version "$VERSION" \
+            --argjson protocol_version "$PROTOCOL_VERSION" \
+            --arg source_commit "$SOURCE_COMMIT" \
+            '.schema_version == 1 and
+             .package == "nrm-agent" and
+             .version == $version and
+             .protocol_version == $protocol_version and
+             .source_commit == $source_commit and
+             [.artifacts[].target] == [
+               "aarch64-apple-darwin",
+               "aarch64-pc-windows-msvc",
+               "aarch64-unknown-linux-musl",
+               "x86_64-apple-darwin",
+               "x86_64-pc-windows-msvc",
+               "x86_64-unknown-linux-musl"
+             ]' "$manifest" >/dev/null
+
+          while IFS= read -r artifact; do
+            cp -- "release-input/$artifact" "$bundle/$artifact"
+          done < expected-artifacts.txt
+          cp -- "$manifest" "$bundle/$manifest"
+
+          {
+            cat expected-artifacts.txt
+            echo "$manifest"
+          } | LC_ALL=C sort > expected-bundle.txt
+          find "$bundle" -mindepth 1 -maxdepth 1 -printf '%f\n' \
+            | LC_ALL=C sort > actual-bundle.txt
+          diff -u expected-bundle.txt actual-bundle.txt
+          while IFS= read -r entry; do
+            if [[ ! -f "$bundle/$entry" || -L "$bundle/$entry" ]]; then
+              echo "bundle entry is not a regular non-symlink file: $entry" >&2
+              exit 1
+            fi
+          done < expected-bundle.txt
+
+          jq -r --arg bundle "$bundle" \
+            '.artifacts[] | "\(.sha256)  \($bundle)/\(.filename)"' "$manifest" \
+            | sha256sum --check --strict
+          sha256sum "$manifest"
+
+      - name: Upload UNSIGNED test-only release bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: UNSIGNED-TEST-ONLY-agent-release-${{ needs.prepare.outputs.source_commit }}
+          path: unsigned-test-only-release
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+          overwrite: true

@@ -118,6 +118,7 @@ jobs:
       contents: read
       id-token: write # Mint the Sigstore certificate for build provenance.
       attestations: write # Persist the native binary attestation.
+      artifact-metadata: write # Record the attested binary in GitHub's artifact metadata store.
     strategy:
       fail-fast: false
       matrix:
@@ -165,7 +166,7 @@ jobs:
           rustc -vV
 
       - name: Run native target tests
-        run: cargo test -p nrm-protocol -p nrm-agent --locked --target "$TARGET"
+        run: cargo test -p nrm-protocol -p nrm-agent -p nrm-sidecar --locked --target "$TARGET"
 
       - name: Build, execute, and validate static agent
         shell: bash
@@ -196,7 +197,7 @@ jobs:
           name: agent-${{ matrix.target }}
           path: dist/nrm-agent-${{ env.VERSION }}-${{ env.TARGET }}
           if-no-files-found: error
-          retention-days: 1
+          retention-days: 30
           compression-level: 0
           overwrite: true
 
@@ -209,6 +210,7 @@ jobs:
       contents: read
       id-token: write # Mint the Sigstore certificate for build provenance.
       attestations: write # Persist the native binary attestation.
+      artifact-metadata: write # Record the attested binary in GitHub's artifact metadata store.
     strategy:
       fail-fast: false
       matrix:
@@ -254,7 +256,7 @@ jobs:
           rustc -vV
 
       - name: Run native target tests
-        run: cargo test -p nrm-protocol -p nrm-agent --locked --target "$TARGET"
+        run: cargo test -p nrm-protocol -p nrm-agent -p nrm-sidecar --locked --target "$TARGET"
 
       - name: Build and execute native agent
         shell: bash
@@ -281,7 +283,7 @@ jobs:
           name: agent-${{ matrix.target }}
           path: dist/nrm-agent-${{ env.VERSION }}-${{ env.TARGET }}
           if-no-files-found: error
-          retention-days: 1
+          retention-days: 30
           compression-level: 0
           overwrite: true
 
@@ -294,6 +296,7 @@ jobs:
       contents: read
       id-token: write # Mint the Sigstore certificate for build provenance.
       attestations: write # Persist the native binary attestation.
+      artifact-metadata: write # Record the attested binary in GitHub's artifact metadata store.
     strategy:
       fail-fast: false
       matrix:
@@ -319,7 +322,9 @@ jobs:
       - name: Require native runner architecture
         shell: pwsh
         run: |
+          Set-StrictMode -Version Latest
           $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
           $actual = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
           if ($actual -cne $env:EXPECTED_RUNNER_ARCH) {
             throw "runner architecture $actual does not match $env:EXPECTED_RUNNER_ARCH"
@@ -332,19 +337,27 @@ jobs:
       - name: Install pinned Rust target
         shell: pwsh
         run: |
+          Set-StrictMode -Version Latest
           $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
           rustup toolchain install $env:RUST_TOOLCHAIN --profile minimal --target $env:TARGET
           rustup default $env:RUST_TOOLCHAIN
           rustc -vV
 
       - name: Run native target tests
         shell: pwsh
-        run: cargo test -p nrm-protocol -p nrm-agent --locked --target $env:TARGET
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+          cargo test -p nrm-protocol -p nrm-agent -p nrm-sidecar --locked --target $env:TARGET
 
       - name: Build and execute native agent
         shell: pwsh
         run: |
+          Set-StrictMode -Version Latest
           $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
           cargo build -p nrm-agent --release --locked --target $env:TARGET
           $binary = "target/$env:TARGET/release/nrm-agent.exe"
           $actualVersion = ((& $binary --version) -join "`n").Trim()
@@ -365,7 +378,7 @@ jobs:
           name: agent-${{ matrix.target }}
           path: dist/nrm-agent-${{ env.VERSION }}-${{ env.TARGET }}.exe
           if-no-files-found: error
-          retention-days: 1
+          retention-days: 30
           compression-level: 0
           overwrite: true
 
@@ -379,6 +392,7 @@ jobs:
       contents: write # Create, populate, and publish the GitHub Release.
       id-token: write # Mint the Sigstore certificate for release metadata.
       attestations: write # Persist manifest and signature attestations.
+      artifact-metadata: write # Record the attested manifest and signature metadata.
     env:
       RELEASE_TAG: ${{ inputs.tag }}
       VERSION: ${{ needs.prepare.outputs.version }}
@@ -392,6 +406,32 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
           ref: ${{ needs.prepare.outputs.source_commit }}
+
+      - name: Require compatible GitHub CLI release policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          minimum=2.94.0
+          version="$(gh --version | sed -nE '1s/^gh version ([0-9]+\.[0-9]+\.[0-9]+).*/\1/p')"
+          if [[ -z "$version" || "$(printf '%s\n%s\n' "$minimum" "$version" | sort -V | head -n 1)" != "$minimum" ]]; then
+            echo "GitHub CLI $minimum or newer is required, found ${version:-unknown}" >&2
+            exit 1
+          fi
+          gh release verify --help >/dev/null
+          release_view_help="$(gh release view --help)"
+          for field in databaseId isImmutable; do
+            grep -F -- "$field" <<< "$release_view_help" >/dev/null || {
+              echo "GitHub CLI release metadata is missing $field" >&2
+              exit 1
+            }
+          done
+          help="$(gh attestation verify --help)"
+          for flag in --deny-self-hosted-runners --signer-digest --source-digest --source-ref; do
+            grep -F -- "$flag" <<< "$help" >/dev/null || {
+              echo "GitHub CLI attestation verification is missing $flag" >&2
+              exit 1
+            }
+          done
 
       - name: Require repository release immutability
         env:
@@ -503,6 +543,7 @@ jobs:
             release-assets/nrm-agent-manifest-v1.json.sig
 
       - name: Create and populate draft release
+        id: draft
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
@@ -562,6 +603,13 @@ jobs:
             release_flags+=(--prerelease --latest=false)
           fi
           gh release create "$RELEASE_TAG" "${release_flags[@]}"
+          echo "created=true" >> "$GITHUB_OUTPUT"
+          draft_id="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" --jq '.id')"
+          if [[ ! "$draft_id" =~ ^[0-9]+$ ]]; then
+            echo "created draft returned an invalid release ID" >&2
+            exit 1
+          fi
+          echo "id=$draft_id" >> "$GITHUB_OUTPUT"
           mapfile -t assets < <(find release-assets -maxdepth 1 -type f -print | LC_ALL=C sort)
           if [[ "${#assets[@]}" -ne 8 ]]; then
             echo "expected exactly eight release assets, found ${#assets[@]}" >&2
@@ -674,7 +722,7 @@ jobs:
           gh release edit "$RELEASE_TAG" "${publish_flags[@]}"
 
           verified=false
-          for attempt in {1..10}; do
+          for attempt in {1..60}; do
             if release_json="$(gh release view "$RELEASE_TAG" \
               --json tagName,isDraft,isImmutable)" \
               && jq -e \
@@ -685,12 +733,19 @@ jobs:
               verified=true
               break
             fi
-            if [[ "$attempt" -lt 10 ]]; then
-              sleep 3
+            if [[ "$attempt" -lt 60 ]]; then
+              sleep 5
             fi
           done
           if [[ "$verified" != true ]]; then
-            echo "published release did not become immutable with a valid release attestation" >&2
+            release_json="$(gh release view "$RELEASE_TAG" --json tagName,isDraft,isImmutable)"
+            if jq -e --arg tag "$RELEASE_TAG" \
+              '.tagName == $tag and .isDraft == false and .isImmutable == true' \
+              <<< "$release_json" >/dev/null; then
+              echo "release is published and immutable, but attestation verification did not converge after five minutes; do not rerun or replace it" >&2
+            else
+              echo "published release did not become immutable with a valid release attestation" >&2
+            fi
             exit 1
           fi
 
@@ -699,3 +754,19 @@ jobs:
             echo "immutable release tag does not match the signed source commit" >&2
             exit 1
           fi
+
+      - name: Remove this run's failed draft
+        if: ${{ failure() && steps.draft.outputs.created == 'true' && steps.draft.outputs.id != '' }}
+        env:
+          EXPECTED_RELEASE_ID: ${{ steps.draft.outputs.id }}
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_json="$(gh release view "$RELEASE_TAG" \
+            --json databaseId,tagName,isDraft,isImmutable)"
+          jq -e --arg tag "$RELEASE_TAG" --argjson id "$EXPECTED_RELEASE_ID" \
+            '.databaseId == $id and .tagName == $tag and .isDraft == true and .isImmutable == false' \
+            <<< "$release_json" >/dev/null
+          gh api --method DELETE \
+            "repos/$GITHUB_REPOSITORY/releases/$EXPECTED_RELEASE_ID"
