@@ -1,5 +1,10 @@
 # nvim-remote-mirror
 
+> [!WARNING]
+> **Work in progress.** This project is being dogfooded, and its configuration,
+> protocol, signed-agent registry, and release process may change before the
+> first stable release.
+
 `nvim-remote-mirror` is a local-first remote workspace prototype for Neovim.
 It keeps navigation and editing on a local mirror while a small remote agent
 reads, searches, checksums, and writes files near the source tree.
