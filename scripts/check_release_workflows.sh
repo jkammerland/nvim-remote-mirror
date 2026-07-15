@@ -39,6 +39,47 @@ line_of_single_block_exact_literal() {
   grep -nFx -- "$literal" <<< "$block" | cut -d: -f1
 }
 
+extract_single_workflow_step() {
+  local workflow=$1
+  local name=$2
+  local header="      - name: $name"
+  local count
+  count=$(grep -Fxc -- "$header" "$workflow" || true)
+  [[ "$count" -eq 1 ]] \
+    || fail "$workflow must contain exactly one $name step, found $count"
+  awk -v header="$header" '
+    $0 == header {
+      active = 1
+    }
+    active && $0 != header && /^      - name:/ {
+      exit
+    }
+    active {
+      print
+    }
+  ' "$workflow"
+}
+
+expected_musl_step="$(cat <<'EOF'
+      - name: Install musl and pinned Rust target
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo sed -i \
+            's|http://ports.ubuntu.com/ubuntu-ports|https://ports.ubuntu.com/ubuntu-ports|g' \
+            /etc/apt/sources.list.d/ubuntu.sources
+          if grep -F 'http://ports.ubuntu.com/ubuntu-ports' /etc/apt/sources.list.d/ubuntu.sources; then
+            echo "Ubuntu ports source was not upgraded to HTTPS" >&2
+            exit 1
+          fi
+          sudo apt-get -o Acquire::Retries=5 -o Acquire::ForceIPv4=true update
+          sudo apt-get -o Acquire::Retries=5 -o Acquire::ForceIPv4=true install -y musl-tools
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --target "$TARGET"
+          rustup default "$RUST_TOOLCHAIN"
+          rustc -vV
+EOF
+)"
+
 for workflow in "$production" "$dry_run"; do
   [[ -f "$workflow" ]] || fail "missing $workflow"
   if grep -En '^[[:space:]]+uses: [^#[:space:]]+@' "$workflow" \
@@ -50,6 +91,11 @@ for workflow in "$production" "$dry_run"; do
   grep -F 'GH_CLI_LINUX_AMD64_SHA256: 83d5c2ccad5498f58bf6368acb1ab32588cf43ab3a4b1c301bf36328b1c8bd60' \
     "$workflow" >/dev/null \
     || fail "$workflow does not pin the reviewed GitHub CLI archive digest"
+
+  actual_musl_step=$(extract_single_workflow_step \
+    "$workflow" 'Install musl and pinned Rust target')
+  [[ "$actual_musl_step" == "$expected_musl_step" ]] \
+    || fail "$workflow native musl setup must match the reviewed fail-closed step exactly"
 done
 
 sign_block="$(sed -n '/^  sign:/,/^  publish:/p' "$production" | sed '$d')"
