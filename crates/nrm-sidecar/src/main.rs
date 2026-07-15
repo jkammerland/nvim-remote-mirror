@@ -15870,6 +15870,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn automatic_post_lease_probe_timeout_releases_lease_without_staging() {
+        const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(3);
+
         let dir = tempdir().unwrap();
         let remote_dir = dir.path().join("remote-bin");
         fs::create_dir_all(&remote_dir).unwrap();
@@ -15878,7 +15880,10 @@ mod tests {
         let prepared = test_prepared_posix_install(dir.path(), &target, ssh.clone());
         let mirror = Mirror::open(Some(dir.path().join("state")), "post-lease-timeout").unwrap();
         let mut sidecar = test_sidecar(mirror);
-        configure_test_registry(&mut sidecar, Duration::from_secs(1));
+        // Native process startup is part of the cumulative bootstrap budget.
+        // Leave enough time for a busy hosted macOS runner to reach the
+        // deliberately stalled post-lease probe that this test exercises.
+        configure_test_registry(&mut sidecar, BOOTSTRAP_TIMEOUT);
         let recovery_ssh = ssh.clone();
         sidecar.agent.launch.transport = RemoteTransport::Ssh(ssh);
         let (worker_tx, worker_rx) = mpsc::channel::<AgentWorkerCommand>();
@@ -15911,7 +15916,7 @@ mod tests {
             prepared,
             true,
             0,
-            BootstrapDeadline::new(Duration::from_secs(1)),
+            BootstrapDeadline::new(BOOTSTRAP_TIMEOUT),
         );
         let request_elapsed = request_started.elapsed();
         sidecar.agent.kill_worker();
@@ -15922,7 +15927,7 @@ mod tests {
         assert!(request_seen.load(Ordering::SeqCst));
         assert!(is_bootstrap_timeout(&error), "{error:#}");
         assert!(
-            request_elapsed < Duration::from_millis(1_250),
+            request_elapsed < BOOTSTRAP_TIMEOUT + Duration::from_millis(250),
             "bootstrap teardown exceeded its request deadline: {request_elapsed:?}"
         );
         assert_eq!(fs::read_to_string(&invocation_log).unwrap(), "L");
