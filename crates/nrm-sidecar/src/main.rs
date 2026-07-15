@@ -15823,6 +15823,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn automatic_post_lease_compatible_peer_skips_and_releases_without_staging() {
+        // This test verifies the compatible-peer branch, not process-startup
+        // performance. The fake SSH lease executes the full POSIX validation
+        // script, which can take several seconds on a loaded Intel macOS host.
+        const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(30);
+
         let dir = tempdir().unwrap();
         let remote_dir = dir.path().join("remote-bin");
         fs::create_dir_all(&remote_dir).unwrap();
@@ -15839,7 +15844,7 @@ mod tests {
                 capabilities: nrm_protocol::CapabilitySet::v1_agent(),
             }),
         );
-        configure_test_registry(&mut sidecar, Duration::from_secs(3));
+        configure_test_registry(&mut sidecar, BOOTSTRAP_TIMEOUT);
         sidecar.agent.launch.transport = RemoteTransport::Ssh(ssh);
         let preflight = AgentInstallPreflight {
             before: json!({"agent_status": "missing_agent"}),
@@ -15855,7 +15860,7 @@ mod tests {
                 prepared,
                 true,
                 0,
-                BootstrapDeadline::new(Duration::from_secs(3)),
+                BootstrapDeadline::new(BOOTSTRAP_TIMEOUT),
             )
             .unwrap();
 

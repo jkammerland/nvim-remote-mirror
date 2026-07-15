@@ -865,7 +865,7 @@ dependencies = [
 
 [[package]]
 name = "nrm-agent"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "blake3",
@@ -883,7 +883,7 @@ dependencies = [
 
 [[package]]
 name = "nrm-protocol"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "criterion",
@@ -894,7 +894,7 @@ dependencies = [
 
 [[package]]
 name = "nrm-registry"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "base64",
  "clap",
@@ -912,7 +912,7 @@ dependencies = [
 
 [[package]]
 name = "nrm-sidecar"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "base64",
