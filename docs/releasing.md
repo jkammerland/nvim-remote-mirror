@@ -53,11 +53,12 @@ attestations](https://docs.github.com/en/actions/how-tos/secure-your-work/use-ar
 
 1. Set the workspace version to the intended SemVer value and complete the
    normal release review and quality gates.
-2. Create and push an exact version tag such as `v0.1.2`. Moving or reusing a
-   tag associated with a published immutable release is unsupported.
+2. Create and push an exact version tag such as `v0.1.3`. Once pushed, never
+   move or reuse a version tag; if its source needs changes, increment the
+   version.
 3. Dispatch **Signed agent release** from that exact tag and enter the same tag
    as its input. For example, use
-   `gh workflow run release.yml --ref v0.1.2 -f tag=v0.1.2`. The workflow
+   `gh workflow run release.yml --ref v0.1.3 -f tag=v0.1.3`. The workflow
    requires its invocation commit and the peeled tag commit to match so GitHub
    provenance identifies the bytes' actual source. Approve the protected
    `release` environment only after reviewing the tag and workflow changes.
@@ -193,7 +194,7 @@ that directory because the tool rejects unexpected artifact-directory entries.
 cargo build -p nrm-registry --bin nrm-registry-release --release --locked
 
 tool=target/release/nrm-registry-release
-version=0.1.2
+version=0.1.3
 protocol_version=7
 source_commit="$(git rev-parse HEAD)"
 
