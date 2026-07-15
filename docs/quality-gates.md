@@ -92,6 +92,13 @@ GitHub Release, and its output is not a valid client registry. See
 [releasing.md](releasing.md#github-unsigned-release-dry-run) for the exact
 scope, retention, and monitoring expectations.
 
+`just check` also runs `scripts/check_release_workflows.sh`. This static policy
+gate rejects mutable action references, drift in the checksum-pinned GitHub CLI,
+one-day dry-run artifacts, signing-secret references outside the isolated
+signer, or any checkout/Cargo/repository-script execution in that secret-bearing
+job. Run actionlint with ShellCheck integration as an additional workflow syntax
+gate before publishing release-workflow changes.
+
 ## Sanitizer Position
 
 Do not add blanket sanitizer runs to `just check` yet.

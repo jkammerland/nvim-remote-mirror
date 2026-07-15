@@ -24,7 +24,7 @@ but it is not a polished replacement for SSHFS or VS Code Remote yet.
 | Local mirror open/find/grep | Working |
 | Save queue and conflicts | Working |
 | Socket sidecar mode | Working, one active Neovim client |
-| Remote agent health/install/update | Explicit commands |
+| Remote agent health/install/update | Signed automatic repair on SSH connect when opted into a registry; explicit commands retained |
 | Remote LSP proxy | Basic |
 | Remote git status/diff/blame | Basic |
 | Terminals, DAP, plugin remoting | Not built |
@@ -37,7 +37,7 @@ but it is not a polished replacement for SSHFS or VS Code Remote yet.
 | Neovim 0.10+ | local | Neovim 0.11+ is preferred |
 | Rust toolchain | local | Builds `nrm-sidecar` and `nrm-agent` |
 | SSH | local and remote | Used for `ssh://host/path` targets |
-| `nrm-agent` | remote | Must be executable on the remote host; explicit install can use a configured local binary or signed registry |
+| `nrm-agent` | remote | Must be executable on the remote host, or installable from a configured trusted signed registry |
 
 ## Install
 
@@ -62,19 +62,58 @@ Or connect and run an explicit repair command from Neovim:
 :RemoteInstallAgent
 ```
 
-The plugin does not silently install or update the remote agent during connect.
-`:RemoteInstallAgent[!]` and `:RemoteUpdateAgent[!]` are always explicit. With
-no registry configured they upload the configured local `agent` binary. With a
-signed registry configured they detect the remote platform, download and verify
-the matching build locally, and fail closed instead of falling back to an
-unsigned local binary.
+No registry URL is configured by default, so connecting does not install or
+replace anything in the default configuration. When an SSH target, a trusted
+signed registry, and the default `remote_agent_auto_install = true` are all in
+effect, connect probes the remote agent and automatically installs or repairs
+it from the matching verified release. Set `remote_agent_auto_install = false`
+to keep registry-backed repair explicit.
+
+Automatic repair is deliberately narrow. It installs a missing agent and
+replaces a non-executable, package-version-mismatched, or
+protocol-version-mismatched agent. It skips an already compatible agent without
+fetching an artifact, and it does not mutate the host for other health states,
+including a missing remote root or an unavailable/unclassified remote. A
+verification, download, or installation failure leaves the editor connected in
+a degraded local-first state and is shown separately from connection health.
+
+`:RemoteInstallAgent[!]` and `:RemoteUpdateAgent[!]` remain available. With no
+registry configured these explicit commands upload the configured local
+`agent` binary. With a signed registry configured they use only the matching
+verified build and fail closed instead of falling back to an unsigned local
+binary.
 
 Installation is transactional: the sidecar stages a unique same-directory
 candidate, checks its exact version and full Hello compatibility, preserves the
 previous executable, activates the candidate, and checks Hello again through
 the normal launch path. A failed post-activation check restores and reprobes the
 previous executable. `process_in_use` and `rollback_failed` remain distinct
-errors.
+errors. A per-target remote lease serializes concurrent sidecars; a second
+automatic connection either observes the first connection's compatible result
+or reports `install_in_progress` without starting another mutation.
+On POSIX hosts, adjacent per-process claim files protect the short lease-owner
+and operation-owner publication windows. An ownerless directory is reaped only
+after every well-formed claim identity is proven dead. Malformed claim names or
+file types fail closed; a dead partial claim is reaped from its strict
+token/PID filename without trusting its contents.
+
+The installer also publishes a stable same-directory transaction journal
+before upload. The next lease holder recovers an interrupted transaction before
+probing or starting a new one: it discards only the exact partial candidate from
+an interrupted upload, or restores the prior executable/finishes committed
+cleanup only when the recorded paths, file types, and journal-recorded digests
+still match. The verified digest for a newer release authorizes only its
+subsequent transaction, so an older valid crash journal remains recoverable.
+Malformed, ambiguous, or file-digest-mismatched state is preserved and fails
+closed for inspection.
+
+On POSIX hosts, missing install-directory components are created one at a time
+with mode `0700`. The final directory must be owned by the remote login UID and
+must not be group/world writable; ancestors must be owned by that UID or root,
+with sticky shared physical ancestors allowed. The final directory cannot be a
+symlink; an ancestor symlink is accepted only when it is root/login-owned and
+its resolved physical chain passes the same checks. Non-private (`0600`)
+recovery journals are rejected.
 
 | Remote OS | Install support | Notes |
 | --- | --- | --- |
@@ -88,11 +127,12 @@ macOS or Windows must point `agent` at a binary built for that remote OS and
 architecture. Registry mode selects one of the six supported native targets
 automatically.
 
-For a bare `remote_agent = "nrm-agent"`, POSIX installs default to
-`$HOME/.local/bin/nrm-agent` and SSH launch prepends that directory to `PATH`.
-Windows installs default to `%LOCALAPPDATA%\nrm\bin\nrm-agent.exe`. Use canonical
-Windows targets such as `ssh://host/B:/repos/project`; UNC paths, drive-relative
-paths, and backslashes in the target URL are unsupported.
+For a safe bare `remote_agent`, POSIX installs under `$HOME/.local/bin` with
+the same command name and SSH launch prepends that directory to `PATH`.
+Windows installs under `%LOCALAPPDATA%\nrm\bin` with an `.exe` suffix. Relative
+agent paths containing a slash are rejected; use a bare name or an absolute
+path. Use canonical Windows targets such as `ssh://host/B:/repos/project`; UNC
+paths, drive-relative paths, and backslashes in the target URL are unsupported.
 Native Windows transport also covers agent/LSP launch, cross-platform mirror
 locking and replacement, and LSP rewriting for drive paths and `file:///B:/...`
 URIs. LSP launch resolves native executables and `.cmd`/`.bat` shims from
@@ -104,6 +144,8 @@ out-of-band trusted key:
 
 ```lua
 require("nvim_remote_mirror").setup({
+  -- Automatic repair is active only for SSH when this trusted registry is set.
+  remote_agent_auto_install = true,
   remote_agent_registry_url =
     "https://github.com/owner/repo/releases/download/v{version}/nrm-agent-manifest-v1.json",
   remote_agent_registry_public_keys = {
@@ -151,6 +193,15 @@ on `runtimepath`:
 ```sh
 nvim --cmd "set rtp+=/path/to/nvim-remote-mirror"
 ```
+
+Socket mode requires the directory immediately containing the Unix socket to
+be owned by the current user with mode `0700`; existing sockets must be owned
+by the current user with permissions no broader than `0600`. The plugin creates
+an absent leaf directory securely, but rejects symlinked, shared, or
+foreign-owned leaves. Its lexical and resolved ancestors must be owned by the
+current user or root and cannot be group/world-writable unless the ancestor is
+sticky and protects the next entry. A private leaf below sticky `/tmp` is
+supported; placing the socket directly in `/tmp` is not.
 
 ## Quick Start
 
@@ -251,7 +302,8 @@ Dashboard keys:
 | `state_dir` | `nil` | Durable mirror state root; default is Neovim state data |
 | `agent` | local checkout/debug path or `"nrm-agent"` | Local agent and SSH upload source when registry mode is disabled |
 | `remote_agent` | `"nrm-agent"` | Remote command run over SSH |
-| `remote_agent_install_path` | `nil` | Optional default remote path for `:RemoteInstallAgent` and `:RemoteUpdateAgent` |
+| `remote_agent_install_path` | `nil` | Optional remote path for automatic bootstrap and explicit install/update commands |
+| `remote_agent_auto_install` | `true` | On SSH connect, repair known agent failures from a configured trusted signed registry; inert when the registry URL is `nil` |
 | `remote_agent_registry_url` | `nil` | Opt-in `https://` or absolute `file://` manifest URL with one `{version}` placeholder |
 | `remote_agent_registry_public_keys` | `{}` | Trusted key-ID to standard-base64 Ed25519 public-key map |
 | `remote_agent_registry_signature_threshold` | `1` | Required distinct trusted signatures |
@@ -301,8 +353,8 @@ Mirror files live under the sidecar state directory, typically below
 | --- | --- |
 | `not connected` | Run `:RemoteWorkspace` or `:RemoteConnect ...` |
 | SSH target fails | Confirm `ssh myhost` works without prompts |
-| Remote agent missing | Run `:RemoteHealth`, then `:RemoteInstallAgent`; inspect remote resolution with POSIX `command -v` or PowerShell `Get-Command` |
-| Registry install fails | Check `:RemoteWorkspace` Registry state/error code; unsigned fallback remains forbidden |
+| Remote agent missing | With a signed registry configured, check the automatic-bootstrap state in `:RemoteWorkspace`; otherwise run `:RemoteHealth`, then `:RemoteInstallAgent` |
+| Automatic registry install fails | The local mirror remains connected but remote work is degraded; check `:RemoteWorkspace` Bootstrap/Registry state and the stable error code; unsigned fallback remains forbidden |
 | Windows target is rejected | Use `ssh://host/B:/absolute/path`, not UNC, drive-relative, or backslash syntax |
 | Opens are stale | Use `:RemoteValidate` or `:RemoteOpen! path` |
 | Saves are queued | Open `:RemoteQueue`, then retry with `:RemoteFlushQueue` |
@@ -334,6 +386,18 @@ timing on bigger synthetic workspaces.
 `just lint-extra`, `just audit-strict`, `just miri-protocol`,
 `just fuzz-protocol`, and `just fuzz-registry` are local quality gates for
 release or riskier changes; see [docs/quality-gates.md](docs/quality-gates.md).
+
+The manual **UNSIGNED six-target release dry run** builds, executes, attests,
+and assembles Linux, macOS, and Windows x64/ARM64 agents without signing or
+publishing a release:
+
+```sh
+gh workflow run release-dry-run.yml --ref master
+```
+
+Its short-lived Actions bundle is test-only and cannot be used as a trusted
+registry because it deliberately has no detached signature. See
+[docs/releasing.md](docs/releasing.md#github-unsigned-release-dry-run).
 
 Set `NRM_TRACE=1` when starting the sidecar to emit JSON trace events for
 request queueing, agent round trips, preemption, truncation, and remote backoff

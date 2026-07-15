@@ -18,11 +18,12 @@ local function executable_or_default(name)
   return name
 end
 
-M.config = {
+local DEFAULT_CONFIG = {
   sidecar = executable_or_default("nrm-sidecar"),
   agent = executable_or_default("nrm-agent"),
   remote_agent = "nrm-agent",
   remote_agent_install_path = nil,
+  remote_agent_auto_install = true,
   remote_agent_registry_url = nil,
   remote_agent_registry_public_keys = {},
   remote_agent_registry_signature_threshold = 1,
@@ -74,8 +75,11 @@ M.config = {
   },
 }
 
+M.config = vim.deepcopy(DEFAULT_CONFIG)
+
 M.client = nil
 M.last_target = nil
+M.last_connection = nil
 M.last_workspace_identity = nil
 M.reconnect_attempts = 0
 M.reconnect_generation = 0
@@ -104,6 +108,8 @@ local setup_mirror_autohydrate
 local update_remote_state
 local stop_lsp_for_client
 local lsp_status_result
+local remote_agent_bootstrap_params
+local request_timeout_ms
 
 local function notify(message, level)
   vim.schedule(function()
@@ -387,6 +393,9 @@ local function validate_https_registry_host(authority)
 end
 
 local function validate_registry_config(config)
+  if type(config.remote_agent_auto_install) ~= "boolean" then
+    error("remote_agent_auto_install must be a boolean")
+  end
   local url = config.remote_agent_registry_url
   if url ~= nil then
     if type(url) ~= "string" or url == "" then
@@ -956,6 +965,33 @@ local function path_join(root, leaf)
   return tostring(root):gsub("[/\\]+$", "") .. "/" .. leaf
 end
 
+local function executable_file_identity(path)
+  path = optional_string(path)
+  if not path then
+    return ""
+  end
+  local resolved = vim.fn.exepath(path)
+  if not optional_string(resolved) then
+    resolved = path
+  end
+  local stat = uv.fs_stat(resolved)
+  if not stat or stat.type ~= "file" then
+    return resolved
+  end
+  local mtime = stat.mtime or {}
+  local ctime = stat.ctime or {}
+  return table.concat({
+    resolved,
+    tostring(stat.dev or ""),
+    tostring(stat.ino or ""),
+    tostring(stat.size or ""),
+    tostring(mtime.sec or ""),
+    tostring(mtime.nsec or ""),
+    tostring(ctime.sec or ""),
+    tostring(ctime.nsec or ""),
+  }, ":")
+end
+
 local function default_socket_dir()
   if optional_string(M.config.socket_dir) then
     return M.config.socket_dir
@@ -983,6 +1019,7 @@ local function socket_path_for(target_arg, target)
   local identity = table.concat({
     target_arg or "",
     M.config.sidecar or "",
+    executable_file_identity(M.config.sidecar),
     agent or "",
     target and target.ssh and (M.config.agent or "") or "",
     M.config.state_dir or "",
@@ -994,6 +1031,16 @@ local function socket_path_for(target_arg, target)
   end
   local hash = vim.fn.sha256(identity):sub(1, 24)
   return path_join(default_socket_dir(), hash .. ".sock")
+end
+
+local FIXED_SOCKET_AUTOMATIC_BOOTSTRAP_SKIP_REASON =
+  "automatic agent bootstrap is disabled for an explicit socket_path; use a derived socket path"
+
+local function automatic_bootstrap_skip_reason(connection)
+  if connection == "socket" and optional_string(M.config.socket_path) then
+    return FIXED_SOCKET_AUTOMATIC_BOOTSTRAP_SKIP_REASON
+  end
+  return nil
 end
 
 if vim.g.nvim_remote_mirror_test then
@@ -1046,11 +1093,278 @@ local function fail_sidecar_send(client, message)
   end
   fail_pending(client, message)
   if not client.closing then
-    schedule_reconnect(client.target_arg, generation)
+    schedule_reconnect(client.target_arg, generation, client.connection)
   end
 end
 
+local SOCKET_DIRECTORY_MODE = 448 -- 0700
+local SOCKET_ALLOWED_MODE = 384 -- 0600
+local SOCKET_STICKY_MODE = 512 -- 01000
+
+local function current_process_uid()
+  if uv.os_getuid then
+    local ok, uid = pcall(uv.os_getuid)
+    if ok and type(uid) == "number" and uid >= 0 then
+      return uid
+    end
+  end
+  if uv.os_get_passwd then
+    local ok, passwd = pcall(uv.os_get_passwd)
+    if ok and type(passwd) == "table" and type(passwd.uid) == "number" and passwd.uid >= 0 then
+      return passwd.uid
+    end
+  end
+  error("cannot determine the current uid for sidecar socket validation")
+end
+
+local function socket_lstat(path)
+  local stat, err, code = uv.fs_lstat(path)
+  if stat then
+    return stat
+  end
+  if code == "ENOENT" then
+    return nil
+  end
+  error("failed to inspect sidecar socket path " .. path .. ": " .. tostring(err or code))
+end
+
+local function permission_mode(stat, path)
+  if type(stat.mode) ~= "number" then
+    error("sidecar socket metadata did not report permissions for " .. path)
+  end
+  return stat.mode % 4096
+end
+
+local function validate_socket_directory(path, stat)
+  if stat.type ~= "directory" then
+    error("sidecar socket directory must be a directory and not a symlink: " .. path)
+  end
+  local uid = current_process_uid()
+  if stat.uid ~= uid then
+    error(
+      "sidecar socket directory must be owned by the current uid: "
+        .. path
+        .. " (owner="
+        .. tostring(stat.uid)
+        .. ", current="
+        .. tostring(uid)
+        .. ")"
+    )
+  end
+  local mode = permission_mode(stat, path)
+  if mode ~= SOCKET_DIRECTORY_MODE then
+    error("sidecar socket directory must have mode 0700: " .. path .. " (mode=" .. string.format("%04o", mode) .. ")")
+  end
+end
+
+local function absolute_socket_path(path)
+  local absolute = vim.fn.fnamemodify(path, ":p")
+  if absolute ~= "/" then
+    absolute = absolute:gsub("/+$", "")
+  end
+  return absolute
+end
+
+local function validate_socket_ancestor_metadata(path, stat, child_stat, uid)
+  if stat.type == "link" then
+    -- The symlink entry itself is protected by its parent. Its resolved target
+    -- is checked separately below.
+    return
+  end
+  if stat.type ~= "directory" then
+    error("sidecar socket ancestor must be a directory or symlink: " .. path)
+  end
+  if stat.uid ~= uid and stat.uid ~= 0 then
+    error(
+      "sidecar socket ancestors must be owned by the current uid or root: "
+        .. path
+        .. " (owner="
+        .. tostring(stat.uid)
+        .. ", current="
+        .. tostring(uid)
+        .. ")"
+    )
+  end
+
+  local mode = permission_mode(stat, path)
+  local group_digit = math.floor(mode / 8) % 8
+  local other_digit = mode % 8
+  local group_writable = math.floor(group_digit / 2) % 2 == 1
+  local other_writable = math.floor(other_digit / 2) % 2 == 1
+  if group_writable or other_writable then
+    local sticky = math.floor(mode / SOCKET_STICKY_MODE) % 2 == 1
+    if not sticky then
+      error(
+        "sidecar socket ancestors must not be group/world-writable unless sticky: "
+          .. path
+          .. " (mode="
+          .. string.format("%04o", mode)
+          .. ")"
+      )
+    end
+    if not child_stat or (child_stat.uid ~= uid and child_stat.uid ~= 0) then
+      error("sidecar socket sticky ancestor does not protect its child entry: " .. path)
+    end
+  end
+end
+
+local function validate_socket_ancestor_chain(directory, directory_stat, uid)
+  local current = absolute_socket_path(directory)
+  local child_stat = directory_stat
+  while current ~= "/" do
+    local parent = absolute_socket_path(vim.fn.fnamemodify(current, ":h"))
+    if parent == current then
+      break
+    end
+    local stat = socket_lstat(parent)
+    if not stat then
+      error("sidecar socket ancestor disappeared during validation: " .. parent)
+    end
+    validate_socket_ancestor_metadata(parent, stat, child_stat, uid)
+    current = parent
+    child_stat = stat
+  end
+end
+
+local function validate_socket_directory_ancestors(directory, directory_stat)
+  local uid = current_process_uid()
+  local lexical = absolute_socket_path(directory)
+  validate_socket_ancestor_chain(lexical, directory_stat, uid)
+
+  local resolved, err = uv.fs_realpath(directory)
+  if not resolved then
+    error("failed to resolve sidecar socket directory " .. directory .. ": " .. tostring(err))
+  end
+  resolved = absolute_socket_path(resolved)
+  if resolved ~= lexical then
+    local resolved_stat = socket_lstat(resolved)
+    if not resolved_stat then
+      error("resolved sidecar socket directory disappeared during validation: " .. resolved)
+    end
+    validate_socket_directory(resolved, resolved_stat)
+    validate_socket_ancestor_chain(resolved, resolved_stat, uid)
+  end
+end
+
+local function validate_socket_creation_anchor(anchor, anchor_stat, uid)
+  validate_socket_ancestor_metadata(anchor, anchor_stat, { uid = uid }, uid)
+  validate_socket_ancestor_chain(anchor, anchor_stat, uid)
+
+  local resolved, err = uv.fs_realpath(anchor)
+  if not resolved then
+    error("failed to resolve sidecar socket creation ancestor " .. anchor .. ": " .. tostring(err))
+  end
+  resolved = absolute_socket_path(resolved)
+  if resolved ~= anchor then
+    local resolved_stat = socket_lstat(resolved)
+    if not resolved_stat then
+      error("resolved sidecar socket creation ancestor disappeared during validation: " .. resolved)
+    end
+    validate_socket_ancestor_metadata(resolved, resolved_stat, { uid = uid }, uid)
+    validate_socket_ancestor_chain(resolved, resolved_stat, uid)
+  end
+end
+
+local function prepare_socket_directory(socket_path)
+  local directory = vim.fn.fnamemodify(socket_path, ":h")
+  local stat = socket_lstat(directory)
+  if stat then
+    validate_socket_directory(directory, stat)
+    validate_socket_directory_ancestors(directory, stat)
+    return directory
+  end
+
+  local uid = current_process_uid()
+  local missing = {}
+  local anchor = absolute_socket_path(directory)
+  local anchor_stat = socket_lstat(anchor)
+  while not anchor_stat do
+    table.insert(missing, anchor)
+    local parent = absolute_socket_path(vim.fn.fnamemodify(anchor, ":h"))
+    if parent == anchor then
+      error("sidecar socket directory has no existing creation ancestor: " .. directory)
+    end
+    anchor = parent
+    anchor_stat = socket_lstat(anchor)
+  end
+  validate_socket_creation_anchor(anchor, anchor_stat, uid)
+
+  for index = #missing, 1, -1 do
+    local component = missing[index]
+    local created, mkdir_err, mkdir_code = uv.fs_mkdir(component, SOCKET_DIRECTORY_MODE)
+    if not created and mkdir_code ~= "EEXIST" then
+      error(
+        "failed to create sidecar socket directory component " .. component .. ": " .. tostring(mkdir_err or mkdir_code)
+      )
+    end
+    stat = socket_lstat(component)
+    if not stat then
+      error("failed to inspect sidecar socket directory component after creation: " .. component)
+    end
+    if created then
+      if stat.type ~= "directory" or stat.uid ~= uid then
+        validate_socket_directory(component, stat)
+      end
+      local chmod_ok, chmod_err = uv.fs_chmod(component, SOCKET_DIRECTORY_MODE)
+      if not chmod_ok then
+        error("failed to secure sidecar socket directory component " .. component .. ": " .. tostring(chmod_err))
+      end
+    end
+    stat = socket_lstat(component)
+    if not stat then
+      error("sidecar socket directory component disappeared during validation: " .. component)
+    end
+    validate_socket_directory(component, stat)
+    validate_socket_directory_ancestors(component, stat)
+  end
+  return directory
+end
+
+local function socket_mode_is_private(mode)
+  local owner = math.floor(mode / 64) % 8
+  local group = math.floor(mode / 8) % 8
+  local other = mode % 8
+  local special = math.floor(mode / 512) % 8
+  return special == 0 and owner % 2 == 0 and group == 0 and other == 0 and mode <= SOCKET_ALLOWED_MODE
+end
+
+local function validate_existing_socket(socket_path)
+  local stat = socket_lstat(socket_path)
+  if not stat then
+    return false
+  end
+  if stat.type ~= "socket" then
+    error("sidecar socket path must be a Unix socket and not a symlink: " .. socket_path)
+  end
+  local uid = current_process_uid()
+  if stat.uid ~= uid then
+    error(
+      "sidecar socket must be owned by the current uid: "
+        .. socket_path
+        .. " (owner="
+        .. tostring(stat.uid)
+        .. ", current="
+        .. tostring(uid)
+        .. ")"
+    )
+  end
+  local mode = permission_mode(stat, socket_path)
+  if not socket_mode_is_private(mode) then
+    error(
+      "sidecar socket permissions must not exceed 0600: "
+        .. socket_path
+        .. " (mode="
+        .. string.format("%04o", mode)
+        .. ")"
+    )
+  end
+  return true
+end
+
 local function connect_socket_channel(client, socket_path)
+  if not validate_existing_socket(socket_path) then
+    return nil
+  end
   local ok, channel = pcall(vim.fn.sockconnect, "pipe", socket_path, {
     on_data = function(_, data)
       if data == nil or (type(data) == "table" and #data == 1 and data[1] == "") then
@@ -1068,7 +1382,7 @@ local function connect_socket_channel(client, socket_path)
 end
 
 local function start_socket_daemon(_client, target, socket_path)
-  vim.fn.mkdir(vim.fn.fnamemodify(socket_path, ":h"), "p", 448)
+  prepare_socket_directory(socket_path)
   local command = vim.list_extend({ M.config.sidecar }, listener_args(target, socket_path))
   local job_id = vim.fn.jobstart(command, {
     detach = true,
@@ -1098,6 +1412,7 @@ end
 local function connect_or_start_socket(client, target)
   local socket_path = socket_path_for(client.target_arg, target)
   client.socket_path = socket_path
+  prepare_socket_directory(socket_path)
   local channel = connect_socket_channel(client, socket_path)
   if channel then
     return channel, nil
@@ -1116,8 +1431,14 @@ local function connect_or_start_socket(client, target)
   return channel, daemon_job_id
 end
 
-function schedule_reconnect(target_arg, generation)
+if vim.g.nvim_remote_mirror_test then
+  M._test_prepare_socket_directory = prepare_socket_directory
+  M._test_validate_existing_socket = validate_existing_socket
+end
+
+function schedule_reconnect(target_arg, generation, connection)
   generation = generation or M.reconnect_generation
+  connection = connection or M.last_connection or M.config.connection
   if not M.config.auto_reconnect then
     return
   end
@@ -1153,14 +1474,14 @@ function schedule_reconnect(target_arg, generation)
     M.connection_status = "reconnecting"
     M.reconnect_pending = false
     notify("reconnecting remote session, attempt " .. tostring(attempt), vim.log.levels.WARN)
-    local ok, err = pcall(M.connect, target_arg, { reconnect = true })
+    local ok, err = pcall(M.connect, target_arg, { reconnect = true, connection = connection })
     if not ok then
       M.connection_status = "reconnect_pending"
       M.reconnect_pending = true
       M.connection_reason = nil
       M.connection_error = tostring(err)
       notify("reconnect failed: " .. tostring(err), vim.log.levels.ERROR)
-      schedule_reconnect(target_arg, generation)
+      schedule_reconnect(target_arg, generation, connection)
     end
   end, M.config.reconnect_delay_ms)
 end
@@ -1278,6 +1599,10 @@ update_remote_state = function(client, result)
   client.hello.retry_after_ms = result.retry_after_ms
   if type(result.registry_health) == "table" then
     client.hello.registry_health = result.registry_health
+  end
+  if result.remote_checked == true and result.remote_available == false then
+    client.hello.agent_version = nil
+    client.hello.protocol_version = nil
   end
   for _, field in ipairs({
     "agent_status",
@@ -1449,6 +1774,11 @@ function M.connection_state()
     install_available = hello.install_available,
     update_available = hello.update_available,
     repair_command = optional_string(hello.repair_command),
+    agent_bootstrap_automatic = client and client.agent_bootstrap_automatic == true or false,
+    agent_bootstrap_state = client and optional_string(client.agent_bootstrap_state) or nil,
+    agent_bootstrap_result = client and optional_string(client.agent_bootstrap_result) or nil,
+    agent_bootstrap_reason = client and optional_string(client.agent_bootstrap_reason) or nil,
+    agent_bootstrap_error = client and optional_string(client.agent_bootstrap_error) or nil,
   }
 end
 
@@ -2015,12 +2345,208 @@ function M.stop_background_mirror()
 end
 
 function M.setup(opts)
-  local merged = vim.tbl_deep_extend("force", M.config, opts or {})
+  local merged = vim.tbl_deep_extend("force", vim.deepcopy(DEFAULT_CONFIG), opts or {})
   if opts and opts.remote_agent_registry_public_keys ~= nil then
     merged.remote_agent_registry_public_keys = vim.deepcopy(opts.remote_agent_registry_public_keys)
   end
   validate_registry_config(merged)
   M.config = merged
+end
+
+local function current_connect_client(client, generation)
+  return M.client == client and not client.closing and generation == M.reconnect_generation
+end
+
+local DISCONNECT_CLOSE_DELAY_MS = 250
+
+local function monotonic_ms()
+  if uv.hrtime then
+    return math.floor(uv.hrtime() / 1000000)
+  end
+  if uv.now then
+    return uv.now()
+  end
+  return math.floor(os.clock() * 1000)
+end
+
+local function automatic_bootstrap_disconnect_delay_ms(client)
+  if not client or client.agent_bootstrap_in_flight ~= true then
+    return DISCONNECT_CLOSE_DELAY_MS
+  end
+  local deadline_ms = tonumber(client.agent_bootstrap_deadline_ms)
+  if not deadline_ms then
+    return math.max(tonumber(client.agent_bootstrap_timeout_ms) or 0, DISCONNECT_CLOSE_DELAY_MS)
+  end
+  local remaining_ms = math.max(math.ceil(deadline_ms - monotonic_ms()), 0)
+  return math.max(remaining_ms, DISCONNECT_CLOSE_DELAY_MS)
+end
+
+local function fail_workspace_info_connect(client, generation, message)
+  if not current_connect_client(client, generation) then
+    return
+  end
+  message = tostring(message)
+  client.closing = true
+  fail_pending(client, message)
+  if client.transport == "socket" and client.job_id then
+    pcall(vim.fn.chanclose, client.job_id)
+  elseif client.job_id then
+    pcall(vim.fn.jobstop, client.job_id)
+  end
+  if M.client == client then
+    M.client = nil
+  end
+  clear_mirror_autohydrate()
+  M.connection_status = M.config.auto_reconnect and "reconnect_pending" or "disconnected"
+  M.connection_target = client.target_arg
+  M.connection_reason = nil
+  M.connection_error = message
+  M.reconnect_pending = M.config.auto_reconnect == true
+  notify(message, vim.log.levels.ERROR)
+  schedule_reconnect(client.target_arg, generation, client.connection)
+end
+
+local function automatic_health_is_compatible(health)
+  local agent_version = optional_string(health.agent_version)
+  local expected_agent_version = optional_string(health.expected_agent_version)
+  local protocol_version = health.protocol_version
+  local expected_protocol_version = health.expected_protocol_version
+  return health.remote_checked == true
+    and health.remote_available == true
+    and optional_string(health.agent_status) == "ok"
+    and agent_version ~= nil
+    and expected_agent_version ~= nil
+    and agent_version == expected_agent_version
+    and type(protocol_version) == "number"
+    and type(expected_protocol_version) == "number"
+    and protocol_version == expected_protocol_version
+end
+
+local function finish_connect(client, target_arg, is_reconnect, generation)
+  if not current_connect_client(client, generation) then
+    return
+  end
+  local result = client.hello or {}
+  M.connection_status = "connected"
+  M.connection_target = target_arg
+  M.connection_reason = nil
+  M.connection_error = nil
+  M.reconnect_pending = false
+  setup_mirror_autohydrate(client)
+  if is_reconnect then
+    schedule_reconnect_stable_reset(client, generation)
+  end
+
+  local suffixes = {}
+  if result.remote_status == "unchecked" then
+    table.insert(suffixes, "remote unchecked")
+  end
+  if client.agent_bootstrap_state == "error" then
+    table.insert(suffixes, "automatic agent install failed")
+  elseif client.agent_bootstrap_state == "skipped" then
+    table.insert(suffixes, "automatic agent install skipped")
+  elseif client.agent_bootstrap_state == "ready" and client.agent_bootstrap_result ~= "skipped" then
+    table.insert(suffixes, "remote agent ready")
+  end
+  local suffix = #suffixes > 0 and (" (" .. table.concat(suffixes, "; ") .. ")") or ""
+  notify("connected: " .. result.remote_root .. suffix)
+
+  if client.agent_bootstrap_state == "error" then
+    notify("automatic remote agent install failed: " .. client.agent_bootstrap_error, vim.log.levels.ERROR)
+  elseif client.agent_bootstrap_state == "skipped" and client.agent_bootstrap_reason then
+    notify("automatic remote agent install skipped: " .. client.agent_bootstrap_reason, vim.log.levels.WARN)
+  end
+
+  schedule_deferred_flushes_on_connect(client, generation)
+  schedule_save_recovery_on_connect(client, generation)
+  if M.config.background_mirror then
+    M.start_background_mirror()
+  end
+end
+
+local function finish_workspace_info(client, result, target_arg, is_reconnect, generation)
+  if not current_connect_client(client, generation) then
+    return
+  end
+  client.hello = result
+  M.last_workspace_identity = client_identity(client)
+
+  if not client.agent_bootstrap_automatic then
+    client.agent_bootstrap_state = "disabled"
+    finish_connect(client, target_arg, is_reconnect, generation)
+    return
+  end
+  if client.agent_bootstrap_skip_reason then
+    client.agent_bootstrap_state = "skipped"
+    client.agent_bootstrap_reason = client.agent_bootstrap_skip_reason
+    finish_connect(client, target_arg, is_reconnect, generation)
+    return
+  end
+  if type(result.capabilities) ~= "table" or result.capabilities.remote_agent_automatic_bootstrap_v1 ~= true then
+    client.agent_bootstrap_state = "skipped"
+    client.agent_bootstrap_reason = "sidecar does not advertise safe automatic agent bootstrap support"
+    finish_connect(client, target_arg, is_reconnect, generation)
+    return
+  end
+
+  client.agent_bootstrap_state = "installing"
+  M.connection_status = "bootstrapping_agent"
+  local params = { automatic = true }
+  if client.agent_bootstrap_install_path then
+    params.install_path = client.agent_bootstrap_install_path
+  end
+  local bootstrap_timeout_ms = request_timeout_ms("remote_agent_update", client)
+  client.agent_bootstrap_in_flight = true
+  client.agent_bootstrap_timeout_ms = bootstrap_timeout_ms
+  client.agent_bootstrap_deadline_ms = math.min(monotonic_ms() + bootstrap_timeout_ms, LUA_MAX_SAFE_INTEGER)
+  M.request("remote_agent_update", params, function(err, bootstrap_result)
+    client.agent_bootstrap_in_flight = false
+    client.agent_bootstrap_deadline_ms = nil
+    if not current_connect_client(client, generation) then
+      return
+    end
+    if err then
+      client.agent_bootstrap_state = "error"
+      client.agent_bootstrap_error = tostring(err)
+      finish_connect(client, target_arg, is_reconnect, generation)
+      return
+    end
+
+    if
+      type(bootstrap_result) ~= "table"
+      or bootstrap_result.automatic ~= true
+      or (bootstrap_result.status ~= "updated" and bootstrap_result.status ~= "skipped")
+      or type(bootstrap_result.remote_health) ~= "table"
+      or (bootstrap_result.status == "skipped" and optional_string(bootstrap_result.reason) == nil)
+    then
+      client.agent_bootstrap_state = "error"
+      client.agent_bootstrap_error = "sidecar returned an invalid automatic agent bootstrap result"
+      finish_connect(client, target_arg, is_reconnect, generation)
+      return
+    end
+
+    local health = bootstrap_result.remote_health
+    local bootstrap_agent_status = optional_string(health.agent_status)
+    local requires_compatible_health = bootstrap_result.status == "updated"
+      or (bootstrap_result.status == "skipped" and bootstrap_agent_status == "ok")
+    if requires_compatible_health and not automatic_health_is_compatible(health) then
+      client.agent_bootstrap_state = "error"
+      client.agent_bootstrap_error = "automatic agent bootstrap completed without compatible remote health"
+      update_remote_state(client, health)
+      finish_connect(client, target_arg, is_reconnect, generation)
+      return
+    end
+
+    update_remote_state(client, health)
+    client.agent_bootstrap_result = bootstrap_result.status
+    client.agent_bootstrap_reason = optional_string(bootstrap_result.reason)
+    if client.agent_bootstrap_result == "skipped" and bootstrap_agent_status ~= "ok" then
+      client.agent_bootstrap_state = "skipped"
+    else
+      client.agent_bootstrap_state = "ready"
+    end
+    finish_connect(client, target_arg, is_reconnect, generation)
+  end)
 end
 
 function M.connect(target, opts)
@@ -2043,6 +2569,8 @@ function M.connect(target, opts)
     M.disconnect({ preserve_last_target = true })
   end
 
+  local connection = opts.connection or M.config.connection or "stdio"
+
   local client = {
     next_id = 1,
     pending = {},
@@ -2050,6 +2578,13 @@ function M.connect(target, opts)
     target = target,
     target_arg = target_arg,
     closing = false,
+    connection = connection,
+    agent_bootstrap_automatic = M.config.remote_agent_auto_install == true and optional_string(
+      M.config.remote_agent_registry_url
+    ) ~= nil and target.ssh ~= nil,
+    agent_bootstrap_install_path = optional_string(M.config.remote_agent_install_path),
+    agent_bootstrap_skip_reason = automatic_bootstrap_skip_reason(connection),
+    agent_bootstrap_state = "disabled",
     expected_registry_policy_fingerprint = registry_policy_fingerprint(M.config),
     -- Requests must use the same timeout policy that was passed to this
     -- sidecar. A later setup() call only applies after reconnecting.
@@ -2060,7 +2595,6 @@ function M.connect(target, opts)
     },
   }
 
-  local connection = opts.connection or M.config.connection or "stdio"
   if connection == "socket" then
     client.transport = "socket"
     local ok, channel, daemon_job_id = pcall(connect_or_start_socket, client, target)
@@ -2090,6 +2624,7 @@ function M.connect(target, opts)
         end
       end,
       on_exit = function(_, code)
+        client.exited = true
         if M.client == client then
           if stop_lsp_for_client then
             stop_lsp_for_client(client, { quiet = true, force = true })
@@ -2107,7 +2642,7 @@ function M.connect(target, opts)
           M.connection_error = "sidecar exited with code " .. tostring(code)
           M.reconnect_pending = M.config.auto_reconnect == true
           notify("sidecar exited with code " .. tostring(code), vim.log.levels.ERROR)
-          schedule_reconnect(client.target_arg, exit_generation)
+          schedule_reconnect(client.target_arg, exit_generation, client.connection)
         else
           fail_pending(client, "disconnected")
         end
@@ -2131,10 +2666,13 @@ function M.connect(target, opts)
 
   M.client = client
   M.last_target = target_arg
+  M.last_connection = connection
   M.request("workspace_info", {}, function(err, result)
+    if not current_connect_client(client, generation) then
+      return
+    end
     if err then
-      M.connection_error = err
-      notify(err, vim.log.levels.ERROR)
+      fail_workspace_info_connect(client, generation, err)
       return
     end
     if not registry_policy_matches(result, client.expected_registry_policy_fingerprint) then
@@ -2156,24 +2694,7 @@ function M.connect(target, opts)
       notify(mismatch, vim.log.levels.ERROR)
       return
     end
-    client.hello = result
-    M.last_workspace_identity = client_identity(client)
-    M.connection_status = "connected"
-    M.connection_target = target_arg
-    M.connection_reason = nil
-    M.connection_error = nil
-    M.reconnect_pending = false
-    setup_mirror_autohydrate(client)
-    if is_reconnect then
-      schedule_reconnect_stable_reset(client, generation)
-    end
-    local remote_suffix = result.remote_status == "unchecked" and " (remote unchecked)" or ""
-    notify("connected: " .. result.remote_root .. remote_suffix)
-    schedule_deferred_flushes_on_connect(client, generation)
-    schedule_save_recovery_on_connect(client, generation)
-    if M.config.background_mirror then
-      M.start_background_mirror()
-    end
+    finish_workspace_info(client, result, target_arg, is_reconnect, generation)
   end)
 end
 
@@ -2193,22 +2714,32 @@ function M.disconnect(opts)
     return
   end
   local client = M.client
+  local automatic_bootstrap_in_flight = client.agent_bootstrap_in_flight == true
+  local process_close_delay_ms = automatic_bootstrap_disconnect_delay_ms(client)
   client.closing = true
   if stop_lsp_for_client then
     stop_lsp_for_client(client, { quiet = true, force = true })
   end
   pcall(M.request, "disconnect", {}, function() end)
   fail_pending(client, "disconnected")
-  vim.defer_fn(function()
-    if client.transport == "socket" and client.job_id then
-      pcall(vim.fn.chanclose, client.job_id)
-    elseif client.job_id then
-      pcall(vim.fn.jobstop, client.job_id)
-    end
+  if client.transport == "socket" then
+    vim.defer_fn(function()
+      if client.job_id then
+        pcall(vim.fn.chanclose, client.job_id)
+      end
+    end, DISCONNECT_CLOSE_DELAY_MS)
     if opts.stop_daemon and client.daemon_job_id then
-      pcall(vim.fn.jobstop, client.daemon_job_id)
+      vim.defer_fn(function()
+        pcall(vim.fn.jobstop, client.daemon_job_id)
+      end, automatic_bootstrap_in_flight and process_close_delay_ms or DISCONNECT_CLOSE_DELAY_MS)
     end
-  end, 250)
+  elseif client.job_id then
+    vim.defer_fn(function()
+      if not client.exited then
+        pcall(vim.fn.jobstop, client.job_id)
+      end
+    end, process_close_delay_ms)
+  end
   clear_mirror_autohydrate()
   M.client = nil
   if not opts.preserve_last_target then
@@ -2237,12 +2768,12 @@ function M.reconnect()
   M.connection_reason = nil
   M.connection_error = nil
   M.reconnect_pending = false
-  M.connect(M.last_target, { reconnect = true })
+  M.connect(M.last_target, { reconnect = true, connection = M.last_connection })
 end
 
 local BOOTSTRAP_TIMER_GRACE_MS = 1000
 
-local function request_timeout_ms(method, client)
+request_timeout_ms = function(method, client)
   local bootstrap = method == "remote_agent_install" or method == "remote_agent_update"
   local timeout_config = client and client.timeout_config or nil
   local configured = timeout_config and timeout_config.request_timeout_ms or M.config.request_timeout_ms
@@ -2263,6 +2794,11 @@ local function request_timeout_ms(method, client)
   return timeout_ms
 end
 
+local function request_cancels_on_timeout(method, params)
+  local bootstrap = method == "remote_agent_install" or method == "remote_agent_update"
+  return not (bootstrap and type(params) == "table" and params.automatic == true)
+end
+
 function M.request(method, params, callback)
   local client = M.client
   if not client or not client.job_id then
@@ -2277,6 +2813,7 @@ function M.request(method, params, callback)
     timer = nil,
   }
   local timeout_ms = request_timeout_ms(method, client)
+  local cancel_on_timeout = request_cancels_on_timeout(method, params)
   if timeout_ms > 0 then
     local timer = uv.new_timer()
     pending.timer = timer
@@ -2284,7 +2821,9 @@ function M.request(method, params, callback)
       vim.schedule(function()
         local timed_out = clear_pending(client, id)
         if timed_out then
-          send_cancel_request(client, id)
+          if cancel_on_timeout then
+            send_cancel_request(client, id)
+          end
           pcall(timed_out, "request `" .. method .. "` timed out after " .. tostring(timeout_ms) .. " ms", nil)
         end
       end)
@@ -2306,6 +2845,7 @@ end
 
 if vim.g.nvim_remote_mirror_test then
   M._test_request_timeout_ms = request_timeout_ms
+  M._test_request_cancels_on_timeout = request_cancels_on_timeout
   M._test_clear_pending = clear_pending
 end
 
@@ -2383,7 +2923,7 @@ function M.remote_health(callback)
   end)
 end
 
-local function remote_agent_bootstrap_params(opts)
+remote_agent_bootstrap_params = function(opts)
   opts = opts or {}
   local params = {}
   if opts.force == true then
@@ -2620,6 +3160,10 @@ function setup_mirror_autohydrate(client)
       end)
     end,
   })
+end
+
+if vim.g.nvim_remote_mirror_test then
+  M._test_setup_mirror_autohydrate = setup_mirror_autohydrate
 end
 
 function prefetch_related(anchor)

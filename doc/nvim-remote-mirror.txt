@@ -34,8 +34,8 @@ Requirements:
     - Neovim 0.10+, with Neovim 0.11+ preferred.
     - Rust toolchain on the local machine.
     - SSH access for POSIX ssh://host/path or Windows ssh://host/B:/path targets.
-    - nrm-agent installed and executable on each remote host, or installable
-      with :RemoteInstallAgent after connecting.
+    - nrm-agent installed and executable on each remote host, installable from
+      a trusted signed registry, or uploadable with :RemoteInstallAgent.
 
 Build the binaries from the checkout:
 >
@@ -54,11 +54,13 @@ Or connect and run the explicit repair flow:
   :RemoteHealth
   :RemoteInstallAgent
 <
-Connect does not silently install or update remote binaries.
-Without a signed registry, install/update uploads the configured local agent.
-With registry mode configured, the sidecar selects and verifies a native Linux,
-macOS, or Windows x64/ARM64 artifact locally and never falls back to an unsigned
-local binary.
+No registry is configured by default, so default connect does not install or
+update remote binaries. With SSH, a configured trusted signed registry, and
+remote_agent_auto_install=true, connect installs or repairs known agent
+failures from a verified Linux, macOS, or Windows x64/ARM64 artifact. It never
+falls back to an unsigned local binary. Set remote_agent_auto_install=false to
+keep registry-backed repair explicit. Explicit install/update remains
+available; without a registry it uploads the configured local agent.
 
 Windows OpenSSH targets use an absolute drive root and forward slashes:
 >
@@ -95,8 +97,9 @@ UI                                                *nvim-remote-mirror-ui*
 :RemoteWorkspace
     Open the remote workspace dashboard. The dashboard shows connection state,
     remote health, mirror root, files root, mirror counts, background scan
-    state, save queue counts, and signed-registry platform, source, cache,
-    digest, signing-key, and stable error-code diagnostics.
+    state, save queue counts, automatic-bootstrap result/reason/error, and
+    signed-registry platform, source, cache, digest, signing-key, and stable
+    error-code diagnostics.
 
 :RemoteConnectUI
     Prompt for a local path, POSIX ssh://host/absolute/path, or Windows
@@ -132,7 +135,11 @@ COMMANDS                                      *nvim-remote-mirror-commands*
     the durable local mirror first; the remote agent handshake is lazy, so
     cached opens, cached grep, and status can work while SSH is unreachable.
     Failed remote attempts use a capped adaptive lane backoff before trying SSH
-    again.
+    again. When signed automatic install is enabled, connect repairs only a
+    missing, non-executable, version-mismatched, or protocol-mismatched agent.
+    A missing root, unavailable host, or unknown failure is not mutated. A
+    bootstrap failure leaves the local-first connection available in a
+    degraded state.
 
 :RemoteReconnect
     Reconnect to the last remote target, reusing the durable mirror and
@@ -254,12 +261,12 @@ COMMANDS                                      *nvim-remote-mirror-commands*
 :RemoteInstallAgent[!] [path]
     Transactionally install an agent on an SSH target. Registry mode downloads
     and verifies the matching native build locally; otherwise the command uses
-    the configured local agent bytes. Without [path], POSIX defaults to
-    $HOME/.local/bin/nrm-agent and Windows defaults to
-    %LOCALAPPDATA%\nrm\bin\nrm-agent.exe. [!] permits replacing an existing
-    target. The candidate passes exact --version and staged Hello checks before
-    activation, then a normal-path Hello; failures restore and reprobe the
-    previous executable.
+    the configured local agent bytes. Without [path], a safe bare remote_agent
+    is installed under $HOME/.local/bin on POSIX or %LOCALAPPDATA%\nrm\bin on
+    Windows, preserving its command name and adding .exe on Windows when
+    needed. [!] permits replacing an existing target. The candidate passes
+    exact --version and staged Hello checks before activation, then a
+    normal-path Hello; failures restore and reprobe the previous executable.
 
 :RemoteUpdateAgent[!] [path]
     Use the same transactional flow when :RemoteHealth reports a missing,
@@ -307,6 +314,7 @@ CONFIGURATION                                  *nvim-remote-mirror-config*
     agent = "/path/to/local/nrm-agent",
     remote_agent = "nrm-agent",
     remote_agent_install_path = nil,
+    remote_agent_auto_install = true,
     remote_agent_registry_url = nil,
     remote_agent_registry_public_keys = {},
     remote_agent_registry_signature_threshold = 1,
@@ -359,14 +367,30 @@ CONFIGURATION                                  *nvim-remote-mirror-config*
   })
 <
 
+Each setup() call is a complete configuration snapshot over the built-in
+defaults. Omitted options reset to their defaults instead of retaining values
+from an earlier call. In particular, omitting remote_agent_registry_url
+disables registry mode, and remote_agent_registry_public_keys replaces the
+previous key table rather than merging with it. Pass the full desired
+configuration on every call.
+
 For ssh:// targets, remote_agent is executed on the remote host. With registry
 mode disabled, the local agent path is the explicit install/update source. With
 registry mode enabled, only the matching signed artifact is used; the local
-agent is not a fallback. Neither source is installed on connect.
-On POSIX, a bare remote_agent installs to $HOME/.local/bin/nrm-agent and SSH
-launch prepends $HOME/.local/bin to PATH. On Windows it installs to
-%LOCALAPPDATA%\nrm\bin\nrm-agent.exe. An absolute remote_agent,
-remote_agent_install_path, or optional command path overrides the default.
+agent is not a fallback. remote_agent_auto_install defaults to true but is
+inactive unless both an SSH target and a trusted signed registry are configured.
+In that opt-in mode connect skips a compatible agent, installs a missing agent,
+and repairs agent_not_executable, version_mismatch, or protocol_mismatch. It
+does not mutate remote_root_missing, unavailable, or unclassified states. Set
+remote_agent_auto_install=false to keep registry operations explicit. A failed
+automatic bootstrap leaves the mirror connected in a degraded state and is
+reported separately in :RemoteWorkspace.
+On POSIX, a safe bare remote_agent installs under $HOME/.local/bin with the
+same command name and SSH launch prepends that directory to PATH. On Windows
+it installs under %LOCALAPPDATA%\nrm\bin and gains an .exe suffix when needed.
+Relative agent paths containing a slash are rejected for default installation.
+An absolute remote_agent, remote_agent_install_path, or optional command path
+overrides the default.
 Non-interactive SSH may not load the same PATH as an interactive login shell.
 If :RemoteHealth reports missing_agent, run :RemoteInstallAgent or set
 remote_agent to an absolute remote path.
@@ -382,25 +406,56 @@ session but leaves the listener available for the next editor. The sidecar
 reports this as workspace_info.client_mode = "single_writer" with a
 workspace_info.client_policy object so future clients can distinguish this
 sequential policy from future multi-client modes.
+The directory immediately containing the socket must be owned by the current
+user with mode 0700. Existing sockets must be owned by the current user, must
+not be symlinks, and may have no permissions beyond 0600. Lexical and resolved
+ancestors must be owned by the current user or root and cannot be group/world-
+writable unless a sticky ancestor protects the next entry. A private leaf
+below sticky /tmp is supported; a socket directly in /tmp is rejected.
+Automatic agent bootstrap requires that derived socket identity. An explicit
+socket_path leaves connect local-first but skips automatic mutation; manage the
+fixed-path daemon and use an explicit install/update command instead.
 When state_dir is unset, durable mirror state uses the platform state directory,
 typically ~/.local/state/nvim-remote-mirror on Linux. Use :RemoteWorkspace to
 inspect the active mirror root and files root before cleaning mirror data.
 
 request_timeout_ms bounds ordinary sidecar/agent work and is the whole
 install/update deadline in local-binary mode.
-remote_agent_registry_timeout_ms is the whole install/update deadline in
-registry mode. It starts when the sidecar accepts the request and covers host
-detection, retrieval, queue drain, staging, probes, activation, rollback, and
-cleanup. Nested work receives only the remaining budget, with a bounded reserve
-for recovery. The Neovim bootstrap callback adds one second for reply delivery.
-Timeout and registry policy are fixed for the lifetime of a connection; after
-changing them with setup(), reconnect before install or update.
+remote_agent_registry_timeout_ms is the whole automatic or explicit
+install/update deadline in registry mode. It starts when the sidecar accepts
+the request and covers host detection, retrieval, queue drain, staging, probes,
+activation, rollback, and cleanup. Nested work receives only the remaining
+budget, with a bounded reserve for recovery. The Neovim bootstrap callback adds
+one second for reply delivery.
+Install/update holds a per-target remote lease through its health recheck,
+staging, activation, rollback, and cleanup. Concurrent sidecars either observe
+the newly compatible agent or report install_in_progress; ambiguous stale
+lease state fails closed. On POSIX, per-process claims protect the lease-owner
+and operation-owner publication windows. Ownerless state is reaped only after
+every well-formed claim identity is proven dead. Malformed claim names or file
+types fail closed; dead partial contents are reaped by strict token/PID name.
+Before upload, the installer publishes a stable same-directory transaction
+journal. The next lease holder recovers it before probing: it removes only an
+exact partial candidate, or restores the prior executable/finishes committed
+cleanup only when the recorded paths, file state, and that journal's own
+digests agree. A newer verified digest authorizes only its subsequent
+transaction. Malformed, ambiguous, or file-hash-mismatched journals are
+preserved and fail closed. POSIX install directories must be login-UID-owned,
+non-symlink, and not group/world writable; new components use mode 0700 and
+recovery journals use mode 0600.
+Timeout, registry policy, and the automatic install path are fixed for the
+lifetime of a connection. After replacing the configuration with setup(),
+reconnect before automatic bootstrap uses those settings. Explicit command
+arguments and defaults are evaluated when the command is invoked.
 When a callback times out, the plugin sends a best-effort sidecar cancel for
-queued remote work. Matching active read-only/background work is preempted by
-restarting the serial SSH/agent worker. Newer interactive remote requests can
-also supersede active read-only/background work; preempted results are normal
-no-op client responses. Active save/flush work is not interrupted by that
-cancel.
+queued remote work. Automatic agent bootstrap is the exception: once accepted,
+its bounded transaction is not client-cancelable. Disconnect detaches Neovim
+immediately but lets a stdio sidecar live through the snapped bootstrap callback
+deadline, while a detached socket daemon can finish after its client channel
+closes. Matching active read-only/background work is preempted by restarting the
+serial SSH/agent worker. Newer interactive remote requests can also supersede
+active read-only/background work; preempted results are normal no-op client
+responses. Active save/flush work is not interrupted by that cancel.
 Remote reads and writes use separate sidecar lanes with separate agent sessions;
 unrelated opens, grep, validation, and probes can continue while save/flush work
 is in flight, while reads that could conflict with pending writes stay ordered
@@ -449,6 +504,11 @@ a session factory that returns the AgentSession and AgentAbortHandle pair while
 preserving that lane-worker abort scope. Neovim still talks only to the sidecar
 JSON API, so SSH stdio can be replaced later without changing editor-facing
 behavior.
+An SSH agent stream starts with one bounded stdout launch record before binary
+RPC. Only an exact pre-exec FAILURE record may classify a missing or
+non-executable agent for automatic repair; READY commits the stream to ordinary
+agent handling. Child stderr and malformed, missing, oversized, or post-READY
+records are diagnostic/untyped and cannot authorize replacement.
 Sidecar command responses are newline-delimited JSON objects with an id, ok,
 and result or error. The sidecar may also send id-less notification lines such
 as workspace/remote_health; Neovim consumes those to keep last-known remote
@@ -510,11 +570,14 @@ absolute file:// URL and contain exactly one {version} placeholder. Configure
 trusted 32-byte Ed25519 public keys with out-of-band key IDs; the default
 signature threshold is one. Registry responses can never add trusted keys.
 
-Explicit install/update detects Linux, macOS, or Windows x64/ARM64, verifies
-detached signatures and the strict manifest locally, rechecks the selected
-artifact size and SHA-256, and then uploads it through SSH. Registry mode fails
-closed: it never falls back to the configured local agent. Connect remains
-local-first and never fetches, installs, or updates an agent automatically.
+Automatic or explicit install/update detects Linux, macOS, or Windows
+x64/ARM64, verifies detached signatures and the strict manifest locally,
+rechecks the selected artifact size and SHA-256, and then uploads it through
+SSH. Registry mode fails closed: it never falls back to the configured local
+agent. Automatic install requires SSH, this trusted registry, and
+remote_agent_auto_install=true; no registry is configured by default. It
+repairs only missing_agent, agent_not_executable, version_mismatch, or
+protocol_mismatch. Other health states are not mutated.
 
 The default 512 MiB cache lives below sidecar state unless
 remote_agent_registry_cache_dir is set. Current keys, signature threshold,
@@ -525,10 +588,11 @@ responses, and policy violations never use that fallback. Content-addressed
 artifacts can be normal cache hits after fresh manifest verification. Budget
 eviction means offline fallback is best-effort, not guaranteed.
 
-Install/update results and the Registry section of :RemoteWorkspace include
-selected platform/target, redacted manifest URL, verified key IDs, digests,
-source/cache state, and stable error codes. Registry state remains separate
-from the health of an already working remote agent.
+Install/update results and the Bootstrap/Registry sections of :RemoteWorkspace
+include automatic state, result/reason/error, selected platform/target,
+redacted manifest URL, verified key IDs, digests, source/cache state, and stable
+error codes. A failed automatic bootstrap leaves connect degraded but complete.
+Registry state remains separate from working-agent health.
 
 See docs/agent-registry.md in the project checkout for the exact manifest,
 redirect, cache, trust, and key-rotation policy.

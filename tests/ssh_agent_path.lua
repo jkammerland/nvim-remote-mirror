@@ -32,7 +32,10 @@ local function main()
   assert_eq(arg_after(ssh_args, "--local-agent"), "/local/build/nrm-agent")
   assert_eq(arg_after(ssh_args, "--ssh"), "host")
 
-  nrm.setup({ remote_agent = "/opt/nrm/bin/nrm-agent" })
+  nrm.setup({
+    agent = "/local/build/nrm-agent",
+    remote_agent = "/opt/nrm/bin/nrm-agent",
+  })
   ssh_args = nrm._test_sidecar_args({ ssh = "host", remote_root = "/repo" })
   assert_eq(arg_after(ssh_args, "--agent"), "/opt/nrm/bin/nrm-agent")
   assert_eq(arg_after(ssh_args, "--local-agent"), "/local/build/nrm-agent")

@@ -1,4 +1,5 @@
 vim.opt.runtimepath:prepend(vim.fn.getcwd())
+vim.g.nvim_remote_mirror_test = true
 
 local nrm = require("nvim_remote_mirror")
 
@@ -6,16 +7,6 @@ local function assert_eq(actual, expected, message)
   if actual ~= expected then
     error((message or "assertion failed") .. ": expected " .. vim.inspect(expected) .. ", got " .. vim.inspect(actual))
   end
-end
-
-local function upvalue(fn, name)
-  for index = 1, debug.getinfo(fn, "u").nups do
-    local found_name, value = debug.getupvalue(fn, index)
-    if found_name == name then
-      return value
-    end
-  end
-  error("missing upvalue " .. name)
 end
 
 local function fake_client(files_root)
@@ -67,7 +58,7 @@ local function main()
   local client = fake_client(files_root)
   nrm.client = client
   nrm.config.auto_hydrate_mirror_buffers = true
-  upvalue(nrm.connect, "setup_mirror_autohydrate")(client)
+  nrm._test_setup_mirror_autohydrate(client)
 
   local failed_path = files_root .. "/src/fail.rs"
   local failed_buf = edit_path(failed_path)

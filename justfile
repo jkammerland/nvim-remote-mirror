@@ -33,6 +33,9 @@ lua-test: nvim-preflight
 shell-syntax:
     bash -n scripts/*.sh
 
+release-workflow-policy: shell-syntax
+    scripts/check_release_workflows.sh
+
 whitespace:
     git diff --check
 
@@ -83,6 +86,6 @@ lint-extra: lua-format-check lua-lint shell-lint
 
 quality-extra: lint-extra audit-strict miri-protocol fuzz-protocol fuzz-registry
 
-check: fmt-check clippy rust-test lua-syntax lua-test shell-syntax whitespace
+check: fmt-check clippy rust-test lua-syntax lua-test release-workflow-policy whitespace
 
 ci: check lint-extra audit-strict perf-smoke-small

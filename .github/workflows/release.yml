@@ -17,6 +17,8 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  GH_CLI_LINUX_AMD64_SHA256: 83d5c2ccad5498f58bf6368acb1ab32588cf43ab3a4b1c301bf36328b1c8bd60
+  GH_CLI_VERSION: "2.96.0"
   RUST_TOOLCHAIN: "1.95.0"
 
 jobs:
@@ -36,6 +38,31 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
           ref: ${{ inputs.tag }}
+
+      - name: Fail fast unless the pinned GitHub CLI supports release policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="gh_${GH_CLI_VERSION}_linux_amd64.tar.gz"
+          path="$RUNNER_TEMP/$archive"
+          curl --fail --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
+            --retry 3 --retry-all-errors \
+            "https://github.com/cli/cli/releases/download/v$GH_CLI_VERSION/$archive" \
+            --output "$path"
+          printf '%s  %s\n' "$GH_CLI_LINUX_AMD64_SHA256" "$path" \
+            | sha256sum --check --strict
+          tar -xzf "$path" -C "$RUNNER_TEMP"
+          gh_bin="$RUNNER_TEMP/gh_${GH_CLI_VERSION}_linux_amd64/bin/gh"
+          [[ "$($gh_bin version | sed -nE '1s/^gh version ([0-9]+\.[0-9]+\.[0-9]+).*/\1/p')" == "$GH_CLI_VERSION" ]]
+          "$gh_bin" release verify --help >/dev/null
+          release_view_help="$("$gh_bin" release view --help)"
+          for field in databaseId isImmutable; do
+            grep -F -- "$field" <<< "$release_view_help" >/dev/null
+          done
+          help="$("$gh_bin" attestation verify --help)"
+          for flag in --deny-self-hosted-runners --signer-digest --source-digest --source-ref; do
+            grep -F -- "$flag" <<< "$help" >/dev/null
+          done
 
       - name: Install pinned Rust toolchain
         run: |
@@ -382,12 +409,406 @@ jobs:
           compression-level: 0
           overwrite: true
 
-  publish:
-    name: Verify and publish immutable release
+  sign:
+    name: Sign verified release candidate
     needs: [prepare, linux, macos, windows]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     environment: release
+    permissions:
+      contents: read
+      attestations: read # Verify every native binary before exposing signing material.
+    env:
+      RELEASE_TAG: ${{ inputs.tag }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+      PROTOCOL_VERSION: ${{ needs.prepare.outputs.protocol_version }}
+      SOURCE_COMMIT: ${{ needs.prepare.outputs.source_commit }}
+      SOURCE_REF: refs/tags/${{ inputs.tag }}
+    steps:
+      # This job intentionally has no checkout, Cargo invocation, repository
+      # script, or other executable produced by the release tag. Keep the
+      # signing seed confined to the small, reviewable step below.
+      - name: Install the checksum-pinned GitHub CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="gh_${GH_CLI_VERSION}_linux_amd64.tar.gz"
+          path="$RUNNER_TEMP/$archive"
+          curl --fail --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
+            --retry 3 --retry-all-errors \
+            "https://github.com/cli/cli/releases/download/v$GH_CLI_VERSION/$archive" \
+            --output "$path"
+          printf '%s  %s\n' "$GH_CLI_LINUX_AMD64_SHA256" "$path" \
+            | sha256sum --check --strict
+          tar -xzf "$path" -C "$RUNNER_TEMP"
+          gh_dir="$RUNNER_TEMP/gh_${GH_CLI_VERSION}_linux_amd64/bin"
+          [[ "$("$gh_dir/gh" version | sed -nE '1s/^gh version ([0-9]+\.[0-9]+\.[0-9]+).*/\1/p')" == "$GH_CLI_VERSION" ]]
+          echo "$gh_dir" >> "$GITHUB_PATH"
+
+      - name: Require repository release immutability
+        env:
+          GH_TOKEN: ${{ secrets.NRM_RELEASE_POLICY_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${GH_TOKEN:-}" ]]; then
+            echo "the release environment is missing NRM_RELEASE_POLICY_TOKEN" >&2
+            exit 1
+          fi
+          policy="$(gh api \
+            --header 'Accept: application/vnd.github+json' \
+            --header 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY/immutable-releases")"
+          jq -e '.enabled == true' <<< "$policy" >/dev/null
+
+      - name: Download all native agents
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: agent-*
+          path: release-input
+          merge-multiple: true
+
+      - name: Require exactly six native agents and verify provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          artifacts=(
+            "nrm-agent-$VERSION-aarch64-apple-darwin"
+            "nrm-agent-$VERSION-aarch64-pc-windows-msvc.exe"
+            "nrm-agent-$VERSION-aarch64-unknown-linux-musl"
+            "nrm-agent-$VERSION-x86_64-apple-darwin"
+            "nrm-agent-$VERSION-x86_64-pc-windows-msvc.exe"
+            "nrm-agent-$VERSION-x86_64-unknown-linux-musl"
+          )
+          printf '%s\n' "${artifacts[@]}" | LC_ALL=C sort > expected-artifacts.txt
+          find release-input -mindepth 1 -maxdepth 1 -printf '%f\n' \
+            | LC_ALL=C sort > actual-artifacts.txt
+          diff -u expected-artifacts.txt actual-artifacts.txt
+          for artifact in "${artifacts[@]}"; do
+            path="release-input/$artifact"
+            if [[ ! -f "$path" || -L "$path" ]]; then
+              echo "missing regular native artifact: $artifact" >&2
+              exit 1
+            fi
+            gh attestation verify "$path" \
+              --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
+              --signer-digest "$SOURCE_COMMIT" \
+              --source-digest "$SOURCE_COMMIT" \
+              --source-ref "refs/tags/$RELEASE_TAG" \
+              --deny-self-hosted-runners
+          done
+
+      - name: Assemble and sign without executing release-tag code
+        env:
+          NRM_REGISTRY_SIGNING_KEYS_JSON: ${{ secrets.NRM_REGISTRY_SIGNING_KEYS_JSON }}
+          NRM_REGISTRY_TRUSTED_PUBLIC_KEYS_JSON: ${{ vars.NRM_REGISTRY_TRUSTED_PUBLIC_KEYS_JSON }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          if [[ -z "${NRM_REGISTRY_SIGNING_KEYS_JSON:-}" ]]; then
+            echo "the release environment is missing NRM_REGISTRY_SIGNING_KEYS_JSON" >&2
+            exit 1
+          fi
+          if [[ -z "${NRM_REGISTRY_TRUSTED_PUBLIC_KEYS_JSON:-}" ]]; then
+            echo "the release environment is missing NRM_REGISTRY_TRUSTED_PUBLIC_KEYS_JSON" >&2
+            exit 1
+          fi
+
+          python3 - <<'PY'
+          import base64
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import subprocess
+          import tempfile
+
+          MAX_ARTIFACT_BYTES = 128 * 1024 * 1024
+          MAX_KEYS = 32
+          PRIVATE_KEY_PREFIX = bytes.fromhex("302e020100300506032b657004220420")
+          PUBLIC_KEY_PREFIX = bytes.fromhex("302a300506032b6570032100")
+          TARGETS = (
+              "aarch64-apple-darwin",
+              "aarch64-pc-windows-msvc",
+              "aarch64-unknown-linux-musl",
+              "x86_64-apple-darwin",
+              "x86_64-pc-windows-msvc",
+              "x86_64-unknown-linux-musl",
+          )
+
+          def strict_map(name):
+              raw = os.environ[name]
+              if len(raw.encode()) > 64 * 1024:
+                  raise SystemExit(f"{name} exceeds 64 KiB")
+              def pairs_hook(pairs):
+                  result = {}
+                  for key, value in pairs:
+                      if key in result:
+                          raise ValueError("duplicate key ID")
+                      result[key] = value
+                  return result
+              try:
+                  value = json.loads(raw, object_pairs_hook=pairs_hook)
+              except (TypeError, ValueError, json.JSONDecodeError) as error:
+                  raise SystemExit(f"{name} is not strict JSON: {error}") from None
+              if not isinstance(value, dict) or not 1 <= len(value) <= MAX_KEYS:
+                  raise SystemExit(f"{name} must contain between 1 and {MAX_KEYS} keys")
+              for key_id, encoded in value.items():
+                  if not isinstance(encoded, str) or not re.fullmatch(r"[A-Za-z0-9._-]{1,128}", key_id):
+                      raise SystemExit(f"{name} contains an invalid key entry")
+              return value
+
+          def canonical_base64(key_id, encoded, size, kind):
+              try:
+                  decoded = base64.b64decode(encoded, validate=True)
+              except ValueError:
+                  raise SystemExit(f"{kind} for {key_id!r} is not canonical base64") from None
+              if len(decoded) != size or base64.b64encode(decoded).decode() != encoded:
+                  raise SystemExit(f"{kind} for {key_id!r} is not canonical base64")
+              return decoded
+
+          def bounded_slice(data, offset, size, kind):
+              end = offset + size
+              if offset < 0 or end < offset or end > len(data):
+                  raise SystemExit(f"artifact has a truncated or out-of-bounds {kind}")
+              return data[offset:end]
+
+          def little(data, offset, size, kind):
+              return int.from_bytes(bounded_slice(data, offset, size, kind), "little")
+
+          def validate_elf(data, target):
+              header = bounded_slice(data, 0, 64, "ELF header")
+              if header[:4] != b"\x7fELF" or header[4] != 2 or header[5] != 1:
+                  raise SystemExit("Linux artifact is not a little-endian ELF64 executable")
+              if header[6] != 1 or little(header, 20, 4, "ELF version") != 1:
+                  raise SystemExit("Linux artifact has an invalid ELF version")
+              if little(header, 16, 2, "ELF type") not in (2, 3):
+                  raise SystemExit("Linux artifact is not an executable image")
+              expected_machine = 183 if target.startswith("aarch64") else 62
+              if little(header, 18, 2, "ELF machine") != expected_machine:
+                  raise SystemExit(f"Linux artifact machine does not match {target}")
+              if little(header, 52, 2, "ELF header size") != 64:
+                  raise SystemExit("Linux artifact has a noncanonical ELF header size")
+              program_offset = little(header, 32, 8, "ELF program offset")
+              program_size = little(header, 54, 2, "ELF program entry size")
+              program_count = little(header, 56, 2, "ELF program count")
+              if (program_count == 0 or program_offset < 64 or program_offset % 8 != 0
+                      or program_size != 56
+                      or program_offset + program_size * program_count > len(data)):
+                  raise SystemExit("Linux artifact has an invalid ELF program-header table")
+              for index in range(program_count):
+                  offset = program_offset + index * program_size
+                  if little(data, offset, 4, "ELF program header") == 3:
+                      raise SystemExit("Linux artifact contains a dynamic program interpreter")
+
+          def validate_mach_o(data, target):
+              header = bounded_slice(data, 0, 32, "Mach-O header")
+              magic = header[:4]
+              if magic in (b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca",
+                           b"\xca\xfe\xba\xbf", b"\xbf\xba\xfe\xca"):
+                  raise SystemExit("fat/universal Mach-O artifacts are not allowed")
+              if magic != b"\xcf\xfa\xed\xfe":
+                  raise SystemExit("macOS artifact is not a thin little-endian Mach-O 64 executable")
+              expected_cpu = 0x0100000C if target.startswith("aarch64") else 0x01000007
+              if little(header, 4, 4, "Mach-O CPU") != expected_cpu:
+                  raise SystemExit(f"Mach-O CPU does not match {target}")
+              if little(header, 12, 4, "Mach-O file type") != 2:
+                  raise SystemExit("Mach-O artifact is not MH_EXECUTE")
+              command_count = little(header, 16, 4, "Mach-O command count")
+              command_bytes = little(header, 20, 4, "Mach-O command bytes")
+              commands_end = 32 + command_bytes
+              if command_count == 0 or command_count > 65535 or commands_end > len(data):
+                  raise SystemExit("Mach-O artifact has an invalid load-command table")
+              command_offset = 32
+              for _ in range(command_count):
+                  command_size = little(data, command_offset + 4, 4, "Mach-O load command")
+                  next_offset = command_offset + command_size
+                  if command_size < 8 or command_size % 8 != 0 or next_offset > commands_end:
+                      raise SystemExit("Mach-O artifact has an invalid load command")
+                  command_offset = next_offset
+              if command_offset != commands_end:
+                  raise SystemExit("Mach-O load-command count and byte size disagree")
+
+          def validate_pe(data, target):
+              dos = bounded_slice(data, 0, 64, "DOS header")
+              if dos[:2] != b"MZ":
+                  raise SystemExit("Windows artifact is missing its MZ header")
+              pe_offset = little(dos, 60, 4, "PE offset")
+              if pe_offset < 64:
+                  raise SystemExit("PE header offset overlaps the DOS header")
+              prefix = bounded_slice(data, pe_offset, 24, "PE signature and COFF header")
+              if prefix[:4] != b"PE\0\0":
+                  raise SystemExit("Windows artifact has an invalid PE signature")
+              expected_machine = 0xAA64 if target.startswith("aarch64") else 0x8664
+              if little(prefix, 4, 2, "PE machine") != expected_machine:
+                  raise SystemExit(f"PE machine does not match {target}")
+              section_count = little(prefix, 6, 2, "PE section count")
+              if not 1 <= section_count <= 96:
+                  raise SystemExit("PE artifact has an invalid section count")
+              optional_size = little(prefix, 20, 2, "PE optional size")
+              characteristics = little(prefix, 22, 2, "PE characteristics")
+              if optional_size < 112 or characteristics & 2 == 0:
+                  raise SystemExit("PE artifact is not a PE32+ executable image")
+              optional_offset = pe_offset + 24
+              if little(data, optional_offset, 2, "PE optional header") != 0x020B:
+                  raise SystemExit("PE artifact is not PE32+")
+              if optional_offset + optional_size + section_count * 40 > len(data):
+                  raise SystemExit("PE artifact has an out-of-bounds header table")
+
+          def validate_executable(data, target):
+              if target.endswith("linux-musl"):
+                  validate_elf(data, target)
+              elif target.endswith("apple-darwin"):
+                  validate_mach_o(data, target)
+              else:
+                  validate_pe(data, target)
+
+          version = os.environ["VERSION"]
+          protocol_text = os.environ["PROTOCOL_VERSION"]
+          source_commit = os.environ["SOURCE_COMMIT"]
+          if not re.fullmatch(r"[0-9A-Za-z][0-9A-Za-z.+-]{0,127}", version):
+              raise SystemExit("release version has an unsafe spelling")
+          if os.environ["RELEASE_TAG"] != f"v{version}" or os.environ["SOURCE_REF"] != f"refs/tags/v{version}":
+              raise SystemExit("release tag, source ref, and package version disagree")
+          if not re.fullmatch(r"[0-9a-f]{40}", source_commit):
+              raise SystemExit("source commit is not an exact 40-character Git ID")
+          if not protocol_text.isascii() or not protocol_text.isdigit():
+              raise SystemExit("protocol version is not an unsigned integer")
+          protocol_version = int(protocol_text)
+          if not 0 <= protocol_version <= 0xFFFFFFFF:
+              raise SystemExit("protocol version exceeds u32")
+
+          source = Path("release-input")
+          output = Path("release-candidate")
+          assets = output / "release-assets"
+          assets.mkdir(parents=True)
+          expected = []
+          artifact_records = []
+          digests = set()
+          for target in TARGETS:
+              extension = ".exe" if target.endswith("windows-msvc") else ""
+              filename = f"nrm-agent-{version}-{target}{extension}"
+              expected.append(filename)
+              path = source / filename
+              if path.is_symlink() or not path.is_file():
+                  raise SystemExit(f"missing regular artifact {filename!r}")
+              size = path.stat().st_size
+              if not 1 <= size <= MAX_ARTIFACT_BYTES:
+                  raise SystemExit(f"artifact {filename!r} has an invalid size")
+              artifact_bytes = path.read_bytes()
+              if len(artifact_bytes) != size:
+                  raise SystemExit(f"artifact {filename!r} changed while it was read")
+              validate_executable(artifact_bytes, target)
+              digest = hashlib.sha256(artifact_bytes).hexdigest()
+              if digest in digests:
+                  raise SystemExit("release targets contain duplicate artifact digests")
+              digests.add(digest)
+              artifact_records.append({
+                  "target": target,
+                  "filename": filename,
+                  "sha256": digest,
+                  "size": size,
+              })
+              (assets / filename).write_bytes(artifact_bytes)
+          if sorted(path.name for path in source.iterdir()) != sorted(expected):
+              raise SystemExit("release input contains a missing or unexpected entry")
+
+          manifest = {
+              "schema_version": 1,
+              "package": "nrm-agent",
+              "version": version,
+              "protocol_version": protocol_version,
+              "source_commit": source_commit,
+              "artifacts": artifact_records,
+          }
+          manifest_path = assets / "nrm-agent-manifest-v1.json"
+          manifest_path.write_bytes(
+              json.dumps(manifest, ensure_ascii=False, separators=(",", ":")).encode() + b"\n"
+          )
+
+          signing = strict_map("NRM_REGISTRY_SIGNING_KEYS_JSON")
+          trusted = strict_map("NRM_REGISTRY_TRUSTED_PUBLIC_KEYS_JSON")
+          if set(signing) != set(trusted):
+              raise SystemExit("signing and trusted public key ID sets differ")
+          seeds = {}
+          trusted_bytes = {}
+          for key_id in sorted(signing):
+              seeds[key_id] = canonical_base64(key_id, signing[key_id], 32, "Ed25519 seed")
+              trusted_bytes[key_id] = canonical_base64(
+                  key_id, trusted[key_id], 32, "Ed25519 public key"
+              )
+          if len(set(seeds.values())) != len(seeds) or len(set(trusted_bytes.values())) != len(trusted_bytes):
+              raise SystemExit("signing configuration repeats key material")
+
+          signatures = []
+          with tempfile.TemporaryDirectory(prefix="nrm-sign-") as temporary:
+              temporary = Path(temporary)
+              for index, key_id in enumerate(sorted(signing)):
+                  key_path = temporary / f"key-{index}.der"
+                  public_path = temporary / f"public-{index}.der"
+                  signature_path = temporary / f"signature-{index}"
+                  key_path.write_bytes(PRIVATE_KEY_PREFIX + seeds[key_id])
+                  key_path.chmod(0o600)
+                  public_der = subprocess.run(
+                      ["openssl", "pkey", "-inform", "DER", "-in", str(key_path),
+                       "-pubout", "-outform", "DER"],
+                      check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                  ).stdout
+                  if not public_der.startswith(PUBLIC_KEY_PREFIX) or len(public_der) != 44:
+                      raise SystemExit("OpenSSL returned a noncanonical Ed25519 public key")
+                  if public_der[len(PUBLIC_KEY_PREFIX):] != trusted_bytes[key_id]:
+                      raise SystemExit(f"signing seed and trusted public key differ for {key_id!r}")
+                  public_path.write_bytes(public_der)
+                  subprocess.run(
+                      ["openssl", "pkeyutl", "-sign", "-inkey", str(key_path),
+                       "-keyform", "DER", "-rawin", "-in", str(manifest_path),
+                       "-out", str(signature_path)],
+                      check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                  )
+                  signature = signature_path.read_bytes()
+                  if len(signature) != 64:
+                      raise SystemExit("OpenSSL returned a noncanonical Ed25519 signature")
+                  subprocess.run(
+                      ["openssl", "pkeyutl", "-verify", "-pubin", "-inkey", str(public_path),
+                       "-keyform", "DER", "-rawin", "-in", str(manifest_path),
+                       "-sigfile", str(signature_path)],
+                      check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                  )
+                  signatures.append({
+                      "key_id": key_id,
+                      "signature": base64.b64encode(signature).decode(),
+                  })
+
+          signature_document = {"schema_version": 1, "signatures": signatures}
+          (assets / "nrm-agent-manifest-v1.json.sig").write_bytes(
+              json.dumps(signature_document, separators=(",", ":")).encode() + b"\n"
+          )
+          (output / "trusted-public-keys.json").write_bytes(
+              json.dumps({key: trusted[key] for key in sorted(trusted)}, separators=(",", ":")).encode() + b"\n"
+          )
+          print(f"assembled six artifacts and {len(signatures)} detached signature(s)")
+          PY
+
+      - name: Upload signed release candidate
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: signed-agent-release-${{ needs.prepare.outputs.source_commit }}
+          path: release-candidate
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+          overwrite: true
+
+  publish:
+    name: Verify and publish immutable release
+    needs: [prepare, sign]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     permissions:
       contents: write # Create, populate, and publish the GitHub Release.
       id-token: write # Mint the Sigstore certificate for release metadata.
@@ -407,133 +828,82 @@ jobs:
           persist-credentials: false
           ref: ${{ needs.prepare.outputs.source_commit }}
 
-      - name: Require compatible GitHub CLI release policy
+      - name: Install the checksum-pinned GitHub CLI
         shell: bash
         run: |
           set -euo pipefail
-          minimum=2.94.0
-          version="$(gh --version | sed -nE '1s/^gh version ([0-9]+\.[0-9]+\.[0-9]+).*/\1/p')"
-          if [[ -z "$version" || "$(printf '%s\n%s\n' "$minimum" "$version" | sort -V | head -n 1)" != "$minimum" ]]; then
-            echo "GitHub CLI $minimum or newer is required, found ${version:-unknown}" >&2
-            exit 1
-          fi
-          gh release verify --help >/dev/null
-          release_view_help="$(gh release view --help)"
-          for field in databaseId isImmutable; do
-            grep -F -- "$field" <<< "$release_view_help" >/dev/null || {
-              echo "GitHub CLI release metadata is missing $field" >&2
-              exit 1
-            }
-          done
-          help="$(gh attestation verify --help)"
-          for flag in --deny-self-hosted-runners --signer-digest --source-digest --source-ref; do
-            grep -F -- "$flag" <<< "$help" >/dev/null || {
-              echo "GitHub CLI attestation verification is missing $flag" >&2
-              exit 1
-            }
-          done
-
-      - name: Require repository release immutability
-        env:
-          GH_TOKEN: ${{ secrets.NRM_RELEASE_POLICY_TOKEN }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [[ -z "${GH_TOKEN:-}" ]]; then
-            echo "the release environment is missing NRM_RELEASE_POLICY_TOKEN" >&2
-            exit 1
-          fi
-          policy="$(gh api \
-            --header 'Accept: application/vnd.github+json' \
-            --header 'X-GitHub-Api-Version: 2026-03-10' \
-            "repos/$GITHUB_REPOSITORY/immutable-releases")"
-          jq -e '.enabled == true' <<< "$policy" >/dev/null
+          archive="gh_${GH_CLI_VERSION}_linux_amd64.tar.gz"
+          path="$RUNNER_TEMP/$archive"
+          curl --fail --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
+            --retry 3 --retry-all-errors \
+            "https://github.com/cli/cli/releases/download/v$GH_CLI_VERSION/$archive" \
+            --output "$path"
+          printf '%s  %s\n' "$GH_CLI_LINUX_AMD64_SHA256" "$path" \
+            | sha256sum --check --strict
+          tar -xzf "$path" -C "$RUNNER_TEMP"
+          gh_dir="$RUNNER_TEMP/gh_${GH_CLI_VERSION}_linux_amd64/bin"
+          [[ "$("$gh_dir/gh" version | sed -nE '1s/^gh version ([0-9]+\.[0-9]+\.[0-9]+).*/\1/p')" == "$GH_CLI_VERSION" ]]
+          echo "$gh_dir" >> "$GITHUB_PATH"
 
       - name: Install pinned Rust toolchain
+        shell: bash
         run: |
+          set -euo pipefail
           rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
           rustup default "$RUST_TOOLCHAIN"
 
       - name: Test and build release verifier
+        shell: bash
         run: |
+          set -euo pipefail
           cargo test -p nrm-registry --bin nrm-registry-release --locked
           cargo build -p nrm-registry --bin nrm-registry-release --release --locked
 
-      - name: Download all native agents
+      - name: Download the signed release candidate
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          pattern: agent-*
-          path: release-input
-          merge-multiple: true
+          name: signed-agent-release-${{ needs.prepare.outputs.source_commit }}
+          path: signed-candidate
 
-      - name: Verify native build provenance
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Strictly verify the isolated signer output
         shell: bash
         run: |
           set -euo pipefail
-          artifacts=(
-            "nrm-agent-$VERSION-aarch64-apple-darwin"
-            "nrm-agent-$VERSION-aarch64-pc-windows-msvc.exe"
-            "nrm-agent-$VERSION-aarch64-unknown-linux-musl"
-            "nrm-agent-$VERSION-x86_64-apple-darwin"
-            "nrm-agent-$VERSION-x86_64-pc-windows-msvc.exe"
-            "nrm-agent-$VERSION-x86_64-unknown-linux-musl"
-          )
-          for artifact in "${artifacts[@]}"; do
-            path="release-input/$artifact"
+          cp -R signed-candidate/release-assets release-assets
+          mkdir release-input
+          {
+            printf '%s\n' \
+              "nrm-agent-$VERSION-aarch64-apple-darwin" \
+              "nrm-agent-$VERSION-aarch64-pc-windows-msvc.exe" \
+              "nrm-agent-$VERSION-aarch64-unknown-linux-musl" \
+              "nrm-agent-$VERSION-x86_64-apple-darwin" \
+              "nrm-agent-$VERSION-x86_64-pc-windows-msvc.exe" \
+              "nrm-agent-$VERSION-x86_64-unknown-linux-musl"
+          } | LC_ALL=C sort > expected-artifacts.txt
+          {
+            cat expected-artifacts.txt
+            printf '%s\n' nrm-agent-manifest-v1.json nrm-agent-manifest-v1.json.sig
+          } | LC_ALL=C sort > expected-assets.txt
+          find release-assets -mindepth 1 -maxdepth 1 -printf '%f\n' \
+            | LC_ALL=C sort > actual-assets.txt
+          diff -u expected-assets.txt actual-assets.txt
+          while IFS= read -r artifact; do
+            path="release-assets/$artifact"
             if [[ ! -f "$path" || -L "$path" ]]; then
-              echo "missing regular native artifact: $artifact" >&2
+              echo "signed candidate entry is not a regular file: $artifact" >&2
               exit 1
             fi
-            gh attestation verify "$path" \
-              --repo "$GITHUB_REPOSITORY" \
-              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
-              --signer-digest "$SOURCE_COMMIT" \
-              --source-digest "$SOURCE_COMMIT" \
-              --source-ref "refs/tags/$RELEASE_TAG" \
-              --deny-self-hosted-runners
-          done
+            cp -- "$path" "release-input/$artifact"
+          done < expected-artifacts.txt
 
-      - name: Assemble, sign, and verify release locally
-        env:
-          NRM_REGISTRY_SIGNING_KEYS_JSON: ${{ secrets.NRM_REGISTRY_SIGNING_KEYS_JSON }}
-          NRM_REGISTRY_TRUSTED_PUBLIC_KEYS_JSON: ${{ vars.NRM_REGISTRY_TRUSTED_PUBLIC_KEYS_JSON }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [[ -z "${NRM_REGISTRY_SIGNING_KEYS_JSON:-}" ]]; then
-            echo "the release environment is missing NRM_REGISTRY_SIGNING_KEYS_JSON" >&2
-            exit 1
-          fi
-          if [[ -z "${NRM_REGISTRY_TRUSTED_PUBLIC_KEYS_JSON:-}" ]]; then
-            echo "the release environment is missing NRM_REGISTRY_TRUSTED_PUBLIC_KEYS_JSON" >&2
-            exit 1
-          fi
-
-          tool=target/release/nrm-registry-release
-          mkdir -p release-assets
-          "$tool" assemble \
-            --artifacts-dir release-input \
-            --version "$VERSION" \
-            --protocol-version "$PROTOCOL_VERSION" \
-            --source-commit "$SOURCE_COMMIT" \
-            --output release-assets/nrm-agent-manifest-v1.json
-          "$tool" sign \
-            --manifest release-assets/nrm-agent-manifest-v1.json \
-            --output release-assets/nrm-agent-manifest-v1.json.sig \
-            --expected-version "$VERSION" \
-            --expected-protocol-version "$PROTOCOL_VERSION" \
-            --expected-source-commit "$SOURCE_COMMIT"
-
-          "$tool" verify \
+          target/release/nrm-registry-release verify \
             --manifest release-assets/nrm-agent-manifest-v1.json \
             --signatures release-assets/nrm-agent-manifest-v1.json.sig \
             --artifacts-dir release-input \
+            --trusted-public-keys signed-candidate/trusted-public-keys.json \
             --expected-version "$VERSION" \
             --expected-protocol-version "$PROTOCOL_VERSION" \
             --expected-source-commit "$SOURCE_COMMIT"
-          cp release-input/* release-assets/
 
       - name: Attest manifest and detached signatures
         uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
@@ -620,7 +990,6 @@ jobs:
       - name: Re-download and verify complete draft
         env:
           GH_TOKEN: ${{ github.token }}
-          NRM_REGISTRY_TRUSTED_PUBLIC_KEYS_JSON: ${{ vars.NRM_REGISTRY_TRUSTED_PUBLIC_KEYS_JSON }}
         shell: bash
         run: |
           set -euo pipefail
@@ -664,6 +1033,7 @@ jobs:
             --manifest downloaded/nrm-agent-manifest-v1.json \
             --signatures downloaded/nrm-agent-manifest-v1.json.sig \
             --artifacts-dir downloaded-artifacts \
+            --trusted-public-keys signed-candidate/trusted-public-keys.json \
             --expected-version "$VERSION" \
             --expected-protocol-version "$PROTOCOL_VERSION" \
             --expected-source-commit "$SOURCE_COMMIT"

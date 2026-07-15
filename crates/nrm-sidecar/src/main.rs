@@ -18,8 +18,8 @@ use nrm_registry::{
 };
 use remote_host::{
     local_host_info, parse_posix_probe, parse_powershell_probe, posix_probe_command,
-    powershell_probe_command, powershell_process_command, validate_remote_root,
-    PowerShellProcessCommand, RemoteHostInfo, RemotePathStyle,
+    powershell_agent_process_command, powershell_probe_command, powershell_process_command,
+    validate_remote_root, PowerShellProcessCommand, RemoteHostInfo, RemotePathStyle,
 };
 use rusqlite::Row;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -32,13 +32,15 @@ use std::fmt;
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 #[cfg(unix)]
-use std::os::unix::fs::FileTypeExt;
+use std::os::unix::fs::{
+    DirBuilderExt as _, FileTypeExt as _, MetadataExt as _, PermissionsExt as _,
+};
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener, UnixStream};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
     mpsc, Arc, Condvar, Mutex, OnceLock,
@@ -73,6 +75,11 @@ const REGISTRY_POLICY_DISABLED: &str = "disabled";
 const BOOTSTRAP_RECOVERY_RESERVE_MIN_MS: u64 = 250;
 const BOOTSTRAP_RECOVERY_RESERVE_MAX_MS: u64 = 10_000;
 const PROCESS_CAPTURE_MAX_STREAM_BYTES: usize = 1024 * 1024;
+const AGENT_STDERR_TAIL_MAX_BYTES: usize = 64 * 1024;
+const AGENT_EXIT_DIAGNOSTIC_GRACE: Duration = Duration::from_millis(250);
+const AGENT_LAUNCH_PRELUDE_MAX_BYTES: usize = 128;
+const AGENT_LAUNCH_READY_RECORD: &[u8] = b"NRM_AGENT_LAUNCH_V1\tREADY\n";
+const AGENT_LAUNCH_FAILURE_PREFIX: &[u8] = b"NRM_AGENT_LAUNCH_V1\tFAILURE\t";
 const BACKGROUND_SCAN_CURSOR_KEY: &str = "background_scan_cursor";
 const BACKGROUND_SCAN_COMPLETED_AT_KEY: &str = "background_scan_completed_at_ms";
 const SIDECAR_COMMAND_SPECS: &[SidecarCommandSpec] = &[
@@ -389,7 +396,58 @@ struct AgentInstallPreflight {
     before: Value,
     target_path: String,
     effective_force: bool,
-    skip: bool,
+    skip_reason: Option<String>,
+    automatic: bool,
+}
+
+#[derive(Debug)]
+struct AgentInstallDecision {
+    effective_force: bool,
+    skip_reason: Option<String>,
+}
+
+fn agent_install_decision(
+    before_status: &str,
+    update: bool,
+    force: bool,
+    automatic: bool,
+) -> Result<AgentInstallDecision> {
+    if automatic {
+        if !update {
+            bail!("automatic remote agent bootstrap requires update/repair semantics");
+        }
+        if force {
+            bail!("automatic remote agent bootstrap does not accept force=true");
+        }
+        return Ok(match before_status {
+            "ok" => AgentInstallDecision {
+                effective_force: false,
+                skip_reason: Some("remote agent is already compatible".to_string()),
+            },
+            "missing_agent" => AgentInstallDecision {
+                effective_force: false,
+                skip_reason: None,
+            },
+            "agent_not_executable" | "version_mismatch" | "protocol_mismatch" => {
+                AgentInstallDecision {
+                    effective_force: true,
+                    skip_reason: None,
+                }
+            }
+            other => AgentInstallDecision {
+                effective_force: false,
+                skip_reason: Some(format!(
+                    "automatic bootstrap left remote agent unchanged for status `{other}`"
+                )),
+            },
+        });
+    }
+
+    Ok(AgentInstallDecision {
+        effective_force: force || (update && before_status != "missing_agent"),
+        skip_reason: (update && !force && before_status == "ok")
+            .then(|| "remote agent is already compatible".to_string()),
+    })
 }
 
 struct PreparedAgentInstall {
@@ -405,6 +463,439 @@ struct PreparedAgentInstall {
 enum PreparedAgentInstallPlan {
     Posix(agent_install::PosixInstallPlan),
     Windows(windows_agent_install::WindowsInstallPlan),
+}
+
+impl PreparedAgentInstallPlan {
+    fn lease_command(&self, token: &str) -> Result<String> {
+        match self {
+            Self::Posix(plan) => plan
+                .lease_command(token)
+                .context("invalid POSIX remote-agent lease plan"),
+            Self::Windows(plan) => plan
+                .lease_command(token)
+                .context("invalid Windows remote-agent lease plan"),
+        }
+    }
+
+    fn parse_lease_ready_stdout(&self, token: &str, stdout: &str) -> Result<String> {
+        match self {
+            Self::Posix(plan) => plan
+                .parse_lease_ready_stdout(token, stdout)
+                .context("POSIX remote-agent lease returned an invalid readiness record"),
+            Self::Windows(plan) => plan
+                .parse_lease_ready_stdout(token, stdout)
+                .context("Windows remote-agent lease returned an invalid readiness record"),
+        }
+    }
+
+    fn set_force(&mut self, force: bool) {
+        match self {
+            Self::Posix(plan) => plan.set_force(force),
+            Self::Windows(plan) => plan.set_force(force),
+        }
+    }
+
+    fn set_expected_sha256(&mut self, digest: &str) -> Result<()> {
+        match self {
+            Self::Posix(plan) => plan
+                .set_expected_sha256(digest)
+                .context("invalid POSIX remote-agent artifact digest"),
+            Self::Windows(plan) => plan
+                .set_expected_sha256(digest)
+                .context("invalid Windows remote-agent artifact digest"),
+        }
+    }
+
+    fn set_lease_token(&mut self, token: &str) -> Result<()> {
+        match self {
+            Self::Posix(plan) => plan
+                .set_lease_token(token)
+                .context("invalid POSIX remote-agent lease token"),
+            Self::Windows(plan) => plan
+                .set_lease_token(token)
+                .context("invalid Windows remote-agent lease token"),
+        }
+    }
+
+    fn bind_lease_target(&mut self, target: &str) -> Result<()> {
+        match self {
+            Self::Posix(plan) => plan
+                .bind_resolved_lease_target(target)
+                .context("invalid resolved POSIX remote-agent lease target"),
+            // Windows readiness parsing already requires the exact normalized
+            // target stored in the plan.
+            Self::Windows(_) => Ok(()),
+        }
+    }
+}
+
+static INSTALL_LEASE_NONCE: AtomicU64 = AtomicU64::new(0);
+const INSTALL_LEASE_READY_MAX_BYTES: usize = 4096;
+const INSTALL_LEASE_STDERR_GRACE: Duration = Duration::from_secs(1);
+const INSTALL_LEASE_DETACHED_STDERR_GRACE: Duration = Duration::from_secs(1);
+
+fn new_install_lease_token(target: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(std::process::id().to_le_bytes());
+    hasher.update(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+            .to_le_bytes(),
+    );
+    hasher.update(
+        INSTALL_LEASE_NONCE
+            .fetch_add(1, Ordering::Relaxed)
+            .to_le_bytes(),
+    );
+    hasher.update(target.as_bytes());
+    let digest = hasher.finalize();
+    digest[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+struct RemoteInstallLease {
+    child: Option<Child>,
+    stdin: Option<ChildStdin>,
+    stderr: Option<ProcessOutputReader>,
+    released: bool,
+}
+
+fn detach_install_lease_stderr(stderr: ProcessOutputReader) {
+    let _ = thread::Builder::new()
+        .name("nrm-install-lease-stderr-reaper".to_owned())
+        .spawn(move || {
+            let started = Instant::now();
+            while !stderr.is_finished() && started.elapsed() < INSTALL_LEASE_DETACHED_STDERR_GRACE {
+                let remaining =
+                    INSTALL_LEASE_DETACHED_STDERR_GRACE.saturating_sub(started.elapsed());
+                thread::sleep(remaining.min(Duration::from_millis(10)));
+            }
+            if stderr.is_finished() {
+                let _ = join_process_output_reader(
+                    stderr,
+                    "remote agent installation lease detached cleanup",
+                    "stderr",
+                );
+            }
+            // If a daemonized descendant retains the pipe beyond the bounded
+            // grace, dropping the join handle detaches the already-bounded
+            // reader rather than extending the bootstrap caller's deadline.
+        });
+}
+
+impl RemoteInstallLease {
+    fn acquire(
+        ssh: &SshTransport,
+        remote_command: String,
+        timeout: Duration,
+    ) -> Result<(Self, String)> {
+        let context = "remote agent installation lease";
+        let mut command = ssh.command(remote_command);
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        configure_agent_process(&mut command);
+        let mut child = command
+            .spawn()
+            .with_context(|| format!("failed to start {context} holder"))?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow!("{context} stdin was not piped"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow!("{context} stdout was not piped"))?;
+        let stderr = child
+            .stderr
+            .take()
+            .map(spawn_process_output_reader)
+            .ok_or_else(|| anyhow!("{context} stderr was not piped"))?;
+        let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+        let ready_reader = thread::Builder::new()
+            .name("nrm-install-lease-ready".to_owned())
+            .spawn(move || {
+                    let limited = LeadingBomReader::new(stdout)
+                        .take((INSTALL_LEASE_READY_MAX_BYTES + 1) as u64);
+                    let mut reader = BufReader::new(limited);
+                    let mut bytes = Vec::new();
+                    let result = match reader.read_until(b'\n', &mut bytes) {
+                        Ok(0) => Err(anyhow!(
+                            "remote agent installation lease closed stdout before readiness"
+                        )),
+                        Ok(_)
+                            if bytes.len() > INSTALL_LEASE_READY_MAX_BYTES
+                                || bytes.last() != Some(&b'\n') =>
+                        {
+                            Err(anyhow!(
+                                "remote agent installation lease readiness exceeded its limit or lacked a newline"
+                            ))
+                        }
+                        Ok(_) => String::from_utf8(bytes).context(
+                            "remote agent installation lease readiness was not UTF-8",
+                        ),
+                        Err(error) => Err(error)
+                            .context("failed to read remote agent installation lease readiness"),
+                    };
+                    let _ = ready_tx.send(result);
+                });
+        let mut ready_reader = match ready_reader {
+            Ok(reader) => Some(reader),
+            Err(error) => {
+                drop(stdin);
+                kill_child_tree(&mut child);
+                reap_child_in_background(child);
+                return Err(error).context("failed to start remote-agent lease readiness reader");
+            }
+        };
+
+        let started = Instant::now();
+        let mut readiness = None;
+        let mut readiness_error = None;
+        loop {
+            if readiness.is_none() && ready_reader.is_some() {
+                match ready_rx.try_recv() {
+                    Ok(result) => readiness = Some(result),
+                    Err(mpsc::TryRecvError::Empty) => {}
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        readiness = Some(Err(anyhow!(
+                            "remote agent installation lease readiness reader stopped"
+                        )));
+                    }
+                }
+            }
+            if let Some(result) = readiness.take() {
+                if let Some(reader) = ready_reader.take() {
+                    if reader.is_finished() {
+                        let _ = reader.join();
+                    }
+                }
+                match result {
+                    Ok(stdout) => match child.try_wait() {
+                        Ok(None) => {
+                            return Ok((
+                                Self {
+                                    child: Some(child),
+                                    stdin: Some(stdin),
+                                    stderr: Some(stderr),
+                                    released: false,
+                                },
+                                stdout,
+                            ));
+                        }
+                        Ok(Some(status)) => {
+                            return Err(Self::exited_error(
+                                status,
+                                stderr,
+                                context,
+                                timeout.saturating_sub(started.elapsed()),
+                            ));
+                        }
+                        Err(error) => {
+                            kill_child_tree(&mut child);
+                            reap_child_in_background(child);
+                            return Err(error).context(format!("failed to poll {context} holder"));
+                        }
+                    },
+                    Err(error) => readiness_error = Some(error),
+                }
+            }
+
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    if let Some(reader) = ready_reader.take() {
+                        if reader.is_finished() {
+                            let _ = reader.join();
+                        }
+                    }
+                    if status.success() {
+                        if let Some(error) = readiness_error.take() {
+                            return Err(error);
+                        }
+                    }
+                    return Err(Self::exited_error(
+                        status,
+                        stderr,
+                        context,
+                        timeout.saturating_sub(started.elapsed()),
+                    ));
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    kill_child_tree(&mut child);
+                    reap_child_in_background(child);
+                    return Err(error).context(format!("failed to poll {context} holder"));
+                }
+            }
+            if started.elapsed() >= timeout {
+                kill_child_tree(&mut child);
+                let status = child.try_wait().ok().flatten();
+                if status.is_none() {
+                    reap_child_in_background(child);
+                }
+                let timeout_error = anyhow!(ProcessTimeoutError {
+                    context: format!("{context} acquisition"),
+                    timeout,
+                    status,
+                });
+                return Err(match readiness_error {
+                    Some(error) => timeout_error.context(error.to_string()),
+                    None => timeout_error,
+                });
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn exited_error(
+        status: ExitStatus,
+        stderr: ProcessOutputReader,
+        context: &str,
+        timeout: Duration,
+    ) -> anyhow::Error {
+        let started = Instant::now();
+        let timeout = timeout.min(INSTALL_LEASE_STDERR_GRACE);
+        while !stderr.is_finished() && started.elapsed() < timeout {
+            let remaining = timeout.saturating_sub(started.elapsed());
+            thread::sleep(remaining.min(Duration::from_millis(1)));
+        }
+        if !stderr.is_finished() {
+            detach_install_lease_stderr(stderr);
+            return anyhow!(
+                "command_failed: {context} holder exited with {status}; stderr did not close"
+            );
+        }
+        let stderr = join_process_output_reader(stderr, context, "stderr")
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            .unwrap_or_else(|error| error.to_string());
+        let failure = agent_install::classify_install_failure(status.code(), &stderr);
+        anyhow!("{}: {}", install_failure_code(failure.kind), failure.detail)
+    }
+
+    fn ensure_held(&mut self, phase: &str) -> Result<()> {
+        let child = self
+            .child
+            .as_mut()
+            .ok_or_else(|| anyhow!("remote agent installation lease was already released"))?;
+        match child.try_wait() {
+            Ok(None) => Ok(()),
+            Ok(Some(status)) => {
+                let stderr = self.stderr.take().ok_or_else(|| {
+                    anyhow!("remote agent installation lease stderr was unavailable")
+                })?;
+                Err(Self::exited_error(status, stderr, phase, Duration::ZERO))
+                    .context("remote agent installation lease holder exited before mutation")
+            }
+            Err(error) => Err(error)
+                .with_context(|| format!("failed to poll installation lease before {phase}")),
+        }
+    }
+
+    fn release(&mut self, timeout: Duration) -> Result<()> {
+        if self.released {
+            return Ok(());
+        }
+        // From this point every owned process/pipe is either reaped here or
+        // handed to a detached reaper. Drop must never start a second wait
+        // that can outlive the caller's bootstrap deadline.
+        self.released = true;
+        self.stdin.take();
+        let mut stderr = self.stderr.take();
+        let Some(mut child) = self.child.take() else {
+            if let Some(stderr) = stderr.take() {
+                detach_install_lease_stderr(stderr);
+            }
+            return Ok(());
+        };
+        if stderr.is_none() {
+            kill_child_tree(&mut child);
+            reap_child_in_background(child);
+            bail!("remote agent installation lease stderr was unavailable during release");
+        }
+        let started = Instant::now();
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if started.elapsed() < timeout => {
+                    let remaining = timeout.saturating_sub(started.elapsed());
+                    thread::sleep(remaining.min(Duration::from_millis(10)));
+                }
+                Ok(None) => {
+                    kill_child_tree(&mut child);
+                    let (status, reap_error) = match child.try_wait() {
+                        Ok(Some(status)) => (Some(status), None),
+                        Ok(None) => {
+                            reap_child_in_background(child);
+                            (None, None)
+                        }
+                        Err(error) => {
+                            reap_child_in_background(child);
+                            (None, Some(error))
+                        }
+                    };
+                    detach_install_lease_stderr(stderr.take().unwrap());
+                    let timeout_error = anyhow!(ProcessTimeoutError {
+                        context: "remote agent installation lease release".to_owned(),
+                        timeout,
+                        status,
+                    });
+                    return Err(match reap_error {
+                        Some(error) => timeout_error.context(format!(
+                            "failed to reap remote agent installation lease holder: {error}"
+                        )),
+                        None => timeout_error,
+                    });
+                }
+                Err(error) => {
+                    kill_child_tree(&mut child);
+                    reap_child_in_background(child);
+                    detach_install_lease_stderr(stderr.take().unwrap());
+                    return Err(error)
+                        .context("failed to poll remote agent installation lease holder");
+                }
+            }
+        };
+        let stderr = stderr.take().unwrap();
+        let stderr_started = Instant::now();
+        let stderr_timeout = timeout.saturating_sub(started.elapsed());
+        while !stderr.is_finished() && stderr_started.elapsed() < stderr_timeout {
+            let remaining = stderr_timeout.saturating_sub(stderr_started.elapsed());
+            thread::sleep(remaining.min(Duration::from_millis(1)));
+        }
+        if !stderr.is_finished() {
+            detach_install_lease_stderr(stderr);
+            bail!("remote agent installation lease stderr did not close during release");
+        }
+        let stderr =
+            join_process_output_reader(stderr, "remote agent installation lease", "stderr")?;
+        if status.success() {
+            // OpenSSH can emit host-key notices or a remote login banner on
+            // stderr even though the fixed lease holder exited cleanly. The
+            // stream is still bounded and drained, but success is determined
+            // by the holder's exit status.
+            return Ok(());
+        }
+        let stderr = String::from_utf8_lossy(&stderr);
+        let failure = agent_install::classify_install_failure(status.code(), &stderr);
+        Err(anyhow!(
+            "{}: {}",
+            install_failure_code(failure.kind),
+            failure.detail
+        ))
+    }
+}
+
+impl Drop for RemoteInstallLease {
+    fn drop(&mut self) {
+        if !self.released {
+            let _ = self.release(Duration::ZERO);
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -576,6 +1067,25 @@ impl BootstrapDeadline {
     }
 }
 
+fn release_remote_install_lease_with_deadline(
+    lease: &mut RemoteInstallLease,
+    deadline: BootstrapDeadline,
+    phase: &str,
+) -> Result<()> {
+    match deadline.recovery_timeout(phase) {
+        Ok(release_timeout) => lease.release(release_timeout),
+        Err(timeout_error) => {
+            let forced_release = lease.release(Duration::ZERO);
+            Err(match forced_release {
+                Ok(()) => timeout_error,
+                Err(release_error) => {
+                    timeout_error.context(format!("install_lease_release_failed: {release_error}"))
+                }
+            })
+        }
+    }
+}
+
 fn is_bootstrap_timeout(error: &anyhow::Error) -> bool {
     error.chain().any(|cause| {
         cause.downcast_ref::<BootstrapTimeoutError>().is_some()
@@ -654,7 +1164,7 @@ fn install_transaction_error_with_timeout(
 trait AgentInstallOps {
     fn stage(&mut self) -> Result<agent_install::StagedInstall>;
     fn validate_staged(&mut self, staged: &agent_install::StagedInstall) -> Result<()>;
-    fn ensure_activation_budget(&self) -> Result<()> {
+    fn ensure_activation_budget(&mut self) -> Result<()> {
         Ok(())
     }
     fn activate(
@@ -818,6 +1328,7 @@ struct PosixSshInstallOps<'a> {
     source: Option<File>,
     launch: AgentLaunch,
     normal_agent: &'a mut AgentClient,
+    lease: &'a mut RemoteInstallLease,
     deadline: BootstrapDeadline,
 }
 
@@ -869,6 +1380,7 @@ impl PosixSshInstallOps<'_> {
 
 impl AgentInstallOps for PosixSshInstallOps<'_> {
     fn stage(&mut self) -> Result<agent_install::StagedInstall> {
+        self.lease.ensure_held("remote agent staging")?;
         let source = self
             .source
             .take()
@@ -893,6 +1405,7 @@ impl AgentInstallOps for PosixSshInstallOps<'_> {
     }
 
     fn validate_staged(&mut self, staged: &agent_install::StagedInstall) -> Result<()> {
+        self.lease.ensure_held("staged agent exact Hello")?;
         let hook = self.plan.staged_validation(staged);
         let timeout = self.deadline.forward_timeout("staged agent exact Hello")?;
         probe_agent_at(&self.launch, &hook.executable_path, timeout)
@@ -909,7 +1422,9 @@ impl AgentInstallOps for PosixSshInstallOps<'_> {
             .map(drop)
     }
 
-    fn ensure_activation_budget(&self) -> Result<()> {
+    fn ensure_activation_budget(&mut self) -> Result<()> {
+        self.lease
+            .ensure_held("remote agent activation budget check")?;
         self.deadline
             .forward_timeout("remote agent activation")
             .map(drop)
@@ -919,6 +1434,7 @@ impl AgentInstallOps for PosixSshInstallOps<'_> {
         &mut self,
         staged: &agent_install::StagedInstall,
     ) -> Result<agent_install::ActivatedInstall> {
+        self.lease.ensure_held("remote agent activation")?;
         let output = self.command_output(
             self.plan.activate_command(staged),
             BootstrapBudget::Forward,
@@ -933,6 +1449,7 @@ impl AgentInstallOps for PosixSshInstallOps<'_> {
     }
 
     fn validate_activated(&mut self, activated: &agent_install::ActivatedInstall) -> Result<()> {
+        self.lease.ensure_held("normal-path agent Hello")?;
         let _hook = self.plan.post_activation_validation(activated);
         let timeout = self.deadline.forward_timeout("normal-path agent Hello")?;
         probe_normal_agent_with_timeout(self.normal_agent, timeout)
@@ -957,6 +1474,8 @@ impl AgentInstallOps for PosixSshInstallOps<'_> {
             BootstrapBudget::Recovery,
             "normal-path agent exit before activation reconciliation",
         )?;
+        self.lease
+            .ensure_held("remote agent activation reconciliation")?;
         let output = self.command_output(
             self.plan.reconcile_activation_command(staged),
             BootstrapBudget::Recovery,
@@ -972,6 +1491,7 @@ impl AgentInstallOps for PosixSshInstallOps<'_> {
         &mut self,
         recovery: &agent_install::ActivationRecovery,
     ) -> Result<()> {
+        self.lease.ensure_held("reconciled agent validation")?;
         let hook = self.plan.reconciliation_validation(recovery);
         match hook.mode {
             agent_install::ValidationMode::Reprobe => {
@@ -1009,6 +1529,7 @@ impl AgentInstallOps for PosixSshInstallOps<'_> {
             BootstrapBudget::Recovery,
             "normal-path agent exit before rollback",
         )?;
+        self.lease.ensure_held("remote agent rollback")?;
         let output = self.command_output(
             self.plan.rollback_command(activated),
             BootstrapBudget::Recovery,
@@ -1021,6 +1542,7 @@ impl AgentInstallOps for PosixSshInstallOps<'_> {
     }
 
     fn validate_rollback(&mut self, rollback: &agent_install::RollbackOutcome) -> Result<()> {
+        self.lease.ensure_held("restored agent validation")?;
         let hook = self.plan.rollback_validation(rollback);
         match hook.mode {
             agent_install::ValidationMode::Reprobe => {
@@ -1051,6 +1573,7 @@ impl AgentInstallOps for PosixSshInstallOps<'_> {
     }
 
     fn cleanup(&mut self, staged: &agent_install::StagedInstall) -> Result<()> {
+        self.lease.ensure_held("remote agent cleanup")?;
         let output = self.command_output(
             self.plan.cleanup_command(staged),
             BootstrapBudget::Recovery,
@@ -1071,10 +1594,28 @@ struct WindowsSshInstallOps<'a> {
     source_sha256: String,
     launch: AgentLaunch,
     normal_agent: &'a mut AgentClient,
+    lease: &'a mut RemoteInstallLease,
     deadline: BootstrapDeadline,
 }
 
 impl WindowsSshInstallOps<'_> {
+    fn recover_stale_transaction(
+        &mut self,
+    ) -> Result<windows_agent_install::WindowsInstallRecovery> {
+        self.lease
+            .ensure_held("remote agent interrupted-install recovery")?;
+        let output = self.action_output(
+            self.plan.recovery_script(),
+            None,
+            BootstrapBudget::Recovery,
+            "remote agent interrupted-install recovery",
+        )?;
+        let stdout = Self::require_success(output)?;
+        self.plan
+            .parse_recovery_stdout(&stdout)
+            .context("remote agent interrupted-install recovery returned an invalid record")
+    }
+
     fn command_output(
         &self,
         command: String,
@@ -1107,7 +1648,11 @@ impl WindowsSshInstallOps<'_> {
             .context("remote installer action-script cleanup returned an invalid record")
     }
 
-    fn abort_stage(&self, prepared: &windows_agent_install::PreparedWindowsStage) -> Result<()> {
+    fn abort_stage(
+        &mut self,
+        prepared: &windows_agent_install::PreparedWindowsStage,
+    ) -> Result<()> {
+        self.lease.ensure_held("remote agent stage abort")?;
         let output = self.action_output(
             self.plan.abort_stage_script(prepared),
             None,
@@ -1163,6 +1708,10 @@ impl WindowsSshInstallOps<'_> {
         budget: BootstrapBudget,
         context: &str,
     ) -> Result<CapturedProcessOutput> {
+        let script = self
+            .plan
+            .guard_action_script(&script)
+            .context("failed to apply the Windows installation lease guard")?;
         let upload_timeout = self
             .deadline
             .timeout(budget, "remote installer action-script upload")?;
@@ -1247,6 +1796,7 @@ impl WindowsSshInstallOps<'_> {
 
 impl AgentInstallOps for WindowsSshInstallOps<'_> {
     fn stage(&mut self) -> Result<agent_install::StagedInstall> {
+        self.lease.ensure_held("remote agent stage preparation")?;
         let source_path = self
             .source_path
             .take()
@@ -1263,7 +1813,9 @@ impl AgentInstallOps for WindowsSshInstallOps<'_> {
             .parse_prepare_stage_stdout(&stdout)
             .context("remote agent stage preparation returned an invalid record")?;
         let result = (|| {
+            self.lease.ensure_held("remote agent artifact scp upload")?;
             self.upload_stage(&source_path, &prepared.staged.stage_path)?;
+            self.lease.ensure_held("remote agent stage finalization")?;
             let output = self.action_output(
                 self.plan
                     .finalize_stage_script(&prepared, self.source_size, &self.source_sha256),
@@ -1286,6 +1838,7 @@ impl AgentInstallOps for WindowsSshInstallOps<'_> {
     }
 
     fn validate_staged(&mut self, staged: &agent_install::StagedInstall) -> Result<()> {
+        self.lease.ensure_held("staged agent exact Hello")?;
         let hook = self.plan.staged_validation(staged);
         let timeout = self.deadline.forward_timeout("staged agent exact Hello")?;
         probe_agent_at(&self.launch, &hook.executable_path, timeout)
@@ -1302,7 +1855,9 @@ impl AgentInstallOps for WindowsSshInstallOps<'_> {
             .map(drop)
     }
 
-    fn ensure_activation_budget(&self) -> Result<()> {
+    fn ensure_activation_budget(&mut self) -> Result<()> {
+        self.lease
+            .ensure_held("remote agent activation budget check")?;
         self.deadline
             .forward_timeout("remote agent activation")
             .map(drop)
@@ -1312,6 +1867,7 @@ impl AgentInstallOps for WindowsSshInstallOps<'_> {
         &mut self,
         staged: &agent_install::StagedInstall,
     ) -> Result<agent_install::ActivatedInstall> {
+        self.lease.ensure_held("remote agent activation")?;
         let output = self.action_output(
             self.plan.activate_script(staged),
             None,
@@ -1334,6 +1890,8 @@ impl AgentInstallOps for WindowsSshInstallOps<'_> {
             BootstrapBudget::Recovery,
             "normal-path agent exit before activation reconciliation",
         )?;
+        self.lease
+            .ensure_held("remote agent activation reconciliation")?;
         let output = self.action_output(
             self.plan.reconcile_activation_script(staged),
             None,
@@ -1350,6 +1908,7 @@ impl AgentInstallOps for WindowsSshInstallOps<'_> {
         &mut self,
         recovery: &agent_install::ActivationRecovery,
     ) -> Result<()> {
+        self.lease.ensure_held("reconciled agent validation")?;
         let hook = self.plan.reconciliation_validation(recovery);
         match hook.mode {
             agent_install::ValidationMode::Reprobe => {
@@ -1380,6 +1939,7 @@ impl AgentInstallOps for WindowsSshInstallOps<'_> {
     }
 
     fn validate_activated(&mut self, activated: &agent_install::ActivatedInstall) -> Result<()> {
+        self.lease.ensure_held("normal-path agent Hello")?;
         let _hook = self.plan.post_activation_validation(activated);
         let timeout = self.deadline.forward_timeout("normal-path agent Hello")?;
         probe_normal_agent_with_timeout(self.normal_agent, timeout)
@@ -1404,6 +1964,7 @@ impl AgentInstallOps for WindowsSshInstallOps<'_> {
             BootstrapBudget::Recovery,
             "normal-path agent exit before rollback",
         )?;
+        self.lease.ensure_held("remote agent rollback")?;
         let output = self.action_output(
             self.plan.rollback_script(activated),
             None,
@@ -1417,6 +1978,7 @@ impl AgentInstallOps for WindowsSshInstallOps<'_> {
     }
 
     fn validate_rollback(&mut self, rollback: &agent_install::RollbackOutcome) -> Result<()> {
+        self.lease.ensure_held("restored agent validation")?;
         let hook = self.plan.rollback_validation(rollback);
         match hook.mode {
             agent_install::ValidationMode::Reprobe => {
@@ -1447,6 +2009,7 @@ impl AgentInstallOps for WindowsSshInstallOps<'_> {
     }
 
     fn cleanup(&mut self, staged: &agent_install::StagedInstall) -> Result<()> {
+        self.lease.ensure_held("remote agent cleanup")?;
         let output = self.action_output(
             self.plan.cleanup_script(staged),
             None,
@@ -1464,6 +2027,7 @@ fn install_failure_code(kind: agent_install::InstallFailureKind) -> &'static str
     use agent_install::InstallFailureKind;
     match kind {
         InstallFailureKind::AlreadyExists => "already_exists",
+        InstallFailureKind::InstallInProgress => "install_in_progress",
         InstallFailureKind::InvalidTarget => "invalid_target",
         InstallFailureKind::StageCreateFailed => "stage_create_failed",
         InstallFailureKind::UploadFailed => "upload_failed",
@@ -1829,6 +2393,9 @@ impl RemoteTransport {
                 stdin_prefix: Vec::new(),
             }),
             Self::Ssh(ssh) => {
+                if remote_agent_uses_managed_path(agent) {
+                    validate_managed_remote_agent_name(agent)?;
+                }
                 validate_remote_root(host, remote_root)?;
                 let (remote_command, stdin_prefix) = match host.path_style {
                     RemotePathStyle::Posix => {
@@ -1969,15 +2536,76 @@ fn validate_ssh_destination(destination: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_agent_hello(agent_version: &str, protocol_version: u16) -> Result<()> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AgentCompatibilityFailure {
+    VersionMismatch { agent_version: String },
+    ProtocolMismatch { protocol_version: u16 },
+}
+
+impl AgentCompatibilityFailure {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::VersionMismatch { .. } => "version_mismatch",
+            Self::ProtocolMismatch { .. } => "protocol_mismatch",
+        }
+    }
+
+    fn insert_observed_version(&self, object: &mut Map<String, Value>) {
+        match self {
+            Self::VersionMismatch { agent_version } => {
+                object.insert("agent_version".to_owned(), json!(agent_version));
+            }
+            Self::ProtocolMismatch { protocol_version } => {
+                object.insert("protocol_version".to_owned(), json!(protocol_version));
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+struct AgentCompatibilityError {
+    failure: Option<AgentCompatibilityFailure>,
+    message: String,
+}
+
+impl std::fmt::Display for AgentCompatibilityError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for AgentCompatibilityError {}
+
+fn validate_agent_hello(
+    agent_version: &str,
+    protocol_version: u16,
+) -> std::result::Result<(), AgentCompatibilityError> {
     if protocol_version != PROTOCOL_VERSION {
-        bail!("protocol version mismatch: sidecar={PROTOCOL_VERSION} agent={protocol_version}");
+        return Err(AgentCompatibilityError {
+            failure: Some(AgentCompatibilityFailure::ProtocolMismatch { protocol_version }),
+            message: format!(
+                "protocol version mismatch: sidecar={PROTOCOL_VERSION} agent={protocol_version}"
+            ),
+        });
     }
     if agent_version != env!("CARGO_PKG_VERSION") {
-        bail!(
-            "package version mismatch: sidecar={} agent={agent_version}",
-            env!("CARGO_PKG_VERSION")
-        );
+        let valid_agent_version = Version::parse(agent_version)
+            .ok()
+            .filter(|version| version.to_string() == agent_version)
+            .map(|_| sanitize_agent_error_text(agent_version));
+        let message = if valid_agent_version.is_some() {
+            format!(
+                "package version mismatch: sidecar={} agent={agent_version}",
+                env!("CARGO_PKG_VERSION")
+            )
+        } else {
+            "agent Hello reported a malformed package version".to_owned()
+        };
+        return Err(AgentCompatibilityError {
+            failure: valid_agent_version
+                .map(|agent_version| AgentCompatibilityFailure::VersionMismatch { agent_version }),
+            message,
+        });
     }
     Ok(())
 }
@@ -2252,6 +2880,277 @@ struct AgentWorker {
     join: Option<thread::JoinHandle<()>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteAgentLaunchFailure {
+    Missing,
+    NotExecutable,
+    RootMissing,
+}
+
+impl RemoteAgentLaunchFailure {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Missing => "missing",
+            Self::NotExecutable => "not_executable",
+            Self::RootMissing => "root_missing",
+        }
+    }
+
+    fn agent_status(self) -> &'static str {
+        match self {
+            Self::Missing => "missing_agent",
+            Self::NotExecutable => "agent_not_executable",
+            Self::RootMissing => "remote_root_missing",
+        }
+    }
+
+    fn detail(self) -> &'static str {
+        match self {
+            Self::Missing => "remote agent launcher reported a missing executable",
+            Self::NotExecutable => {
+                "remote agent launcher reported a non-executable or invalid executable"
+            }
+            Self::RootMissing => "remote agent launcher reported a missing remote root",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TrustedAgentFailure {
+    Launch(RemoteAgentLaunchFailure),
+    Compatibility(AgentCompatibilityFailure),
+}
+
+impl TrustedAgentFailure {
+    fn insert_into(&self, object: &mut Map<String, Value>) {
+        match self {
+            Self::Launch(failure) => {
+                object.insert("agent_launch_failure".to_owned(), json!(failure.as_str()));
+            }
+            Self::Compatibility(failure) => {
+                object.insert(
+                    "agent_compatibility_failure".to_owned(),
+                    json!(failure.as_str()),
+                );
+                failure.insert_observed_version(object);
+            }
+        }
+    }
+
+    fn trace_value(&self) -> &'static str {
+        match self {
+            Self::Launch(failure) => failure.as_str(),
+            Self::Compatibility(failure) => failure.as_str(),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct AgentStderrTailState {
+    bytes: VecDeque<u8>,
+    truncated: bool,
+    read_error: Option<String>,
+}
+
+struct AgentStderrCapture {
+    state: Arc<Mutex<AgentStderrTailState>>,
+    join: Option<thread::JoinHandle<()>>,
+}
+
+impl AgentStderrCapture {
+    fn spawn<R>(mut stderr: R) -> Result<Self>
+    where
+        R: Read + Send + 'static,
+    {
+        let state = Arc::new(Mutex::new(AgentStderrTailState::default()));
+        let reader_state = Arc::clone(&state);
+        let join = thread::Builder::new()
+            .name("nrm-agent-stderr".to_owned())
+            .spawn(move || {
+                let mut buffer = [0_u8; 8 * 1024];
+                loop {
+                    match stderr.read(&mut buffer) {
+                        Ok(0) => break,
+                        Ok(read) => {
+                            if let Ok(mut state) = reader_state.lock() {
+                                append_agent_stderr_tail(&mut state, &buffer[..read]);
+                            }
+                        }
+                        Err(error) => {
+                            if let Ok(mut state) = reader_state.lock() {
+                                state.read_error = Some(error.to_string());
+                            }
+                            break;
+                        }
+                    }
+                }
+            })
+            .context("failed to start remote-agent stderr drainer")?;
+        Ok(Self {
+            state,
+            join: Some(join),
+        })
+    }
+
+    fn is_finished(&self) -> bool {
+        self.join
+            .as_ref()
+            .is_none_or(thread::JoinHandle::is_finished)
+    }
+
+    fn wait_for_finish(&self, timeout: Duration) {
+        let started = Instant::now();
+        while !self.is_finished() && started.elapsed() < timeout {
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn snapshot(&self) -> AgentStderrSnapshot {
+        match self.state.lock() {
+            Ok(state) => AgentStderrSnapshot {
+                bytes: state.bytes.iter().copied().collect(),
+                truncated: state.truncated,
+                read_error: state.read_error.clone(),
+            },
+            Err(poisoned) => {
+                let state = poisoned.into_inner();
+                AgentStderrSnapshot {
+                    bytes: state.bytes.iter().copied().collect(),
+                    truncated: state.truncated,
+                    read_error: state.read_error.clone(),
+                }
+            }
+        }
+    }
+
+    fn finish_bounded(mut self, timeout: Duration) -> bool {
+        self.wait_for_finish(timeout);
+        let Some(join) = self.join.take() else {
+            return true;
+        };
+        if join.is_finished() {
+            let _ = join.join();
+            true
+        } else {
+            // A remote descendant can inherit the SSH stderr pipe after the
+            // launcher itself has exited. Dropping the join handle detaches the
+            // bounded diagnostic drainer so worker teardown never waits on an
+            // untrusted pipe lifetime.
+            drop(join);
+            false
+        }
+    }
+}
+
+#[derive(Debug)]
+struct AgentStderrSnapshot {
+    bytes: Vec<u8>,
+    truncated: bool,
+    read_error: Option<String>,
+}
+
+fn append_agent_stderr_tail(state: &mut AgentStderrTailState, bytes: &[u8]) {
+    if bytes.len() >= AGENT_STDERR_TAIL_MAX_BYTES {
+        state.bytes.clear();
+        state.bytes.extend(
+            bytes[bytes.len() - AGENT_STDERR_TAIL_MAX_BYTES..]
+                .iter()
+                .copied(),
+        );
+        state.truncated = true;
+        return;
+    }
+    let excess = state
+        .bytes
+        .len()
+        .saturating_add(bytes.len())
+        .saturating_sub(AGENT_STDERR_TAIL_MAX_BYTES);
+    if excess > 0 {
+        state.bytes.drain(..excess);
+        state.truncated = true;
+    }
+    state.bytes.extend(bytes.iter().copied());
+}
+
+fn agent_transport_error_reply(
+    error: String,
+    child: &Arc<Mutex<Child>>,
+    stderr: &AgentStderrCapture,
+) -> AgentWorkerReply {
+    let Some(status) = poll_agent_exit_status(child, AGENT_EXIT_DIAGNOSTIC_GRACE) else {
+        return AgentWorkerReply::TransportError(error);
+    };
+    stderr.wait_for_finish(AGENT_EXIT_DIAGNOSTIC_GRACE);
+    let snapshot = stderr.snapshot();
+    AgentWorkerReply::TransportError(format_agent_transport_error(error, status, &snapshot))
+}
+
+fn poll_agent_exit_status(child: &Arc<Mutex<Child>>, timeout: Duration) -> Option<ExitStatus> {
+    let started = Instant::now();
+    loop {
+        let status = match child.try_lock() {
+            Ok(mut child) => child.try_wait().ok().flatten(),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                poisoned.into_inner().try_wait().ok().flatten()
+            }
+            Err(std::sync::TryLockError::WouldBlock) => None,
+        };
+        if status.is_some() {
+            return status;
+        }
+        if started.elapsed() >= timeout {
+            return None;
+        }
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+fn format_agent_transport_error(
+    error: String,
+    status: ExitStatus,
+    stderr: &AgentStderrSnapshot,
+) -> String {
+    let error = sanitize_agent_error_text(&error);
+    let mut message = format!("{error}; agent process exited with {status}");
+    let stderr_text = String::from_utf8_lossy(&stderr.bytes);
+    let stderr_text = stderr_text.trim();
+    if !stderr_text.is_empty() {
+        const MAX_DETAIL_CHARS: usize = 4096;
+        let stderr_text = sanitize_agent_error_text(stderr_text);
+        let chars: Vec<_> = stderr_text.chars().collect();
+        let detail = if chars.len() > MAX_DETAIL_CHARS {
+            chars[chars.len() - MAX_DETAIL_CHARS..].iter().collect()
+        } else {
+            stderr_text.to_owned()
+        };
+        let prefix = if stderr.truncated || chars.len() > MAX_DETAIL_CHARS {
+            "truncated stderr tail"
+        } else {
+            "stderr"
+        };
+        message.push_str(&format!("; {prefix}: {detail}"));
+    }
+    if let Some(read_error) = &stderr.read_error {
+        message.push_str(&format!(
+            "; stderr capture failed: {}",
+            sanitize_agent_error_text(read_error)
+        ));
+    }
+    message
+}
+
+fn sanitize_agent_error_text(text: &str) -> String {
+    text.chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect()
+}
+
 struct RetiredAgentWorker {
     abort: Arc<dyn AgentAbortHandle>,
     join: Option<thread::JoinHandle<()>>,
@@ -2265,6 +3164,7 @@ trait AgentSession: Send {
 struct FramedAgentSession<W, R> {
     writer: W,
     reader: BufReader<R>,
+    launch_prelude_pending: bool,
 }
 
 impl<W, R: Read> FramedAgentSession<W, R> {
@@ -2272,6 +3172,15 @@ impl<W, R: Read> FramedAgentSession<W, R> {
         Self {
             writer,
             reader: BufReader::new(reader),
+            launch_prelude_pending: false,
+        }
+    }
+
+    fn new_with_launch_prelude(writer: W, reader: R) -> Self {
+        Self {
+            writer,
+            reader: BufReader::new(reader),
+            launch_prelude_pending: true,
         }
     }
 
@@ -2287,8 +3196,49 @@ where
     R: Read + Send,
 {
     fn request(&mut self, id: RequestId, request: Request) -> Result<AgentWorkerReply> {
+        if self.launch_prelude_pending {
+            self.launch_prelude_pending = false;
+            if let Some(failure) = read_agent_launch_prelude(&mut self.reader)? {
+                return Ok(AgentWorkerReply::LaunchError(failure));
+            }
+        }
         send_agent_frame(&mut self.writer, &mut self.reader, id, request)
     }
+}
+
+fn read_agent_launch_prelude<R: BufRead>(
+    reader: &mut R,
+) -> Result<Option<RemoteAgentLaunchFailure>> {
+    let mut limited = reader.take((AGENT_LAUNCH_PRELUDE_MAX_BYTES + 1) as u64);
+    let mut record = Vec::with_capacity(AGENT_LAUNCH_PRELUDE_MAX_BYTES);
+    let read = limited
+        .read_until(b'\n', &mut record)
+        .context("failed to read SSH agent launch prelude")?;
+    if read == 0 {
+        bail!("SSH agent launch prelude was missing");
+    }
+    if record.len() > AGENT_LAUNCH_PRELUDE_MAX_BYTES {
+        bail!("SSH agent launch prelude exceeded its {AGENT_LAUNCH_PRELUDE_MAX_BYTES}-byte limit");
+    }
+    if record.last() != Some(&b'\n') {
+        bail!("SSH agent launch prelude was not newline terminated");
+    }
+    if record == AGENT_LAUNCH_READY_RECORD {
+        return Ok(None);
+    }
+    let Some(kind) = record
+        .strip_prefix(AGENT_LAUNCH_FAILURE_PREFIX)
+        .and_then(|kind| kind.strip_suffix(b"\n"))
+    else {
+        bail!("SSH agent launch prelude was malformed");
+    };
+    let failure = match kind {
+        b"missing" => RemoteAgentLaunchFailure::Missing,
+        b"not_executable" => RemoteAgentLaunchFailure::NotExecutable,
+        b"root_missing" => RemoteAgentLaunchFailure::RootMissing,
+        _ => bail!("SSH agent launch prelude contained an unknown failure kind"),
+    };
+    Ok(Some(failure))
 }
 
 struct AgentWorkerCommand {
@@ -2301,6 +3251,7 @@ struct AgentWorkerCommand {
 enum AgentWorkerReply {
     Response(Response),
     Error(RpcError),
+    LaunchError(RemoteAgentLaunchFailure),
     TransportError(String),
 }
 
@@ -2322,6 +3273,7 @@ struct RemoteHealth {
     state: RemoteHealthState,
     unavailable_until: Option<Instant>,
     error: Option<String>,
+    trusted_failure: Option<TrustedAgentFailure>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2561,6 +3513,7 @@ impl Default for RemoteHealth {
             state: RemoteHealthState::Unchecked,
             unavailable_until: None,
             error: None,
+            trusted_failure: None,
         }
     }
 }
@@ -2571,14 +3524,20 @@ impl RemoteHealth {
             state: RemoteHealthState::Connected,
             unavailable_until: None,
             error: None,
+            trusted_failure: None,
         }
     }
 
-    fn unavailable(unavailable_until: Option<Instant>, error: String) -> Self {
+    fn unavailable(
+        unavailable_until: Option<Instant>,
+        error: String,
+        trusted_failure: Option<TrustedAgentFailure>,
+    ) -> Self {
         Self {
             state: RemoteHealthState::Unavailable,
             unavailable_until,
             error: Some(error),
+            trusted_failure,
         }
     }
 
@@ -2627,6 +3586,9 @@ impl RemoteHealth {
                 if let Some(error) = &self.error {
                     object.insert("remote_error".to_string(), json!(error));
                 }
+                if let Some(failure) = &self.trusted_failure {
+                    failure.insert_into(object);
+                }
             }
         }
     }
@@ -2639,10 +3601,18 @@ struct AgentClient {
     worker: Option<AgentWorker>,
     retired_workers: Vec<RetiredAgentWorker>,
     handshake_complete: bool,
+    negotiated_hello: Option<NegotiatedAgentHello>,
     backoff_lane: AgentBackoffLane,
     remote_backoff: Arc<Mutex<RemoteBackoffState>>,
     next_id: RequestId,
     worker_generation: u64,
+}
+
+#[derive(Debug, Clone)]
+struct NegotiatedAgentHello {
+    agent_version: String,
+    protocol_version: u16,
+    capabilities: nrm_protocol::CapabilitySet,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2664,6 +3634,7 @@ impl AgentBackoffLane {
 struct RemoteBackoffSlot {
     unavailable_until: Option<Instant>,
     last_remote_error: Option<String>,
+    trusted_failure: Option<TrustedAgentFailure>,
     last_remote_error_at: Option<Instant>,
     consecutive_failures: u32,
 }
@@ -2689,7 +3660,10 @@ impl RemoteBackoffState {
         }
     }
 
-    fn lane_backoff(&self, lane: AgentBackoffLane) -> Option<(u64, String)> {
+    fn lane_backoff(
+        &self,
+        lane: AgentBackoffLane,
+    ) -> Option<(u64, String, Option<TrustedAgentFailure>)> {
         let slot = self.slot(lane);
         let until = slot.unavailable_until?;
         let now = Instant::now();
@@ -2704,15 +3678,21 @@ impl RemoteBackoffState {
             .last_remote_error
             .clone()
             .unwrap_or_else(|| "last remote attempt failed".to_string());
-        Some((remaining_ms, error))
+        Some((remaining_ms, error, slot.trusted_failure.clone()))
     }
 
-    fn mark_unavailable(&mut self, lane: AgentBackoffLane, error: String) {
+    fn mark_unavailable(
+        &mut self,
+        lane: AgentBackoffLane,
+        error: String,
+        trusted_failure: Option<TrustedAgentFailure>,
+    ) {
         let now = Instant::now();
         let slot = self.slot_mut(lane);
         slot.consecutive_failures = slot.consecutive_failures.saturating_add(1).max(1);
         let backoff_ms = remote_unavailable_backoff_ms(slot.consecutive_failures);
         slot.last_remote_error = Some(error);
+        slot.trusted_failure = trusted_failure;
         slot.last_remote_error_at = Some(now);
         slot.unavailable_until = Some(now + Duration::from_millis(backoff_ms));
     }
@@ -2721,6 +3701,7 @@ impl RemoteBackoffState {
         let slot = self.slot_mut(lane);
         slot.unavailable_until = None;
         slot.last_remote_error = None;
+        slot.trusted_failure = None;
         slot.last_remote_error_at = None;
         slot.consecutive_failures = 0;
     }
@@ -2730,7 +3711,7 @@ impl RemoteBackoffState {
         self.clear_lane(AgentBackoffLane::Write);
     }
 
-    fn health_error(&self) -> Option<(Option<Instant>, String)> {
+    fn health_error(&self) -> Option<(Option<Instant>, String, Option<TrustedAgentFailure>)> {
         let now = Instant::now();
         let slots = [&self.read, &self.write];
         let mut selected = None;
@@ -2741,13 +3722,18 @@ impl RemoteBackoffState {
             let error_at = slot.last_remote_error_at.unwrap_or(now);
             let replace = selected
                 .as_ref()
-                .map(|(selected_at, _, _)| error_at >= *selected_at)
+                .map(|(selected_at, _, _, _)| error_at >= *selected_at)
                 .unwrap_or(true);
             if replace {
-                selected = Some((error_at, slot.unavailable_until, error));
+                selected = Some((
+                    error_at,
+                    slot.unavailable_until,
+                    error,
+                    slot.trusted_failure.clone(),
+                ));
             }
         }
-        selected.map(|(_, unavailable_until, error)| (unavailable_until, error))
+        selected.map(|(_, unavailable_until, error, failure)| (unavailable_until, error, failure))
     }
 }
 
@@ -2808,6 +3794,7 @@ impl AgentClient {
             worker: None,
             retired_workers: Vec::new(),
             handshake_complete: false,
+            negotiated_hello: None,
             backoff_lane: AgentBackoffLane::Read,
             remote_backoff: Arc::new(Mutex::new(RemoteBackoffState::default())),
             next_id: 1,
@@ -2823,6 +3810,7 @@ impl AgentClient {
             worker: None,
             retired_workers: Vec::new(),
             handshake_complete: false,
+            negotiated_hello: None,
             backoff_lane: AgentBackoffLane::Write,
             remote_backoff: Arc::clone(&self.remote_backoff),
             next_id: 1,
@@ -2845,7 +3833,7 @@ impl AgentClient {
         let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::piped())
             .spawn()
             .with_context(|| {
                 format!(
@@ -2858,6 +3846,16 @@ impl AgentClient {
         let mut stdin = child.stdin.take().context("agent stdin was not piped")?;
         let stdin_prefix = plan.stdin_prefix;
         let stdout = child.stdout.take().context("agent stdout was not piped")?;
+        let stderr = child.stderr.take().context("agent stderr was not piped")?;
+        let stderr_capture = match AgentStderrCapture::spawn(stderr) {
+            Ok(capture) => capture,
+            Err(error) => {
+                kill_child_tree(&mut child);
+                reap_child_in_background(child);
+                return Err(error);
+            }
+        };
+        let launch_prelude_required = matches!(launch.transport, RemoteTransport::Ssh(_));
         let child = Arc::new(Mutex::new(child));
         let abort: Arc<dyn AgentAbortHandle> = Arc::new(ProcessAgentAbort {
             child: Arc::clone(&child),
@@ -2865,25 +3863,40 @@ impl AgentClient {
         interrupt.set_abort_handle(Arc::clone(&abort));
         let (tx, rx) = mpsc::channel::<AgentWorkerCommand>();
         let worker_abort = Arc::clone(&abort);
+        let diagnostic_child = Arc::clone(&child);
         let join = thread::spawn(move || {
             let bootstrap_error = stdin
                 .write_all(&stdin_prefix)
                 .and_then(|()| stdin.flush())
                 .err()
                 .map(|error| format!("failed to write Windows agent bootstrap: {error}"));
-            let mut session: Box<dyn AgentSession> = Box::new(FramedAgentSession::new(
-                stdin,
-                LeadingBomReader::new(stdout),
-            ));
+            let reader = LeadingBomReader::new(stdout);
+            let mut session: Box<dyn AgentSession> = if launch_prelude_required {
+                Box::new(FramedAgentSession::new_with_launch_prelude(stdin, reader))
+            } else {
+                Box::new(FramedAgentSession::new(stdin, reader))
+            };
             while let Ok(command) = rx.recv() {
                 let response = if let Some(error) = &bootstrap_error {
-                    AgentWorkerReply::TransportError(error.clone())
+                    agent_transport_error_reply(error.clone(), &diagnostic_child, &stderr_capture)
                 } else {
-                    session
-                        .request(command.id, command.request)
-                        .unwrap_or_else(|error| AgentWorkerReply::TransportError(error.to_string()))
+                    match session.request(command.id, command.request) {
+                        Ok(reply) => reply,
+                        Err(error) => agent_transport_error_reply(
+                            error.to_string(),
+                            &diagnostic_child,
+                            &stderr_capture,
+                        ),
+                    }
                 };
+                let terminal = matches!(
+                    response,
+                    AgentWorkerReply::LaunchError(_) | AgentWorkerReply::TransportError(_)
+                );
                 let _ = command.reply.send(response);
+                if terminal {
+                    break;
+                }
             }
             worker_abort.abort();
             // This cleanup loop is intentionally owned by the retiring worker
@@ -2894,6 +3907,7 @@ impl AgentClient {
                 worker_abort.abort();
                 thread::sleep(Duration::from_millis(10));
             }
+            let _ = stderr_capture.finish_bounded(AGENT_EXIT_DIAGNOSTIC_GRACE);
             interrupt.clear_abort_handle(&worker_abort);
         });
 
@@ -2937,49 +3951,100 @@ impl AgentClient {
         self.handshake_complete
     }
 
-    fn remote_health(&self) -> RemoteHealth {
-        if let Ok(backoff) = self.remote_backoff.lock() {
-            if let Some((unavailable_until, error)) = backoff.health_error() {
-                return RemoteHealth::unavailable(unavailable_until, error);
+    fn negotiated_hello(&self) -> Option<&NegotiatedAgentHello> {
+        self.negotiated_hello.as_ref()
+    }
+
+    fn remote_backoff_guard(&self) -> std::sync::MutexGuard<'_, RemoteBackoffState> {
+        match self.remote_backoff.lock() {
+            Ok(backoff) => backoff,
+            Err(poisoned) => {
+                // Backoff is advisory shared state. A panic must not make it
+                // impossible to clear a stale trusted failure and can safely
+                // be recovered from the data left in the poisoned guard.
+                self.remote_backoff.clear_poison();
+                poisoned.into_inner()
             }
         }
+    }
+
+    fn remote_health(&self) -> RemoteHealth {
+        let backoff = self.remote_backoff_guard();
+        if let Some((unavailable_until, error, failure)) = backoff.health_error() {
+            return RemoteHealth::unavailable(unavailable_until, error, failure);
+        }
+        drop(backoff);
         if self.handshake_complete {
             return RemoteHealth::connected();
         }
         RemoteHealth::default()
     }
 
-    fn remote_backoff(&self) -> Option<(u64, String)> {
-        let backoff = self.remote_backoff.lock().ok()?;
+    fn remote_backoff(&self) -> Option<(u64, String, Option<TrustedAgentFailure>)> {
+        let backoff = self.remote_backoff_guard();
         backoff.lane_backoff(self.backoff_lane)
     }
 
     fn check_remote_backoff(&mut self) -> Result<()> {
-        if let Some((remaining_ms, error)) = self.remote_backoff() {
+        if let Some((remaining_ms, error, _)) = self.remote_backoff() {
             bail!("remote unavailable; retry after {remaining_ms} ms: {error}");
         }
-        if let Ok(mut backoff) = self.remote_backoff.lock() {
-            backoff.slot_mut(self.backoff_lane).unavailable_until = None;
-        }
+        self.remote_backoff_guard()
+            .slot_mut(self.backoff_lane)
+            .unavailable_until = None;
         Ok(())
     }
 
     fn mark_remote_unavailable(&mut self, error: impl Into<String>) -> anyhow::Error {
+        self.mark_remote_unavailable_with_trusted_failure(error, None)
+    }
+
+    fn mark_remote_unavailable_with_launch_failure(
+        &mut self,
+        error: impl Into<String>,
+        failure: RemoteAgentLaunchFailure,
+    ) -> anyhow::Error {
+        self.mark_remote_unavailable_with_trusted_failure(
+            error,
+            Some(TrustedAgentFailure::Launch(failure)),
+        )
+    }
+
+    fn mark_remote_unavailable_with_compatibility_failure(
+        &mut self,
+        error: impl Into<String>,
+        failure: AgentCompatibilityFailure,
+    ) -> anyhow::Error {
+        self.mark_remote_unavailable_with_trusted_failure(
+            error,
+            Some(TrustedAgentFailure::Compatibility(failure)),
+        )
+    }
+
+    fn mark_remote_unavailable_with_trusted_failure(
+        &mut self,
+        error: impl Into<String>,
+        trusted_failure: Option<TrustedAgentFailure>,
+    ) -> anyhow::Error {
         self.handshake_complete = false;
-        let error = error.into();
-        if let Ok(mut backoff) = self.remote_backoff.lock() {
-            backoff.mark_unavailable(self.backoff_lane, error.clone());
-        }
+        self.negotiated_hello = None;
+        let error = sanitize_agent_error_text(&error.into());
+        self.remote_backoff_guard().mark_unavailable(
+            self.backoff_lane,
+            error.clone(),
+            trusted_failure.clone(),
+        );
         let retry_after_ms = self
             .remote_backoff()
-            .map(|(remaining_ms, _)| remaining_ms)
+            .map(|(remaining_ms, _, _)| remaining_ms)
             .unwrap_or(0);
         trace_event(
             "remote_backoff",
             json!({
                 "lane": self.backoff_lane.label(),
                 "retry_after_ms": retry_after_ms,
-                "error": error.as_str()
+                "error": error.as_str(),
+                "trusted_agent_failure": trusted_failure.as_ref().map(TrustedAgentFailure::trace_value)
             }),
         );
         anyhow!(error)
@@ -2997,15 +4062,11 @@ impl AgentClient {
     }
 
     fn clear_remote_unavailable(&mut self) {
-        if let Ok(mut backoff) = self.remote_backoff.lock() {
-            backoff.clear_lane(self.backoff_lane);
-        }
+        self.remote_backoff_guard().clear_lane(self.backoff_lane);
     }
 
     fn clear_all_remote_unavailable(&mut self) {
-        if let Ok(mut backoff) = self.remote_backoff.lock() {
-            backoff.clear_all();
-        }
+        self.remote_backoff_guard().clear_all();
     }
 
     #[cfg(all(test, unix))]
@@ -3079,16 +4140,26 @@ impl AgentClient {
             AgentRequestOutcome::Response(Response::Hello {
                 agent_version,
                 protocol_version,
-                ..
+                capabilities,
             }) => match validate_agent_hello(&agent_version, protocol_version) {
                 Ok(()) => {
                     self.handshake_complete = true;
+                    self.negotiated_hello = Some(NegotiatedAgentHello {
+                        agent_version,
+                        protocol_version,
+                        capabilities,
+                    });
                     self.clear_remote_unavailable();
                     Ok(None)
                 }
                 Err(error) => {
                     self.kill_worker();
-                    Err(self.mark_remote_unavailable(error.to_string()))
+                    let message = error.to_string();
+                    Err(match error.failure {
+                        Some(failure) => self
+                            .mark_remote_unavailable_with_compatibility_failure(message, failure),
+                        None => self.mark_remote_unavailable(message),
+                    })
                 }
             },
             AgentRequestOutcome::Response(other) => {
@@ -3106,16 +4177,26 @@ impl AgentClient {
             AgentRequestOutcome::Response(Response::Hello {
                 agent_version,
                 protocol_version,
-                ..
+                capabilities,
             }) => match validate_agent_hello(agent_version, *protocol_version) {
                 Ok(()) => {
                     self.handshake_complete = true;
+                    self.negotiated_hello = Some(NegotiatedAgentHello {
+                        agent_version: agent_version.clone(),
+                        protocol_version: *protocol_version,
+                        capabilities: capabilities.clone(),
+                    });
                     self.clear_remote_unavailable();
                     Ok(())
                 }
                 Err(error) => {
                     self.kill_worker();
-                    Err(self.mark_remote_unavailable(error.to_string()))
+                    let message = error.to_string();
+                    Err(match error.failure {
+                        Some(failure) => self
+                            .mark_remote_unavailable_with_compatibility_failure(message, failure),
+                        None => self.mark_remote_unavailable(message),
+                    })
                 }
             },
             AgentRequestOutcome::Response(other) => {
@@ -3180,7 +4261,14 @@ impl AgentClient {
             self.launch.invalidate_remote_host_info();
             Err(self.mark_request_timeout(id, timeout, "while launching its worker"))
         } else {
-            self.wait_for_reply(id, reply_rx, preemptible, preempt_epoch, remaining)
+            self.wait_for_reply(
+                id,
+                &request,
+                reply_rx,
+                preemptible,
+                preempt_epoch,
+                remaining,
+            )
         };
         trace_event(
             "agent_request",
@@ -3200,6 +4288,7 @@ impl AgentClient {
     fn wait_for_reply(
         &mut self,
         id: RequestId,
+        request: &Request,
         reply_rx: mpsc::Receiver<AgentWorkerReply>,
         preemptible: bool,
         preempt_epoch: u64,
@@ -3222,7 +4311,7 @@ impl AgentClient {
             let wait = remaining.min(Duration::from_millis(25));
 
             match reply_rx.recv_timeout(wait) {
-                Ok(reply) => return self.handle_worker_reply(reply),
+                Ok(reply) => return self.handle_worker_reply(reply, request),
                 Err(mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(mpsc::RecvTimeoutError::Disconnected) => {
                     self.kill_worker();
@@ -3235,15 +4324,34 @@ impl AgentClient {
         }
     }
 
-    fn handle_worker_reply(&mut self, reply: AgentWorkerReply) -> Result<AgentRequestOutcome> {
+    fn handle_worker_reply(
+        &mut self,
+        reply: AgentWorkerReply,
+        request: &Request,
+    ) -> Result<AgentRequestOutcome> {
         match reply {
             AgentWorkerReply::Response(Response::Error { message }) => Err(anyhow!(message)),
             AgentWorkerReply::Response(response) => Ok(AgentRequestOutcome::Response(response)),
-            AgentWorkerReply::Error(error) if error.retryable => {
-                self.kill_worker();
-                Err(self.mark_remote_unavailable(format_rpc_error(error)))
+            AgentWorkerReply::Error(error) => {
+                if let Some(failure) = parse_agent_compatibility_rpc_error(&error, request) {
+                    self.kill_worker();
+                    return Err(self.mark_remote_unavailable_with_compatibility_failure(
+                        format_rpc_error(error),
+                        failure,
+                    ));
+                }
+                if error.retryable {
+                    self.kill_worker();
+                    Err(self.mark_remote_unavailable(format_rpc_error(error)))
+                } else {
+                    Err(anyhow!(format_rpc_error(error)))
+                }
             }
-            AgentWorkerReply::Error(error) => Err(anyhow!(format_rpc_error(error))),
+            AgentWorkerReply::LaunchError(failure) => {
+                self.kill_worker();
+                self.launch.invalidate_remote_host_info();
+                Err(self.mark_remote_unavailable_with_launch_failure(failure.detail(), failure))
+            }
             AgentWorkerReply::TransportError(message) => {
                 self.kill_worker();
                 self.launch.invalidate_remote_host_info();
@@ -3280,6 +4388,7 @@ impl AgentClient {
 
     fn retire_active_worker(&mut self) {
         self.handshake_complete = false;
+        self.negotiated_hello = None;
         let Some(worker) = self.worker.take() else {
             return;
         };
@@ -3437,22 +4546,27 @@ fn probe_restored_agent_at(
         timeout,
     ) {
         Ok(AgentRequestOutcome::Response(Response::Hello { .. })) => Ok(()),
-        Err(error) if is_agent_compatibility_mismatch(&error.to_string()) => Ok(()),
         Ok(AgentRequestOutcome::Response(other)) => {
             bail!("unexpected restored-agent Hello response: {other:?}")
         }
         Ok(AgentRequestOutcome::Preempted) => bail!("restored-agent Hello was preempted"),
-        Err(error) => Err(error),
+        Err(error) => {
+            let typed_compatibility_failure = candidate
+                .remote_backoff()
+                .and_then(|(_, _, failure)| failure)
+                .is_some_and(|failure| matches!(failure, TrustedAgentFailure::Compatibility(_)));
+            if typed_compatibility_failure {
+                Ok(())
+            } else {
+                Err(error)
+            }
+        }
     };
     let cleanup = candidate.kill_worker_with_timeout(
         remaining_timeout_since(started, timeout),
         "restored agent probe cleanup",
     );
     cleanup.and(result)
-}
-
-fn is_agent_compatibility_mismatch(message: &str) -> bool {
-    message.contains("package version mismatch:") || message.contains("protocol version mismatch:")
 }
 
 fn probe_normal_agent(agent: &mut AgentClient) -> Result<()> {
@@ -3573,6 +4687,53 @@ fn format_rpc_error(error: RpcError) -> String {
         error.message,
         if error.retryable { " (retryable)" } else { "" }
     )
+}
+
+fn parse_agent_compatibility_rpc_error(
+    error: &RpcError,
+    request: &Request,
+) -> Option<AgentCompatibilityFailure> {
+    let Request::Hello {
+        client_version,
+        protocol_version,
+    } = request
+    else {
+        return None;
+    };
+    if client_version != env!("CARGO_PKG_VERSION")
+        || *protocol_version != PROTOCOL_VERSION
+        || error.retryable
+        || error.code != nrm_protocol::RpcErrorCode::Agent
+    {
+        return None;
+    }
+
+    let package_prefix = format!(
+        "package version mismatch: client={} agent=",
+        env!("CARGO_PKG_VERSION")
+    );
+    if let Some(agent_version) = error.message.strip_prefix(&package_prefix) {
+        let parsed = Version::parse(agent_version).ok()?;
+        if parsed.to_string() == agent_version && agent_version != env!("CARGO_PKG_VERSION") {
+            return Some(AgentCompatibilityFailure::VersionMismatch {
+                agent_version: agent_version.to_owned(),
+            });
+        }
+        return None;
+    }
+
+    let protocol_prefix = format!("protocol version mismatch: client={PROTOCOL_VERSION} agent=");
+    if let Some(agent_protocol) = error.message.strip_prefix(&protocol_prefix) {
+        let agent_protocol = agent_protocol.parse::<u16>().ok()?;
+        if agent_protocol.to_string() == error.message[protocol_prefix.len()..]
+            && agent_protocol != PROTOCOL_VERSION
+        {
+            return Some(AgentCompatibilityFailure::ProtocolMismatch {
+                protocol_version: agent_protocol,
+            });
+        }
+    }
+    None
 }
 
 fn indexed_text_lines(text: &str) -> Vec<(i64, String)> {
@@ -5791,6 +6952,7 @@ fn workspace_info_value(
             "lsp_proxy": true,
             "remote_git": true,
             "remote_agent_bootstrap": true,
+            "remote_agent_automatic_bootstrap_v1": true,
             "transport_neutral_agent_frames": true,
             "agent_abort_handle": true,
             "agent_abort_scope": "lane_worker",
@@ -7032,6 +8194,19 @@ impl Sidecar {
         preempt_epoch: u64,
         timeout: Option<Duration>,
     ) -> Value {
+        if let Some(hello) = self.agent.negotiated_hello() {
+            return json!({
+                "remote_status": "connected",
+                "remote_checked": true,
+                "remote_available": true,
+                "agent_version": hello.agent_version,
+                "protocol_version": hello.protocol_version,
+                "capabilities": hello.capabilities
+            });
+        }
+        // Some tests and transitional in-process callers may only retain the
+        // legacy boolean. Production handshakes always retain the complete
+        // negotiated response above.
         if self.agent.handshake_complete() {
             return json!({
                 "remote_status": "connected",
@@ -7039,14 +8214,18 @@ impl Sidecar {
                 "remote_available": true
             });
         }
-        if let Some((retry_after_ms, error)) = self.agent.remote_backoff() {
-            return json!({
+        if let Some((retry_after_ms, error, trusted_failure)) = self.agent.remote_backoff() {
+            let mut value = json!({
                 "remote_status": "unavailable",
                 "remote_checked": true,
                 "remote_available": false,
                 "retry_after_ms": retry_after_ms,
                 "remote_error": error
             });
+            if let (Some(object), Some(failure)) = (value.as_object_mut(), trusted_failure) {
+                failure.insert_into(object);
+            }
+            return value;
         }
 
         let request = Request::Hello {
@@ -7090,16 +8269,25 @@ impl Sidecar {
     }
 
     fn remote_probe_unavailable(&mut self, error: String) -> Value {
+        let error = sanitize_agent_error_text(&error);
         if self.agent.remote_backoff().is_none() {
             let _ = self.agent.mark_remote_unavailable(error.clone());
         }
-        json!({
+        let backoff = self.agent.remote_backoff();
+        let mut value = json!({
             "remote_status": "unavailable",
             "remote_checked": true,
             "remote_available": false,
-            "retry_after_ms": self.agent.remote_backoff().map(|(remaining, _)| remaining).unwrap_or(0),
+            "retry_after_ms": backoff.as_ref().map(|(remaining, _, _)| *remaining).unwrap_or(0),
             "remote_error": error
-        })
+        });
+        if let (Some(object), Some(failure)) = (
+            value.as_object_mut(),
+            backoff.and_then(|(_, _, failure)| failure),
+        ) {
+            failure.insert_into(object);
+        }
+        value
     }
 
     fn remote_health(&mut self, preempt_epoch: u64) -> Value {
@@ -7123,19 +8311,70 @@ impl Sidecar {
         preempt_epoch: u64,
         deadline: BootstrapDeadline,
     ) -> Result<AgentInstallPreflight> {
-        let force = params
-            .get("force")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let requested_target = params
-            .get("install_path")
-            .and_then(Value::as_str)
-            .filter(|path| !path.trim().is_empty())
-            .map(ToString::to_string);
+        let force = match params.get("force") {
+            None => false,
+            Some(Value::Bool(force)) => *force,
+            Some(_) => bail!("params.force must be a boolean"),
+        };
+        let automatic = match params.get("automatic") {
+            None => false,
+            Some(Value::Bool(automatic)) => *automatic,
+            Some(_) => bail!("params.automatic must be a boolean"),
+        };
+        let requested_target = match params.get("install_path") {
+            None => None,
+            Some(Value::String(path)) if !path.trim().is_empty() => Some(path.clone()),
+            Some(Value::String(_)) => bail!("params.install_path must not be empty"),
+            Some(_) => bail!("params.install_path must be a string"),
+        };
+        if automatic {
+            if !update {
+                bail!("automatic remote agent bootstrap requires update/repair semantics");
+            }
+            if force {
+                bail!("automatic remote agent bootstrap does not accept force=true");
+            }
+            if self.agent.launch.registry.is_none() {
+                bail!("automatic remote agent bootstrap requires a configured signed registry");
+            }
+            if !matches!(&self.agent.launch.transport, RemoteTransport::Ssh(_)) {
+                bail!("automatic remote agent bootstrap is only supported for ssh targets");
+            }
+            // A socket daemon may retain a prior launch failure in its shared
+            // backoff state. Automatic mutation decisions must be based on a
+            // fresh probe, not on a cached error from an earlier connection.
+            self.agent.clear_all_remote_unavailable();
+        }
 
         let before_timeout = deadline.forward_timeout("remote agent preflight health")?;
         let before = self.remote_health_with_timeout(preempt_epoch, before_timeout);
         deadline.forward_timeout("remote agent preflight health")?;
+        let before_status = before
+            .get("agent_status")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let decision = agent_install_decision(before_status, update, force, automatic)?;
+        if decision.skip_reason.is_some() {
+            let target_path = requested_target
+                .or_else(|| {
+                    before
+                        .get("remote_agent_install_path")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned)
+                })
+                .map(Ok)
+                .unwrap_or_else(|| {
+                    default_posix_remote_agent_install_path(&self.agent.launch.agent)
+                })?;
+            deadline.forward_timeout("remote agent preflight")?;
+            return Ok(AgentInstallPreflight {
+                effective_force: decision.effective_force,
+                skip_reason: decision.skip_reason,
+                automatic,
+                before,
+                target_path,
+            });
+        }
         let target_path = match requested_target {
             Some(target_path) => target_path,
             None => {
@@ -7155,14 +8394,11 @@ impl Sidecar {
                 default_remote_agent_install_path(&self.agent.launch.agent, &host)?
             }
         };
-        let before_status = before
-            .get("agent_status")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown");
         deadline.forward_timeout("remote agent preflight")?;
         Ok(AgentInstallPreflight {
-            effective_force: force || (update && before_status != "missing_agent"),
-            skip: update && !force && before_status == "ok",
+            effective_force: decision.effective_force,
+            skip_reason: decision.skip_reason,
+            automatic,
             before,
             target_path,
         })
@@ -7178,10 +8414,11 @@ impl Sidecar {
         (|| {
             let preflight =
                 self.remote_agent_install_preflight(&params, update, preempt_epoch, deadline)?;
-            if preflight.skip {
+            if let Some(reason) = preflight.skip_reason.as_deref() {
                 return Ok(json!({
                     "status": "skipped",
-                    "reason": "remote agent is already compatible",
+                    "reason": reason,
+                    "automatic": preflight.automatic,
                     "install_path": preflight.target_path,
                     "remote_health": preflight.before
                 }));
@@ -7236,7 +8473,7 @@ impl Sidecar {
                     error,
                 )
             })?;
-        let plan = match host.path_style {
+        let mut plan = match host.path_style {
             RemotePathStyle::Posix => PreparedAgentInstallPlan::Posix(
                 agent_install::PosixInstallPlan::new(
                     &preflight.target_path,
@@ -7285,6 +8522,7 @@ impl Sidecar {
                 source.expected_sha256.as_deref().unwrap_or_default()
             );
         }
+        plan.set_expected_sha256(&source_sha256)?;
         let upload = match source
             .file
             .try_clone()
@@ -7320,8 +8558,9 @@ impl Sidecar {
         let AgentInstallPreflight {
             before: _,
             target_path,
-            effective_force,
-            skip: _,
+            mut effective_force,
+            skip_reason: _,
+            automatic,
         } = preflight;
         let PreparedAgentInstall {
             source,
@@ -7330,8 +8569,104 @@ impl Sidecar {
             source_sha256,
             source_size,
             ssh,
-            plan,
+            mut plan,
         } = prepared;
+        let lease_token = new_install_lease_token(&target_path);
+        let lease_command = plan.lease_command(&lease_token)?;
+        let lease_timeout = deadline.forward_timeout("remote agent installation lease")?;
+        let (mut lease, lease_stdout) =
+            RemoteInstallLease::acquire(&ssh, lease_command, lease_timeout).map_err(|error| {
+                deadline.map_budgeted_error(
+                    BootstrapBudget::Forward,
+                    "remote agent installation lease",
+                    error,
+                )
+            })?;
+        let leased_target = plan.parse_lease_ready_stdout(&lease_token, &lease_stdout)?;
+        plan.bind_lease_target(&leased_target)?;
+        plan.set_lease_token(&lease_token)?;
+
+        if let PreparedAgentInstallPlan::Windows(windows_plan) = &plan {
+            let recovery = {
+                let mut recovery_ops = WindowsSshInstallOps {
+                    plan: windows_plan.clone(),
+                    ssh: ssh.clone(),
+                    source_path: None,
+                    source_size: 0,
+                    source_sha256: source_sha256.clone(),
+                    launch: self.agent.launch.clone(),
+                    normal_agent: &mut self.agent,
+                    lease: &mut lease,
+                    deadline,
+                };
+                recovery_ops.recover_stale_transaction()?
+            };
+            if recovery.kind != windows_agent_install::WindowsInstallRecoveryKind::None {
+                eprintln!(
+                    "recovered interrupted remote-agent transaction at {}: {:?}",
+                    recovery.target_path, recovery.kind
+                );
+            }
+        }
+
+        if automatic {
+            lease.ensure_held("automatic remote agent post-lease health probe")?;
+            self.agent.clear_all_remote_unavailable();
+            let fresh_timeout =
+                deadline.forward_timeout("automatic remote agent post-lease health probe")?;
+            let fresh = self.remote_health_with_timeout(preempt_epoch, fresh_timeout);
+            deadline.forward_timeout("automatic remote agent post-lease health probe")?;
+            let fresh_status = fresh
+                .get("agent_status")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let fresh_decision = agent_install_decision(fresh_status, update, false, true)?;
+            if let Some(reason) = fresh_decision.skip_reason {
+                release_remote_install_lease_with_deadline(
+                    &mut lease,
+                    deadline,
+                    "remote agent installation lease release",
+                )
+                .context("failed to release remote agent installation lease")?;
+                let mut result = json!({
+                    "status": "skipped",
+                    "reason": reason,
+                    "automatic": true,
+                    "install_path": leased_target,
+                    "requested_install_path": target_path,
+                    "remote_health": fresh
+                });
+                if let (Some(result), Some(details)) =
+                    (result.as_object_mut(), source.details.as_object())
+                {
+                    result.extend(details.clone());
+                }
+                return Ok(result);
+            }
+            effective_force = fresh_decision.effective_force;
+            plan.set_force(effective_force);
+
+            // The fresh probe may have started the normal control-lane agent.
+            // Stop it again before any staging or target mutation while the
+            // remote lease is still held.
+            let reset_timeout =
+                deadline.forward_timeout("post-lease control-lane agent worker exit")?;
+            self.agent
+                .invalidate_shared_workers_with_timeout(
+                    reset_timeout,
+                    "post-lease control-lane agent worker exit",
+                )
+                .map_err(|error| {
+                    deadline.map_budgeted_error(
+                        BootstrapBudget::Forward,
+                        "post-lease control-lane agent worker exit",
+                        error,
+                    )
+                })?;
+            self.agent.clear_all_remote_unavailable();
+            lease.ensure_held("automatic remote agent staging")?;
+        }
+
         let launch = self.agent.launch.clone();
         let mut operations: Box<dyn AgentInstallOps + '_> = match plan {
             PreparedAgentInstallPlan::Posix(plan) => Box::new(PosixSshInstallOps {
@@ -7340,6 +8675,7 @@ impl Sidecar {
                 source: Some(upload),
                 launch,
                 normal_agent: &mut self.agent,
+                lease: &mut lease,
                 deadline,
             }),
             PreparedAgentInstallPlan::Windows(plan) => {
@@ -7352,19 +8688,42 @@ impl Sidecar {
                     source_sha256: source_sha256.clone(),
                     launch,
                     normal_agent: &mut self.agent,
+                    lease: &mut lease,
                     deadline,
                 })
             }
         };
         let transaction = run_agent_install_transaction(operations.as_mut());
         drop(operations);
+        let release = release_remote_install_lease_with_deadline(
+            &mut lease,
+            deadline,
+            "remote agent installation lease release",
+        );
         let activated = match transaction {
             Ok(activated) => activated,
-            Err(error) => {
+            Err(mut error) => {
+                if let Err(release) = release {
+                    error
+                        .message
+                        .push_str(&format!("; install_lease_release_failed: {release}"));
+                }
                 self.record_agent_install_error_health(&error);
                 return Err(anyhow!(error));
             }
         };
+        if let Err(error) = release {
+            let timed_out = is_bootstrap_timeout(&error);
+            let error = install_transaction_error_with_timeout(
+                AgentInstallFinalState::CandidateHealthy,
+                timed_out,
+                format!(
+                    "cleanup_failed: activated agent is healthy but installation lease release failed: {error}"
+                ),
+            );
+            self.record_agent_install_error_health(&error);
+            return Err(anyhow!(error));
+        }
         let after = self.remote_health(preempt_epoch);
         let mut result = json!({
             "status": if update { "updated" } else { "installed" },
@@ -7375,6 +8734,7 @@ impl Sidecar {
             "source_sha256": source_sha256,
             "bytes": source_size,
             "force": effective_force,
+            "automatic": automatic,
             "remote_health": after
         });
         if let (Some(result), Some(details)) = (result.as_object_mut(), source.details.as_object())
@@ -7558,7 +8918,8 @@ impl Sidecar {
         let install_path = cached_host
             .as_ref()
             .and_then(|host| default_remote_agent_install_path(&self.agent.launch.agent, host).ok())
-            .unwrap_or_else(|| default_posix_remote_agent_install_path(&self.agent.launch.agent));
+            .or_else(|| default_posix_remote_agent_install_path(&self.agent.launch.agent).ok())
+            .unwrap_or_else(|| self.agent.launch.agent.clone());
         let managed_install_path = cached_host
             .as_ref()
             .and_then(|host| default_remote_agent_install_path("nrm-agent", host).ok())
@@ -9174,8 +10535,7 @@ fn run_listener(
     request_timeout_ms: u64,
 ) -> Result<()> {
     prepare_listener_socket(&socket)?;
-    let listener = UnixListener::bind(&socket)
-        .with_context(|| format!("failed to bind sidecar socket {}", socket.display()))?;
+    let listener = bind_secure_listener_socket(&socket)?;
     sync_parent_dir(&socket)?;
 
     let listen_result = (|| -> Result<()> {
@@ -9225,25 +10585,392 @@ fn run_listener(
 }
 
 #[cfg(unix)]
-fn prepare_listener_socket(socket: &Path) -> Result<()> {
-    if let Some(parent) = socket.parent() {
-        fs::create_dir_all(parent)?;
+const LISTENER_DIRECTORY_MODE: u32 = 0o700;
+#[cfg(unix)]
+const LISTENER_SOCKET_MODE: u32 = 0o600;
+
+#[cfg(unix)]
+fn effective_uid() -> u32 {
+    // SAFETY: geteuid has no preconditions and does not access caller-provided memory.
+    unsafe { libc::geteuid() }
+}
+
+#[cfg(unix)]
+fn listener_socket_directory(socket: &Path) -> &Path {
+    socket
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+#[cfg(unix)]
+fn validate_listener_directory_metadata(
+    directory: &Path,
+    metadata: &fs::Metadata,
+    expected_uid: u32,
+) -> Result<()> {
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        bail!(
+            "sidecar socket directory must be a directory and not a symlink: {}",
+            directory.display()
+        );
     }
-    if let Ok(metadata) = fs::symlink_metadata(socket) {
-        if !metadata.file_type().is_socket() {
+    if metadata.uid() != expected_uid {
+        bail!(
+            "sidecar socket directory must be owned by the current uid: {} (owner={}, current={expected_uid})",
+            directory.display(),
+            metadata.uid()
+        );
+    }
+    let mode = metadata.mode() & 0o7777;
+    if mode != LISTENER_DIRECTORY_MODE {
+        bail!(
+            "sidecar socket directory must have mode 0700: {} (mode={mode:04o})",
+            directory.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_listener_ancestor_metadata(
+    ancestor: &Path,
+    metadata: &fs::Metadata,
+    child_uid: u32,
+    expected_uid: u32,
+) -> Result<()> {
+    if metadata.file_type().is_symlink() {
+        // The symlink entry is protected by its lexical parent. The resolved
+        // target chain is validated independently.
+        return Ok(());
+    }
+    if !metadata.file_type().is_dir() {
+        bail!(
+            "sidecar socket ancestor must be a directory or symlink: {}",
+            ancestor.display()
+        );
+    }
+    if metadata.uid() != expected_uid && metadata.uid() != 0 {
+        bail!(
+            "sidecar socket ancestors must be owned by the current uid or root: {} (owner={}, current={expected_uid})",
+            ancestor.display(),
+            metadata.uid()
+        );
+    }
+
+    let mode = metadata.mode() & 0o7777;
+    if mode & 0o022 != 0 {
+        if mode & 0o1000 == 0 {
             bail!(
-                "socket path already exists and is not a socket: {}",
+                "sidecar socket ancestors must not be group/world-writable unless sticky: {} (mode={mode:04o})",
+                ancestor.display()
+            );
+        }
+        if child_uid != expected_uid && child_uid != 0 {
+            bail!(
+                "sidecar socket sticky ancestor does not protect its child entry: {}",
+                ancestor.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_listener_ancestor_chain(directory: &Path, expected_uid: u32) -> Result<()> {
+    let mut current = directory.to_path_buf();
+    let mut child_metadata = fs::symlink_metadata(&current).with_context(|| {
+        format!(
+            "failed to inspect sidecar socket directory ancestor {}",
+            current.display()
+        )
+    })?;
+    while let Some(parent) = current.parent() {
+        if parent == current {
+            break;
+        }
+        let metadata = fs::symlink_metadata(parent).with_context(|| {
+            format!(
+                "failed to inspect sidecar socket directory ancestor {}",
+                parent.display()
+            )
+        })?;
+        validate_listener_ancestor_metadata(parent, &metadata, child_metadata.uid(), expected_uid)?;
+        child_metadata = metadata;
+        current = parent.to_path_buf();
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_listener_directory_ancestors(directory: &Path, expected_uid: u32) -> Result<()> {
+    let lexical = std::path::absolute(directory).with_context(|| {
+        format!(
+            "failed to make sidecar socket directory absolute: {}",
+            directory.display()
+        )
+    })?;
+    validate_listener_ancestor_chain(&lexical, expected_uid)?;
+
+    let resolved = fs::canonicalize(directory).with_context(|| {
+        format!(
+            "failed to resolve sidecar socket directory {}",
+            directory.display()
+        )
+    })?;
+    if resolved != lexical {
+        let metadata = fs::symlink_metadata(&resolved).with_context(|| {
+            format!(
+                "failed to inspect resolved sidecar socket directory {}",
+                resolved.display()
+            )
+        })?;
+        validate_listener_directory_metadata(&resolved, &metadata, expected_uid)?;
+        validate_listener_ancestor_chain(&resolved, expected_uid)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_listener_creation_anchor(anchor: &Path, expected_uid: u32) -> Result<()> {
+    let metadata = fs::symlink_metadata(anchor).with_context(|| {
+        format!(
+            "failed to inspect sidecar socket creation ancestor {}",
+            anchor.display()
+        )
+    })?;
+    validate_listener_ancestor_metadata(anchor, &metadata, expected_uid, expected_uid)?;
+    validate_listener_ancestor_chain(anchor, expected_uid)?;
+
+    let resolved = fs::canonicalize(anchor).with_context(|| {
+        format!(
+            "failed to resolve sidecar socket creation ancestor {}",
+            anchor.display()
+        )
+    })?;
+    if resolved != anchor {
+        let resolved_metadata = fs::symlink_metadata(&resolved).with_context(|| {
+            format!(
+                "failed to inspect resolved sidecar socket creation ancestor {}",
+                resolved.display()
+            )
+        })?;
+        validate_listener_ancestor_metadata(
+            &resolved,
+            &resolved_metadata,
+            expected_uid,
+            expected_uid,
+        )?;
+        validate_listener_ancestor_chain(&resolved, expected_uid)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_created_listener_component(
+    component: &Path,
+    expected_uid: u32,
+    created: bool,
+) -> Result<()> {
+    let metadata = fs::symlink_metadata(component).with_context(|| {
+        format!(
+            "failed to inspect sidecar socket directory component {}",
+            component.display()
+        )
+    })?;
+    if created {
+        if !metadata.file_type().is_dir()
+            || metadata.file_type().is_symlink()
+            || metadata.uid() != expected_uid
+        {
+            validate_listener_directory_metadata(component, &metadata, expected_uid)?;
+        }
+        fs::set_permissions(
+            component,
+            fs::Permissions::from_mode(LISTENER_DIRECTORY_MODE),
+        )
+        .with_context(|| {
+            format!(
+                "failed to secure sidecar socket directory component {}",
+                component.display()
+            )
+        })?;
+    }
+    let metadata = fs::symlink_metadata(component).with_context(|| {
+        format!(
+            "failed to recheck sidecar socket directory component {}",
+            component.display()
+        )
+    })?;
+    validate_listener_directory_metadata(component, &metadata, expected_uid)?;
+    validate_listener_directory_ancestors(component, expected_uid)
+}
+
+#[cfg(unix)]
+fn ensure_secure_listener_directory(socket: &Path) -> Result<()> {
+    let directory = listener_socket_directory(socket);
+    if directory
+        .components()
+        .any(|component| component == std::path::Component::ParentDir)
+    {
+        bail!(
+            "sidecar socket directory must not contain parent traversal: {}",
+            directory.display()
+        );
+    }
+    let uid = effective_uid();
+    match fs::symlink_metadata(directory) {
+        Ok(metadata) => {
+            validate_listener_directory_metadata(directory, &metadata, uid)?;
+            return validate_listener_directory_ancestors(directory, uid);
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to inspect sidecar socket directory {}",
+                    directory.display()
+                )
+            })
+        }
+    }
+
+    let absolute = std::path::absolute(directory).with_context(|| {
+        format!(
+            "failed to make sidecar socket directory absolute: {}",
+            directory.display()
+        )
+    })?;
+    let mut missing = Vec::new();
+    let mut anchor = absolute.clone();
+    loop {
+        match fs::symlink_metadata(&anchor) {
+            Ok(_) => break,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                missing.push(anchor.clone());
+                anchor = anchor.parent().map(Path::to_path_buf).ok_or_else(|| {
+                    anyhow!(
+                        "sidecar socket directory has no existing creation ancestor: {}",
+                        directory.display()
+                    )
+                })?;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to inspect sidecar socket creation ancestor {}",
+                        anchor.display()
+                    )
+                })
+            }
+        }
+    }
+    validate_listener_creation_anchor(&anchor, uid)?;
+
+    for component in missing.iter().rev() {
+        let mut builder = fs::DirBuilder::new();
+        builder.mode(LISTENER_DIRECTORY_MODE);
+        let created = match builder.create(component) {
+            Ok(()) => true,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => false,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to create sidecar socket directory component {}",
+                        component.display()
+                    )
+                })
+            }
+        };
+        validate_created_listener_component(component, uid, created)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_listener_socket_metadata(
+    socket: &Path,
+    metadata: &fs::Metadata,
+    expected_uid: u32,
+) -> Result<()> {
+    if !metadata.file_type().is_socket() || metadata.file_type().is_symlink() {
+        bail!(
+            "sidecar socket path must be a Unix socket and not a symlink: {}",
+            socket.display()
+        );
+    }
+    if metadata.uid() != expected_uid {
+        bail!(
+            "sidecar socket must be owned by the current uid: {} (owner={}, current={expected_uid})",
+            socket.display(),
+            metadata.uid()
+        );
+    }
+    let mode = metadata.mode() & 0o7777;
+    if mode & !LISTENER_SOCKET_MODE != 0 {
+        bail!(
+            "sidecar socket permissions must not exceed 0600: {} (mode={mode:04o})",
+            socket.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn prepare_listener_socket(socket: &Path) -> Result<()> {
+    ensure_secure_listener_directory(socket)?;
+    match fs::symlink_metadata(socket) {
+        Ok(metadata) => {
+            validate_listener_socket_metadata(socket, &metadata, effective_uid())?;
+            match UnixStream::connect(socket) {
+                Ok(_) => bail!("sidecar socket is already in use: {}", socket.display()),
+                Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {}
+                Err(error) => {
+                    bail!(
+                        "failed to verify existing sidecar socket {}; refusing to remove it: {error}",
+                        socket.display()
+                    )
+                }
+            }
+            fs::remove_file(socket)
+                .with_context(|| format!("failed to remove stale socket {}", socket.display()))?;
+            sync_parent_dir(socket)?;
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("failed to inspect sidecar socket path {}", socket.display())
+            })
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn bind_secure_listener_socket(socket: &Path) -> Result<UnixListener> {
+    let listener = UnixListener::bind(socket)
+        .with_context(|| format!("failed to bind sidecar socket {}", socket.display()))?;
+    let secured = (|| -> Result<()> {
+        fs::set_permissions(socket, fs::Permissions::from_mode(LISTENER_SOCKET_MODE))
+            .with_context(|| format!("failed to secure sidecar socket {}", socket.display()))?;
+        let metadata = fs::symlink_metadata(socket)
+            .with_context(|| format!("failed to inspect bound socket {}", socket.display()))?;
+        validate_listener_socket_metadata(socket, &metadata, effective_uid())?;
+        let mode = metadata.mode() & 0o7777;
+        if mode != LISTENER_SOCKET_MODE {
+            bail!(
+                "bound sidecar socket does not have mode 0600: {} (mode={mode:04o})",
                 socket.display()
             );
         }
-        if UnixStream::connect(socket).is_ok() {
-            bail!("sidecar socket is already in use: {}", socket.display());
-        }
-        fs::remove_file(socket)
-            .with_context(|| format!("failed to remove stale socket {}", socket.display()))?;
-        sync_parent_dir(socket)?;
+        Ok(())
+    })();
+    if let Err(error) = secured {
+        drop(listener);
+        let _ = fs::remove_file(socket);
+        return Err(error);
     }
-    Ok(())
+    Ok(listener)
 }
 
 #[cfg(unix)]
@@ -9505,18 +11232,24 @@ where
                         continue;
                     }
                 };
-                if preflight.skip {
+                if let Some(reason) = preflight.skip_reason.as_deref() {
+                    control_sidecar.record_remote_health();
                     send_client_response(
                         &response_tx,
                         result_to_client_response(
                             request_id,
                             Ok(json!({
                                 "status": "skipped",
-                                "reason": "remote agent is already compatible",
+                                "reason": reason,
+                                "automatic": preflight.automatic,
                                 "install_path": preflight.target_path,
                                 "remote_health": preflight.before
                             })),
                         ),
+                    );
+                    send_client_notification(
+                        &response_tx,
+                        control_sidecar.remote_health_notification(),
                     );
                     continue;
                 }
@@ -10769,21 +12502,40 @@ impl LspLaunch {
 }
 
 fn posix_agent_remote_command(agent: &str, remote_root: &Path) -> String {
-    if remote_agent_uses_managed_path(agent) {
-        return [
-            shell_quote("sh"),
-            shell_quote("-lc"),
-            shell_quote("PATH=\"$HOME/.local/bin:$PATH\"; exec \"$@\""),
-            shell_quote("nrm-agent-launch"),
-            shell_quote(agent),
-            shell_quote("serve"),
-            shell_quote("--root"),
-            shell_quote(remote_root.to_string_lossy()),
-        ]
-        .join(" ");
-    }
+    const SCRIPT: &str = r#"set -u
+agent=$1
+root=$2
+managed=$3
+shift 3
+fail() {
+  printf 'NRM_AGENT_LAUNCH_V1\tFAILURE\t%s\n' "$1"
+  exit "$2"
+}
+if [ ! -d "$root" ]; then fail root_missing 66; fi
+if [ "$managed" = 1 ]; then
+  PATH="${HOME-}/.local/bin:${PATH-}"
+  export PATH
+fi
+case "$agent" in
+  */*) executable=$agent ;;
+  *) executable=$(command -v "$agent" 2>/dev/null) || fail missing 127 ;;
+esac
+if [ ! -e "$executable" ] && [ ! -L "$executable" ]; then fail missing 127; fi
+if [ ! -f "$executable" ] || [ ! -x "$executable" ]; then fail not_executable 126; fi
+printf 'NRM_AGENT_LAUNCH_V1\tREADY\n' || exit 70
+exec "$executable" "$@""#;
     [
+        shell_quote("sh"),
+        shell_quote("-c"),
+        shell_quote(SCRIPT),
+        shell_quote("nrm-agent-launch"),
         shell_quote(agent),
+        shell_quote(remote_root.to_string_lossy()),
+        shell_quote(if remote_agent_uses_managed_path(agent) {
+            "1"
+        } else {
+            "0"
+        }),
         shell_quote("serve"),
         shell_quote("--root"),
         shell_quote(remote_root.to_string_lossy()),
@@ -10821,26 +12573,43 @@ fn powershell_agent_remote_command(
     } else {
         (agent.to_string(), None)
     };
-    powershell_process_command(&program, &args, None, path_prepend.as_deref())
+    powershell_agent_process_command(&program, &args, None, path_prepend.as_deref())
 }
 
 fn remote_agent_uses_managed_path(agent: &str) -> bool {
     !agent.contains(['/', '\\', ':'])
 }
 
-fn default_posix_remote_agent_install_path(agent: &str) -> String {
-    if agent.starts_with('/') {
-        agent.to_string()
-    } else {
-        REMOTE_AGENT_MANAGED_PATH.to_string()
+fn validate_managed_remote_agent_name(agent: &str) -> Result<()> {
+    if agent.is_empty()
+        || matches!(agent, "." | "..")
+        || agent.starts_with('-')
+        || !agent
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        bail!("remote_agent must be an absolute path or a safe bare command name");
     }
+    Ok(())
+}
+
+fn default_posix_remote_agent_install_path(agent: &str) -> Result<String> {
+    if agent.starts_with('/') {
+        return Ok(agent.to_string());
+    }
+    if !remote_agent_uses_managed_path(agent) {
+        bail!("POSIX remote_agent must be an absolute path or a bare command name");
+    }
+    validate_managed_remote_agent_name(agent)?;
+    Ok(format!("$HOME/.local/bin/{agent}"))
 }
 
 fn default_remote_agent_install_path(agent: &str, host: &RemoteHostInfo) -> Result<String> {
     match host.path_style {
-        RemotePathStyle::Posix => Ok(default_posix_remote_agent_install_path(agent)),
+        RemotePathStyle::Posix => default_posix_remote_agent_install_path(agent),
         RemotePathStyle::Windows if !remote_agent_uses_managed_path(agent) => Ok(agent.to_string()),
         RemotePathStyle::Windows => {
+            validate_managed_remote_agent_name(agent)?;
             let local_app_data = host
                 .local_app_data
                 .as_deref()
@@ -10865,37 +12634,32 @@ fn classify_remote_agent_status(value: &Value) -> String {
         .and_then(Value::as_bool)
         .unwrap_or(false)
     {
-        let agent_version = value.get("agent_version").and_then(Value::as_str);
-        if agent_version.is_some_and(|version| version != env!("CARGO_PKG_VERSION")) {
-            return "version_mismatch".to_string();
-        }
         return "ok".to_string();
     }
 
-    let error = value
-        .get("remote_error")
+    if let Some(status) = value
+        .get("agent_launch_failure")
         .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    if error.contains("protocol version mismatch") {
-        return "protocol_mismatch".to_string();
-    }
-    if error.contains("package version mismatch") {
-        return "version_mismatch".to_string();
-    }
-    if error.contains("failed to canonicalize root")
-        || error.contains("no such file or directory") && error.contains("--root")
+        .and_then(|failure| match failure {
+            "missing" => Some(RemoteAgentLaunchFailure::Missing),
+            "not_executable" => Some(RemoteAgentLaunchFailure::NotExecutable),
+            "root_missing" => Some(RemoteAgentLaunchFailure::RootMissing),
+            _ => None,
+        })
     {
-        return "remote_root_missing".to_string();
+        return status.agent_status().to_owned();
     }
-    if error.contains("permission denied") || error.contains("not executable") {
-        return "agent_not_executable".to_string();
-    }
-    if error.contains("failed to launch agent")
-        || error.contains("not found")
-        || error.contains("no such file or directory")
+
+    if let Some(status) = value
+        .get("agent_compatibility_failure")
+        .and_then(Value::as_str)
+        .and_then(|failure| match failure {
+            "version_mismatch" => Some("version_mismatch"),
+            "protocol_mismatch" => Some("protocol_mismatch"),
+            _ => None,
+        })
     {
-        return "missing_agent".to_string();
+        return status.to_owned();
     }
     "unavailable".to_string()
 }
@@ -11288,6 +13052,11 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use tempfile::tempdir;
 
+    #[cfg(unix)]
+    fn secure_socket_test_directory(path: &Path) {
+        fs::set_permissions(path, fs::Permissions::from_mode(LISTENER_DIRECTORY_MODE)).unwrap();
+    }
+
     struct TestAbortHandle {
         aborts: AtomicUsize,
         waits: AtomicUsize,
@@ -11335,6 +13104,47 @@ mod tests {
             .arg("-c")
             .arg("printf 'NRM_INSTALL_ERROR_V1\\talready_exists\\n' >&2; exit 23");
         command
+    }
+
+    #[cfg(unix)]
+    fn local_remote_install_lease(script: &str) -> (RemoteInstallLease, u32) {
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg(script)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        configure_agent_process(&mut command);
+        let mut child = command.spawn().unwrap();
+        let pid = child.id();
+        let stdin = child.stdin.take().unwrap();
+        let stderr = spawn_process_output_reader(child.stderr.take().unwrap());
+        (
+            RemoteInstallLease {
+                child: Some(child),
+                stdin: Some(stdin),
+                stderr: Some(stderr),
+                released: false,
+            },
+            pid,
+        )
+    }
+
+    #[cfg(unix)]
+    fn wait_for_local_process_reap(pid: u32) {
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_secs(2) {
+            // SAFETY: signal zero only checks whether the captured child PID is
+            // still present; it does not deliver a signal.
+            if unsafe { libc::kill(pid as libc::pid_t, 0) } != 0
+                && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+            {
+                return;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("detached install-lease reaper did not reap process {pid}");
     }
 
     #[cfg(windows)]
@@ -11419,6 +13229,55 @@ mod tests {
             remote_agent_registry_cache_max_bytes: DEFAULT_REGISTRY_CACHE_MAX_BYTES,
             remote_agent_registry_timeout_ms: DEFAULT_REGISTRY_TIMEOUT_MS,
         }
+    }
+
+    fn test_registry_launch_config(timeout: Duration) -> RegistryLaunchConfig {
+        RegistryLaunchConfig {
+            url_template: RegistryUrlTemplate::parse(
+                "https://registry.example.test/v{version}/manifest.json",
+            )
+            .unwrap(),
+            trusted_keys: TrustedKeySet::from_base64([(
+                "release-test",
+                "11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=",
+            )])
+            .unwrap(),
+            signature_threshold: 1,
+            cache_dir: None,
+            cache_max_bytes: DEFAULT_REGISTRY_CACHE_MAX_BYTES,
+            timeout,
+            policy_fingerprint: "test-registry-policy".to_owned(),
+        }
+    }
+
+    fn configure_test_registry(sidecar: &mut Sidecar, timeout: Duration) {
+        let registry = test_registry_launch_config(timeout);
+        sidecar.registry_health =
+            Arc::new(Mutex::new(RegistryHealth::from_registry(Some(&registry))));
+        sidecar.agent.launch.registry = Some(registry);
+    }
+
+    type TestBackoffSlotSnapshot = (
+        Option<Instant>,
+        Option<String>,
+        Option<TrustedAgentFailure>,
+        Option<Instant>,
+        u32,
+    );
+
+    fn test_backoff_snapshot(
+        backoff: &RemoteBackoffState,
+    ) -> (TestBackoffSlotSnapshot, TestBackoffSlotSnapshot) {
+        let slot = |slot: &RemoteBackoffSlot| {
+            (
+                slot.unavailable_until,
+                slot.last_remote_error.clone(),
+                slot.trusted_failure.clone(),
+                slot.last_remote_error_at,
+                slot.consecutive_failures,
+            )
+        };
+        (slot(&backoff.read), slot(&backoff.write))
     }
 
     #[test]
@@ -11678,7 +13537,7 @@ mod tests {
             Ok(())
         }
 
-        fn ensure_activation_budget(&self) -> Result<()> {
+        fn ensure_activation_budget(&mut self) -> Result<()> {
             if let Some(deadline) = self.deadline {
                 deadline.forward_timeout("test activation").map(drop)?;
             }
@@ -12134,7 +13993,8 @@ mod tests {
             before: json!({"agent_status": "ok"}),
             target_path: "/home/test/.local/bin/nrm-agent".to_string(),
             effective_force: true,
-            skip: false,
+            skip_reason: None,
+            automatic: false,
         };
 
         let error = sidecar
@@ -12161,7 +14021,8 @@ mod tests {
             before: json!({"agent_status": "ok"}),
             target_path: r"C:\Users\test\AppData\Local\nrm\bin\nrm-agent.exe".to_string(),
             effective_force: true,
-            skip: false,
+            skip_reason: None,
+            automatic: false,
         };
         let error = sidecar
             .prepare_remote_agent_install(
@@ -12532,13 +14393,13 @@ mod tests {
     fn remote_backoff_state_resets_lane_failure_count_on_clear() {
         let mut backoff = RemoteBackoffState::default();
 
-        backoff.mark_unavailable(AgentBackoffLane::Read, "first".to_string());
+        backoff.mark_unavailable(AgentBackoffLane::Read, "first".to_string(), None);
         assert_eq!(
             slot_backoff_window_ms(backoff.slot(AgentBackoffLane::Read)),
             REMOTE_UNAVAILABLE_BACKOFF_BASE_MS
         );
 
-        backoff.mark_unavailable(AgentBackoffLane::Read, "second".to_string());
+        backoff.mark_unavailable(AgentBackoffLane::Read, "second".to_string(), None);
         assert_eq!(
             slot_backoff_window_ms(backoff.slot(AgentBackoffLane::Read)),
             REMOTE_UNAVAILABLE_BACKOFF_BASE_MS * 2
@@ -12550,11 +14411,64 @@ mod tests {
 
         backoff.clear_lane(AgentBackoffLane::Read);
         assert_eq!(backoff.slot(AgentBackoffLane::Read).consecutive_failures, 0);
-        backoff.mark_unavailable(AgentBackoffLane::Read, "third".to_string());
+        backoff.mark_unavailable(AgentBackoffLane::Read, "third".to_string(), None);
         assert_eq!(
             slot_backoff_window_ms(backoff.slot(AgentBackoffLane::Read)),
             REMOTE_UNAVAILABLE_BACKOFF_BASE_MS
         );
+    }
+
+    #[test]
+    fn agent_client_recovers_poisoned_shared_backoff() {
+        let dir = tempdir().unwrap();
+        let mut read = AgentClient::new(
+            "nrm-agent".to_string(),
+            None,
+            RemoteTransport::Local,
+            dir.path().to_path_buf(),
+            Duration::from_millis(100),
+            AgentInterrupt::default(),
+        );
+        let mut write = read.clone_for_lane(AgentInterrupt::default());
+        let _ = read.mark_remote_unavailable_with_launch_failure(
+            "missing",
+            RemoteAgentLaunchFailure::Missing,
+        );
+        let _ = write.mark_remote_unavailable_with_compatibility_failure(
+            "old version",
+            AgentCompatibilityFailure::VersionMismatch {
+                agent_version: "0.0.1".to_string(),
+            },
+        );
+
+        let shared = Arc::clone(&read.remote_backoff);
+        let poison = Arc::clone(&shared);
+        assert!(thread::spawn(move || {
+            let _guard = poison.lock().unwrap();
+            panic!("poison shared backoff for regression coverage");
+        })
+        .join()
+        .is_err());
+        assert!(shared.is_poisoned());
+
+        read.clear_all_remote_unavailable();
+        assert!(!shared.is_poisoned());
+        {
+            let backoff = shared.lock().unwrap();
+            for lane in [AgentBackoffLane::Read, AgentBackoffLane::Write] {
+                let slot = backoff.slot(lane);
+                assert_eq!(slot.consecutive_failures, 0);
+                assert!(slot.unavailable_until.is_none());
+                assert!(slot.last_remote_error.is_none());
+                assert!(slot.trusted_failure.is_none());
+                assert!(slot.last_remote_error_at.is_none());
+            }
+        }
+
+        let _ = write.mark_remote_unavailable("retry after poison recovery");
+        assert!(write.remote_backoff().is_some());
+        write.clear_remote_unavailable();
+        assert!(write.remote_backoff().is_none());
     }
 
     #[test]
@@ -12570,9 +14484,46 @@ mod tests {
             REMOTE_AGENT_MANAGED_PATH
         );
         assert_eq!(
+            default_remote_agent_install_path("custom-agent", &test_posix_host()).unwrap(),
+            "$HOME/.local/bin/custom-agent"
+        );
+        assert_eq!(
             default_remote_agent_install_path("/opt/bin/nrm-agent", &test_posix_host()).unwrap(),
             "/opt/bin/nrm-agent"
         );
+        for invalid in [
+            "./nrm-agent",
+            "bin/nrm-agent",
+            "-nrm-agent",
+            "nrm agent",
+            "nrm-agent\n",
+            "*.exe",
+            "agent?.exe",
+            "[ab].exe",
+            "agent+debug",
+            "nrm-agént",
+            ".",
+            "..",
+            "",
+        ] {
+            assert!(
+                default_remote_agent_install_path(invalid, &test_posix_host()).is_err(),
+                "accepted invalid POSIX remote agent {invalid:?}"
+            );
+        }
+        let ssh = RemoteTransport::from_ssh(Some("example.test".to_owned()), 1).unwrap();
+        for invalid in ["*.exe", "agent?.exe", "[ab].exe"] {
+            assert!(
+                ssh.agent_plan(invalid, Path::new("/repo"), &test_posix_host())
+                    .is_err(),
+                "accepted unsafe POSIX launch name {invalid:?}"
+            );
+            assert!(
+                ssh.agent_plan(invalid, Path::new("B:/repo"), &test_windows_host())
+                    .is_err(),
+                "accepted wildcard-aware PowerShell launch name {invalid:?}"
+            );
+        }
         assert_eq!(
             default_remote_agent_install_path("nrm-agent", &test_windows_host()).unwrap(),
             r"C:\Users\test\AppData\Local\nrm\bin\nrm-agent.exe"
@@ -12700,22 +14651,132 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(protocol_error.contains("protocol version mismatch"));
+
+        let malformed = validate_agent_hello("not-semver\x1b[31m", PROTOCOL_VERSION).unwrap_err();
+        assert!(malformed.failure.is_none());
+        assert_eq!(
+            malformed.to_string(),
+            "agent Hello reported a malformed package version"
+        );
     }
 
     #[test]
-    fn restored_agent_probe_accepts_only_compatibility_mismatches() {
-        assert!(is_agent_compatibility_mismatch(
-            "agent rpc error (agent): package version mismatch: client=0.2.0 agent=0.1.0"
-        ));
-        assert!(is_agent_compatibility_mismatch(
-            "protocol version mismatch: client=8 agent=7"
-        ));
-        assert!(!is_agent_compatibility_mismatch(
-            "failed to start agent: permission denied"
-        ));
-        assert!(!is_agent_compatibility_mismatch(
-            "unexpected restored-agent Hello response"
-        ));
+    fn compatibility_rpc_error_requires_exact_hello_bound_grammar() {
+        let hello = Request::Hello {
+            client_version: env!("CARGO_PKG_VERSION").to_owned(),
+            protocol_version: PROTOCOL_VERSION,
+        };
+        let error = |message: String| RpcError {
+            code: nrm_protocol::RpcErrorCode::Agent,
+            message,
+            retryable: false,
+        };
+
+        assert_eq!(
+            parse_agent_compatibility_rpc_error(
+                &error(format!(
+                    "package version mismatch: client={} agent=0.0.1",
+                    env!("CARGO_PKG_VERSION")
+                )),
+                &hello,
+            ),
+            Some(AgentCompatibilityFailure::VersionMismatch {
+                agent_version: "0.0.1".to_owned()
+            })
+        );
+        let agent_protocol = PROTOCOL_VERSION.saturating_add(1);
+        assert_eq!(
+            parse_agent_compatibility_rpc_error(
+                &error(format!(
+                    "protocol version mismatch: client={PROTOCOL_VERSION} agent={agent_protocol}"
+                )),
+                &hello,
+            ),
+            Some(AgentCompatibilityFailure::ProtocolMismatch {
+                protocol_version: agent_protocol
+            })
+        );
+
+        let malformed = [
+            "package version mismatch".to_owned(),
+            format!(
+                "prefix package version mismatch: client={} agent=0.0.1",
+                env!("CARGO_PKG_VERSION")
+            ),
+            "package version mismatch: client=spoofed agent=0.0.1".to_owned(),
+            format!(
+                "package version mismatch: client={} agent=not-semver",
+                env!("CARGO_PKG_VERSION")
+            ),
+            format!(
+                "package version mismatch: client={} agent=0.0.1 suffix",
+                env!("CARGO_PKG_VERSION")
+            ),
+            format!(
+                "package version mismatch: client={} agent=0.0.1\n",
+                env!("CARGO_PKG_VERSION")
+            ),
+            format!(
+                "package version mismatch: client={} agent={}",
+                env!("CARGO_PKG_VERSION"),
+                env!("CARGO_PKG_VERSION")
+            ),
+            format!(
+                "protocol version mismatch: client={} agent={}",
+                PROTOCOL_VERSION.saturating_add(1),
+                PROTOCOL_VERSION
+            ),
+            format!(
+                "protocol version mismatch: client={PROTOCOL_VERSION} agent=01"
+            ),
+            format!(
+                "protocol version mismatch: client={PROTOCOL_VERSION} agent={PROTOCOL_VERSION}"
+            ),
+            format!(
+                "protocol version mismatch: client={PROTOCOL_VERSION} agent={agent_protocol}\x1b[31m"
+            ),
+        ];
+        for message in malformed {
+            assert_eq!(
+                parse_agent_compatibility_rpc_error(&error(message.clone()), &hello),
+                None,
+                "accepted malformed compatibility error {message:?}"
+            );
+        }
+
+        let wrong_code = RpcError {
+            code: nrm_protocol::RpcErrorCode::Protocol,
+            message: format!(
+                "package version mismatch: client={} agent=0.0.1",
+                env!("CARGO_PKG_VERSION")
+            ),
+            retryable: false,
+        };
+        assert_eq!(
+            parse_agent_compatibility_rpc_error(&wrong_code, &hello),
+            None
+        );
+        let retryable = RpcError {
+            retryable: true,
+            ..error(format!(
+                "package version mismatch: client={} agent=0.0.1",
+                env!("CARGO_PKG_VERSION")
+            ))
+        };
+        assert_eq!(
+            parse_agent_compatibility_rpc_error(&retryable, &hello),
+            None
+        );
+        assert_eq!(
+            parse_agent_compatibility_rpc_error(
+                &error(format!(
+                    "package version mismatch: client={} agent=0.0.1",
+                    env!("CARGO_PKG_VERSION")
+                )),
+                &Request::Shutdown,
+            ),
+            None
+        );
     }
 
     #[test]
@@ -12846,6 +14907,149 @@ mod tests {
         assert_eq!(output.stderr, " error \n");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn remote_install_lease_reports_contention_and_reaps_holder() {
+        let dir = tempdir().unwrap();
+        let fake_ssh = dir.path().join("fake-ssh");
+        fs::write(
+            &fake_ssh,
+            b"#!/bin/sh\nprintf 'test login banner\\n' >&2\nfor last do :; done\nexec sh -c \"$last\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&fake_ssh, fs::Permissions::from_mode(0o755)).unwrap();
+        let ssh = SshTransport {
+            program: fake_ssh,
+            target: "ignored.example".to_owned(),
+            connect_timeout_seconds: 1,
+        };
+        let target = dir.path().join("nrm-agent");
+        let mut plan = agent_install::PosixInstallPlan::new(
+            target.to_str().unwrap(),
+            env!("CARGO_PKG_VERSION"),
+            PROTOCOL_VERSION,
+            true,
+        )
+        .unwrap();
+        plan.set_expected_sha256(&"0".repeat(64)).unwrap();
+        let token_one = "0123456789abcdef0123456789abcdef";
+        let token_two = "fedcba9876543210fedcba9876543210";
+        let (mut lease, readiness) = RemoteInstallLease::acquire(
+            &ssh,
+            plan.lease_command(token_one).unwrap(),
+            Duration::from_secs(2),
+        )
+        .unwrap();
+        assert_eq!(
+            plan.parse_lease_ready_stdout(token_one, &readiness)
+                .unwrap(),
+            target.to_str().unwrap()
+        );
+
+        let contender = RemoteInstallLease::acquire(
+            &ssh,
+            plan.lease_command(token_two).unwrap(),
+            Duration::from_secs(2),
+        )
+        .err()
+        .expect("a second holder must not acquire the same target");
+        assert!(
+            contender.to_string().contains("install_in_progress"),
+            "{contender:#}"
+        );
+        lease.ensure_held("test mutation").unwrap();
+        lease.release(Duration::from_secs(2)).unwrap();
+        assert!(!PathBuf::from(format!("{}.nrm-install-lease", target.display())).exists());
+
+        let oversized = RemoteInstallLease::acquire(
+            &ssh,
+            "printf '%05000d' 0".to_owned(),
+            Duration::from_secs(2),
+        )
+        .err()
+        .expect("oversized readiness must fail");
+        assert!(
+            oversized.to_string().contains("readiness exceeded"),
+            "{oversized:#}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_install_lease_release_budget_detaches_retained_stderr() {
+        let (mut lease, _) = local_remote_install_lease("(sleep 0.3) & exit 0");
+        let budget = Duration::from_millis(30);
+        let started = Instant::now();
+        let error = lease.release(budget).unwrap_err();
+        let elapsed = started.elapsed();
+
+        assert!(
+            error.to_string().contains("stderr did not close"),
+            "{error:#}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "release waited {elapsed:?} for a descendant-held stderr pipe"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_install_lease_release_and_drop_bound_eof_ignoring_holder() {
+        let script = "trap '' HUP TERM; while :; do sleep 1; done";
+        let (mut lease, release_pid) = local_remote_install_lease(script);
+        let budget = Duration::from_millis(30);
+        let started = Instant::now();
+        let error = lease.release(budget).unwrap_err();
+        let elapsed = started.elapsed();
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.downcast_ref::<ProcessTimeoutError>().is_some()),
+            "{error:#}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "release exceeded its teardown budget: {elapsed:?}"
+        );
+        wait_for_local_process_reap(release_pid);
+
+        let (lease, drop_pid) = local_remote_install_lease(script);
+        let started = Instant::now();
+        drop(lease);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "zero-budget Drop blocked for {elapsed:?}"
+        );
+        wait_for_local_process_reap(drop_pid);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn expired_recovery_budget_does_not_grant_lease_release_a_fresh_grace() {
+        let (mut lease, pid) =
+            local_remote_install_lease("trap '' HUP TERM; while :; do sleep 1; done");
+        let deadline =
+            BootstrapDeadline::with_elapsed(Duration::from_millis(20), Duration::from_secs(1));
+
+        let started = Instant::now();
+        let error = release_remote_install_lease_with_deadline(
+            &mut lease,
+            deadline,
+            "test expired lease release",
+        )
+        .unwrap_err();
+        let elapsed = started.elapsed();
+
+        assert!(is_bootstrap_timeout(&error), "{error:#}");
+        assert!(
+            elapsed < Duration::from_millis(100),
+            "expired recovery budget gained a new teardown grace: {elapsed:?}"
+        );
+        wait_for_local_process_reap(pid);
+    }
+
     #[test]
     fn incompatible_agent_hello_blocks_ordinary_remote_work() {
         for (response, expected_error, expected_status) in [
@@ -12904,38 +15108,711 @@ mod tests {
                 "remote_available": true,
                 "agent_version": "0.0.0"
             })),
-            "version_mismatch"
+            "ok"
         );
         assert_eq!(
             classify_remote_agent_status(&json!({
-                "remote_error": "protocol version mismatch: agent=1 client=2"
+                "agent_compatibility_failure": "protocol_mismatch",
+                "protocol_version": 1
             })),
             "protocol_mismatch"
         );
         assert_eq!(
             classify_remote_agent_status(&json!({
-                "remote_error": "package version mismatch: sidecar=0.1.0 agent=0.0.9"
+                "agent_compatibility_failure": "version_mismatch",
+                "agent_version": "0.0.9"
             })),
             "version_mismatch"
         );
         assert_eq!(
             classify_remote_agent_status(&json!({
-                "remote_error": "failed to canonicalize root: No such file or directory"
+                "agent_launch_failure": "root_missing",
+                "remote_error": "remote agent launcher reported a missing remote root"
             })),
             "remote_root_missing"
         );
         assert_eq!(
             classify_remote_agent_status(&json!({
-                "remote_error": "failed to launch agent: Permission denied"
+                "agent_launch_failure": "not_executable",
+                "remote_error": "remote agent launcher reported a non-executable"
             })),
             "agent_not_executable"
         );
         assert_eq!(
             classify_remote_agent_status(&json!({
-                "remote_error": "failed to launch agent: nrm-agent: not found"
+                "agent_launch_failure": "missing",
+                "remote_error": "remote agent launcher reported a missing executable"
             })),
             "missing_agent"
         );
+        for untrusted_text in [
+            "failed to canonicalize root: No such file or directory",
+            "failed to launch agent: Permission denied",
+            "failed to launch agent: nrm-agent: not found",
+            "protocol version mismatch: agent=1 client=2",
+            "package version mismatch: sidecar=0.1.0 agent=0.0.9",
+        ] {
+            assert_eq!(
+                classify_remote_agent_status(&json!({ "remote_error": untrusted_text })),
+                "unavailable"
+            );
+        }
+    }
+
+    #[test]
+    fn automatic_agent_bootstrap_repairs_only_known_agent_failures() {
+        let compatible = agent_install_decision("ok", true, false, true).unwrap();
+        assert!(!compatible.effective_force);
+        assert_eq!(
+            compatible.skip_reason.as_deref(),
+            Some("remote agent is already compatible")
+        );
+
+        let missing = agent_install_decision("missing_agent", true, false, true).unwrap();
+        assert!(!missing.effective_force);
+        assert!(missing.skip_reason.is_none());
+
+        for status in [
+            "agent_not_executable",
+            "version_mismatch",
+            "protocol_mismatch",
+        ] {
+            let repair = agent_install_decision(status, true, false, true).unwrap();
+            assert!(repair.effective_force, "status {status}");
+            assert!(repair.skip_reason.is_none(), "status {status}");
+        }
+
+        for status in ["unavailable", "remote_root_missing", "unknown"] {
+            let unchanged = agent_install_decision(status, true, false, true).unwrap();
+            assert!(!unchanged.effective_force, "status {status}");
+            assert!(
+                unchanged
+                    .skip_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("left remote agent unchanged")),
+                "status {status}"
+            );
+        }
+
+        assert!(agent_install_decision("missing_agent", false, false, true)
+            .unwrap_err()
+            .to_string()
+            .contains("update/repair semantics"));
+        assert!(agent_install_decision("missing_agent", true, true, true)
+            .unwrap_err()
+            .to_string()
+            .contains("does not accept force=true"));
+
+        let explicit_update = agent_install_decision("unavailable", true, false, false).unwrap();
+        assert!(explicit_update.effective_force);
+        assert!(explicit_update.skip_reason.is_none());
+    }
+
+    #[test]
+    fn automatic_agent_bootstrap_requires_signed_registry_before_remote_work() {
+        let dir = tempdir().unwrap();
+        let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
+        let mut sidecar = test_sidecar(mirror);
+
+        let error = sidecar
+            .remote_agent_install_preflight(
+                &json!({"automatic": true}),
+                true,
+                0,
+                BootstrapDeadline::new(Duration::from_secs(1)),
+            )
+            .err()
+            .expect("automatic bootstrap without registry must fail")
+            .to_string();
+
+        assert!(error.contains("requires a configured signed registry"));
+        assert_eq!(
+            sidecar.remote_health_snapshot().state,
+            RemoteHealthState::Unchecked
+        );
+    }
+
+    #[test]
+    fn automatic_preflight_rejects_invalid_policy_and_path_before_remote_work() {
+        struct Case {
+            name: &'static str,
+            params: Value,
+            update: bool,
+            registry: bool,
+            ssh: bool,
+            expected: &'static str,
+        }
+
+        let cases = [
+            Case {
+                name: "force type",
+                params: json!({"automatic": true, "force": "yes"}),
+                update: true,
+                registry: false,
+                ssh: false,
+                expected: "params.force must be a boolean",
+            },
+            Case {
+                name: "automatic type",
+                params: json!({"automatic": 1}),
+                update: true,
+                registry: false,
+                ssh: false,
+                expected: "params.automatic must be a boolean",
+            },
+            Case {
+                name: "install semantics",
+                params: json!({"automatic": true}),
+                update: false,
+                registry: false,
+                ssh: false,
+                expected: "requires update/repair semantics",
+            },
+            Case {
+                name: "forced automatic repair",
+                params: json!({"automatic": true, "force": true}),
+                update: true,
+                registry: false,
+                ssh: false,
+                expected: "does not accept force=true",
+            },
+            Case {
+                name: "local transport",
+                params: json!({"automatic": true}),
+                update: true,
+                registry: true,
+                ssh: false,
+                expected: "only supported for ssh targets",
+            },
+            Case {
+                name: "install path type",
+                params: json!({"automatic": true, "install_path": ["/tmp/agent"]}),
+                update: true,
+                registry: true,
+                ssh: true,
+                expected: "params.install_path must be a string",
+            },
+            Case {
+                name: "empty install path",
+                params: json!({"automatic": true, "install_path": "  "}),
+                update: true,
+                registry: true,
+                ssh: true,
+                expected: "params.install_path must not be empty",
+            },
+        ];
+
+        for case in cases {
+            let dir = tempdir().unwrap();
+            let mirror = Mirror::open(Some(dir.path().join("state")), case.name).unwrap();
+            let mut sidecar = test_sidecar(mirror);
+            if case.registry {
+                configure_test_registry(&mut sidecar, Duration::from_secs(2));
+            }
+            if case.ssh {
+                sidecar.agent.launch.transport = RemoteTransport::Ssh(SshTransport {
+                    program: PathBuf::from("definitely-not-a-real-ssh-program"),
+                    target: "test.example".to_owned(),
+                    connect_timeout_seconds: 1,
+                });
+            }
+            let backoff_before = {
+                let mut backoff = sidecar.agent.remote_backoff.lock().unwrap();
+                backoff.mark_unavailable(
+                    AgentBackoffLane::Read,
+                    "prior read failure".to_owned(),
+                    Some(TrustedAgentFailure::Launch(
+                        RemoteAgentLaunchFailure::Missing,
+                    )),
+                );
+                backoff.mark_unavailable(
+                    AgentBackoffLane::Write,
+                    "prior write failure".to_owned(),
+                    Some(TrustedAgentFailure::Compatibility(
+                        AgentCompatibilityFailure::VersionMismatch {
+                            agent_version: "9.9.9".to_owned(),
+                        },
+                    )),
+                );
+                test_backoff_snapshot(&backoff)
+            };
+            let worker_generation = sidecar
+                .agent
+                .launch
+                .worker_generation
+                .load(Ordering::SeqCst);
+            let next_request_id = sidecar.agent.next_id;
+
+            let error = sidecar
+                .remote_agent_install_preflight(
+                    &case.params,
+                    case.update,
+                    0,
+                    BootstrapDeadline::new(Duration::from_secs(2)),
+                )
+                .err()
+                .unwrap_or_else(|| panic!("{} unexpectedly passed preflight", case.name))
+                .to_string();
+
+            assert!(error.contains(case.expected), "{}: {error}", case.name);
+            let backoff_after = sidecar
+                .agent
+                .remote_backoff
+                .lock()
+                .map(|backoff| test_backoff_snapshot(&backoff))
+                .unwrap();
+            assert_eq!(
+                backoff_after, backoff_before,
+                "{} changed cached failure state",
+                case.name
+            );
+            assert!(
+                sidecar.agent.launch.cached_remote_host_info().is_none(),
+                "{} performed remote host detection",
+                case.name
+            );
+            assert_eq!(
+                sidecar
+                    .agent
+                    .launch
+                    .worker_generation
+                    .load(Ordering::SeqCst),
+                worker_generation,
+                "{} invalidated an agent worker",
+                case.name
+            );
+            assert_eq!(
+                sidecar.agent.next_id, next_request_id,
+                "{} attempted remote work",
+                case.name
+            );
+        }
+    }
+
+    #[test]
+    fn automatic_preflight_mutates_only_for_typed_repairable_failures() {
+        struct Case {
+            name: &'static str,
+            reply: AgentWorkerReply,
+            expected_status: &'static str,
+            expected_force: bool,
+            expected_skip: bool,
+        }
+
+        let cases = vec![
+            Case {
+                name: "missing",
+                reply: AgentWorkerReply::LaunchError(RemoteAgentLaunchFailure::Missing),
+                expected_status: "missing_agent",
+                expected_force: false,
+                expected_skip: false,
+            },
+            Case {
+                name: "not executable",
+                reply: AgentWorkerReply::LaunchError(RemoteAgentLaunchFailure::NotExecutable),
+                expected_status: "agent_not_executable",
+                expected_force: true,
+                expected_skip: false,
+            },
+            Case {
+                name: "version mismatch",
+                reply: AgentWorkerReply::Response(Response::Hello {
+                    agent_version: "9.9.9".to_owned(),
+                    protocol_version: PROTOCOL_VERSION,
+                    capabilities: nrm_protocol::CapabilitySet::v1_agent(),
+                }),
+                expected_status: "version_mismatch",
+                expected_force: true,
+                expected_skip: false,
+            },
+            Case {
+                name: "protocol mismatch",
+                reply: AgentWorkerReply::Response(Response::Hello {
+                    agent_version: env!("CARGO_PKG_VERSION").to_owned(),
+                    protocol_version: PROTOCOL_VERSION + 1,
+                    capabilities: nrm_protocol::CapabilitySet::v1_agent(),
+                }),
+                expected_status: "protocol_mismatch",
+                expected_force: true,
+                expected_skip: false,
+            },
+            Case {
+                name: "missing root",
+                reply: AgentWorkerReply::LaunchError(RemoteAgentLaunchFailure::RootMissing),
+                expected_status: "remote_root_missing",
+                expected_force: false,
+                expected_skip: true,
+            },
+            Case {
+                name: "generic transport",
+                reply: AgentWorkerReply::TransportError("ssh authentication failed".to_owned()),
+                expected_status: "unavailable",
+                expected_force: false,
+                expected_skip: true,
+            },
+            Case {
+                name: "spoofed missing",
+                reply: AgentWorkerReply::TransportError(
+                    "nrm-agent: not found; permission denied".to_owned(),
+                ),
+                expected_status: "unavailable",
+                expected_force: false,
+                expected_skip: true,
+            },
+            Case {
+                name: "spoofed compatibility",
+                reply: AgentWorkerReply::TransportError(format!(
+                    "package version mismatch: client={} agent=9.9.9; protocol version mismatch",
+                    env!("CARGO_PKG_VERSION")
+                )),
+                expected_status: "unavailable",
+                expected_force: false,
+                expected_skip: true,
+            },
+        ];
+
+        for case in cases {
+            let dir = tempdir().unwrap();
+            let mirror = Mirror::open(Some(dir.path().join("state")), case.name).unwrap();
+            let mut sidecar = test_sidecar_with_agent_reply(mirror, case.reply);
+            configure_test_registry(&mut sidecar, Duration::from_secs(2));
+            sidecar.agent.launch.transport = RemoteTransport::Ssh(SshTransport {
+                program: PathBuf::from("definitely-not-a-real-ssh-program"),
+                target: "test.example".to_owned(),
+                connect_timeout_seconds: 1,
+            });
+
+            let preflight = sidecar
+                .remote_agent_install_preflight(
+                    &json!({
+                        "automatic": true,
+                        "install_path": "/tmp/nrm-test-agent"
+                    }),
+                    true,
+                    0,
+                    BootstrapDeadline::new(Duration::from_secs(2)),
+                )
+                .unwrap_or_else(|error| panic!("{} preflight failed: {error:#}", case.name));
+
+            assert_eq!(
+                preflight.before["agent_status"], case.expected_status,
+                "{}",
+                case.name
+            );
+            assert_eq!(
+                preflight.effective_force, case.expected_force,
+                "{}",
+                case.name
+            );
+            assert_eq!(
+                preflight.skip_reason.is_some(),
+                case.expected_skip,
+                "{}",
+                case.name
+            );
+        }
+    }
+
+    #[test]
+    fn zero_budget_registry_automatic_request_fails_before_remote_work() {
+        let dir = tempdir().unwrap();
+        let mirror = Mirror::open(Some(dir.path().join("state")), "zero-budget-registry").unwrap();
+        let mut sidecar = test_sidecar(mirror);
+        configure_test_registry(&mut sidecar, Duration::ZERO);
+        sidecar.agent.launch.transport = RemoteTransport::Ssh(SshTransport {
+            program: PathBuf::from("definitely-not-a-real-ssh-program"),
+            target: "test.example".to_owned(),
+            connect_timeout_seconds: 1,
+        });
+
+        let error = sidecar
+            .remote_agent_install(
+                json!({
+                    "automatic": true,
+                    "install_path": "/tmp/nrm-test-agent"
+                }),
+                true,
+                0,
+            )
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.starts_with("bootstrap_timeout:"), "{error}");
+        assert!(sidecar.agent.remote_backoff().is_none());
+        assert!(sidecar.agent.launch.cached_remote_host_info().is_none());
+        let registry = sidecar.registry_health_snapshot();
+        assert_eq!(registry.state, RegistryHealthState::Error);
+        assert_eq!(registry.error_code.as_deref(), Some("bootstrap_timeout"));
+    }
+
+    #[cfg(unix)]
+    fn test_install_lease_ssh(directory: &Path) -> (SshTransport, PathBuf) {
+        let invocation_log = directory.join("ssh-invocations");
+        let fake_ssh = directory.join("fake-ssh");
+        fs::write(
+            &fake_ssh,
+            format!(
+                "#!/bin/sh\nfor last do :; done\ncase \"$last\" in *nrm-agent-install-lease*) printf L ;; *nrm-agent-stage*) printf S ;; *) printf O ;; esac >> {}\nexec sh -c \"$last\"\n",
+                shell_quote(invocation_log.to_string_lossy())
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&fake_ssh, fs::Permissions::from_mode(0o755)).unwrap();
+        (
+            SshTransport {
+                program: fake_ssh,
+                target: "ignored.example".to_owned(),
+                connect_timeout_seconds: 1,
+            },
+            invocation_log,
+        )
+    }
+
+    #[cfg(unix)]
+    fn test_prepared_posix_install(
+        directory: &Path,
+        target: &Path,
+        ssh: SshTransport,
+    ) -> PreparedAgentInstall {
+        let source_path = directory.join("candidate-agent");
+        let source_bytes = b"signed candidate bytes";
+        fs::write(&source_path, source_bytes).unwrap();
+        let source_file = File::open(&source_path).unwrap();
+        let upload = source_file.try_clone().unwrap();
+        let source_sha256 = sha256_bytes(source_bytes);
+        let mut plan = agent_install::PosixInstallPlan::new(
+            target.to_string_lossy(),
+            env!("CARGO_PKG_VERSION"),
+            PROTOCOL_VERSION,
+            false,
+        )
+        .unwrap();
+        plan.set_expected_sha256(&source_sha256).unwrap();
+        PreparedAgentInstall {
+            source: ResolvedAgentSource {
+                path: source_path,
+                file: source_file,
+                expected_sha256: Some(source_sha256.clone()),
+                details: json!({"agent_source": "registry"}),
+                _registry_artifact: None,
+            },
+            upload,
+            source_hash: blake3::hash(source_bytes).to_hex().to_string(),
+            source_sha256,
+            source_size: source_bytes.len() as u64,
+            ssh,
+            plan: PreparedAgentInstallPlan::Posix(plan),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn automatic_post_lease_compatible_peer_skips_and_releases_without_staging() {
+        let dir = tempdir().unwrap();
+        let remote_dir = dir.path().join("remote-bin");
+        fs::create_dir_all(&remote_dir).unwrap();
+        let target = remote_dir.join("nrm-agent");
+        fs::write(&target, b"peer-installed-agent").unwrap();
+        let (ssh, invocation_log) = test_install_lease_ssh(dir.path());
+        let prepared = test_prepared_posix_install(dir.path(), &target, ssh.clone());
+        let mirror = Mirror::open(Some(dir.path().join("state")), "post-lease-peer").unwrap();
+        let mut sidecar = test_sidecar_with_agent_reply(
+            mirror,
+            AgentWorkerReply::Response(Response::Hello {
+                agent_version: env!("CARGO_PKG_VERSION").to_owned(),
+                protocol_version: PROTOCOL_VERSION,
+                capabilities: nrm_protocol::CapabilitySet::v1_agent(),
+            }),
+        );
+        configure_test_registry(&mut sidecar, Duration::from_secs(3));
+        sidecar.agent.launch.transport = RemoteTransport::Ssh(ssh);
+        let preflight = AgentInstallPreflight {
+            before: json!({"agent_status": "missing_agent"}),
+            target_path: target.to_string_lossy().into_owned(),
+            effective_force: false,
+            skip_reason: None,
+            automatic: true,
+        };
+
+        let result = sidecar
+            .remote_agent_install_prepared(
+                preflight,
+                prepared,
+                true,
+                0,
+                BootstrapDeadline::new(Duration::from_secs(3)),
+            )
+            .unwrap();
+
+        assert_eq!(result["status"], "skipped");
+        assert_eq!(result["automatic"], true);
+        assert!(result["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("already compatible")));
+        assert_eq!(fs::read(&target).unwrap(), b"peer-installed-agent");
+        assert_eq!(fs::read_to_string(&invocation_log).unwrap(), "L");
+        assert_eq!(
+            fs::read_dir(&remote_dir)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>(),
+            [target.file_name().unwrap().to_os_string()]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn automatic_post_lease_probe_timeout_releases_lease_without_staging() {
+        let dir = tempdir().unwrap();
+        let remote_dir = dir.path().join("remote-bin");
+        fs::create_dir_all(&remote_dir).unwrap();
+        let target = remote_dir.join("nrm-agent");
+        let (ssh, invocation_log) = test_install_lease_ssh(dir.path());
+        let prepared = test_prepared_posix_install(dir.path(), &target, ssh.clone());
+        let mirror = Mirror::open(Some(dir.path().join("state")), "post-lease-timeout").unwrap();
+        let mut sidecar = test_sidecar(mirror);
+        configure_test_registry(&mut sidecar, Duration::from_secs(1));
+        let recovery_ssh = ssh.clone();
+        sidecar.agent.launch.transport = RemoteTransport::Ssh(ssh);
+        let (worker_tx, worker_rx) = mpsc::channel::<AgentWorkerCommand>();
+        let (release_tx, release_rx) = mpsc::channel();
+        let request_seen = Arc::new(AtomicBool::new(false));
+        let worker_request_seen = Arc::clone(&request_seen);
+        let worker_thread = thread::spawn(move || {
+            if let Ok(command) = worker_rx.recv() {
+                worker_request_seen.store(true, Ordering::SeqCst);
+                let _ = release_rx.recv();
+                drop(command);
+            }
+        });
+        sidecar.agent.worker = Some(AgentWorker {
+            tx: worker_tx,
+            abort: Arc::new(TestAbortHandle::default()),
+            join: None,
+        });
+        let preflight = AgentInstallPreflight {
+            before: json!({"agent_status": "missing_agent"}),
+            target_path: target.to_string_lossy().into_owned(),
+            effective_force: false,
+            skip_reason: None,
+            automatic: true,
+        };
+
+        let request_started = Instant::now();
+        let result = sidecar.remote_agent_install_prepared(
+            preflight,
+            prepared,
+            true,
+            0,
+            BootstrapDeadline::new(Duration::from_secs(1)),
+        );
+        let request_elapsed = request_started.elapsed();
+        sidecar.agent.kill_worker();
+        let _ = release_tx.send(());
+        worker_thread.join().unwrap();
+        let error = result.unwrap_err();
+
+        assert!(request_seen.load(Ordering::SeqCst));
+        assert!(is_bootstrap_timeout(&error), "{error:#}");
+        assert!(
+            request_elapsed < Duration::from_millis(1_250),
+            "bootstrap teardown exceeded its request deadline: {request_elapsed:?}"
+        );
+        assert_eq!(fs::read_to_string(&invocation_log).unwrap(), "L");
+
+        // Zero-budget teardown hands the holder to a detached reaper. If
+        // SIGKILL wins the race with the remote EXIT trap, the stable owner
+        // record deliberately remains for the next acquisition to reap.
+        let source_sha256 = sha256_bytes(b"signed candidate bytes");
+        let mut recovery_plan = agent_install::PosixInstallPlan::new(
+            target.to_string_lossy(),
+            env!("CARGO_PKG_VERSION"),
+            PROTOCOL_VERSION,
+            false,
+        )
+        .unwrap();
+        recovery_plan.set_expected_sha256(&source_sha256).unwrap();
+        let recovery_token = "fedcba9876543210fedcba9876543210";
+        let recovery_started = Instant::now();
+        let (mut recovery_lease, readiness) = loop {
+            match RemoteInstallLease::acquire(
+                &recovery_ssh,
+                recovery_plan.lease_command(recovery_token).unwrap(),
+                Duration::from_millis(200),
+            ) {
+                Ok(acquired) => break acquired,
+                Err(error)
+                    if error.to_string().contains("install_in_progress")
+                        && recovery_started.elapsed() < Duration::from_secs(2) =>
+                {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("next lease acquisition did not reap stale owner: {error:#}"),
+            }
+        };
+        recovery_plan
+            .parse_lease_ready_stdout(recovery_token, &readiness)
+            .unwrap();
+        recovery_lease.release(Duration::from_secs(1)).unwrap();
+
+        let lease_path = PathBuf::from(format!("{}.nrm-install-lease", target.display()));
+        assert!(fs::read_dir(&remote_dir).unwrap().next().is_none());
+        assert!(!lease_path.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn automatic_preflight_skips_unsafe_health_without_detecting_install_target() {
+        let dir = tempdir().unwrap();
+        let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
+        let mut sidecar = test_sidecar_with_agent_reply(
+            mirror,
+            AgentWorkerReply::LaunchError(RemoteAgentLaunchFailure::RootMissing),
+        );
+        sidecar.agent.launch.transport = RemoteTransport::Ssh(SshTransport {
+            program: PathBuf::from("definitely-not-a-real-ssh-program"),
+            target: "test.example".to_owned(),
+            connect_timeout_seconds: 1,
+        });
+        sidecar.agent.launch.registry = Some(RegistryLaunchConfig {
+            url_template: RegistryUrlTemplate::parse(
+                "https://registry.example.test/v{version}/manifest.json",
+            )
+            .unwrap(),
+            trusted_keys: TrustedKeySet::from_base64([(
+                "release-test",
+                "11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=",
+            )])
+            .unwrap(),
+            signature_threshold: 1,
+            cache_dir: None,
+            cache_max_bytes: DEFAULT_REGISTRY_CACHE_MAX_BYTES,
+            timeout: Duration::from_secs(2),
+            policy_fingerprint: "test-registry-policy".to_owned(),
+        });
+
+        let preflight = sidecar
+            .remote_agent_install_preflight(
+                &json!({"automatic": true}),
+                true,
+                0,
+                BootstrapDeadline::new(Duration::from_secs(2)),
+            )
+            .unwrap();
+
+        assert_eq!(preflight.before["agent_status"], "remote_root_missing");
+        assert!(preflight
+            .skip_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("left remote agent unchanged")));
+        assert_eq!(preflight.target_path, "$HOME/.local/bin/unused-agent");
+        assert!(sidecar
+            .agent
+            .launch
+            .remote_host_info
+            .lock()
+            .unwrap()
+            .is_none());
     }
 
     #[test]
@@ -12951,11 +15828,14 @@ mod tests {
         );
 
         let error = client
-            .handle_worker_reply(AgentWorkerReply::Error(RpcError {
-                code: nrm_protocol::RpcErrorCode::Agent,
-                message: "missing file".to_string(),
-                retryable: false,
-            }))
+            .handle_worker_reply(
+                AgentWorkerReply::Error(RpcError {
+                    code: nrm_protocol::RpcErrorCode::Agent,
+                    message: "missing file".to_string(),
+                    retryable: false,
+                }),
+                &Request::Shutdown,
+            )
             .unwrap_err()
             .to_string();
 
@@ -12976,11 +15856,14 @@ mod tests {
         );
 
         let error = client
-            .handle_worker_reply(AgentWorkerReply::Error(RpcError {
-                code: nrm_protocol::RpcErrorCode::Agent,
-                message: "transport reset".to_string(),
-                retryable: true,
-            }))
+            .handle_worker_reply(
+                AgentWorkerReply::Error(RpcError {
+                    code: nrm_protocol::RpcErrorCode::Agent,
+                    message: "transport reset".to_string(),
+                    retryable: true,
+                }),
+                &Request::Shutdown,
+            )
             .unwrap_err()
             .to_string();
 
@@ -13176,8 +16059,8 @@ mod tests {
                 code: nrm_protocol::RpcErrorCode::Agent,
                 message: format!(
                     "protocol version mismatch: client={} agent={}",
-                    PROTOCOL_VERSION + 1,
-                    PROTOCOL_VERSION
+                    PROTOCOL_VERSION,
+                    PROTOCOL_VERSION + 1
                 ),
                 retryable: false,
             }),
@@ -13187,6 +16070,8 @@ mod tests {
         assert_eq!(probe["remote_status"], "unavailable");
         assert_eq!(probe["remote_checked"], true);
         assert_eq!(probe["remote_available"], false);
+        assert_eq!(probe["agent_compatibility_failure"], "protocol_mismatch");
+        assert_eq!(probe["protocol_version"], PROTOCOL_VERSION + 1);
         assert!(probe["retry_after_ms"].as_u64().unwrap() > 0);
         assert!(probe["remote_error"]
             .as_str()
@@ -13200,6 +16085,34 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("protocol version mismatch"));
+    }
+
+    #[test]
+    fn remote_health_fast_path_retains_negotiated_agent_details() {
+        let state_dir = tempdir().unwrap();
+        let mirror = Mirror::open(Some(state_dir.path().to_path_buf()), "test").unwrap();
+        let capabilities = nrm_protocol::CapabilitySet::v1_agent();
+        let mut sidecar = test_sidecar_with_agent_reply(
+            mirror,
+            AgentWorkerReply::Response(Response::Hello {
+                agent_version: env!("CARGO_PKG_VERSION").to_string(),
+                protocol_version: PROTOCOL_VERSION,
+                capabilities: capabilities.clone(),
+            }),
+        );
+
+        let first = sidecar.handle("remote_health", json!({}), 0).unwrap();
+        let fast = sidecar.handle("remote_health", json!({}), 0).unwrap();
+
+        for health in [&first, &fast] {
+            assert_eq!(health["remote_status"], "connected");
+            assert_eq!(health["agent_status"], "ok");
+            assert_eq!(health["agent_version"], env!("CARGO_PKG_VERSION"));
+            assert_eq!(health["protocol_version"], PROTOCOL_VERSION);
+            assert_eq!(health["expected_agent_version"], env!("CARGO_PKG_VERSION"));
+            assert_eq!(health["expected_protocol_version"], PROTOCOL_VERSION);
+            assert_eq!(health["capabilities"], json!(capabilities));
+        }
     }
 
     #[test]
@@ -13363,8 +16276,213 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn listener_socket_security_creates_private_leaf_and_bound_socket() {
+        let root = tempdir().unwrap();
+        let parent = root.path().join("sockets");
+        let directory = parent.join("nested");
+        let socket = directory.join("sidecar.sock");
+
+        prepare_listener_socket(&socket).unwrap();
+        let parent_metadata = fs::symlink_metadata(&parent).unwrap();
+        assert!(parent_metadata.file_type().is_dir());
+        assert_eq!(parent_metadata.uid(), effective_uid());
+        assert_eq!(parent_metadata.mode() & 0o7777, LISTENER_DIRECTORY_MODE);
+        let directory_metadata = fs::symlink_metadata(&directory).unwrap();
+        assert!(directory_metadata.file_type().is_dir());
+        assert_eq!(directory_metadata.uid(), effective_uid());
+        assert_eq!(directory_metadata.mode() & 0o7777, LISTENER_DIRECTORY_MODE);
+
+        let listener = bind_secure_listener_socket(&socket).unwrap();
+        let socket_metadata = fs::symlink_metadata(&socket).unwrap();
+        assert!(socket_metadata.file_type().is_socket());
+        assert_eq!(socket_metadata.uid(), effective_uid());
+        assert_eq!(socket_metadata.mode() & 0o7777, LISTENER_SOCKET_MODE);
+
+        drop(listener);
+        fs::remove_file(socket).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn listener_socket_security_creation_is_atomic_and_never_chmods_a_raced_entry() {
+        let root = tempdir().unwrap();
+        secure_socket_test_directory(root.path());
+
+        let traversal = root.path().join("missing").join("..").join("escaped");
+        let error = prepare_listener_socket(&traversal.join("sidecar.sock"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("must not contain parent traversal"));
+        assert!(!root.path().join("missing").exists());
+        assert!(!root.path().join("escaped").exists());
+
+        let shared = root.path().join("shared");
+        fs::create_dir(&shared).unwrap();
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o777)).unwrap();
+        let missing = shared.join("missing").join("leaf");
+        let error = prepare_listener_socket(&missing.join("sidecar.sock"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("must not be group/world-writable unless sticky"));
+        assert!(!shared.join("missing").exists());
+
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o1777)).unwrap();
+        prepare_listener_socket(&missing.join("sidecar.sock")).unwrap();
+        for component in [shared.join("missing"), missing] {
+            let metadata = fs::symlink_metadata(component).unwrap();
+            assert!(metadata.file_type().is_dir());
+            assert_eq!(metadata.uid(), effective_uid());
+            assert_eq!(metadata.mode() & 0o7777, LISTENER_DIRECTORY_MODE);
+        }
+
+        let target = root.path().join("race-target");
+        fs::create_dir(&target).unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+        let raced = shared.join("raced");
+        std::os::unix::fs::symlink(&target, &raced).unwrap();
+        let error = validate_created_listener_component(&raced, effective_uid(), false)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("must be a directory and not a symlink"));
+        assert_eq!(
+            fs::symlink_metadata(&target).unwrap().mode() & 0o7777,
+            0o755,
+            "an EEXIST race must not chmod the symlink target"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn listener_socket_security_rejects_insecure_foreign_or_symlink_leaf() {
+        let root = tempdir().unwrap();
+        let insecure = root.path().join("insecure");
+        fs::create_dir(&insecure).unwrap();
+        fs::set_permissions(&insecure, fs::Permissions::from_mode(0o755)).unwrap();
+        let insecure_error = prepare_listener_socket(&insecure.join("sidecar.sock"))
+            .unwrap_err()
+            .to_string();
+        assert!(insecure_error.contains("must have mode 0700"));
+
+        let secure = root.path().join("secure");
+        fs::create_dir(&secure).unwrap();
+        secure_socket_test_directory(&secure);
+        let secure_metadata = fs::symlink_metadata(&secure).unwrap();
+        let foreign_error = validate_listener_directory_metadata(
+            &secure,
+            &secure_metadata,
+            secure_metadata.uid().wrapping_add(1),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(foreign_error.contains("must be owned by the current uid"));
+
+        let link = root.path().join("linked-sockets");
+        std::os::unix::fs::symlink(&secure, &link).unwrap();
+        let link_error = prepare_listener_socket(&link.join("sidecar.sock"))
+            .unwrap_err()
+            .to_string();
+        assert!(link_error.contains("must be a directory and not a symlink"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn listener_socket_security_rejects_unsafe_lexical_and_resolved_ancestors() {
+        let root = tempdir().unwrap();
+        secure_socket_test_directory(root.path());
+
+        let shared = root.path().join("shared");
+        let leaf = shared.join("leaf");
+        fs::create_dir_all(&leaf).unwrap();
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o777)).unwrap();
+        secure_socket_test_directory(&leaf);
+        let shared_error = prepare_listener_socket(&leaf.join("sidecar.sock"))
+            .unwrap_err()
+            .to_string();
+        assert!(shared_error.contains("must not be group/world-writable unless sticky"));
+
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o1777)).unwrap();
+        prepare_listener_socket(&leaf.join("sidecar.sock")).unwrap();
+
+        let safe_target = root.path().join("safe-target");
+        let safe_target_leaf = safe_target.join("leaf");
+        fs::create_dir_all(&safe_target_leaf).unwrap();
+        secure_socket_test_directory(&safe_target);
+        secure_socket_test_directory(&safe_target_leaf);
+        let unsafe_lexical = root.path().join("unsafe-lexical");
+        fs::create_dir(&unsafe_lexical).unwrap();
+        fs::set_permissions(&unsafe_lexical, fs::Permissions::from_mode(0o777)).unwrap();
+        std::os::unix::fs::symlink(&safe_target, unsafe_lexical.join("link")).unwrap();
+        let lexical_error = prepare_listener_socket(&unsafe_lexical.join("link/leaf/sidecar.sock"))
+            .unwrap_err()
+            .to_string();
+        assert!(lexical_error.contains("must not be group/world-writable unless sticky"));
+
+        let unsafe_target = root.path().join("unsafe-target");
+        let unsafe_target_leaf = unsafe_target.join("leaf");
+        fs::create_dir_all(&unsafe_target_leaf).unwrap();
+        fs::set_permissions(&unsafe_target, fs::Permissions::from_mode(0o777)).unwrap();
+        secure_socket_test_directory(&unsafe_target_leaf);
+        let safe_lexical = root.path().join("safe-lexical");
+        fs::create_dir(&safe_lexical).unwrap();
+        secure_socket_test_directory(&safe_lexical);
+        std::os::unix::fs::symlink(&unsafe_target, safe_lexical.join("link")).unwrap();
+        let resolved_error = prepare_listener_socket(&safe_lexical.join("link/leaf/sidecar.sock"))
+            .unwrap_err()
+            .to_string();
+        assert!(resolved_error.contains("must not be group/world-writable unless sticky"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn listener_socket_security_rejects_unsafe_existing_socket_and_removes_safe_stale_socket() {
+        let root = tempdir().unwrap();
+        secure_socket_test_directory(root.path());
+        let socket = root.path().join("sidecar.sock");
+
+        fs::write(&socket, b"not a socket").unwrap();
+        fs::set_permissions(&socket, fs::Permissions::from_mode(LISTENER_SOCKET_MODE)).unwrap();
+        let type_error = prepare_listener_socket(&socket).unwrap_err().to_string();
+        assert!(type_error.contains("must be a Unix socket and not a symlink"));
+        fs::remove_file(&socket).unwrap();
+
+        let link_target = root.path().join("link-target");
+        fs::write(&link_target, b"not a socket").unwrap();
+        std::os::unix::fs::symlink(&link_target, &socket).unwrap();
+        let link_error = prepare_listener_socket(&socket).unwrap_err().to_string();
+        assert!(link_error.contains("must be a Unix socket and not a symlink"));
+        fs::remove_file(&socket).unwrap();
+
+        let listener = UnixListener::bind(&socket).unwrap();
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o660)).unwrap();
+        let mode_error = prepare_listener_socket(&socket).unwrap_err().to_string();
+        assert!(mode_error.contains("permissions must not exceed 0600"));
+        drop(listener);
+        fs::remove_file(&socket).unwrap();
+
+        let listener = UnixListener::bind(&socket).unwrap();
+        fs::set_permissions(&socket, fs::Permissions::from_mode(LISTENER_SOCKET_MODE)).unwrap();
+        let live_error = prepare_listener_socket(&socket).unwrap_err().to_string();
+        assert!(live_error.contains("already in use"));
+        let socket_metadata = fs::symlink_metadata(&socket).unwrap();
+        let foreign_error = validate_listener_socket_metadata(
+            &socket,
+            &socket_metadata,
+            socket_metadata.uid().wrapping_add(1),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(foreign_error.contains("must be owned by the current uid"));
+
+        drop(listener);
+        prepare_listener_socket(&socket).unwrap();
+        assert!(!socket.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn socket_listener_accepts_sequential_sessions() {
         let socket_dir = tempdir().unwrap();
+        secure_socket_test_directory(socket_dir.path());
         let state_dir = tempdir().unwrap();
         let remote_dir = tempdir().unwrap();
         let socket = socket_dir.path().join("sidecar.sock");
@@ -13392,6 +16510,10 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         assert!(socket.exists());
+        assert_eq!(
+            fs::symlink_metadata(&socket).unwrap().mode() & 0o7777,
+            LISTENER_SOCKET_MODE
+        );
 
         fn connect_socket(socket: &Path) -> UnixStream {
             for _ in 0..100 {
@@ -13451,6 +16573,7 @@ mod tests {
     #[test]
     fn socket_listener_interrupts_active_request_on_client_eof() {
         let socket_dir = tempdir().unwrap();
+        secure_socket_test_directory(socket_dir.path());
         let state_dir = tempdir().unwrap();
         let remote_dir = tempdir().unwrap();
         let agent_dir = tempdir().unwrap();
@@ -13555,6 +16678,7 @@ mod tests {
     #[test]
     fn socket_listener_interrupts_active_write_request_on_client_eof() {
         let socket_dir = tempdir().unwrap();
+        secure_socket_test_directory(socket_dir.path());
         let state_dir = tempdir().unwrap();
         let remote_dir = tempdir().unwrap();
         let agent_dir = tempdir().unwrap();
@@ -17180,7 +20304,7 @@ mod tests {
         assert_eq!(plan.program, "ssh");
         assert_eq!(plan.current_dir, None);
         assert_eq!(
-            plan.args,
+            &plan.args[..plan.args.len() - 1],
             vec![
                 "-o",
                 "BatchMode=yes",
@@ -17195,10 +20319,16 @@ mod tests {
                 "-o",
                 "ControlPath=none",
                 "--",
-                "host",
-                "'sh' '-lc' 'PATH=\"$HOME/.local/bin:$PATH\"; exec \"$@\"' 'nrm-agent-launch' 'nrm-agent' 'serve' '--root' '/tmp/repo with '\\''quote'\\'' ; x'"
+                "host"
             ]
         );
+        let remote_command = plan.args.last().unwrap();
+        assert!(remote_command.starts_with("'sh' '-c'"));
+        assert!(remote_command.contains("NRM_AGENT_LAUNCH_V1"));
+        assert!(remote_command.contains("FAILURE"));
+        assert!(remote_command.contains("READY"));
+        assert!(remote_command.contains("'nrm-agent-launch' 'nrm-agent'"));
+        assert!(remote_command.contains("'/tmp/repo with '\\''quote'\\'' ; x'"));
     }
 
     #[test]
@@ -17374,9 +20504,10 @@ mod tests {
         *read.launch.remote_host_info.lock().unwrap() = Some(test_posix_host());
 
         let error = write
-            .handle_worker_reply(AgentWorkerReply::TransportError(
-                "ssh transport closed".to_string(),
-            ))
+            .handle_worker_reply(
+                AgentWorkerReply::TransportError("ssh transport closed".to_string()),
+                &Request::Shutdown,
+            )
             .unwrap_err()
             .to_string();
 
@@ -17595,6 +20726,220 @@ mod tests {
         assert!(!status.success());
     }
 
+    #[test]
+    fn remote_agent_launch_prelude_accepts_only_one_exact_bounded_record() {
+        for (failure, kind) in [
+            (RemoteAgentLaunchFailure::Missing, "missing"),
+            (RemoteAgentLaunchFailure::NotExecutable, "not_executable"),
+            (RemoteAgentLaunchFailure::RootMissing, "root_missing"),
+        ] {
+            let record = format!("NRM_AGENT_LAUNCH_V1\tFAILURE\t{kind}\n");
+            assert_eq!(
+                read_agent_launch_prelude(&mut io::Cursor::new(record)).unwrap(),
+                Some(failure)
+            );
+        }
+
+        assert_eq!(
+            read_agent_launch_prelude(&mut io::Cursor::new(AGENT_LAUNCH_READY_RECORD)).unwrap(),
+            None
+        );
+        for record in [
+            "",
+            "missing executable\n",
+            "NRM_AGENT_LAUNCH_V1 READY\n",
+            "NRM_AGENT_LAUNCH_V1\tFAILURE\tunknown\n",
+            "NRM_AGENT_LAUNCH_V1\tFAILURE\tmissing\r\n",
+            "NRM_AGENT_LAUNCH_V1\tREADY suffix\n",
+            "NRM_AGENT_LAUNCH_V1\tREADY",
+        ] {
+            assert!(
+                read_agent_launch_prelude(&mut io::Cursor::new(record)).is_err(),
+                "accepted malformed launch prelude {record:?}"
+            );
+        }
+        let oversized = format!("{}\n", "x".repeat(AGENT_LAUNCH_PRELUDE_MAX_BYTES));
+        let error = read_agent_launch_prelude(&mut io::Cursor::new(oversized))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("exceeded"), "{error}");
+    }
+
+    #[test]
+    fn agent_stderr_capture_continuously_drains_and_retains_a_bounded_tail() {
+        let mut input = vec![b'x'; AGENT_STDERR_TAIL_MAX_BYTES * 3];
+        input.extend_from_slice(b"final-tail");
+        let capture = AgentStderrCapture::spawn(io::Cursor::new(input)).unwrap();
+        capture.wait_for_finish(Duration::from_secs(1));
+        let snapshot = capture.snapshot();
+        assert!(capture.finish_bounded(Duration::from_secs(1)));
+
+        assert!(snapshot.truncated);
+        assert_eq!(snapshot.bytes.len(), AGENT_STDERR_TAIL_MAX_BYTES);
+        assert!(snapshot.bytes.ends_with(b"final-tail"));
+        assert!(snapshot.read_error.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_stderr_cleanup_detaches_when_a_descendant_retains_the_pipe() {
+        use std::os::unix::net::UnixStream;
+
+        let (reader, writer) = UnixStream::pair().unwrap();
+        let capture = AgentStderrCapture::spawn(reader).unwrap();
+        let started = Instant::now();
+
+        assert!(!capture.finish_bounded(Duration::from_millis(20)));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "stderr cleanup blocked on an inherited pipe"
+        );
+        drop(writer);
+    }
+
+    #[test]
+    fn agent_transport_diagnostics_strip_terminal_controls() {
+        let sanitized = sanitize_agent_error_text("line\r\n\t\x1b[31mred\x1b[0m\x7f\u{0085}done");
+
+        assert!(!sanitized.chars().any(char::is_control), "{sanitized:?}");
+        assert!(sanitized.contains("[31mred [0m"));
+        assert!(sanitized.ends_with(" done"));
+    }
+
+    #[cfg(unix)]
+    fn probe_health_with_fake_ssh(script: &str) -> Value {
+        probe_health_with_fake_ssh_timeout(script, Duration::from_secs(3))
+    }
+
+    #[cfg(unix)]
+    fn probe_health_with_fake_ssh_timeout(script: &str, timeout: Duration) -> Value {
+        let dir = tempdir().unwrap();
+        let fake_ssh = dir.path().join("fake-ssh");
+        fs::write(&fake_ssh, format!("#!/bin/sh\n{script}\n")).unwrap();
+        let mut permissions = fs::metadata(&fake_ssh).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&fake_ssh, permissions).unwrap();
+        let remote_root = dir.path().join("remote-root");
+        fs::create_dir_all(&remote_root).unwrap();
+        let mut client = AgentClient::new(
+            "nrm-agent".to_owned(),
+            None,
+            RemoteTransport::Ssh(SshTransport {
+                program: fake_ssh,
+                target: "fake.example".to_owned(),
+                connect_timeout_seconds: 1,
+            }),
+            remote_root,
+            timeout,
+            AgentInterrupt::default(),
+        );
+        *client.launch.remote_host_info.lock().unwrap() = Some(test_posix_host());
+
+        let _ = client.request_with_timeout(
+            Request::Hello {
+                client_version: env!("CARGO_PKG_VERSION").to_owned(),
+                protocol_version: PROTOCOL_VERSION,
+            },
+            timeout,
+        );
+        client.remote_health().to_value()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fake_ssh_launch_diagnostics_authorize_only_the_first_exact_stdout_prelude() {
+        for (kind, code, expected) in [
+            ("missing", 127, "missing"),
+            ("not_executable", 126, "not_executable"),
+            ("root_missing", 66, "root_missing"),
+        ] {
+            let health = probe_health_with_fake_ssh(&format!(
+                "printf 'NRM_AGENT_LAUNCH_V1\\tFAILURE\\t{kind}\\n'; exit {code}"
+            ));
+            assert_eq!(health["agent_launch_failure"], expected);
+        }
+
+        for script in [
+            "printf 'nrm-agent: not found; package version mismatch; protocol version mismatch\\n' >&2; exit 127",
+            "printf 'NRM_AGENT_LAUNCH_ERROR_V1\\tmissing\\n' >&2; exit 126",
+            "printf 'NRM_AGENT_LAUNCH_ERROR_V1\\tmissing\\nNRM_AGENT_LAUNCH_ERROR_V1\\tmissing\\n' >&2; exit 127",
+            "printf 'NRM_AGENT_LAUNCH_ERROR_V1\\tunknown\\n' >&2; exit 127",
+            "printf 'NRM_AGENT_LAUNCH_V1\\tFAILURE\\tmissing\\n' >&2; exit 127",
+            "printf 'NRM_AGENT_LAUNCH_V1\\tREADY\\n'; printf 'NRM_AGENT_LAUNCH_V1\\tFAILURE\\tmissing\\n' >&2; exit 127",
+            "printf 'Permission denied\\n' >&2; exit 255",
+        ] {
+            let health = probe_health_with_fake_ssh(script);
+            assert!(health.get("agent_launch_failure").is_none(), "{health}");
+            assert!(
+                health.get("agent_compatibility_failure").is_none(),
+                "{health}"
+            );
+            assert_eq!(classify_remote_agent_status(&health), "unavailable");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fake_ssh_separated_stderr_markers_never_authorize_install_mutation() {
+        let started = Instant::now();
+        let health = probe_health_with_fake_ssh(
+            "printf 'NRM_AGENT_LAUNCH_V1\\tREADY\\n'; i=0; while [ \"$i\" -lt 4096 ]; do printf '0123456789abcdef0123456789abcdef' >&2; i=$((i+1)); done; printf '\\nNRM_AGENT_LAUNCH_V1\\tFAILURE\\tmissing\\n' >&2; exit 127",
+        );
+
+        assert!(health.get("agent_launch_failure").is_none(), "{health}");
+        assert_eq!(classify_remote_agent_status(&health), "unavailable");
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fake_ssh_rejects_missing_malformed_and_oversized_launch_preludes() {
+        let oversized = "x".repeat(AGENT_LAUNCH_PRELUDE_MAX_BYTES + 1);
+        for script in [
+            "exit 127".to_string(),
+            "printf 'NRM_AGENT_LAUNCH_V1 READY\\n'; exit 127".to_string(),
+            "printf 'NRM_AGENT_LAUNCH_V1\\tFAILURE\\tunknown\\n'; exit 127".to_string(),
+            format!("printf '%s\\n' '{oversized}'; exit 127"),
+        ] {
+            let health = probe_health_with_fake_ssh(&script);
+            assert!(health.get("agent_launch_failure").is_none(), "{health}");
+            assert!(
+                health.get("agent_compatibility_failure").is_none(),
+                "{health}"
+            );
+            assert_eq!(classify_remote_agent_status(&health), "unavailable");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fake_ssh_partial_launch_prelude_respects_the_request_timeout() {
+        let started = Instant::now();
+        let health = probe_health_with_fake_ssh_timeout(
+            "printf 'NRM_AGENT_LAUNCH_V1\\tREADY'; sleep 60",
+            Duration::from_millis(50),
+        );
+
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(health.get("agent_launch_failure").is_none(), "{health}");
+        assert_eq!(classify_remote_agent_status(&health), "unavailable");
+        assert!(health["remote_error"]
+            .as_str()
+            .is_some_and(|error| error.contains("timed out")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fake_ssh_transport_error_health_contains_no_terminal_controls() {
+        let health = probe_health_with_fake_ssh(
+            "printf 'line\\n\\033[31mred\\033[0m\\t\\177done\\n' >&2; exit 255",
+        );
+        let error = health["remote_error"].as_str().unwrap();
+
+        assert!(!error.chars().any(char::is_control), "{error:?}");
+        assert!(error.contains("[31mred [0m"));
+    }
+
     #[cfg(unix)]
     #[test]
     fn agent_ssh_remote_command_preserves_agent_and_root_through_shell_parse() {
@@ -17627,6 +20972,7 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(stdout.starts_with("NRM_AGENT_LAUNCH_V1\tREADY\n"));
         assert!(stdout.contains("ARG1=<serve>"));
         assert!(stdout.contains("ARG2=<--root>"));
         assert!(stdout.contains(&format!("ARG3=<{}>", remote_root.display())));
@@ -17668,9 +21014,130 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(stdout.starts_with("NRM_AGENT_LAUNCH_V1\tREADY\n"));
         assert!(stdout.contains("ARG1=<serve>"));
         assert!(stdout.contains("ARG2=<--root>"));
         assert!(stdout.contains(&format!("ARG3=<{}>", remote_root.display())));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn posix_agent_launcher_reports_exact_pre_exec_failures() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("repo");
+        fs::create_dir_all(&root).unwrap();
+        let missing = dir.path().join("missing-agent");
+        let non_executable = dir.path().join("non-executable-agent");
+        fs::write(&non_executable, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&non_executable, fs::Permissions::from_mode(0o644)).unwrap();
+        let missing_root = dir.path().join("missing-root");
+
+        for (agent, remote_root, expected_code, expected_kind) in [
+            (missing.as_path(), root.as_path(), 127, "missing"),
+            (
+                non_executable.as_path(),
+                root.as_path(),
+                126,
+                "not_executable",
+            ),
+            (
+                missing.as_path(),
+                missing_root.as_path(),
+                66,
+                "root_missing",
+            ),
+        ] {
+            let output = Command::new("sh")
+                .arg("-c")
+                .arg(posix_agent_remote_command(
+                    agent.to_string_lossy().as_ref(),
+                    remote_root,
+                ))
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(expected_code));
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout),
+                format!("NRM_AGENT_LAUNCH_V1\tFAILURE\t{expected_kind}\n")
+            );
+            assert!(output.stderr.is_empty());
+        }
+    }
+
+    #[cfg(unix)]
+    fn probe_health_through_posix_launcher(agent: &Path, remote_root: &Path) -> Value {
+        let dir = tempdir().unwrap();
+        let fake_ssh = dir.path().join("fake-ssh-exec");
+        fs::write(
+            &fake_ssh,
+            "#!/bin/sh\nfor remote_command do :; done\nexec sh -c \"$remote_command\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&fake_ssh, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut client = AgentClient::new(
+            agent.to_string_lossy().into_owned(),
+            None,
+            RemoteTransport::Ssh(SshTransport {
+                program: fake_ssh,
+                target: "fake.example".to_owned(),
+                connect_timeout_seconds: 1,
+            }),
+            remote_root.to_path_buf(),
+            Duration::from_secs(3),
+            AgentInterrupt::default(),
+        );
+        *client.launch.remote_host_info.lock().unwrap() = Some(test_posix_host());
+
+        let _ = client.request_with_timeout(
+            Request::Hello {
+                client_version: env!("CARGO_PKG_VERSION").to_owned(),
+                protocol_version: PROTOCOL_VERSION,
+            },
+            Duration::from_secs(3),
+        );
+        client.remote_health().to_value()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn posix_exec_format_and_missing_loader_failures_are_safe_untyped_skips() {
+        let dir = tempdir().unwrap();
+        let root = dir.path().join("repo");
+        fs::create_dir_all(&root).unwrap();
+        let garbage = dir.path().join("garbage-agent");
+        fs::write(&garbage, b"\x7fnot-an-executable\0\n").unwrap();
+        fs::set_permissions(&garbage, fs::Permissions::from_mode(0o755)).unwrap();
+        let missing_loader = dir.path().join("missing-loader-agent");
+        fs::write(
+            &missing_loader,
+            b"#!/definitely/missing/nrm-interpreter\nexit 0\n",
+        )
+        .unwrap();
+        fs::set_permissions(&missing_loader, fs::Permissions::from_mode(0o755)).unwrap();
+
+        for agent in [&garbage, &missing_loader] {
+            let output = Command::new("sh")
+                .arg("-c")
+                .arg(posix_agent_remote_command(
+                    agent.to_string_lossy().as_ref(),
+                    &root,
+                ))
+                .output()
+                .unwrap();
+            assert!(!output.status.success());
+            assert!(output.stdout.starts_with(AGENT_LAUNCH_READY_RECORD));
+            assert!(
+                !output
+                    .stdout
+                    .windows(AGENT_LAUNCH_FAILURE_PREFIX.len())
+                    .any(|window| window == AGENT_LAUNCH_FAILURE_PREFIX),
+                "post-READY exec failure must not become a trusted launch failure"
+            );
+
+            let health = probe_health_through_posix_launcher(agent, &root);
+            assert!(health.get("agent_launch_failure").is_none(), "{health}");
+            assert_eq!(classify_remote_agent_status(&health), "unavailable");
+        }
     }
 
     #[cfg(unix)]
@@ -17817,8 +21284,54 @@ mod tests {
     }
 
     #[test]
+    fn framed_agent_session_consumes_ready_prelude_without_losing_binary_rpc_bytes() {
+        let mut inbound = AGENT_LAUNCH_READY_RECORD.to_vec();
+        write_frame(
+            &mut inbound,
+            &RpcMessage::Response {
+                id: 7,
+                response: Response::Ack,
+            },
+        )
+        .unwrap();
+        let mut session =
+            FramedAgentSession::new_with_launch_prelude(Vec::new(), io::Cursor::new(inbound));
+
+        let reply = session.request(7, Request::Shutdown).unwrap();
+
+        assert!(matches!(reply, AgentWorkerReply::Response(Response::Ack)));
+        let mut outbound = BufReader::new(io::Cursor::new(session.into_writer()));
+        let message: RpcMessage = read_frame(&mut outbound).unwrap();
+        assert!(matches!(
+            message,
+            RpcMessage::Request {
+                id: 7,
+                request: Request::Shutdown
+            }
+        ));
+    }
+
+    #[test]
+    fn framed_agent_session_returns_launch_failure_without_sending_rpc() {
+        let inbound = b"NRM_AGENT_LAUNCH_V1\tFAILURE\tmissing\n";
+        let mut session = FramedAgentSession::new_with_launch_prelude(
+            Vec::new(),
+            io::Cursor::new(inbound.as_slice()),
+        );
+
+        let reply = session.request(7, Request::Shutdown).unwrap();
+
+        assert!(matches!(
+            reply,
+            AgentWorkerReply::LaunchError(RemoteAgentLaunchFailure::Missing)
+        ));
+        assert!(session.into_writer().is_empty());
+    }
+
+    #[test]
     fn framed_agent_session_ignores_windows_ssh_transport_bom() {
         let mut inbound = vec![0xef, 0xbb, 0xbf];
+        inbound.extend_from_slice(AGENT_LAUNCH_READY_RECORD);
         write_frame(
             &mut inbound,
             &RpcMessage::Response {
@@ -17828,7 +21341,7 @@ mod tests {
         )
         .unwrap();
         let reader = LeadingBomReader::new(io::Cursor::new(inbound));
-        let mut session = FramedAgentSession::new(Vec::new(), reader);
+        let mut session = FramedAgentSession::new_with_launch_prelude(Vec::new(), reader);
 
         let reply = session.request(7, Request::Shutdown).unwrap();
 

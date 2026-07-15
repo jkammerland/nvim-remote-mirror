@@ -12,6 +12,8 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  GH_CLI_LINUX_AMD64_SHA256: 83d5c2ccad5498f58bf6368acb1ab32588cf43ab3a4b1c301bf36328b1c8bd60
+  GH_CLI_VERSION: "2.96.0"
   RUST_TOOLCHAIN: "1.95.0"
 
 jobs:
@@ -30,6 +32,26 @@ jobs:
         with:
           persist-credentials: false
           ref: ${{ github.sha }}
+
+      - name: Fail fast unless the pinned GitHub CLI supports release policy
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="gh_${GH_CLI_VERSION}_linux_amd64.tar.gz"
+          path="$RUNNER_TEMP/$archive"
+          curl --fail --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
+            --retry 3 --retry-all-errors \
+            "https://github.com/cli/cli/releases/download/v$GH_CLI_VERSION/$archive" \
+            --output "$path"
+          printf '%s  %s\n' "$GH_CLI_LINUX_AMD64_SHA256" "$path" \
+            | sha256sum --check --strict
+          tar -xzf "$path" -C "$RUNNER_TEMP"
+          gh_bin="$RUNNER_TEMP/gh_${GH_CLI_VERSION}_linux_amd64/bin/gh"
+          [[ "$($gh_bin version | sed -nE '1s/^gh version ([0-9]+\.[0-9]+\.[0-9]+).*/\1/p')" == "$GH_CLI_VERSION" ]]
+          help="$($gh_bin attestation verify --help)"
+          for flag in --deny-self-hosted-runners --signer-digest --source-digest --source-ref; do
+            grep -F -- "$flag" <<< "$help" >/dev/null
+          done
 
       - name: Install pinned Rust toolchain
         shell: bash
@@ -174,7 +196,7 @@ jobs:
           name: unsigned-agent-${{ matrix.target }}
           path: dist/nrm-agent-${{ env.VERSION }}-${{ env.TARGET }}
           if-no-files-found: error
-          retention-days: 1
+          retention-days: 7
           compression-level: 0
           overwrite: true
 
@@ -261,7 +283,7 @@ jobs:
           name: unsigned-agent-${{ matrix.target }}
           path: dist/nrm-agent-${{ env.VERSION }}-${{ env.TARGET }}
           if-no-files-found: error
-          retention-days: 1
+          retention-days: 7
           compression-level: 0
           overwrite: true
 
@@ -356,7 +378,7 @@ jobs:
           name: unsigned-agent-${{ matrix.target }}
           path: dist/nrm-agent-${{ env.VERSION }}-${{ env.TARGET }}.exe
           if-no-files-found: error
-          retention-days: 1
+          retention-days: 7
           compression-level: 0
           overwrite: true
 
@@ -396,17 +418,23 @@ jobs:
           rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
           rustup default "$RUST_TOOLCHAIN"
 
-      - name: Require compatible GitHub CLI attestation policy
+      - name: Install the checksum-pinned GitHub CLI
         shell: bash
         run: |
           set -euo pipefail
-          minimum=2.94.0
-          version="$(gh --version | sed -nE '1s/^gh version ([0-9]+\.[0-9]+\.[0-9]+).*/\1/p')"
-          if [[ -z "$version" || "$(printf '%s\n%s\n' "$minimum" "$version" | sort -V | head -n 1)" != "$minimum" ]]; then
-            echo "GitHub CLI $minimum or newer is required, found ${version:-unknown}" >&2
-            exit 1
-          fi
-          help="$(gh attestation verify --help)"
+          archive="gh_${GH_CLI_VERSION}_linux_amd64.tar.gz"
+          path="$RUNNER_TEMP/$archive"
+          curl --fail --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
+            --retry 3 --retry-all-errors \
+            "https://github.com/cli/cli/releases/download/v$GH_CLI_VERSION/$archive" \
+            --output "$path"
+          printf '%s  %s\n' "$GH_CLI_LINUX_AMD64_SHA256" "$path" \
+            | sha256sum --check --strict
+          tar -xzf "$path" -C "$RUNNER_TEMP"
+          gh_dir="$RUNNER_TEMP/gh_${GH_CLI_VERSION}_linux_amd64/bin"
+          [[ "$("$gh_dir/gh" version | sed -nE '1s/^gh version ([0-9]+\.[0-9]+\.[0-9]+).*/\1/p')" == "$GH_CLI_VERSION" ]]
+          echo "$gh_dir" >> "$GITHUB_PATH"
+          help="$("$gh_dir/gh" attestation verify --help)"
           for flag in --deny-self-hosted-runners --signer-digest --source-digest --source-ref; do
             grep -F -- "$flag" <<< "$help" >/dev/null || {
               echo "GitHub CLI attestation verification is missing $flag" >&2

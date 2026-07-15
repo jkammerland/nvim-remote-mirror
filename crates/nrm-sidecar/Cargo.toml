@@ -9,6 +9,7 @@ anyhow.workspace = true
 base64.workspace = true
 blake3.workspace = true
 clap.workspace = true
+flate2.workspace = true
 libc.workspace = true
 nrm-protocol = { path = "../nrm-protocol" }
 nrm-registry = { path = "../nrm-registry" }
@@ -21,5 +22,4 @@ url.workspace = true
 
 [dev-dependencies]
 ed25519-dalek.workspace = true
-flate2.workspace = true
 tempfile.workspace = true

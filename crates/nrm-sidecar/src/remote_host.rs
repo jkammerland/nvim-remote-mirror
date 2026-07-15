@@ -45,6 +45,8 @@ struct ProcessPayload<'a> {
     command_line: String,
     cwd: Option<&'a str>,
     path_prepend: Option<&'a str>,
+    agent_launch_diagnostics: bool,
+    agent_root: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -185,6 +187,20 @@ private static void WriteStandard(IntPtr destination, byte[] buffer, uint count)
         throw Error("standard stream flush failed");
 }
 
+private static void WriteLaunchReady()
+{
+    byte[] record = System.Text.Encoding.ASCII.GetBytes(
+        "NRM_AGENT_LAUNCH_V1\tREADY\n");
+    WriteStandard(GetStdHandle(-11), record, (uint)record.Length);
+}
+
+private static void WriteLaunchFailure(string kind)
+{
+    byte[] record = System.Text.Encoding.ASCII.GetBytes(
+        "NRM_AGENT_LAUNCH_V1\tFAILURE\t" + kind + "\n");
+    WriteStandard(GetStdHandle(-11), record, (uint)record.Length);
+}
+
 private static void PumpInput(
     System.IO.Pipes.AnonymousPipeServerStream destination,
     RelayState state)
@@ -245,7 +261,12 @@ private static void MakeParentHandlePrivate(
         throw Error("parent pipe inheritance clear failed");
 }
 
-public static int Run(IntPtr job, string applicationName, string commandLine, string directory)
+public static int Run(
+    IntPtr job,
+    string applicationName,
+    string commandLine,
+    string directory,
+    bool agentLaunchDiagnostics)
 {
     System.IO.Pipes.AnonymousPipeServerStream input = null;
     System.IO.Pipes.AnonymousPipeServerStream output = null;
@@ -324,12 +345,33 @@ public static int Run(IntPtr job, string applicationName, string commandLine, st
                 String.IsNullOrEmpty(directory) ? null : directory,
                 startup,
                 out information))
-            throw Error("CreateProcessW failed");
+        {
+            int launchError = Marshal.GetLastWin32Error();
+            if (agentLaunchDiagnostics && (launchError == 2 || launchError == 3))
+            {
+                WriteLaunchFailure("missing");
+                return 127;
+            }
+            if (agentLaunchDiagnostics &&
+                (launchError == 5 || launchError == 193 || launchError == 216))
+            {
+                WriteLaunchFailure("not_executable");
+                return 126;
+            }
+            throw new System.ComponentModel.Win32Exception(
+                launchError, "CreateProcessW failed");
+        }
         process = information.Process;
         thread = information.Thread;
         input.DisposeLocalCopyOfClientHandle();
         output.DisposeLocalCopyOfClientHandle();
         error.DisposeLocalCopyOfClientHandle();
+
+        // The child is real but still suspended, and no child output pump has
+        // started. This ordered record therefore cannot be forged by the
+        // executable that follows it on stdout.
+        if (agentLaunchDiagnostics)
+            WriteLaunchReady();
 
         state = new RelayState();
         state.Process = process;
@@ -438,6 +480,7 @@ try {
     }
   }
   $commandLine = [string]$payload.command_line
+  $agentLaunchDiagnostics = $payload.agent_launch_diagnostics -eq $true
   $extension = [IO.Path]::GetExtension($applicationName)
   $isBatch = [string]::Equals($extension, '.cmd', [StringComparison]::OrdinalIgnoreCase) -or
     [string]::Equals($extension, '.bat', [StringComparison]::OrdinalIgnoreCase)
@@ -475,7 +518,8 @@ try {
     $job,
     $applicationName,
     $commandLine,
-    [string]$payload.cwd)
+    [string]$payload.cwd,
+    $agentLaunchDiagnostics)
 } finally {
   $env:PATH = $oldPath
   if ($job -ne [IntPtr]::Zero) { [void][Nrm.Job]::CloseHandle($job) }
@@ -483,7 +527,7 @@ try {
 exit $exitCode"#;
 
 // Deterministic gzip (`mtime = 0`) of `POWERSHELL_PROCESS_SCRIPT_SOURCE`.
-const POWERSHELL_PROCESS_SCRIPT_GZIP_BASE64: &str = "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";
+const POWERSHELL_PROCESS_SCRIPT_GZIP_BASE64: &str = "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";
 
 pub(crate) fn local_host_info() -> Result<RemoteHostInfo> {
     let os = std::env::consts::OS;
@@ -642,6 +686,25 @@ pub(crate) fn powershell_process_command(
     cwd: Option<&str>,
     path_prepend: Option<&str>,
 ) -> Result<PowerShellProcessCommand> {
+    powershell_process_command_inner(program, args, cwd, path_prepend, false)
+}
+
+pub(crate) fn powershell_agent_process_command(
+    program: &str,
+    args: &[String],
+    cwd: Option<&str>,
+    path_prepend: Option<&str>,
+) -> Result<PowerShellProcessCommand> {
+    powershell_process_command_inner(program, args, cwd, path_prepend, true)
+}
+
+fn powershell_process_command_inner(
+    program: &str,
+    args: &[String],
+    cwd: Option<&str>,
+    path_prepend: Option<&str>,
+    agent_launch_diagnostics: bool,
+) -> Result<PowerShellProcessCommand> {
     reject_process_field("program", program)?;
     for arg in args {
         reject_process_argument(arg)?;
@@ -656,12 +719,23 @@ pub(crate) fn powershell_process_command(
     let mut command_arguments = Vec::with_capacity(args.len() + 1);
     command_arguments.push(program.to_string());
     command_arguments.extend(args.iter().cloned());
+    let agent_root = if agent_launch_diagnostics {
+        Some(
+            args.windows(2)
+                .find_map(|pair| (pair[0] == "--root").then_some(pair[1].as_str()))
+                .ok_or_else(|| anyhow!("agent launch diagnostics require a --root argument"))?,
+        )
+    } else {
+        None
+    };
     let payload = ProcessPayload {
         program,
         arguments: args,
         command_line: windows_join_arguments(&command_arguments),
         cwd,
         path_prepend,
+        agent_launch_diagnostics,
+        agent_root,
     };
     let payload = serde_json::to_vec(&payload)?;
     let compressed_script = STANDARD
@@ -688,6 +762,11 @@ function Read-NrmBytes([int]$length) {
   }
   return ,$bytes
 }
+function Fail-Nrm($kind,$status) {
+  $record=[Text.Encoding]::ASCII.GetBytes("NRM_AGENT_LAUNCH_V1`tFAILURE`t$kind`n")
+  $output=[Console]::OpenStandardOutput()
+  $output.Write($record,0,$record.Length);$output.Flush();exit $status
+}
 [byte[]]$header=Read-NrmBytes 12
 if($header[0]-ne 78 -or $header[1]-ne 82 -or $header[2]-ne 77 -or $header[3]-ne 49) { throw 'invalid nrm process bootstrap' }
 $scriptLength=[BitConverter]::ToUInt32($header,4)
@@ -695,6 +774,29 @@ $payloadLength=[BitConverter]::ToUInt32($header,8)
 if($scriptLength -gt 65536 -or $payloadLength -gt 65536) { throw 'oversized nrm process bootstrap' }
 [byte[]]$compressed=Read-NrmBytes ([int]$scriptLength)
 [byte[]]$payload=Read-NrmBytes ([int]$payloadLength)
+$document=[Text.Encoding]::UTF8.GetString($payload)|ConvertFrom-Json
+$diagnose=$document.agent_launch_diagnostics -eq $true
+if($diagnose) {
+  $pathPrepend=[string]$document.path_prepend
+  if(-not [string]::IsNullOrEmpty($pathPrepend)) {
+    $env:PATH=$pathPrepend+[IO.Path]::PathSeparator+$env:PATH
+  }
+  $root=[string]$document.agent_root
+  if([string]::IsNullOrEmpty($root) -or -not [IO.Directory]::Exists($root)) {
+    Fail-Nrm root_missing 66
+  }
+  $program=[string]$document.program
+  $isPath=[IO.Path]::IsPathRooted($program) -or $program.Contains('\') -or $program.Contains('/')
+  if($isPath) {
+    if([IO.Directory]::Exists($program)) { Fail-Nrm not_executable 126 }
+    if(-not [IO.File]::Exists($program)) { Fail-Nrm missing 127 }
+  } else {
+    try {
+      $resolved=Get-Command -Name $program -CommandType Application -ErrorAction Stop|Select-Object -First 1
+      if($null -eq $resolved) { Fail-Nrm missing 127 }
+    } catch { Fail-Nrm missing 127 }
+  }
+}
 $memory=New-Object IO.MemoryStream(,$compressed)
 $gzip=New-Object IO.Compression.GZipStream($memory,[IO.Compression.CompressionMode]::Decompress)
 $reader=New-Object IO.StreamReader($gzip,[Text.Encoding]::UTF8)
@@ -1082,6 +1184,14 @@ mod tests {
         assert!(script.contains("GetStdHandle(-10)"));
         assert!(script.contains("PumpOutput(output, -11"));
         assert!(script.contains("PumpOutput(error, -12"));
+        assert!(script.contains("bool agentLaunchDiagnostics)"));
+        assert!(script
+            .contains("if (agentLaunchDiagnostics && (launchError == 2 || launchError == 3))"));
+        assert!(script.contains("if (agentLaunchDiagnostics)\n            WriteLaunchReady();"));
+        assert!(script.contains("WriteLaunchReady();"));
+        assert!(script.contains("WriteLaunchFailure(\"missing\");"));
+        assert!(script.contains("WriteLaunchFailure(\"not_executable\");"));
+        assert!(script.contains("NRM_AGENT_LAUNCH_V1\\tREADY\\n"));
         assert!(script.contains("System.Threading.Thread"));
         assert!(script.contains("STARTUPINFOEX is 112 bytes"));
         assert!(script.contains("JOBOBJECT_EXTENDED_LIMIT_INFORMATION is 144 bytes"));
@@ -1099,6 +1209,9 @@ mod tests {
         assert!(script.contains("'cmd.exe'"));
         assert!(script.contains(" /d /s /v:off /c "));
         assert!(script.contains("$applicationName = $cmdApplication"));
+        assert!(script
+            .contains("$agentLaunchDiagnostics = $payload.agent_launch_diagnostics -eq $true"));
+        assert!(script.contains("[string]$payload.cwd,\n    $agentLaunchDiagnostics)"));
         assert!(script.contains("-replace '(\\\\+)$', '$1$1'"));
         assert!(script.contains(
             "batch application paths and arguments must not contain double quotes or percent signs"
@@ -1120,6 +1233,39 @@ mod tests {
             .contains("$(owned)"));
         assert!(payload["command_line"].as_str().unwrap().contains(program));
         assert_eq!(payload["cwd"], "B:/repo with space");
+        assert_eq!(payload["agent_launch_diagnostics"], false);
+        assert!(payload["agent_root"].is_null());
+    }
+
+    #[test]
+    fn powershell_agent_process_uses_ordered_launch_prelude_and_preflight_path() {
+        let root = r#"B:/repo ' ; Write-Output owned"#;
+        let path_prepend = r#"C:\nrm-test\bin"#;
+        let args = vec!["serve".to_owned(), "--root".to_owned(), root.to_owned()];
+        let launch =
+            powershell_agent_process_command("custom-agent.exe", &args, None, Some(path_prepend))
+                .unwrap();
+
+        assert!(!launch.command.contains("custom-agent"));
+        assert!(!launch.command.contains("Write-Output owned"));
+        assert!(!launch.command.contains(path_prepend));
+        assert!(
+            launch.command.encode_utf16().count() <= WINDOWS_REMOTE_COMMAND_MAX_CHARS,
+            "PowerShell agent command exceeds the Windows command-line limit"
+        );
+        let bootstrap = decode_encoded_command(&launch.command);
+        assert!(bootstrap.contains("NRM_AGENT_LAUNCH_V1`tFAILURE"));
+        assert!(bootstrap.contains("$env:PATH=$pathPrepend+[IO.Path]::PathSeparator+$env:PATH"));
+        assert!(bootstrap.contains("Fail-Nrm root_missing 66"));
+        assert!(bootstrap.contains("Fail-Nrm not_executable 126"));
+        assert!(bootstrap.contains("Fail-Nrm missing 127"));
+
+        let (_, payload_bytes) = bootstrap_documents(&launch.stdin_prefix);
+        let payload: serde_json::Value = serde_json::from_slice(payload_bytes).unwrap();
+        assert_eq!(payload["agent_launch_diagnostics"], true);
+        assert_eq!(payload["agent_root"], root);
+        assert_eq!(payload["path_prepend"], path_prepend);
+        assert_eq!(payload["program"], "custom-agent.exe");
     }
 
     #[test]
@@ -1185,6 +1331,114 @@ mod tests {
             error,
             "PowerShell process bootstrap exceeds the 65536-byte document limit"
         );
+    }
+
+    #[cfg(windows)]
+    fn run_native_powershell_process(
+        launch: &PowerShellProcessCommand,
+    ) -> (std::process::ExitStatus, Vec<u8>, Vec<u8>) {
+        use std::io::{Read as _, Write as _};
+        use std::process::{Command, Stdio};
+
+        let encoded = launch.command.split_whitespace().last().unwrap();
+        let mut child = Command::new("powershell.exe")
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-EncodedCommand",
+                encoded,
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(&launch.stdin_prefix)
+            .unwrap();
+        let mut stdout = child.stdout.take().unwrap();
+        let stdout_reader = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            stdout.read_to_end(&mut bytes).map(|_| bytes)
+        });
+        let mut stderr = child.stderr.take().unwrap();
+        let stderr_reader = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            stderr.read_to_end(&mut bytes).map(|_| bytes)
+        });
+        let status = child.wait().unwrap();
+        (
+            status,
+            stdout_reader.join().unwrap().unwrap(),
+            stderr_reader.join().unwrap().unwrap(),
+        )
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn powershell_agent_process_reports_exact_missing_launch_record() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().to_string_lossy().into_owned();
+        let missing = format!(r#"{}\definitely-missing-nrm-agent.exe"#, root);
+        let launch = powershell_agent_process_command(
+            &missing,
+            &["serve".to_owned(), "--root".to_owned(), root],
+            None,
+            None,
+        )
+        .unwrap();
+
+        let (status, stdout, stderr) = run_native_powershell_process(&launch);
+
+        assert_eq!(status.code(), Some(127));
+        assert_eq!(stdout, b"NRM_AGENT_LAUNCH_V1\tFAILURE\tmissing\n");
+        assert!(stderr.is_empty(), "{}", String::from_utf8_lossy(&stderr));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn powershell_agent_preflight_resolves_bare_program_from_path_prepend() {
+        use std::process::Command;
+
+        let directory = tempfile::tempdir().unwrap();
+        let bin = directory.path().join("managed-bin");
+        let root = directory.path().join("repo");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        let source = bin.join("managed-agent.rs");
+        let executable = bin.join("managed-agent.exe");
+        std::fs::write(&source, "fn main() { std::process::exit(41); }").unwrap();
+        let compile = Command::new("rustc")
+            .arg(&source)
+            .arg("-o")
+            .arg(&executable)
+            .output()
+            .unwrap();
+        assert!(
+            compile.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+        let root = root.to_string_lossy().into_owned();
+        let launch = powershell_agent_process_command(
+            "managed-agent.exe",
+            &["serve".to_owned(), "--root".to_owned(), root],
+            None,
+            Some(&bin.to_string_lossy()),
+        )
+        .unwrap();
+
+        let (status, stdout, stderr) = run_native_powershell_process(&launch);
+
+        assert_eq!(status.code(), Some(41));
+        assert_eq!(stdout, b"NRM_AGENT_LAUNCH_V1\tREADY\n");
+        assert!(stderr.is_empty(), "{}", String::from_utf8_lossy(&stderr));
     }
 
     #[cfg(windows)]

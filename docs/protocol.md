@@ -34,24 +34,74 @@ last known remote health. It must not block on SSH.
 
 Clients that understand command metadata should check
 `capabilities.remote_agent_bootstrap == true` before presenting remote agent
-repair actions. The public commands are:
+repair actions. Automatic mutation additionally requires the versioned
+`capabilities.remote_agent_automatic_bootstrap_v1 == true`; the generic
+capability predates automatic-request enforcement and is not sufficient. The
+public commands are:
 
 | Method | Lane | Mutates | Behavior |
 | --- | --- | --- | --- |
 | `remote_health` | read/control | no | Actively probes the agent and decorates health with `agent_status`, expected versions, local/remote agent paths, install/update availability, and a suggested `repair_command` |
 | `remote_agent_install` | write/control | yes | Transactionally installs a verified registry artifact, or the configured local binary when registry mode is disabled |
-| `remote_agent_update` | write/control | yes | Transactionally replaces an incompatible/missing SSH agent, skipping when already compatible unless `force = true` |
+| `remote_agent_update` | write/control | yes | Transactionally replaces an incompatible/missing SSH agent; also provides the guarded signed-registry repair operation used on connect |
 
-`remote_agent_install` and `remote_agent_update` are explicit user actions. The
-sidecar must not silently install or update the remote agent during
-`workspace_info` or connect. During replacement, the sidecar drains queued
-remote work, preempts both agent lanes, and waits for their workers to exit. It
-then transfers the candidate to a unique same-directory staging path, checks
-exact `--version` output and a complete Hello, preserves the
-previous executable, activates the candidate, and checks Hello again through
-the normal launch path. A failed post-activation check restores and reprobes the
-previous executable. Ambiguous activation replies are reconciled before a
-result is returned; `process_in_use` and `rollback_failed` are distinct errors.
+The user commands exposing `remote_agent_install` and `remote_agent_update`
+remain available as explicit actions. `workspace_info` itself is local-only and
+never retrieves or installs an artifact. After it returns, a Lua client may
+issue `remote_agent_update` with `automatic = true` when SSH, a configured
+trusted signed registry, and the client's automatic-install option are all
+enabled, and only when the versioned automatic-bootstrap capability is present.
+The sidecar independently rejects automatic requests for local
+transports, without a registry, through install rather than update semantics,
+or with `force = true`.
+
+The Lua client also refuses automatic bootstrap through a configured fixed
+`socket_path`, because that path cannot encode the current sidecar executable
+identity. Derived socket paths remain eligible. Once an automatic update is
+accepted, it is a bounded non-cancellable transaction: disconnect detaches the
+editor and queues `disconnect`, but a stdio sidecar is kept alive through the
+snapshotted bootstrap callback deadline so activation or rollback can finish.
+A socket client can close its channel without terminating the detached daemon.
+
+An automatic update first classifies agent health. It skips `ok` without
+fetching, installs `missing_agent`, and transactionally repairs
+`agent_not_executable`, `version_mismatch`, or `protocol_mismatch`. Every other
+status is skipped without host mutation, including `remote_root_missing`,
+unavailable, and unclassified failures.
+
+An automatic result echoes `automatic = true` and includes `remote_health`.
+`updated` results, and `skipped` results that claim `agent_status = "ok"`, are
+accepted as ready only when health is checked and available and its actual agent
+and protocol versions exactly match their expected values. Every skipped result
+must include a non-empty reason. Other malformed or inconsistent results leave
+the connection degraded instead of being treated as successful.
+
+During replacement, the sidecar drains queued remote work, preempts both agent
+lanes, and waits for their workers to exit. It then transfers the candidate to
+a unique same-directory staging path, checks exact `--version` output and a
+complete Hello, preserves the previous executable, activates the candidate,
+and checks Hello again through the normal launch path. A failed post-activation
+check restores and reprobes the previous executable. Ambiguous activation
+replies are reconciled before a result is returned; `process_in_use` and
+`rollback_failed` are distinct errors. A per-target remote lease spans the
+post-lease health probe and every mutation/recovery phase. Concurrent sidecars
+therefore either observe the compatible result of the first installer or fail
+with the distinct `install_in_progress` error; ambiguous stale lease state is
+never treated as permission to mutate.
+POSIX claim files are published before each fixed lease or operation directory.
+A live claim protects the owner-publication window; an ownerless directory is
+reaped only after every well-formed claim identity is proven dead. Malformed
+claim names or file types fail closed; dead partial contents are reaped using
+the strict token/PID filename.
+
+Before artifact upload, the installer publishes a stable same-directory
+transaction journal. The next lease holder reconciles it before running the
+post-lease health probe: an exact partial staging file may be discarded, while
+an interrupted activation is restored or committed cleanup is completed only
+when recorded state and the journal's own candidate/previous SHA-256 digests
+agree. The verified digest for a newer request binds only the new transaction;
+invalid, ambiguous, or file-hash-mismatched journals are preserved and fail
+closed.
 
 The POSIX planner supports Linux and macOS x64/ARM64 and streams the artifact
 over SSH stdin. The Windows planner uses PowerShell 5.1 encoded commands and a
@@ -65,21 +115,39 @@ Install/update params:
 {"force":true,"install_path":"$HOME/.local/bin/nrm-agent"}
 ```
 
-For bare remote agent commands such as `nrm-agent`, POSIX SSH launches prepend
-`$HOME/.local/bin` to `PATH`, and the managed default install path is
-`$HOME/.local/bin/nrm-agent`. Windows defaults to
-`%LOCALAPPDATA%\nrm\bin\nrm-agent.exe`. Absolute `remote_agent` values default
-their install path to the same absolute path.
+Automatic connection-time repair uses update semantics and a separate guarded
+flag; it never combines that flag with force:
+
+```json
+{"automatic":true,"install_path":"$HOME/.local/bin/nrm-agent"}
+```
+
+For safe bare remote agent commands, POSIX SSH launches prepend
+`$HOME/.local/bin` to `PATH`, and the managed default install path keeps the
+same command name in that directory. Windows keeps the name under
+`%LOCALAPPDATA%\nrm\bin` and adds `.exe` when needed. Absolute `remote_agent`
+values default their install path to the same absolute path. Relative command
+paths containing a slash are rejected for default installation.
+
+An SSH agent stream begins with exactly one bounded stdout launch record before
+the first binary RPC frame: `NRM_AGENT_LAUNCH_V1\tREADY` or
+`NRM_AGENT_LAUNCH_V1\tFAILURE\t<typed-reason>`. Only a failure produced before
+the child process starts can authorize automatic repair; child stderr is
+diagnostic only. Missing, malformed, oversized, or post-`READY` records are
+ordinary untyped transport failures and therefore fail closed. POSIX failures
+that occur inside `exec` after `READY` (for example a missing dynamic loader)
+also remain untyped.
 
 ## Registry Source
 
 Registry mode is enabled only when the sidecar starts with a registry URL and
-out-of-band trusted Ed25519 keys. Connect and `workspace_info` do not fetch it.
+out-of-band trusted Ed25519 keys. `workspace_info` does not fetch it; an
+eligible connect may start an automatic update request immediately afterward.
 `workspace_info.registry_policy_fingerprint` covers URL, sorted key
 fingerprints, threshold, cache policy, and timeout; the Lua client refuses a
 socket daemon with a different policy.
-For an explicit install/update, the sidecar detects the remote host and selects
-one of:
+For an automatic bootstrap or explicit install/update, the sidecar detects the
+remote host and selects one of:
 
 ```text
 x86_64-unknown-linux-musl
@@ -103,7 +171,9 @@ candidate `source_sha256`. `registry_health` is also attached to status,
 workspace, hello, and remote-health notification objects. It carries only a
 redacted manifest origin plus structured platform, target, signing-key, digest,
 source/cache, state, and stable error-code fields. A registry update failure
-does not replace the health of an already working remote agent.
+does not replace the health of an already working remote agent. An automatic
+bootstrap error is retained by the Lua client while connect finishes in a
+degraded local-first state.
 
 An install/update uses one absolute deadline beginning when the sidecar accepts
 the request. Registry mode uses `remote_agent_registry_timeout_ms`; local mode

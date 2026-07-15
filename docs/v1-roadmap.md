@@ -279,6 +279,9 @@ performance checks that make failures diagnosable before data is at risk.
   classify missing, incompatible, non-executable, and missing-root failures and
   originally uploaded the configured local agent over SSH. Signed registry mode
   later added verified native artifact selection without changing the commands.
+  Connection-time repair is now automatic only for SSH clients that configure
+  that trusted signed registry and leave `remote_agent_auto_install` enabled;
+  default no-registry connections remain non-mutating.
 - Sync configuration docs and help with Lua defaults, including prefetch,
   autohydrate, and queue replay delay options.
 - Add failure-injection coverage for sidecar restart, agent kill, SSH drop,

@@ -12,11 +12,16 @@ local original_sockconnect = vim.fn.sockconnect
 local original_jobstart = vim.fn.jobstart
 local original_chansend = vim.fn.chansend
 local original_notify = vim.notify
+local uv = vim.uv or vim.loop
+local original_fs_lstat = uv.fs_lstat
+local original_fs_realpath = uv.fs_realpath
+local original_os_getuid = uv.os_getuid
+local original_os_get_passwd = uv.os_get_passwd
 
 local function main()
   nrm.setup({
     connection = "socket",
-    socket_path = "/tmp/nrm-test-sidecar-eof.sock",
+    socket_path = "/tmp/nrm-test-sidecar-eof/socket.sock",
     auto_reconnect = false,
     background_mirror = false,
     recover_local_edits_on_connect = false,
@@ -26,6 +31,27 @@ local function main()
   local socket_opts = nil
   local hold_status = false
   vim.notify = function() end
+  uv.os_getuid = function()
+    return 1000
+  end
+  uv.os_get_passwd = function()
+    return { uid = 1000 }
+  end
+  uv.fs_lstat = function(path)
+    if path == "/tmp/nrm-test-sidecar-eof" then
+      return { type = "directory", uid = 1000, mode = 448 }
+    end
+    if path == "/tmp/nrm-test-sidecar-eof/socket.sock" then
+      return { type = "socket", uid = 1000, mode = 384 }
+    end
+    return original_fs_lstat(path)
+  end
+  uv.fs_realpath = function(path)
+    if path == "/tmp/nrm-test-sidecar-eof" then
+      return path
+    end
+    return original_fs_realpath(path)
+  end
   vim.fn.sockconnect = function(_, _, opts)
     socket_opts = opts
     return 55
@@ -89,6 +115,10 @@ vim.fn.sockconnect = original_sockconnect
 vim.fn.jobstart = original_jobstart
 vim.fn.chansend = original_chansend
 vim.notify = original_notify
+uv.fs_lstat = original_fs_lstat
+uv.fs_realpath = original_fs_realpath
+uv.os_getuid = original_os_getuid
+uv.os_get_passwd = original_os_get_passwd
 if not ok then
   vim.api.nvim_err_writeln(err)
   vim.cmd("cquit")

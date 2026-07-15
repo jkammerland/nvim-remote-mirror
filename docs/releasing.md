@@ -39,6 +39,11 @@ Before the first release:
    The workflow exposes it only to the immutable-release policy check; release
    creation uses the narrower workflow `GITHUB_TOKEN` instead.
 
+The workflows checksum-pin the Linux x64 GitHub CLI archive and verify its
+release, attestation, and immutable-release commands in the initial identity
+job. This makes an unavailable or incompatible CLI fail before the six native
+builders start instead of depending on the mutable runner-image copy.
+
 See GitHub's documentation for [enabling immutable
 releases](https://docs.github.com/en/code-security/concepts/supply-chain-security/immutable-releases)
 and [artifact
@@ -88,28 +93,45 @@ coverage even though only `nrm-agent` is published. Linux jobs additionally
 reject binaries with a dynamic program interpreter, keeping the published musl
 executables static.
 
-Only after all six jobs pass does the protected job:
+Only after all six jobs pass does the protected `sign` job:
 
 1. verify each downloaded binary's GitHub build provenance against the exact
    release workflow, tag, and source commit;
-2. validate each thin ELF, Mach-O, or PE executable header against its target,
-   reject dynamic-interpreter Linux binaries and duplicate artifact digests,
-   and assemble the canonical target-sorted manifest;
-3. sign its unmodified bytes with every configured seed;
-4. require the detached signer IDs to equal the protected release public-key
-   policy and verify every artifact and expected signature locally;
-5. attest the manifest and signature document;
-6. create a draft release and upload exactly eight assets;
-7. re-download the complete draft, compare every byte to the local output, and
-   run `nrm-registry-release verify` over the downloaded files; and
-8. publish the draft, verify GitHub's immutable-release attestation, and
-   re-resolve the now-locked tag to the signed source commit.
+2. require exactly the six expected regular files, validate each ELF64,
+   thin Mach-O, or PE32+ machine header, reject Linux program interpreters and
+   duplicate digests, and independently assemble the canonical target-sorted
+   manifest; and
+3. strictly parse the protected signing and trust maps, derive each Ed25519
+   public key from its seed, require exact key-ID and public-key equality, then
+   sign and locally verify the exact manifest bytes.
 
-The six production build artifacts are retained for 30 days so protected
-environment review does not normally outlive them. If a run fails after draft
-creation, the workflow deletes only the exact release ID it created, and only
-while that release is still an unpublished, mutable draft. If cleanup cannot
-prove all of those conditions, inspect the draft manually before rerunning.
+The secret-bearing job intentionally performs no checkout, Cargo invocation,
+repository script, or executable produced by the release tag. It uses only
+checksum-pinned GitHub CLI, pinned official artifact actions, and the runner's
+Python/OpenSSL to reduce the signing seed's exposure to a small reviewable
+step. The signed candidate is then handed to a separate job that has no access
+to the seed. That job:
+
+1. checks out the exact source commit, tests and builds the release verifier,
+   and strictly verifies all six executable formats, hashes, manifest fields,
+   signer IDs, and signatures;
+2. attests the manifest and signature document;
+3. creates a draft release and uploads exactly eight assets;
+4. re-downloads the complete draft, compares every byte to the local output,
+   and runs `nrm-registry-release verify` over the downloaded files; and
+5. publishes the draft, verifies GitHub's immutable-release attestation, and
+   re-resolves the now-locked tag to the signed source commit.
+
+A hardware-backed or external KMS signer remains the preferred future
+replacement for the exported seed JSON. The isolated job limits exposure but
+does not turn an environment secret into non-exportable key material.
+
+The six production build artifacts and isolated signed candidate are retained
+for 30 days so protected environment review does not normally outlive them. If
+a run fails after draft creation, the workflow deletes only the exact release
+ID it created, and only while that release is still an unpublished, mutable
+draft. If cleanup cannot prove all of those conditions, inspect the draft
+manually before rerunning.
 The workflow refuses to replace any existing draft or release. A published
 release must never be edited, replaced, or recreated under the same version.
 After publication it allows up to five minutes for immutable-release and
@@ -140,13 +162,14 @@ The only combined output is a seven-file Actions artifact named
 `UNSIGNED-TEST-ONLY-agent-release-<source-commit>`, retained for seven days. It
 contains the six native binaries and
 `UNSIGNED-nrm-agent-manifest-v1.json`. Individual per-target build artifacts are
-retained for one day. The workflow deliberately does not create a detached
-signature, GitHub Release, tag, or trusted registry endpoint. Consequently its
-bundle cannot satisfy client registry verification and must not be renamed or
-published as a production release. It is useful for runner availability,
-native execution, provenance, format/architecture checks, deterministic
-assembly, and downstream test-fixture experiments that explicitly treat the
-bytes as unsigned.
+retained for seven days so delayed preview ARM64 capacity cannot expire early
+matrix outputs before aggregation. The workflow deliberately does not create a
+detached signature, GitHub Release, tag, or trusted registry endpoint.
+Consequently its bundle cannot satisfy client registry verification and must
+not be renamed or published as a production release. It is useful for runner
+availability, native execution, provenance, format/architecture checks,
+deterministic assembly, and downstream test-fixture experiments that explicitly
+treat the bytes as unsigned.
 
 Preview ARM64 runner unavailability is a dry-run failure, just as it is for the
 production workflow. Monitor every matrix job rather than interpreting the

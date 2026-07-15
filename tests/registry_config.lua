@@ -56,9 +56,11 @@ end
 local function main()
   local default_args = nrm._test_sidecar_args({ ssh = "host", remote_root = "/repo" })
   assert_eq(values_after(default_args, "--remote-agent-registry-url"), {})
+  assert_eq(nrm.config.remote_agent_auto_install, true)
   assert_eq(nrm._test_registry_policy_fingerprint(nrm.config), "disabled")
   assert_eq(nrm._test_registry_policy_matches({ registry_policy_fingerprint = "disabled" }, "disabled"), true)
   assert_eq(nrm._test_registry_policy_matches({}, "disabled"), false)
+  assert_rejected({ remote_agent_auto_install = "yes" }, "must be a boolean")
   assert_rejected({ remote_agent_registry_public_keys = { ["release-a"] = KEY_A } }, "require")
 
   nrm.setup(registry_options({ ["release-z"] = KEY_Z, ["release-a"] = KEY_A }))
@@ -86,6 +88,18 @@ local function main()
     true
   )
 
+  nrm.config.remote_agent_registry_public_keys["runtime-only"] = KEY_Z
+  nrm.setup({})
+  assert_eq(nrm.config.remote_agent_registry_url, nil, "setup reset retained a registry URL")
+  assert_eq(nrm.config.remote_agent_registry_public_keys, {}, "setup reset reused the mutated live key table")
+  assert_eq(nrm.config.remote_agent_registry_timeout_ms, 120000)
+  assert_eq(nrm.config.remote_agent_auto_install, true)
+  assert_eq(nrm._test_registry_policy_fingerprint(nrm.config), "disabled")
+  local reset_args = nrm._test_sidecar_args({ ssh = "host", remote_root = "/repo" })
+  assert_eq(values_after(reset_args, "--remote-agent-registry-url"), {})
+  assert_eq(values_after(reset_args, "--remote-agent-registry-public-key"), {})
+
+  nrm.setup(registry_options({ ["release-z"] = KEY_Z, ["release-a"] = KEY_A }))
   local first = nrm._test_socket_path_for("ssh://host/repo", { ssh = "host", remote_root = "/repo" })
   nrm.setup(registry_options({ ["release-a"] = KEY_A, ["release-z"] = KEY_Z }))
   local reordered = nrm._test_socket_path_for("ssh://host/repo", { ssh = "host", remote_root = "/repo" })
@@ -95,6 +109,13 @@ local function main()
   if changed == first then
     error("registry policy change did not change socket identity")
   end
+
+  nrm.setup(registry_options({ ["release-a"] = KEY_A }))
+  assert_eq(
+    nrm.config.remote_agent_registry_public_keys,
+    { ["release-a"] = KEY_A },
+    "a later setup merged rather than replaced the trusted-key table"
+  )
 
   nrm.setup({
     remote_agent_registry_url = "file:///tmp/releases/v{version}/nrm-agent-manifest-v1.json",

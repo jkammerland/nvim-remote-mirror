@@ -32,7 +32,7 @@ changing Neovim commands.
 | Conflict | Keep local save as truth and preserve remote copy |
 | Background mirror | Scan, prefetch, and validate in small idle batches |
 | Reconnect | Reuse mirror state and retry queued saves |
-| Agent install/update | Explicit only; verify locally, stage and activate transactionally, roll back failures |
+| Agent install/update | Opt-in signed repair on SSH connect plus explicit commands; verify locally, activate transactionally, roll back failures |
 
 ## Remote Host and Agent Distribution
 
@@ -43,20 +43,47 @@ encoded commands and binary-safe stdio. Canonical Windows workspace targets use
 `ssh://host/B:/repos/project`; UNC and drive-relative roots are outside the
 supported model.
 
+SSH agent launch has a bounded ordered stdout prelude before framed RPC. The
+transport wrapper may report a narrow typed pre-exec failure or confirm
+`READY`; after that point child stderr is diagnostics-only and cannot trigger
+automatic replacement. Missing or invalid preludes and failures after `READY`
+remain untyped, so bootstrap eligibility cannot be forged by agent output.
+
 Agent distribution has two mutually exclusive sources:
 
-- With no registry URL, explicit install/update streams the configured local
-  `agent` file. The caller owns OS/architecture selection.
+- With no registry URL, automatic install is inactive. Explicit install/update
+  streams the configured local `agent` file, and the caller owns
+  OS/architecture selection.
 - With a registry URL, the local sidecar verifies a detached Ed25519 signature,
   strict manifest policy, target, size, and SHA-256 before upload. Registry mode
   fails closed and cannot fall back to the local file.
 
-Connect remains local-first in both modes and never installs or updates. The
+Connect remains local-first and non-mutating unless SSH, a configured trusted
+signed registry, and `remote_agent_auto_install` are all enabled. In that
+opt-in mode it repairs only missing, non-executable, version-mismatched, or
+protocol-mismatched agents; it does not mutate missing-root, unavailable, or
+unclassified hosts. Failures leave a connected but degraded mirror. The
+transaction holds a per-target lease across sidecar processes and reprobes
+under that lease, so simultaneous connects cannot both replace the executable;
+a live contender reports `install_in_progress`. POSIX per-process claims close
+the lease-owner and operation-owner publication windows: a live claim prevents
+ownerless state from being reaped, while malformed claim identities or file
+types fail closed. Dead partial claim contents are safely ignored because the
+strict token/PID filename is the liveness identity.
+The
 registry cache is a performance/reliability layer, not a trust anchor: current
-keys, signatures, manifest policy, size, and digest are reverified on every use.
-Only transient network/rate-limit/server failures may use a verified cached
-manifest pair. See [agent-registry.md](agent-registry.md) for the full trust and
-key-rotation model.
+keys, signatures, manifest policy, size, and digest are reverified on every
+use. Only transient network/rate-limit/server failures may use a verified
+cached manifest pair. See [agent-registry.md](agent-registry.md) for the full
+trust and key-rotation model.
+
+The remote transaction writes a stable same-directory recovery journal before
+upload. The next per-target lease holder reconciles interrupted staging or
+activation before probing the agent. Recovery removes or replaces files only
+when the recorded paths, file types, prior state, and that journal's own
+candidate/previous digests agree. A newer request's verified digest is applied
+only to its subsequent transaction; malformed or file-hash-mismatched state
+still fails closed and remains available for diagnosis.
 
 ## Current Limits
 

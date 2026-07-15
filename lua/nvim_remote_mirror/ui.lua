@@ -145,6 +145,10 @@ local function format_dashboard_lines(status, err)
   add_line(lines, "Source", status.agent_source or connection.agent_source)
   add_line(lines, "Repair", status.repair_command or connection.repair_command)
   add_line(lines, "Local Error", status.local_agent_error or connection.local_agent_error)
+  add_line(lines, "Auto Bootstrap", connection.agent_bootstrap_state)
+  add_line(lines, "Bootstrap Result", connection.agent_bootstrap_result)
+  add_line(lines, "Bootstrap Reason", connection.agent_bootstrap_reason)
+  add_line(lines, "Bootstrap Error", connection.agent_bootstrap_error)
 
   local registry = status.registry_health or connection.registry_health or {}
   local platform = registry.platform or {}
