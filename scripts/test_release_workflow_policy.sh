@@ -81,6 +81,112 @@ insert_after_line() {
   mv "$mutated" "$path"
 }
 
+relocate_windows_sidecar_test_to_linux() {
+  local path=$1
+  # These must remain literal workflow expressions.
+  # shellcheck disable=SC2016
+  local linux_line='          cargo test -p nrm-sidecar --locked --target "$TARGET" -- --test-threads=1'
+  # shellcheck disable=SC2016
+  local windows_line='          cargo test -p nrm-sidecar --locked --target $env:TARGET -- --test-threads=1'
+  awk -v linux_line="$linux_line" -v windows_line="$windows_line" '
+    /^  [[:alnum:]_-]+:$/ {
+      job = $0
+    }
+    job == "  linux:" && $0 == linux_line && !duplicated {
+      print
+      print
+      duplicated = 1
+      next
+    }
+    job == "  windows:" && $0 == windows_line && !removed {
+      removed = 1
+      next
+    }
+    {
+      print
+    }
+    END {
+      if (!duplicated || !removed) {
+        exit 42
+      }
+    }
+  ' "$path" > "$mutated"
+  mv "$mutated" "$path"
+}
+
+insert_extra_parallel_sidecar_step() {
+  local path=$1
+  local next_step=$2
+  insert_before_line "$path" "$next_step" \
+    '      - name: Re-run sidecar tests at default parallelism'
+  # This must remain a literal workflow expression.
+  # shellcheck disable=SC2016
+  insert_before_line "$path" "$next_step" \
+    '        run: cargo test --locked --target "$TARGET" -p nrm-sidecar'
+}
+
+insert_extra_toolchain_workspace_test_step() {
+  local path=$1
+  local next_step=$2
+  insert_before_line "$path" "$next_step" \
+    '      - name: Re-run workspace tests at default parallelism'
+  # This must remain a literal workflow expression.
+  # shellcheck disable=SC2016
+  insert_before_line "$path" "$next_step" \
+    '        run: cargo +1.95.0 test --workspace --locked --target "$TARGET"'
+}
+
+insert_extra_variable_workspace_test_step() {
+  local path=$1
+  local next_step=$2
+  insert_before_line "$path" "$next_step" \
+    '      - name: Re-run workspace tests through configured Cargo'
+  # These must remain literal workflow expressions.
+  # shellcheck disable=SC2016
+  insert_before_line "$path" "$next_step" \
+    '        run: "${CARGO:-cargo}" test --workspace --locked --target "$TARGET"'
+}
+
+move_linux_test_step_to_job_end() {
+  local path=$1
+  local name=$2
+  local header="      - name: $name"
+  awk -v header="$header" '
+    $0 == "  linux:" {
+      in_linux = 1
+    }
+    in_linux && $0 == header {
+      captured = $0 ORS
+      capturing = 1
+      next
+    }
+    capturing {
+      if ($0 ~ /^      - name:/) {
+        capturing = 0
+      } else {
+        captured = captured $0 ORS
+        next
+      }
+    }
+    $0 == "  macos:" {
+      printf "%s", captured
+      print
+      inserted = 1
+      in_linux = 0
+      next
+    }
+    {
+      print
+    }
+    END {
+      if (captured == "" || !inserted) {
+        exit 42
+      }
+    }
+  ' "$path" > "$mutated"
+  mv "$mutated" "$path"
+}
+
 insert_upload_into_create() {
   awk '
     /^      - name: Create draft release$/ {
@@ -167,6 +273,137 @@ insert_before_line "$case_dry_run" \
   '          sudo apt-get -o Acquire::Retries=5 -o Acquire::ForceIPv4=true update' \
   "          sudo sed -i 's|https://ports.ubuntu.com/ubuntu-ports|http://ports.ubuntu.com/ubuntu-ports|g' /etc/apt/sources.list.d/ubuntu.sources"
 expect_rejected 'dry-run source downgrade after the HTTPS guard'
+cp "$dry_run" "$case_dry_run"
+
+cp "$production" "$case_production"
+apply_sed_mutation 's/ -- --test-threads=1//g'
+expect_rejected 'parallel production sidecar suites'
+
+cp "$production" "$case_production"
+# Keep the total marker count unchanged while moving serialization off the
+# process-heavy sidecar command. The policy must bind both on one line.
+# shellcheck disable=SC2016
+apply_sed_mutation \
+  's/cargo test -p nrm-protocol -p nrm-agent --locked --target "$TARGET"/cargo test -p nrm-protocol -p nrm-agent --locked --target "$TARGET" -- --test-threads=1/; s/cargo test -p nrm-sidecar --locked --target "$TARGET" -- --test-threads=1/cargo test -p nrm-sidecar --locked --target "$TARGET"/'
+expect_rejected 'production serialization marker detached from the sidecar command'
+
+cp "$production" "$case_production"
+relocate_windows_sidecar_test_to_linux "$case_production"
+expect_rejected 'production sidecar test relocated out of the Windows job'
+
+cp "$production" "$case_production"
+insert_extra_parallel_sidecar_step "$case_production" \
+  '      - name: Build, execute, and validate static agent'
+expect_rejected 'extra production sidecar test at default parallelism'
+
+cp "$production" "$case_production"
+insert_extra_toolchain_workspace_test_step "$case_production" \
+  '      - name: Build, execute, and validate static agent'
+expect_rejected 'extra production toolchain-qualified workspace test'
+
+cp "$production" "$case_production"
+insert_extra_variable_workspace_test_step "$case_production" \
+  '      - name: Build, execute, and validate static agent'
+expect_rejected 'extra production variable-expanded workspace test'
+
+cp "$production" "$case_production"
+insert_after_line "$case_production" \
+  '      - name: Run native target tests' \
+  '        if: false'
+expect_rejected 'conditionally skipped production native test steps'
+
+cp "$production" "$case_production"
+insert_after_line "$case_production" \
+  '      - name: Run native target tests' \
+  '        continue-on-error : true'
+expect_rejected 'whitespace-obscured production continue-on-error key'
+
+cp "$production" "$case_production"
+insert_after_line "$case_production" \
+  '      - name: Build, execute, and validate static agent' \
+  '        "i\u0066": false'
+expect_rejected 'escaped production conditional key outside the reviewed test step'
+
+cp "$production" "$case_production"
+move_linux_test_step_to_job_end "$case_production" 'Run native target tests'
+expect_rejected 'production native test moved after artifact upload'
+
+cp "$production" "$case_production"
+apply_sed_mutation 's/timeout-minutes: 60/timeout-minutes: 600/g'
+expect_rejected 'production native jobs without the 60-minute bound'
+
+cp "$production" "$case_production"
+insert_after_line "$case_production" \
+  '    timeout-minutes: 60' \
+  '    timeout-minutes: 600'
+expect_rejected 'production native jobs with an overriding timeout key'
+
+cp "$production" "$case_production"
+cp "$dry_run" "$case_dry_run"
+apply_dry_run_sed_mutation 's/ -- --test-threads=1//g'
+expect_rejected 'parallel dry-run sidecar suites'
+
+cp "$production" "$case_production"
+cp "$dry_run" "$case_dry_run"
+relocate_windows_sidecar_test_to_linux "$case_dry_run"
+expect_rejected 'dry-run sidecar test relocated out of the Windows job'
+
+cp "$production" "$case_production"
+cp "$dry_run" "$case_dry_run"
+insert_extra_parallel_sidecar_step "$case_dry_run" \
+  '      - name: Build, execute, and reject dynamic Linux agents'
+expect_rejected 'extra dry-run sidecar test at default parallelism'
+
+cp "$production" "$case_production"
+cp "$dry_run" "$case_dry_run"
+insert_extra_toolchain_workspace_test_step "$case_dry_run" \
+  '      - name: Build, execute, and reject dynamic Linux agents'
+expect_rejected 'extra dry-run toolchain-qualified workspace test'
+
+cp "$production" "$case_production"
+cp "$dry_run" "$case_dry_run"
+insert_extra_variable_workspace_test_step "$case_dry_run" \
+  '      - name: Build, execute, and reject dynamic Linux agents'
+expect_rejected 'extra dry-run variable-expanded workspace test'
+
+cp "$production" "$case_production"
+cp "$dry_run" "$case_dry_run"
+insert_after_line "$case_dry_run" \
+  '      - name: Run native protocol, agent, and sidecar tests' \
+  '        if: false'
+expect_rejected 'conditionally skipped dry-run native test steps'
+
+cp "$production" "$case_production"
+cp "$dry_run" "$case_dry_run"
+insert_after_line "$case_dry_run" \
+  '      - name: Run native protocol, agent, and sidecar tests' \
+  '        continue-on-error : true'
+expect_rejected 'whitespace-obscured dry-run continue-on-error key'
+
+cp "$production" "$case_production"
+cp "$dry_run" "$case_dry_run"
+insert_after_line "$case_dry_run" \
+  '      - name: Build, execute, and reject dynamic Linux agents' \
+  '        "i\u0066": false'
+expect_rejected 'escaped dry-run conditional key outside the reviewed test step'
+
+cp "$production" "$case_production"
+cp "$dry_run" "$case_dry_run"
+move_linux_test_step_to_job_end "$case_dry_run" \
+  'Run native protocol, agent, and sidecar tests'
+expect_rejected 'dry-run native test moved after artifact upload'
+
+cp "$production" "$case_production"
+cp "$dry_run" "$case_dry_run"
+apply_dry_run_sed_mutation 's/timeout-minutes: 60/timeout-minutes: 600/g'
+expect_rejected 'dry-run native jobs without the 60-minute bound'
+
+cp "$production" "$case_production"
+cp "$dry_run" "$case_dry_run"
+insert_after_line "$case_dry_run" \
+  '    timeout-minutes: 60' \
+  '    timeout-minutes: 600'
+expect_rejected 'dry-run native jobs with an overriding timeout key'
 cp "$dry_run" "$case_dry_run"
 
 cp "$production" "$case_production"

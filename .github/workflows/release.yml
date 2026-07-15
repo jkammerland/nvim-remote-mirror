@@ -200,7 +200,11 @@ jobs:
           rustc -vV
 
       - name: Run native target tests
-        run: cargo test -p nrm-protocol -p nrm-agent -p nrm-sidecar --locked --target "$TARGET"
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p nrm-protocol -p nrm-agent --locked --target "$TARGET"
+          cargo test -p nrm-sidecar --locked --target "$TARGET" -- --test-threads=1
 
       - name: Build, execute, and validate static agent
         shell: bash
@@ -290,7 +294,11 @@ jobs:
           rustc -vV
 
       - name: Run native target tests
-        run: cargo test -p nrm-protocol -p nrm-agent -p nrm-sidecar --locked --target "$TARGET"
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p nrm-protocol -p nrm-agent --locked --target "$TARGET"
+          cargo test -p nrm-sidecar --locked --target "$TARGET" -- --test-threads=1
 
       - name: Build and execute native agent
         shell: bash
@@ -384,7 +392,8 @@ jobs:
           Set-StrictMode -Version Latest
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $true
-          cargo test -p nrm-protocol -p nrm-agent -p nrm-sidecar --locked --target $env:TARGET
+          cargo test -p nrm-protocol -p nrm-agent --locked --target $env:TARGET
+          cargo test -p nrm-sidecar --locked --target $env:TARGET -- --test-threads=1
 
       - name: Build and execute native agent
         shell: pwsh
