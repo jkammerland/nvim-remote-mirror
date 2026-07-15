@@ -172,7 +172,10 @@ jobs:
 
       - name: Run native protocol, agent, and sidecar tests
         shell: bash
-        run: cargo test -p nrm-protocol -p nrm-agent -p nrm-sidecar --locked --target "$TARGET"
+        run: |
+          set -euo pipefail
+          cargo test -p nrm-protocol -p nrm-agent --locked --target "$TARGET"
+          cargo test -p nrm-sidecar --locked --target "$TARGET" -- --test-threads=1
 
       - name: Build, execute, and reject dynamic Linux agents
         shell: bash
@@ -263,7 +266,10 @@ jobs:
 
       - name: Run native protocol, agent, and sidecar tests
         shell: bash
-        run: cargo test -p nrm-protocol -p nrm-agent -p nrm-sidecar --locked --target "$TARGET"
+        run: |
+          set -euo pipefail
+          cargo test -p nrm-protocol -p nrm-agent --locked --target "$TARGET"
+          cargo test -p nrm-sidecar --locked --target "$TARGET" -- --test-threads=1
 
       - name: Build and execute native agent
         shell: bash
@@ -357,7 +363,8 @@ jobs:
           Set-StrictMode -Version Latest
           $ErrorActionPreference = "Stop"
           $PSNativeCommandUseErrorActionPreference = $true
-          cargo test -p nrm-protocol -p nrm-agent -p nrm-sidecar --locked --target $env:TARGET
+          cargo test -p nrm-protocol -p nrm-agent --locked --target $env:TARGET
+          cargo test -p nrm-sidecar --locked --target $env:TARGET -- --test-threads=1
 
       - name: Build and execute native agent
         shell: pwsh

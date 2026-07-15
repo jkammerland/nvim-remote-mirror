@@ -60,6 +60,67 @@ extract_single_workflow_step() {
   ' "$workflow"
 }
 
+extract_single_workflow_job() {
+  local workflow=$1
+  local name=$2
+  local header="  $name:"
+  local count
+  count=$(grep -Fxc -- "$header" "$workflow" || true)
+  [[ "$count" -eq 1 ]] \
+    || fail "$workflow must contain exactly one $name job, found $count"
+  awk -v header="$header" '
+    $0 == header {
+      active = 1
+    }
+    active && $0 != header && /^  [[:alnum:]_-]+:$/ {
+      exit
+    }
+    active {
+      print
+    }
+  ' "$workflow"
+}
+
+extract_single_block_workflow_step() {
+  local block=$1
+  local name=$2
+  local header="      - name: $name"
+  local count
+  count=$(grep -Fxc -- "$header" <<< "$block" || true)
+  [[ "$count" -eq 1 ]] \
+    || fail "native job must contain exactly one $name step, found $count"
+  awk -v header="$header" '
+    $0 == header {
+      active = 1
+    }
+    active && $0 != header && /^      - name:/ {
+      exit
+    }
+    active {
+      print
+    }
+  ' <<< "$block"
+}
+
+reviewed_native_job_sha256() {
+  local workflow_kind=$1
+  local native_job=$2
+  case "$workflow_kind:$native_job" in
+    production:linux) printf '%s\n' '17621b452a63043fbfaa832af082d491ce4c7fcbf96bbf23f2cbab51dca0c4a4' ;;
+    production:macos) printf '%s\n' '2d85c04f513b458ee42f6b5b1b683c37be8a23fd03c9b56f1c61b0de31f42e3e' ;;
+    production:windows) printf '%s\n' '17e4bdfdf8274187de11d659ac58f74924fbf7f0a4bf8d1dadd08fbbcb29f2a1' ;;
+    dry-run:linux) printf '%s\n' '4ed0e21a285bde76f1cc1214edc47428f266c6f63d470ca463c5f60f74fa739f' ;;
+    dry-run:macos) printf '%s\n' '6a5b5ae3b1c808d914606f10623b163af1c678de3463aa9f7b08805ec39fa53b' ;;
+    dry-run:windows) printf '%s\n' 'a42bedf88fc5f6e56843d63b880331b25ba77b2791f8ccefc0f1f2a33957fbee' ;;
+    *) fail "missing reviewed digest for $workflow_kind $native_job job" ;;
+  esac
+}
+
+sha256_stdin() {
+  python3 -c \
+    'import hashlib, sys; print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest())'
+}
+
 expected_musl_step="$(cat <<'EOF'
       - name: Install musl and pinned Rust target
         shell: bash
@@ -80,6 +141,29 @@ expected_musl_step="$(cat <<'EOF'
 EOF
 )"
 
+expected_bash_native_test_body="$(cat <<'EOF'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p nrm-protocol -p nrm-agent --locked --target "$TARGET"
+          cargo test -p nrm-sidecar --locked --target "$TARGET" -- --test-threads=1
+EOF
+)"
+
+expected_windows_native_test_body="$(cat <<'EOF'
+        shell: pwsh
+        run: |
+          Set-StrictMode -Version Latest
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+          cargo test -p nrm-protocol -p nrm-agent --locked --target $env:TARGET
+          cargo test -p nrm-sidecar --locked --target $env:TARGET -- --test-threads=1
+EOF
+)"
+
+command -v python3 >/dev/null 2>&1 \
+  || fail 'python3 is required to validate release workflows'
+
 for workflow in "$production" "$dry_run"; do
   [[ -f "$workflow" ]] || fail "missing $workflow"
   if grep -En '^[[:space:]]+uses: [^#[:space:]]+@' "$workflow" \
@@ -96,6 +180,85 @@ for workflow in "$production" "$dry_run"; do
     "$workflow" 'Install musl and pinned Rust target')
   [[ "$actual_musl_step" == "$expected_musl_step" ]] \
     || fail "$workflow native musl setup must match the reviewed fail-closed step exactly"
+
+  if [[ "$workflow" == "$production" ]]; then
+    workflow_kind=production
+    native_test_step_name='Run native target tests'
+  else
+    workflow_kind=dry-run
+    native_test_step_name='Run native protocol, agent, and sidecar tests'
+  fi
+
+  for native_job in linux macos windows; do
+    native_job_block=$(extract_single_workflow_job "$workflow" "$native_job")
+    native_timeout_key_count=$(grep -Ec -- \
+      "^[[:space:]]+['\"]?timeout-minutes['\"]?[[:space:]]*:" \
+      <<< "$native_job_block" || true)
+    native_timeout_count=$(grep -Fxc -- '    timeout-minutes: 60' \
+      <<< "$native_job_block" || true)
+    [[ "$native_timeout_key_count" -eq 1 && "$native_timeout_count" -eq 1 ]] \
+      || fail "$workflow $native_job job must have exactly one 60-minute timeout"
+    if grep -Eq \
+      "^[[:space:]]+['\"]?(if|continue-on-error)['\"]?[[:space:]]*:" \
+      <<< "$native_job_block"; then
+      fail "$workflow $native_job job must not conditionally skip or ignore native validation"
+    fi
+
+    actual_native_test_step=$(extract_single_block_workflow_step \
+      "$native_job_block" "$native_test_step_name")
+    if [[ "$native_job" == windows ]]; then
+      expected_native_test_step="      - name: $native_test_step_name
+$expected_windows_native_test_body"
+    else
+      expected_native_test_step="      - name: $native_test_step_name
+$expected_bash_native_test_body"
+    fi
+    [[ "$actual_native_test_step" == "$expected_native_test_step" ]] \
+      || fail "$workflow $native_job native test step must match the reviewed fail-closed step exactly"
+
+    if [[ "$native_job" == linux ]]; then
+      if [[ "$workflow" == "$production" ]]; then
+        native_build_step_name='Build, execute, and validate static agent'
+      else
+        native_build_step_name='Build, execute, and reject dynamic Linux agents'
+      fi
+    else
+      native_build_step_name='Build and execute native agent'
+    fi
+    if [[ "$workflow" == "$production" ]]; then
+      native_attest_step_name='Attest native agent provenance'
+      native_upload_step_name='Upload native agent'
+    else
+      native_attest_step_name='Attest dry-run agent provenance'
+      native_upload_step_name='Upload dry-run native agent'
+    fi
+    native_test_step_line=$(line_of_single_block_exact_literal \
+      "$workflow $native_job native test step" \
+      "      - name: $native_test_step_name" "$native_job_block")
+    native_build_step_line=$(line_of_single_block_exact_literal \
+      "$workflow $native_job native build step" \
+      "      - name: $native_build_step_name" "$native_job_block")
+    native_attest_step_line=$(line_of_single_block_exact_literal \
+      "$workflow $native_job native attestation step" \
+      "      - name: $native_attest_step_name" "$native_job_block")
+    native_upload_step_line=$(line_of_single_block_exact_literal \
+      "$workflow $native_job native upload step" \
+      "      - name: $native_upload_step_name" "$native_job_block")
+    [[ "$native_test_step_line" -lt "$native_build_step_line" \
+      && "$native_build_step_line" -lt "$native_attest_step_line" \
+      && "$native_attest_step_line" -lt "$native_upload_step_line" ]] \
+      || fail "$workflow $native_job must test before build, attestation, and upload"
+
+    actual_native_job_sha256=$(printf '%s' "$native_job_block" | sha256_stdin)
+    expected_native_job_sha256=$(reviewed_native_job_sha256 \
+      "$workflow_kind" "$native_job")
+    [[ "$actual_native_job_sha256" == "$expected_native_job_sha256" ]] \
+      || fail "$workflow $native_job job differs from its fully reviewed block"
+  done
+
+  if grep -F -- 'cargo test -p nrm-protocol -p nrm-agent -p nrm-sidecar' "$workflow"; then
+    fail "$workflow must not run the process-heavy sidecar suite at default parallelism"
+  fi
 done
 
 sign_block="$(sed -n '/^  sign:/,/^  publish:/p' "$production" | sed '$d')"
@@ -150,7 +313,6 @@ awk -v start="$heredoc_start" -v finish="$heredoc_end" '
 ' "$production" > "$signer_python" \
   || fail 'could not extract the indentation-safe inline signer Python'
 [[ -s "$signer_python" ]] || fail 'inline signer Python is empty'
-command -v python3 >/dev/null 2>&1 || fail 'python3 is required to compile the inline signer'
 PYTHONPYCACHEPREFIX="$temporary/pycache" python3 -m py_compile "$signer_python" \
   || fail 'inline signer Python does not compile'
 
