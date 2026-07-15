@@ -94,8 +94,10 @@ secure_directory() {
   secure_path=$1
   require_current_owner=$2
   [ -d "$secure_path" ] && [ ! -L "$secure_path" ] || return 1
+  secure_stat_style=gnu
   if secure_metadata=$(LC_ALL=C stat -c '%u %a' "$secure_path" 2>/dev/null); then :
-  elif secure_metadata=$(LC_ALL=C stat -f '%u %Lp' "$secure_path" 2>/dev/null); then :
+  elif secure_metadata=$(LC_ALL=C stat -f '%u %p' "$secure_path" 2>/dev/null); then
+    secure_stat_style=bsd
   else return 1
   fi
   old_ifs=$IFS
@@ -105,6 +107,12 @@ secure_directory() {
   [ "$#" -eq 2 ] || return 1
   secure_owner=$1
   secure_mode=$2
+  if [ "$secure_stat_style" = bsd ]; then
+    case "$secure_mode" in
+      4[0-7][0-7][0-7][0-7]) secure_mode=${secure_mode#?} ;;
+      *) return 1 ;;
+    esac
+  fi
   case "$secure_owner" in ''|*[!0-9]*) return 1 ;; esac
   if [ "$secure_owner" != 0 ] && [ "$secure_owner" != "$current_uid" ]; then return 1; fi
   if [ "$require_current_owner" = 1 ] && [ "$secure_owner" != "$current_uid" ]; then return 1; fi
@@ -1042,8 +1050,10 @@ secure_directory() {
   secure_path=$1
   require_current_owner=$2
   [ -d "$secure_path" ] && [ ! -L "$secure_path" ] || return 1
+  secure_stat_style=gnu
   if secure_metadata=$(LC_ALL=C stat -c '%u %a' "$secure_path" 2>/dev/null); then :
-  elif secure_metadata=$(LC_ALL=C stat -f '%u %Lp' "$secure_path" 2>/dev/null); then :
+  elif secure_metadata=$(LC_ALL=C stat -f '%u %p' "$secure_path" 2>/dev/null); then
+    secure_stat_style=bsd
   else return 1
   fi
   old_ifs=$IFS
@@ -1053,6 +1063,12 @@ secure_directory() {
   [ "$#" -eq 2 ] || return 1
   secure_owner=$1
   secure_mode=$2
+  if [ "$secure_stat_style" = bsd ]; then
+    case "$secure_mode" in
+      4[0-7][0-7][0-7][0-7]) secure_mode=${secure_mode#?} ;;
+      *) return 1 ;;
+    esac
+  fi
   case "$secure_owner" in ''|*[!0-9]*) return 1 ;; esac
   if [ "$secure_owner" != 0 ] && [ "$secure_owner" != "$current_uid" ]; then return 1; fi
   if [ "$require_current_owner" = 1 ] && [ "$secure_owner" != "$current_uid" ]; then return 1; fi
@@ -3546,6 +3562,103 @@ rm -f "$claim"
         let linked_target = linked_parent.join("nrm-agent");
         let linked_plan = plan(linked_target.to_str().unwrap(), true);
         let rejected = run(&linked_plan.lease_command(TOKEN).unwrap(), &[]);
+        assert_eq!(rejected.status.code(), Some(40), "{}", stderr(&rejected));
+        assert_eq!(
+            classify_install_failure(rejected.status.code(), &stderr(&rejected)).kind,
+            InstallFailureKind::InvalidTarget
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bsd_stat_preserves_sticky_ancestor_bits_for_lease_and_stage() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        const TOKEN: &str = "0123456789abcdef0123456789abcdef";
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let fake_bin = root.path().join("fake-bin");
+        fs::create_dir(&fake_bin).unwrap();
+        let fake_stat = fake_bin.join("stat");
+        fs::write(
+            &fake_stat,
+            br#"#!/bin/sh
+[ "$1" = "-f" ] || exit 1
+format=$2
+path=$3
+uid=$(id -u) || exit 1
+case "$format" in
+  '%u %p')
+    [ -d "$path" ] && [ ! -L "$path" ] || exit 1
+    case "$path" in
+      /|/private) printf '0 40755\n' ;;
+      /tmp|/private/tmp) printf '0 41777\n' ;;
+      */bad-bsd-type) printf '%s 100700\n' "$uid" ;;
+      *) printf '%s 40700\n' "$uid" ;;
+    esac
+    ;;
+  '%u %Lp')
+    if [ -d "$path" ] && [ ! -L "$path" ]; then
+      case "$path" in
+        /|/private) printf '0 755\n' ;;
+        /tmp|/private/tmp) printf '0 777\n' ;;
+        *) printf '%s 700\n' "$uid" ;;
+      esac
+    else
+      printf '%s 600\n' "$uid"
+    fi
+    ;;
+  '%u') printf '%s\n' "$uid" ;;
+  *) exit 1 ;;
+esac
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&fake_stat, fs::Permissions::from_mode(0o755)).unwrap();
+        let search_path = std::path::PathBuf::from(format!(
+            "{}:{}",
+            fake_bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        ));
+
+        let lease_target = root.path().join("lease/new/nrm-agent");
+        let lease_plan = plan(lease_target.to_str().unwrap(), true);
+        let leased = run_with_env(
+            &lease_plan.lease_command(TOKEN).unwrap(),
+            &[],
+            Some(("PATH", &search_path)),
+        );
+        assert!(leased.status.success(), "{}", stderr(&leased));
+        lease_plan
+            .parse_lease_ready_stdout(TOKEN, &stdout(&leased))
+            .unwrap();
+
+        let candidate = fake_agent(VERSION);
+        let stage_target = root.path().join("stage/new/nrm-agent");
+        let stage_plan = plan_for_candidate(stage_target.to_str().unwrap(), true, &candidate);
+        let staged_output = run_with_env(
+            &stage_plan.stage_command(),
+            &candidate,
+            Some(("PATH", &search_path)),
+        );
+        assert!(staged_output.status.success(), "{}", stderr(&staged_output));
+        let staged = stage_plan
+            .parse_stage_stdout(&stdout(&staged_output))
+            .unwrap();
+        let cleanup = run_with_env(
+            &stage_plan.cleanup_command(&staged),
+            &[],
+            Some(("PATH", &search_path)),
+        );
+        assert!(cleanup.status.success(), "{}", stderr(&cleanup));
+
+        let malformed_parent = root.path().join("bad-bsd-type");
+        fs::create_dir(&malformed_parent).unwrap();
+        let malformed_plan = plan(malformed_parent.join("nrm-agent").to_str().unwrap(), true);
+        let rejected = run_with_env(
+            &malformed_plan.lease_command(TOKEN).unwrap(),
+            &[],
+            Some(("PATH", &search_path)),
+        );
         assert_eq!(rejected.status.code(), Some(40), "{}", stderr(&rejected));
         assert_eq!(
             classify_install_failure(rejected.status.code(), &stderr(&rejected)).kind,
