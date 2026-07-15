@@ -1587,20 +1587,25 @@ fn main() {
         stdin.write_all(&request).unwrap();
         stdin.flush().unwrap();
 
-        let timeout = Duration::from_secs(10);
-        let received_stdout = stdout_rx.recv_timeout(timeout).unwrap_or_else(|error| {
+        // This is a deadlock watchdog, not a process-startup performance
+        // contract. Native ARM64 hosted runners can spend several seconds in
+        // PowerShell startup and Add-Type before the child is created.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let remaining = || deadline.saturating_duration_since(Instant::now());
+        let received_stdout = stdout_rx.recv_timeout(remaining()).unwrap_or_else(|error| {
             let _ = child.kill();
             let _ = child.wait();
             panic!("stdout was not flushed before stdin EOF: {error}");
         });
         assert_eq!(received_stdout.unwrap(), request);
-        stderr_rx
-            .recv_timeout(timeout)
-            .expect("stderr was not flushed before stdin EOF")
-            .unwrap();
+        let received_stderr = stderr_rx.recv_timeout(remaining()).unwrap_or_else(|error| {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("stderr was not flushed before stdin EOF: {error}");
+        });
+        received_stderr.unwrap();
 
         drop(stdin);
-        let deadline = Instant::now() + timeout;
         let status = loop {
             if let Some(status) = child.try_wait().unwrap() {
                 break status;
