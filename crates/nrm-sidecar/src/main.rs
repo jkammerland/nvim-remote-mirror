@@ -15941,17 +15941,20 @@ mod tests {
         recovery_plan.set_expected_sha256(&source_sha256).unwrap();
         let recovery_token = "fedcba9876543210fedcba9876543210";
         let recovery_started = Instant::now();
+        // A native macOS process launch can exceed 200 ms on a busy hosted
+        // runner. Keep each attempt bounded, and retain a separate total
+        // bound so a genuinely live stale owner still fails the test.
         let (mut recovery_lease, readiness) = loop {
             match RemoteInstallLease::acquire(
                 &recovery_ssh,
                 recovery_plan.lease_command(recovery_token).unwrap(),
                 None,
-                Duration::from_millis(200),
+                Duration::from_secs(1),
             ) {
                 Ok(acquired) => break acquired,
                 Err(error)
                     if error.to_string().contains("install_in_progress")
-                        && recovery_started.elapsed() < Duration::from_secs(2) =>
+                        && recovery_started.elapsed() < Duration::from_secs(5) =>
                 {
                     thread::sleep(Duration::from_millis(10));
                 }
@@ -20779,14 +20782,13 @@ mod tests {
     fn lsp_wait_kills_stalled_child_after_grace() {
         let mut child = Command::new("sh").arg("-c").arg("sleep 5").spawn().unwrap();
         let started = Instant::now();
-        let err = wait_lsp_child_with_grace(&mut child, Duration::from_millis(20)).unwrap_err();
+        // Leave enough of the grace period for macOS to schedule and reap a
+        // SIGKILLed child while remaining far below its natural five seconds.
+        let err = wait_lsp_child_with_grace(&mut child, Duration::from_millis(500)).unwrap_err();
         let elapsed = started.elapsed();
+        assert!(err.to_string().contains("killed with"), "{err:#}");
         assert!(
-            err.to_string().contains("language server did not exit"),
-            "{err:#}"
-        );
-        assert!(
-            elapsed < Duration::from_secs(1),
+            elapsed < Duration::from_secs(2),
             "wait should kill promptly, elapsed {elapsed:?}"
         );
         let status = child.try_wait().unwrap().expect("child should be reaped");
@@ -20800,8 +20802,10 @@ mod tests {
             Command::new("sh").arg("-c").arg("sleep 5").spawn().unwrap(),
         ));
         let started = Instant::now();
+        // As above, exercise the killed-and-reaped path rather than making
+        // the assertion depend on a 10 ms hosted-runner scheduling window.
         let err =
-            finish_lsp_upstream_result(Ok(()), &child, Duration::from_millis(20)).unwrap_err();
+            finish_lsp_upstream_result(Ok(()), &child, Duration::from_millis(500)).unwrap_err();
         let elapsed = started.elapsed();
 
         assert!(
@@ -20809,8 +20813,9 @@ mod tests {
                 .contains("language server did not stop after LSP client input closed"),
             "{err:#}"
         );
+        assert!(format!("{err:#}").contains("killed with"), "{err:#}");
         assert!(
-            elapsed < Duration::from_secs(1),
+            elapsed < Duration::from_secs(2),
             "upstream EOF should not wait for natural child exit, elapsed {elapsed:?}"
         );
         let status = child

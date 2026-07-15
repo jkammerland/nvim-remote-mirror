@@ -3273,6 +3273,70 @@ mod tests {
     }
 
     #[cfg(windows)]
+    struct NativeTestDirectory {
+        _temporary_directory: tempfile::TempDir,
+        canonical_path: PathBuf,
+    }
+
+    #[cfg(windows)]
+    impl NativeTestDirectory {
+        fn path(&self) -> &Path {
+            &self.canonical_path
+        }
+    }
+
+    #[cfg(windows)]
+    fn native_test_directory() -> NativeTestDirectory {
+        let directory = tempfile::tempdir().unwrap();
+        let encoded_path = STANDARD.encode(directory.path().to_str().unwrap().as_bytes());
+        let script = format!(
+            r#"$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
+$path = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{encoded_path}'))
+[Console]::Out.WriteLine([IO.Path]::GetFullPath($path))"#
+        );
+        let output = run_script(&powershell_encoded_command(&script), None);
+        assert!(
+            output.status.success(),
+            "PowerShell 5.1 failed to canonicalize the native-test directory"
+        );
+        let stdout = std::str::from_utf8(&output.stdout).unwrap();
+        let mut lines = stdout.lines();
+        let canonical = lines.next().unwrap_or_default();
+        assert!(
+            !canonical.is_empty() && lines.next().is_none(),
+            "PowerShell 5.1 returned an invalid native-test directory record"
+        );
+        assert!(
+            !canonical.chars().any(char::is_control),
+            "PowerShell 5.1 returned controls in the native-test directory"
+        );
+        let bytes = canonical.as_bytes();
+        assert!(
+            bytes.len() >= 3
+                && bytes[0].is_ascii_alphabetic()
+                && bytes[1] == b':'
+                && bytes[2] == b'\\'
+                && !canonical.contains('/'),
+            "PowerShell 5.1 did not return an absolute drive path"
+        );
+        let canonical_path = PathBuf::from(canonical);
+        assert!(
+            canonical_path.is_absolute() && canonical_path.is_dir(),
+            "PowerShell 5.1 returned an unusable native-test directory"
+        );
+        assert!(
+            fs::canonicalize(&canonical_path).unwrap()
+                == fs::canonicalize(directory.path()).unwrap(),
+            "PowerShell 5.1 changed the native-test directory identity"
+        );
+        NativeTestDirectory {
+            _temporary_directory: directory,
+            canonical_path,
+        }
+    }
+
+    #[cfg(windows)]
     fn run_streamed_action(
         plan: &WindowsInstallPlan,
         script: &str,
@@ -3359,7 +3423,7 @@ mod tests {
 
         const TOKEN_ONE: &str = "0123456789abcdef0123456789abcdef";
         const TOKEN_TWO: &str = "fedcba9876543210fedcba9876543210";
-        let directory = tempfile::tempdir().unwrap();
+        let directory = native_test_directory();
 
         let target = directory.path().join("released-agent.exe");
         let target = target.to_str().unwrap();
@@ -3508,7 +3572,7 @@ try {{ [Console]::Out.WriteLine('READY'); [Console]::Out.Flush(); [void][Console
     fn native_powershell_transaction_handles_locking_rollback_and_new_install() {
         use crate::agent_install::{classify_install_failure, InstallFailureKind};
 
-        let directory = tempfile::tempdir().unwrap();
+        let directory = native_test_directory();
         let candidate = build_version_candidate(directory.path());
         let candidate_bytes = fs::read(&candidate).unwrap();
         let target = directory.path().join("nrm-agent.exe");
@@ -3689,7 +3753,7 @@ try {{ [Console]::Out.WriteLine('READY'); [Console]::Out.Flush(); [void][Console
     #[cfg(windows)]
     #[test]
     fn native_recovery_uses_historical_journal_digest_after_candidate_upgrade() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = native_test_directory();
         let candidate = build_version_candidate(directory.path());
         let candidate_bytes = fs::read(&candidate).unwrap();
         let next_candidate_digest = sha256_hex(b"different signed release candidate");
@@ -3773,7 +3837,7 @@ try {{ [Console]::Out.WriteLine('READY'); [Console]::Out.Flush(); [void][Console
     fn native_reconciliation_preserves_changed_backup_and_target_artifacts() {
         use crate::agent_install::{classify_install_failure, InstallFailureKind};
 
-        let directory = tempfile::tempdir().unwrap();
+        let directory = native_test_directory();
         let candidate = build_version_candidate(directory.path());
         let candidate_bytes = fs::read(&candidate).unwrap();
         let previous_bytes = b"previous remote agent";
@@ -3867,7 +3931,7 @@ try {{ [Console]::Out.WriteLine('READY'); [Console]::Out.Flush(); [void][Console
     fn native_reconciliation_preserves_stage_when_prior_target_disappears() {
         use crate::agent_install::{classify_install_failure, InstallFailureKind};
 
-        let directory = tempfile::tempdir().unwrap();
+        let directory = native_test_directory();
         let candidate = build_version_candidate(directory.path());
         let candidate_bytes = fs::read(&candidate).unwrap();
         let target = directory.path().join("missing-prior-agent.exe");

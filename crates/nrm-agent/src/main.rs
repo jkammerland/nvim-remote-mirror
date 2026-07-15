@@ -1434,7 +1434,10 @@ fn abort_write_file_cas(state: &mut AgentState, upload_id: String) -> Result<Res
 }
 
 fn cleanup_expired_uploads(state: &mut AgentState) {
-    let now = Instant::now();
+    cleanup_expired_uploads_at(state, Instant::now());
+}
+
+fn cleanup_expired_uploads_at(state: &mut AgentState, now: Instant) {
     let expired = state
         .uploads
         .iter()
@@ -5442,8 +5445,11 @@ mod tests {
             other => panic!("unexpected begin response: {other:?}"),
         };
         let tmp_path = state.uploads.get(&upload_id).unwrap().tmp_path.clone();
-        state.uploads.get_mut(&upload_id).unwrap().created_at =
-            Instant::now() - UPLOAD_TTL - Duration::from_secs(1);
+        let created_at = state.uploads.get(&upload_id).unwrap().created_at;
+        cleanup_expired_uploads_at(&mut state, created_at + UPLOAD_TTL);
+        assert!(state.uploads.contains_key(&upload_id));
+        assert!(tmp_path.exists());
+        cleanup_expired_uploads_at(&mut state, created_at + UPLOAD_TTL + Duration::from_secs(1));
 
         let next = begin_write_file_cas(
             &mut state,
