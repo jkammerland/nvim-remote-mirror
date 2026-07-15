@@ -16679,6 +16679,7 @@ mod tests {
         fs::set_permissions(&socket, fs::Permissions::from_mode(LISTENER_SOCKET_MODE)).unwrap();
         let live_error = prepare_listener_socket(&socket).unwrap_err().to_string();
         assert!(live_error.contains("already in use"));
+        assert!(socket.exists(), "a live socket must never be removed");
         let socket_metadata = fs::symlink_metadata(&socket).unwrap();
         let foreign_error = validate_listener_socket_metadata(
             &socket,
@@ -16690,8 +16691,18 @@ mod tests {
         assert!(foreign_error.contains("must be owned by the current uid"));
 
         drop(listener);
-        prepare_listener_socket(&socket).unwrap();
-        assert!(!socket.exists());
+        fs::remove_file(&socket).unwrap();
+
+        let stale_socket = root.path().join("stale-sidecar.sock");
+        let stale_listener = UnixListener::bind(&stale_socket).unwrap();
+        fs::set_permissions(
+            &stale_socket,
+            fs::Permissions::from_mode(LISTENER_SOCKET_MODE),
+        )
+        .unwrap();
+        drop(stale_listener);
+        prepare_listener_socket(&stale_socket).unwrap();
+        assert!(!stale_socket.exists());
     }
 
     #[cfg(unix)]
