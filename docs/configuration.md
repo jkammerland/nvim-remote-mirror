@@ -188,6 +188,9 @@ POSIX lease directory is reaped only after every well-formed publication claim
 identity is proven dead. Malformed claim names/file types or otherwise
 ambiguous state fail closed; dead partial claim contents are not treated as an
 additional ownership record.
+Windows holders consume a token-bound release marker sent over a second SSH
+command and self-release after a bounded snapshot of the remaining bootstrap
+budget if the sidecar disappears.
 
 Portable Rust cannot interrupt an individual filesystem syscall already inside
 the kernel. Local registry/cache work checks the deadline immediately before

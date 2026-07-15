@@ -159,6 +159,18 @@ proven dead. Malformed names or file types fail closed, while a dead partial
 claim is recovered from its strict token/PID filename without trusting its
 contents.
 
+Windows lease holders do not depend on delayed stdin or EOF delivery from
+PowerShell 5.1 through Win32-OpenSSH. The sidecar sends a second SSH command
+that creates and durably flushes a strict `.release.<token>` marker beside the
+exclusive delete-on-close lease anchor. The holder polls for the exact regular,
+non-reparse marker, opens it exclusively with delete-on-close, verifies its
+token-bound bytes, and then releases the owner and anchor. Its watchdog uses a
+snapshot of the remaining whole-bootstrap budget, including the reserved
+recovery window, so a caller crash cannot leave the holder indefinitely. A
+later holder removes stale regular release markers without trusting their names
+or contents; locked, directory, or reparse-point state fails closed. A malformed
+current-token marker also fails closed.
+
 Each transaction publishes a stable same-directory journal before the artifact
 upload starts. After a process or connection interruption, the next lease
 holder reconciles that journal before its health probe. A prepared partial

@@ -406,6 +406,14 @@ struct AgentInstallDecision {
     skip_reason: Option<String>,
 }
 
+enum RemoteAgentInstallLeaseOutcome {
+    Skipped(Value),
+    Transaction {
+        result: std::result::Result<agent_install::ActivatedInstall, AgentInstallTransactionError>,
+        effective_force: bool,
+    },
+}
+
 fn agent_install_decision(
     before_status: &str,
     update: bool,
@@ -466,14 +474,33 @@ enum PreparedAgentInstallPlan {
 }
 
 impl PreparedAgentInstallPlan {
-    fn lease_command(&self, token: &str) -> Result<String> {
+    fn lease_command(&self, token: &str, watchdog: Duration) -> Result<String> {
         match self {
             Self::Posix(plan) => plan
                 .lease_command(token)
                 .context("invalid POSIX remote-agent lease plan"),
             Self::Windows(plan) => plan
-                .lease_command(token)
+                .lease_command(token, watchdog)
                 .context("invalid Windows remote-agent lease plan"),
+        }
+    }
+
+    fn lease_release_signal(
+        &self,
+        ssh: &SshTransport,
+        token: &str,
+    ) -> Result<Option<RemoteInstallLeaseReleaseSignal>> {
+        match self {
+            Self::Posix(_) => Ok(None),
+            Self::Windows(plan) => Ok(Some(RemoteInstallLeaseReleaseSignal {
+                ssh: ssh.clone(),
+                remote_command: plan
+                    .lease_release_command(token)
+                    .context("invalid Windows remote-agent lease release plan")?,
+                expected_record: plan
+                    .expected_lease_release_record(token)
+                    .context("invalid Windows remote-agent lease release record")?,
+            })),
         }
     }
 
@@ -561,7 +588,46 @@ struct RemoteInstallLease {
     child: Option<Child>,
     stdin: Option<ChildStdin>,
     stderr: Option<ProcessOutputReader>,
+    release_signal: Option<RemoteInstallLeaseReleaseSignal>,
     released: bool,
+}
+
+struct RemoteInstallLeaseReleaseSignal {
+    ssh: SshTransport,
+    remote_command: String,
+    expected_record: String,
+}
+
+impl RemoteInstallLeaseReleaseSignal {
+    fn send(self, timeout: Duration) -> Result<()> {
+        if timeout.is_zero() {
+            bail!(ProcessTimeoutError {
+                context: "remote agent installation lease release signal".to_owned(),
+                timeout,
+                status: None,
+            });
+        }
+        let context = "remote agent installation lease release signal";
+        let output = run_command_capture(
+            self.ssh.command(self.remote_command),
+            None,
+            timeout,
+            context,
+        )?;
+        if !output.status.success() {
+            let failure =
+                agent_install::classify_install_failure(output.status.code(), &output.stderr);
+            bail!("{}: {}", install_failure_code(failure.kind), failure.detail);
+        }
+        let expected_lf = format!("{}\n", self.expected_record);
+        let expected_crlf = format!("{}\r\n", self.expected_record);
+        if output.stdout != expected_lf && output.stdout != expected_crlf {
+            bail!(
+                "invalid_state: remote agent installation lease release returned an invalid record"
+            );
+        }
+        Ok(())
+    }
 }
 
 fn detach_install_lease_stderr(stderr: ProcessOutputReader) {
@@ -591,6 +657,7 @@ impl RemoteInstallLease {
     fn acquire(
         ssh: &SshTransport,
         remote_command: String,
+        release_signal: Option<RemoteInstallLeaseReleaseSignal>,
         timeout: Duration,
     ) -> Result<(Self, String)> {
         let context = "remote agent installation lease";
@@ -683,6 +750,7 @@ impl RemoteInstallLease {
                                     child: Some(child),
                                     stdin: Some(stdin),
                                     stderr: Some(stderr),
+                                    release_signal,
                                     released: false,
                                 },
                                 stdout,
@@ -804,20 +872,34 @@ impl RemoteInstallLease {
         // handed to a detached reaper. Drop must never start a second wait
         // that can outlive the caller's bootstrap deadline.
         self.released = true;
+        let started = Instant::now();
+        let mut release_signal_error = self
+            .release_signal
+            .take()
+            .and_then(|signal| signal.send(timeout).err());
         self.stdin.take();
         let mut stderr = self.stderr.take();
         let Some(mut child) = self.child.take() else {
             if let Some(stderr) = stderr.take() {
                 detach_install_lease_stderr(stderr);
             }
-            return Ok(());
+            return match release_signal_error.take() {
+                Some(error) => Err(error),
+                None => Ok(()),
+            };
         };
         if stderr.is_none() {
             kill_child_tree(&mut child);
             reap_child_in_background(child);
-            bail!("remote agent installation lease stderr was unavailable during release");
+            let error =
+                anyhow!("remote agent installation lease stderr was unavailable during release");
+            return Err(match release_signal_error.take() {
+                Some(signal_error) => error.context(format!(
+                    "install lease release signal also failed: {signal_error:#}"
+                )),
+                None => error,
+            });
         }
-        let started = Instant::now();
         let status = loop {
             match child.try_wait() {
                 Ok(Some(status)) => break status,
@@ -844,9 +926,15 @@ impl RemoteInstallLease {
                         timeout,
                         status,
                     });
-                    return Err(match reap_error {
+                    let timeout_error = match reap_error {
                         Some(error) => timeout_error.context(format!(
                             "failed to reap remote agent installation lease holder: {error}"
+                        )),
+                        None => timeout_error,
+                    };
+                    return Err(match release_signal_error.take() {
+                        Some(signal_error) => timeout_error.context(format!(
+                            "install lease release signal failed: {signal_error:#}"
                         )),
                         None => timeout_error,
                     });
@@ -855,8 +943,14 @@ impl RemoteInstallLease {
                     kill_child_tree(&mut child);
                     reap_child_in_background(child);
                     detach_install_lease_stderr(stderr.take().unwrap());
-                    return Err(error)
+                    let error = anyhow!(error)
                         .context("failed to poll remote agent installation lease holder");
+                    return Err(match release_signal_error.take() {
+                        Some(signal_error) => error.context(format!(
+                            "install lease release signal also failed: {signal_error:#}"
+                        )),
+                        None => error,
+                    });
                 }
             }
         };
@@ -878,15 +972,35 @@ impl RemoteInstallLease {
             // stderr even though the fixed lease holder exited cleanly. The
             // stream is still bounded and drained, but success is determined
             // by the holder's exit status.
+            if started.elapsed() >= timeout {
+                let error = anyhow!(ProcessTimeoutError {
+                    context: "remote agent installation lease release".to_owned(),
+                    timeout,
+                    status: Some(status),
+                });
+                return Err(match release_signal_error.take() {
+                    Some(signal_error) => error.context(format!(
+                        "install lease release signal also failed: {signal_error:#}"
+                    )),
+                    None => error,
+                });
+            }
+            if let Some(error) = release_signal_error.take() {
+                eprintln!(
+                    "remote agent installation lease release signal lost its acknowledgement after the holder released cleanly: {error:#}"
+                );
+            }
             return Ok(());
         }
         let stderr = String::from_utf8_lossy(&stderr);
         let failure = agent_install::classify_install_failure(status.code(), &stderr);
-        Err(anyhow!(
-            "{}: {}",
-            install_failure_code(failure.kind),
-            failure.detail
-        ))
+        let error = anyhow!("{}: {}", install_failure_code(failure.kind), failure.detail);
+        Err(match release_signal_error.take() {
+            Some(signal_error) => error.context(format!(
+                "install lease release signal also failed: {signal_error:#}"
+            )),
+            None => error,
+        })
     }
 }
 
@@ -8572,138 +8686,164 @@ impl Sidecar {
             mut plan,
         } = prepared;
         let lease_token = new_install_lease_token(&target_path);
-        let lease_command = plan.lease_command(&lease_token)?;
         let lease_timeout = deadline.forward_timeout("remote agent installation lease")?;
+        let lease_command = plan.lease_command(&lease_token, deadline.remaining())?;
+        let release_signal = plan.lease_release_signal(&ssh, &lease_token)?;
         let (mut lease, lease_stdout) =
-            RemoteInstallLease::acquire(&ssh, lease_command, lease_timeout).map_err(|error| {
-                deadline.map_budgeted_error(
-                    BootstrapBudget::Forward,
-                    "remote agent installation lease",
-                    error,
-                )
-            })?;
-        let leased_target = plan.parse_lease_ready_stdout(&lease_token, &lease_stdout)?;
-        plan.bind_lease_target(&leased_target)?;
-        plan.set_lease_token(&lease_token)?;
-
-        if let PreparedAgentInstallPlan::Windows(windows_plan) = &plan {
-            let recovery = {
-                let mut recovery_ops = WindowsSshInstallOps {
-                    plan: windows_plan.clone(),
-                    ssh: ssh.clone(),
-                    source_path: None,
-                    source_size: 0,
-                    source_sha256: source_sha256.clone(),
-                    launch: self.agent.launch.clone(),
-                    normal_agent: &mut self.agent,
-                    lease: &mut lease,
-                    deadline,
-                };
-                recovery_ops.recover_stale_transaction()?
-            };
-            if recovery.kind != windows_agent_install::WindowsInstallRecoveryKind::None {
-                eprintln!(
-                    "recovered interrupted remote-agent transaction at {}: {:?}",
-                    recovery.target_path, recovery.kind
-                );
-            }
-        }
-
-        if automatic {
-            lease.ensure_held("automatic remote agent post-lease health probe")?;
-            self.agent.clear_all_remote_unavailable();
-            let fresh_timeout =
-                deadline.forward_timeout("automatic remote agent post-lease health probe")?;
-            let fresh = self.remote_health_with_timeout(preempt_epoch, fresh_timeout);
-            deadline.forward_timeout("automatic remote agent post-lease health probe")?;
-            let fresh_status = fresh
-                .get("agent_status")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown");
-            let fresh_decision = agent_install_decision(fresh_status, update, false, true)?;
-            if let Some(reason) = fresh_decision.skip_reason {
-                release_remote_install_lease_with_deadline(
-                    &mut lease,
-                    deadline,
-                    "remote agent installation lease release",
-                )
-                .context("failed to release remote agent installation lease")?;
-                let mut result = json!({
-                    "status": "skipped",
-                    "reason": reason,
-                    "automatic": true,
-                    "install_path": leased_target,
-                    "requested_install_path": target_path,
-                    "remote_health": fresh
-                });
-                if let (Some(result), Some(details)) =
-                    (result.as_object_mut(), source.details.as_object())
-                {
-                    result.extend(details.clone());
-                }
-                return Ok(result);
-            }
-            effective_force = fresh_decision.effective_force;
-            plan.set_force(effective_force);
-
-            // The fresh probe may have started the normal control-lane agent.
-            // Stop it again before any staging or target mutation while the
-            // remote lease is still held.
-            let reset_timeout =
-                deadline.forward_timeout("post-lease control-lane agent worker exit")?;
-            self.agent
-                .invalidate_shared_workers_with_timeout(
-                    reset_timeout,
-                    "post-lease control-lane agent worker exit",
-                )
+            RemoteInstallLease::acquire(&ssh, lease_command, release_signal, lease_timeout)
                 .map_err(|error| {
                     deadline.map_budgeted_error(
                         BootstrapBudget::Forward,
-                        "post-lease control-lane agent worker exit",
+                        "remote agent installation lease",
                         error,
                     )
                 })?;
-            self.agent.clear_all_remote_unavailable();
-            lease.ensure_held("automatic remote agent staging")?;
-        }
+        let lease_work = (|| -> Result<RemoteAgentInstallLeaseOutcome> {
+            let leased_target = plan.parse_lease_ready_stdout(&lease_token, &lease_stdout)?;
+            plan.bind_lease_target(&leased_target)?;
+            plan.set_lease_token(&lease_token)?;
 
-        let launch = self.agent.launch.clone();
-        let mut operations: Box<dyn AgentInstallOps + '_> = match plan {
-            PreparedAgentInstallPlan::Posix(plan) => Box::new(PosixSshInstallOps {
-                plan,
-                ssh,
-                source: Some(upload),
-                launch,
-                normal_agent: &mut self.agent,
-                lease: &mut lease,
-                deadline,
-            }),
-            PreparedAgentInstallPlan::Windows(plan) => {
-                drop(upload);
-                Box::new(WindowsSshInstallOps {
+            if let PreparedAgentInstallPlan::Windows(windows_plan) = &plan {
+                let recovery = {
+                    let mut recovery_ops = WindowsSshInstallOps {
+                        plan: windows_plan.clone(),
+                        ssh: ssh.clone(),
+                        source_path: None,
+                        source_size: 0,
+                        source_sha256: source_sha256.clone(),
+                        launch: self.agent.launch.clone(),
+                        normal_agent: &mut self.agent,
+                        lease: &mut lease,
+                        deadline,
+                    };
+                    recovery_ops.recover_stale_transaction()?
+                };
+                if recovery.kind != windows_agent_install::WindowsInstallRecoveryKind::None {
+                    eprintln!(
+                        "recovered interrupted remote-agent transaction at {}: {:?}",
+                        recovery.target_path, recovery.kind
+                    );
+                }
+            }
+
+            if automatic {
+                lease.ensure_held("automatic remote agent post-lease health probe")?;
+                self.agent.clear_all_remote_unavailable();
+                let fresh_timeout =
+                    deadline.forward_timeout("automatic remote agent post-lease health probe")?;
+                let fresh = self.remote_health_with_timeout(preempt_epoch, fresh_timeout);
+                deadline.forward_timeout("automatic remote agent post-lease health probe")?;
+                let fresh_status = fresh
+                    .get("agent_status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                let fresh_decision = agent_install_decision(fresh_status, update, false, true)?;
+                if let Some(reason) = fresh_decision.skip_reason {
+                    let mut result = json!({
+                        "status": "skipped",
+                        "reason": reason,
+                        "automatic": true,
+                        "install_path": leased_target,
+                        "requested_install_path": target_path,
+                        "remote_health": fresh
+                    });
+                    if let (Some(result), Some(details)) =
+                        (result.as_object_mut(), source.details.as_object())
+                    {
+                        result.extend(details.clone());
+                    }
+                    return Ok(RemoteAgentInstallLeaseOutcome::Skipped(result));
+                }
+                effective_force = fresh_decision.effective_force;
+                plan.set_force(effective_force);
+
+                // The fresh probe may have started the normal control-lane agent.
+                // Stop it again before any staging or target mutation while the
+                // remote lease is still held.
+                let reset_timeout =
+                    deadline.forward_timeout("post-lease control-lane agent worker exit")?;
+                self.agent
+                    .invalidate_shared_workers_with_timeout(
+                        reset_timeout,
+                        "post-lease control-lane agent worker exit",
+                    )
+                    .map_err(|error| {
+                        deadline.map_budgeted_error(
+                            BootstrapBudget::Forward,
+                            "post-lease control-lane agent worker exit",
+                            error,
+                        )
+                    })?;
+                self.agent.clear_all_remote_unavailable();
+                lease.ensure_held("automatic remote agent staging")?;
+            }
+
+            let launch = self.agent.launch.clone();
+            let mut operations: Box<dyn AgentInstallOps + '_> = match plan {
+                PreparedAgentInstallPlan::Posix(plan) => Box::new(PosixSshInstallOps {
                     plan,
                     ssh,
-                    source_path: Some(source.path.clone()),
-                    source_size,
-                    source_sha256: source_sha256.clone(),
+                    source: Some(upload),
                     launch,
                     normal_agent: &mut self.agent,
                     lease: &mut lease,
                     deadline,
-                })
-            }
-        };
-        let transaction = run_agent_install_transaction(operations.as_mut());
-        drop(operations);
+                }),
+                PreparedAgentInstallPlan::Windows(plan) => {
+                    drop(upload);
+                    Box::new(WindowsSshInstallOps {
+                        plan,
+                        ssh,
+                        source_path: Some(source.path.clone()),
+                        source_size,
+                        source_sha256: source_sha256.clone(),
+                        launch,
+                        normal_agent: &mut self.agent,
+                        lease: &mut lease,
+                        deadline,
+                    })
+                }
+            };
+            let result = run_agent_install_transaction(operations.as_mut());
+            drop(operations);
+            Ok(RemoteAgentInstallLeaseOutcome::Transaction {
+                result,
+                effective_force,
+            })
+        })();
         let release = release_remote_install_lease_with_deadline(
             &mut lease,
             deadline,
             "remote agent installation lease release",
         );
+        let (transaction, effective_force) = match lease_work {
+            Ok(RemoteAgentInstallLeaseOutcome::Skipped(result)) => {
+                release.context("failed to release remote agent installation lease")?;
+                return Ok(result);
+            }
+            Ok(RemoteAgentInstallLeaseOutcome::Transaction {
+                result,
+                effective_force,
+            }) => (result, effective_force),
+            Err(error) => {
+                let error = match release {
+                    Ok(()) => error,
+                    Err(release_error) if is_bootstrap_timeout(&release_error) => release_error
+                        .context(format!(
+                            "lease-protected remote agent work also failed: {error:#}"
+                        )),
+                    Err(release_error) => {
+                        error.context(format!("install_lease_release_failed: {release_error:#}"))
+                    }
+                };
+                return Err(error);
+            }
+        };
         let activated = match transaction {
             Ok(activated) => activated,
             Err(mut error) => {
                 if let Err(release) = release {
+                    error.bootstrap_timeout |= is_bootstrap_timeout(&release);
                     error
                         .message
                         .push_str(&format!("; install_lease_release_failed: {release}"));
@@ -8724,7 +8864,9 @@ impl Sidecar {
             self.record_agent_install_error_health(&error);
             return Err(anyhow!(error));
         }
-        let after = self.remote_health(preempt_epoch);
+        let after_timeout = deadline.recovery_timeout("post-install remote agent health probe")?;
+        let after = self.remote_health_with_timeout(preempt_epoch, after_timeout);
+        deadline.recovery_timeout("post-install remote agent health probe")?;
         let mut result = json!({
             "status": if update { "updated" } else { "installed" },
             "install_path": activated.staged.target_path,
@@ -13125,6 +13267,7 @@ mod tests {
                 child: Some(child),
                 stdin: Some(stdin),
                 stderr: Some(stderr),
+                release_signal: None,
                 released: false,
             },
             pid,
@@ -14937,6 +15080,7 @@ mod tests {
         let (mut lease, readiness) = RemoteInstallLease::acquire(
             &ssh,
             plan.lease_command(token_one).unwrap(),
+            None,
             Duration::from_secs(2),
         )
         .unwrap();
@@ -14949,6 +15093,7 @@ mod tests {
         let contender = RemoteInstallLease::acquire(
             &ssh,
             plan.lease_command(token_two).unwrap(),
+            None,
             Duration::from_secs(2),
         )
         .err()
@@ -14964,6 +15109,7 @@ mod tests {
         let oversized = RemoteInstallLease::acquire(
             &ssh,
             "printf '%05000d' 0".to_owned(),
+            None,
             Duration::from_secs(2),
         )
         .err()
@@ -14972,6 +15118,67 @@ mod tests {
             oversized.to_string().contains("readiness exceeded"),
             "{oversized:#}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remote_install_lease_sends_bounded_out_of_band_release_signal() {
+        let dir = tempdir().unwrap();
+        let fake_ssh = dir.path().join("fake-ssh");
+        fs::write(
+            &fake_ssh,
+            b"#!/bin/sh\nfor last do :; done\nexec sh -c \"$last\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&fake_ssh, fs::Permissions::from_mode(0o755)).unwrap();
+        let ssh = SshTransport {
+            program: fake_ssh,
+            target: "ignored.example".to_owned(),
+            connect_timeout_seconds: 1,
+        };
+        let marker = dir.path().join("release-marker");
+        let marker_quoted = shell_quote(marker.to_string_lossy());
+        let holder_command = format!(
+            "printf 'NRM_TEST_LEASE_READY\\n'; while [ ! -f {marker_quoted} ]; do sleep 0.01; done; rm -f {marker_quoted}"
+        );
+        let release_command =
+            format!("printf release > {marker_quoted}; printf 'NRM_TEST_LEASE_RELEASED\\n'");
+        let signal = RemoteInstallLeaseReleaseSignal {
+            ssh: ssh.clone(),
+            remote_command: release_command,
+            expected_record: "NRM_TEST_LEASE_RELEASED".to_owned(),
+        };
+        let (mut lease, readiness) =
+            RemoteInstallLease::acquire(&ssh, holder_command, Some(signal), Duration::from_secs(2))
+                .unwrap();
+        assert_eq!(readiness, "NRM_TEST_LEASE_READY\n");
+        lease.release(Duration::from_secs(2)).unwrap();
+        assert!(!marker.exists());
+
+        let delayed_marker = dir.path().join("delayed-release-marker");
+        let delayed_marker_quoted = shell_quote(delayed_marker.to_string_lossy());
+        let holder_command = format!(
+            "printf 'NRM_TEST_LEASE_READY\\n'; while [ ! -f {delayed_marker_quoted} ]; do sleep 0.01; done; rm -f {delayed_marker_quoted}"
+        );
+        let release_command = format!(
+            "printf release > {delayed_marker_quoted}; printf 'NRM_TEST_LEASE_RELEASED\\n'; sleep 1"
+        );
+        let signal = RemoteInstallLeaseReleaseSignal {
+            ssh: ssh.clone(),
+            remote_command: release_command,
+            expected_record: "NRM_TEST_LEASE_RELEASED".to_owned(),
+        };
+        let (mut lease, _) =
+            RemoteInstallLease::acquire(&ssh, holder_command, Some(signal), Duration::from_secs(2))
+                .unwrap();
+        let error = lease.release(Duration::from_millis(100)).unwrap_err();
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.downcast_ref::<ProcessTimeoutError>().is_some()),
+            "{error:#}"
+        );
+        assert!(!delayed_marker.exists());
     }
 
     #[cfg(unix)]
@@ -15738,6 +15945,7 @@ mod tests {
             match RemoteInstallLease::acquire(
                 &recovery_ssh,
                 recovery_plan.lease_command(recovery_token).unwrap(),
+                None,
                 Duration::from_millis(200),
             ) {
                 Ok(acquired) => break acquired,

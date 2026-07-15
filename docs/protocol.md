@@ -93,6 +93,10 @@ A live claim protects the owner-publication window; an ownerless directory is
 reaped only after every well-formed claim identity is proven dead. Malformed
 claim names or file types fail closed; dead partial contents are reaped using
 the strict token/PID filename.
+Windows releases the exclusive lease through a separately transported,
+token-bound marker rather than delayed PowerShell stdin. The holder validates
+and consumes that marker with delete-on-close and has a remaining-budget
+watchdog so a lost sidecar cannot retain the lease indefinitely.
 
 Before artifact upload, the installer publishes a stable same-directory
 transaction journal. The next lease holder reconciles it before running the

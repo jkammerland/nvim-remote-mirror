@@ -96,6 +96,10 @@ and operation-owner publication windows. An ownerless directory is reaped only
 after every well-formed claim identity is proven dead. Malformed claim names or
 file types fail closed; a dead partial claim is reaped from its strict
 token/PID filename without trusting its contents.
+On Windows, lease release uses a token-bound same-directory marker sent over a
+separate SSH command. The holder validates and deletes that marker atomically;
+a watchdog bounded by a snapshot of the remaining bootstrap budget releases
+the anchor if the sidecar disappears.
 
 The installer also publishes a stable same-directory transaction journal
 before upload. The next lease holder recovers an interrupted transaction before

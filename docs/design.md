@@ -70,6 +70,9 @@ the lease-owner and operation-owner publication windows: a live claim prevents
 ownerless state from being reaped, while malformed claim identities or file
 types fail closed. Dead partial claim contents are safely ignored because the
 strict token/PID filename is the liveness identity.
+Windows uses an exclusive delete-on-close anchor plus a token-bound release
+marker sent by a separate SSH process. A remote watchdog tied to the same
+remaining-budget snapshot closes the anchor after a caller crash.
 The
 registry cache is a performance/reliability layer, not a trust anchor: current
 keys, signatures, manifest policy, size, and digest are reverified on every

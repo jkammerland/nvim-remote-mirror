@@ -4,7 +4,7 @@
 //! controlled values are serialized as JSON, base64 encoded, and decoded only
 //! after PowerShell starts; they are never interpolated into script source.
 
-use std::{fmt, io::Write as _};
+use std::{fmt, io::Write as _, time::Duration};
 
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use flate2::{write::GzEncoder, Compression};
@@ -28,6 +28,7 @@ const ACTION_SCRIPT_CLEANED_RECORD: &str = "NRM_INSTALL_ACTION_SCRIPT_CLEANED_V1
 const STAGE_PREPARED_RECORD: &str = "NRM_INSTALL_STAGE_PREPARED_V1";
 const STAGE_ABORTED_RECORD: &str = "NRM_INSTALL_STAGE_ABORTED_V1";
 const LEASE_READY_RECORD: &str = "NRM_INSTALL_LEASE_READY_V1";
+const LEASE_RELEASED_RECORD: &str = "NRM_INSTALL_LEASE_RELEASED_V1";
 const RECOVERED_RECORD: &str = "NRM_INSTALL_RECOVERED_V1";
 const PAYLOAD_MARKER: &str = "__NRM_INSTALL_PAYLOAD_BASE64__";
 const COMPRESSED_SCRIPT_MARKER: &str = "__NRM_INSTALL_SCRIPT_GZIP_BASE64__";
@@ -47,11 +48,12 @@ $ProgressPreference='SilentlyContinue'
 function root($e){while($null-ne $e.InnerException){$e=$e.InnerException};$e}
 function fail($c,$s,$d){if($d){[Console]::Error.WriteLine($d.Replace("`r",' ').Replace("`n",' '))};[Console]::Error.WriteLine("NRM_INSTALL_ERROR_V1`t$c");exit $s}
 $p=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__NRM_INSTALL_PAYLOAD_BASE64__'))|ConvertFrom-Json
-$t=[string]$p.target;$k=[string]$p.token;$l="$t.nrm-install-lease";$o="$l.owner.$k";$f=$null;$h=$null
+$t=[string]$p.target;$k=[string]$p.token;$w=[long]$p.watchdog_ms;$l="$t.nrm-install-lease";$o="$l.owner.$k";$u="$l.release.$k";$f=$null;$h=$null
 try{
  $x=[IO.Path]::GetFullPath($t)
  if(-not [string]::Equals($x,$t,[StringComparison]::OrdinalIgnoreCase)){fail invalid_target 40 'target path was not canonical'}
  if($k-notmatch'^[0-9a-f]{32}$'){fail invalid_state 40 'lease token was malformed'}
+ if($w-lt 1){fail invalid_state 40 'lease watchdog was malformed'}
  $d=[IO.Path]::GetDirectoryName($t);if(!$d){fail invalid_target 40 'target path has no parent directory'}
  [void][IO.Directory]::CreateDirectory($d)
  $f=New-Object IO.FileStream($l,[IO.FileMode]::CreateNew,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None,4096,[IO.FileOptions]::DeleteOnClose)
@@ -61,16 +63,58 @@ try{
   try{$q=New-Object IO.FileStream($m,[IO.FileMode]::Open,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None)}catch{$r=root $_.Exception;$c=$r.HResult-band 0xffff;if($c-eq 32-or$c-eq 33){fail install_in_progress 24 'an installer operation is still active'};throw}finally{if($q){$q.Dispose()}}
   [IO.File]::Delete($m)
  }
+ foreach($s in [IO.Directory]::GetFileSystemEntries($d,[IO.Path]::GetFileName($l)+'.release.*')){$a=[IO.File]::GetAttributes($s);if($a-band([IO.FileAttributes]::Directory-bor[IO.FileAttributes]::ReparsePoint)){fail invalid_state 40 'unsafe lease release path'};[IO.File]::Delete($s)}
  foreach($s in [IO.Directory]::GetFileSystemEntries($d,[IO.Path]::GetFileName($l)+'.owner.*')){$a=[IO.File]::GetAttributes($s);if($a-band([IO.FileAttributes]::Directory-bor[IO.FileAttributes]::ReparsePoint)){fail invalid_state 40 'unsafe lease owner path'};[IO.File]::Delete($s)}
  $b=[Text.Encoding]::ASCII.GetBytes("$k`n");$h=New-Object IO.FileStream($o,[IO.FileMode]::CreateNew,[IO.FileAccess]::ReadWrite,[IO.FileShare]::Read);$h.Write($b,0,$b.Length);$h.Flush($true)
 }catch{$r=root $_.Exception;$c=$r.HResult-band 0xffff;if($c-eq 32-or$c-eq 33-or$c-eq 80-or$c-eq 183){fail install_in_progress 24 'another installer holds the remote-agent lease'};fail invalid_state 40 $r.Message}
 try{
  $f.SetLength(0);$f.Write($b,0,$b.Length);$f.Flush($true)
  [Console]::Out.WriteLine("NRM_INSTALL_LEASE_READY_V1`t$t`t$k");[Console]::Out.Flush()
- $i=[Console]::OpenStandardInput();while($i.ReadByte()-ne -1){}
+ $z=[Diagnostics.Stopwatch]::StartNew();$v=$false
+ while(!$v){
+  if([IO.Directory]::Exists($u)){fail invalid_state 40 'lease release path was a directory'}
+  if([IO.File]::Exists($u)){
+   $m=$null
+   try{
+    $a=[IO.File]::GetAttributes($u);if($a-band([IO.FileAttributes]::Directory-bor[IO.FileAttributes]::ReparsePoint)){fail invalid_state 40 'unsafe lease release path'}
+    $m=New-Object IO.FileStream($u,[IO.FileMode]::Open,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None,4096,[IO.FileOptions]::DeleteOnClose)
+    if($m.Length-ne 33){fail invalid_state 40 'lease release record had the wrong length'}
+    $q=New-Object byte[] 33;$n=$m.Read($q,0,$q.Length);if($n-ne 33-or[Text.Encoding]::ASCII.GetString($q,0,$n)-cne"$k`n"){fail invalid_state 40 'lease release record did not match the holder'}
+    $v=$true
+   }catch{$e=root $_.Exception;$c=$e.HResult-band 0xffff;if($c-ne 32-and$c-ne 33){fail invalid_state 40 $e.Message}}
+   finally{if($m){$m.Dispose()}}
+  }
+  if(!$v-and$z.ElapsedMilliseconds-ge$w){fail cleanup_failed 51 'lease watchdog expired before release'}
+  if(!$v){Start-Sleep -Milliseconds 25}
+ }
 }finally{
  if($h){$h.Dispose();try{[IO.File]::Delete($o)}catch{}};if($f){$f.Dispose()}
 }
+"#;
+
+const POWERSHELL_RELEASE_LEASE_SCRIPT: &str = r#"$ErrorActionPreference='Stop'
+$ProgressPreference='SilentlyContinue'
+[Console]::OutputEncoding=New-Object Text.UTF8Encoding($false)
+function root($e){while($null-ne $e.InnerException){$e=$e.InnerException};$e}
+function fail($c,$s,$d){if($d){[Console]::Error.WriteLine($d.Replace("`r",' ').Replace("`n",' '))};[Console]::Error.WriteLine("NRM_INSTALL_ERROR_V1`t$c");exit $s}
+$p=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('__NRM_INSTALL_PAYLOAD_BASE64__'))|ConvertFrom-Json
+$t=[string]$p.target;$k=[string]$p.token;$l="$t.nrm-install-lease";$o="$l.owner.$k";$r="$l.release.$k";$a=$null;$h=$null;$f=$null;$created=$false
+try{
+ $x=[IO.Path]::GetFullPath($t);if(-not[string]::Equals($x,$t,[StringComparison]::OrdinalIgnoreCase)){fail invalid_target 40 'target path was not canonical'}
+ if($k-notmatch'^[0-9a-f]{32}$'){fail invalid_state 40 'lease token was malformed'}
+ $held=$false
+ try{$a=New-Object IO.FileStream($l,[IO.FileMode]::Open,[IO.FileAccess]::ReadWrite,[IO.FileShare]::ReadWrite)}catch{$e=root $_.Exception;$c=$e.HResult-band 0xffff;if($c-eq 32-or$c-eq 33){$held=$true}else{throw}}finally{if($a){$a.Dispose()}}
+ if(!$held){fail invalid_state 40 'installation lease holder was not active'}
+ if(![IO.File]::Exists($o)-or[IO.Directory]::Exists($o)){fail invalid_state 40 'installation lease owner record was missing'}
+ $x=[IO.File]::GetAttributes($o);if($x-band([IO.FileAttributes]::Directory-bor[IO.FileAttributes]::ReparsePoint)){fail invalid_state 40 'unsafe lease owner path'}
+ $h=New-Object IO.FileStream($o,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::ReadWrite)
+ if($h.Length-ne 33){fail invalid_state 40 'lease owner record had the wrong length'}
+ $b=New-Object byte[] 33;$n=$h.Read($b,0,$b.Length);if($n-ne 33-or[Text.Encoding]::ASCII.GetString($b,0,$n)-cne"$k`n"){fail invalid_state 40 'lease owner record did not match the holder'};$h.Dispose();$h=$null
+ if([IO.File]::Exists($r)-or[IO.Directory]::Exists($r)){fail invalid_state 40 'lease release path already existed'}
+ $f=New-Object IO.FileStream($r,[IO.FileMode]::CreateNew,[IO.FileAccess]::ReadWrite,[IO.FileShare]::None);$created=$true
+ $b=[Text.Encoding]::ASCII.GetBytes("$k`n");$f.Write($b,0,$b.Length);$f.Flush($true);$f.Dispose();$f=$null
+}catch{$e=root $_.Exception;if($f){$f.Dispose();$f=$null};if($h){$h.Dispose();$h=$null};if($created){try{if([IO.File]::Exists($r)){[IO.File]::Delete($r)}}catch{}};$c=$e.HResult-band 0xffff;if($c-eq 32-or$c-eq 33-or$c-eq 80-or$c-eq 183){fail invalid_state 40 'lease release signal conflicted with remote state'};fail invalid_state 40 $e.Message}
+[Console]::Out.WriteLine("NRM_INSTALL_LEASE_RELEASED_V1`t$t`t$k")
 "#;
 
 const POWERSHELL_COMPRESSED_SCRIPT_BOOTSTRAP: &str = r#"$ErrorActionPreference='Stop'
@@ -1699,15 +1743,66 @@ impl WindowsInstallPlan {
         &self.target
     }
 
-    pub(crate) fn lease_command(&self, token: &str) -> Result<String, WindowsInstallPlanError> {
+    pub(crate) fn lease_command(
+        &self,
+        token: &str,
+        watchdog: Duration,
+    ) -> Result<String, WindowsInstallPlanError> {
         validate_lease_token(token)?;
+        let watchdog_ms = u64::try_from(watchdog.as_millis())
+            .unwrap_or(u64::MAX)
+            .min(i64::MAX as u64);
+        if watchdog_ms == 0 {
+            return Err(WindowsInstallPlanError::Record(
+                "lease watchdog must be at least one millisecond".to_owned(),
+            ));
+        }
         Ok(render_compressed_command_script(
             POWERSHELL_LEASE_SCRIPT,
+            &LeaseAcquirePayload {
+                target: &self.target,
+                token,
+                watchdog_ms,
+            },
+        ))
+    }
+
+    pub(crate) fn lease_release_command(
+        &self,
+        token: &str,
+    ) -> Result<String, WindowsInstallPlanError> {
+        validate_lease_token(token)?;
+        Ok(render_compressed_command_script(
+            POWERSHELL_RELEASE_LEASE_SCRIPT,
             &LeasePayload {
                 target: &self.target,
                 token,
             },
         ))
+    }
+
+    pub(crate) fn expected_lease_release_record(
+        &self,
+        token: &str,
+    ) -> Result<String, WindowsInstallPlanError> {
+        validate_lease_token(token)?;
+        Ok(format!("{LEASE_RELEASED_RECORD}\t{}\t{token}", self.target))
+    }
+
+    #[cfg(all(test, windows))]
+    pub(crate) fn parse_lease_release_stdout(
+        &self,
+        token: &str,
+        stdout: &str,
+    ) -> Result<(), WindowsInstallPlanError> {
+        validate_lease_token(token)?;
+        let fields = parse_record(stdout, LEASE_RELEASED_RECORD, 2)?;
+        if fields[0] != self.target || fields[1] != token {
+            return Err(WindowsInstallPlanError::Record(
+                "lease release record does not match the requested target and token".to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     pub(crate) fn parse_lease_ready_stdout(
@@ -2240,6 +2335,13 @@ struct LeasePayload<'a> {
 }
 
 #[derive(Serialize)]
+struct LeaseAcquirePayload<'a> {
+    target: &'a str,
+    token: &'a str,
+    watchdog_ms: u64,
+}
+
+#[derive(Serialize)]
 struct StagePayload<'a> {
     target: &'a str,
     stage: &'a str,
@@ -2752,7 +2854,7 @@ mod tests {
         const TOKEN: &str = "0123456789abcdef0123456789abcdef";
         let target = r"C:\Users\me\Agent ' ; $(Write-Output owned)\nrm-agent.exe";
         let mut plan = plan(target, true);
-        let command = plan.lease_command(TOKEN).unwrap();
+        let command = plan.lease_command(TOKEN, Duration::from_secs(120)).unwrap();
         let script = decode_compressed_command(&command);
         assert!(!script.contains(target));
         assert!(script.contains("[IO.FileShare]::None"));
@@ -2764,11 +2866,32 @@ mod tests {
         assert!(!script.contains("WriteAllText"));
         assert!(!script.contains("ReadAllText"));
         assert!(script.contains("fail install_in_progress 24"));
-        assert!(script.contains("OpenStandardInput"));
+        assert!(!script.contains("OpenStandardInput"));
+        assert!(!script.contains("ReadLine"));
+        assert!(script.contains("[Diagnostics.Stopwatch]::StartNew()"));
+        assert!(script.contains("$u=\"$l.release.$k\""));
+        assert!(script.contains("lease watchdog expired before release"));
         let lease_payload = payload(&script);
         assert_eq!(lease_payload["target"], target);
         assert_eq!(lease_payload["token"], TOKEN);
+        assert_eq!(lease_payload["watchdog_ms"], 120_000);
         assert!(command.len() < MAX_OPENSSH_CMD_COMMAND_CHARS);
+
+        let release_command = plan.lease_release_command(TOKEN).unwrap();
+        let release_script = decode_compressed_command(&release_command);
+        assert!(!release_script.contains(target));
+        assert!(release_script.contains("$r=\"$l.release.$k\""));
+        assert!(release_script.contains("[IO.FileMode]::CreateNew"));
+        assert!(release_script.contains("$f.Flush($true)"));
+        assert!(release_script.contains(LEASE_RELEASED_RECORD));
+        let release_payload = payload(&release_script);
+        assert_eq!(release_payload["target"], target);
+        assert_eq!(release_payload["token"], TOKEN);
+        assert_eq!(
+            plan.expected_lease_release_record(TOKEN).unwrap(),
+            format!("{LEASE_RELEASED_RECORD}\t{target}\t{TOKEN}")
+        );
+        assert!(release_command.len() < MAX_OPENSSH_CMD_COMMAND_CHARS);
 
         let record = format!("{LEASE_READY_RECORD}\t{target}\t{TOKEN}\r\n");
         assert_eq!(
@@ -2782,7 +2905,11 @@ mod tests {
         ] {
             assert!(plan.parse_lease_ready_stdout(TOKEN, &invalid).is_err());
         }
-        assert!(plan.lease_command("ABCDEF").is_err());
+        assert!(plan
+            .lease_command("ABCDEF", Duration::from_secs(1))
+            .is_err());
+        assert!(plan.lease_command(TOKEN, Duration::ZERO).is_err());
+        assert!(plan.lease_release_command("ABCDEF").is_err());
 
         plan.set_lease_token(TOKEN).unwrap();
         let guarded = plan
@@ -2949,7 +3076,9 @@ mod tests {
         let mut commands = vec![
             plan.action_script_upload_command(),
             plan.action_script_cleanup_command(&helper),
-            plan.lease_command("0123456789abcdef0123456789abcdef")
+            plan.lease_command("0123456789abcdef0123456789abcdef", Duration::from_secs(120))
+                .unwrap(),
+            plan.lease_release_command("0123456789abcdef0123456789abcdef")
                 .unwrap(),
         ];
         commands.extend(
@@ -3199,6 +3328,116 @@ mod tests {
             std::str::from_utf8(&output.stdout).unwrap(),
             std::str::from_utf8(&output.stderr).unwrap(),
         )
+    }
+
+    #[cfg(windows)]
+    fn start_lease_holder(
+        plan: &WindowsInstallPlan,
+        token: &str,
+        watchdog: Duration,
+    ) -> std::process::Child {
+        let command = plan.lease_command(token, watchdog).unwrap();
+        let mut process = encoded_process(&command);
+        let mut child = process
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut readiness = String::new();
+        BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut readiness)
+            .unwrap();
+        plan.parse_lease_ready_stdout(token, &readiness).unwrap();
+        child
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_lease_release_marker_is_strict_and_watchdog_cleans_up() {
+        use crate::agent_install::{classify_install_failure, InstallFailureKind};
+
+        const TOKEN_ONE: &str = "0123456789abcdef0123456789abcdef";
+        const TOKEN_TWO: &str = "fedcba9876543210fedcba9876543210";
+        let directory = tempfile::tempdir().unwrap();
+
+        let target = directory.path().join("released-agent.exe");
+        let target = target.to_str().unwrap();
+        let plan = WindowsInstallPlan::new(target, VERSION, PROTOCOL, true).unwrap();
+        let stale_release = format!("{target}.nrm-install-lease.release.{TOKEN_TWO}");
+        fs::write(&stale_release, format!("{TOKEN_TWO}\n")).unwrap();
+        let holder = start_lease_holder(&plan, TOKEN_ONE, Duration::from_secs(30));
+        assert!(!Path::new(&stale_release).exists());
+
+        let wrong_release = run_script(&plan.lease_release_command(TOKEN_TWO).unwrap(), None);
+        let (_, stderr) = output_text(&wrong_release);
+        assert!(
+            !wrong_release.status.success(),
+            "wrong-token release succeeded"
+        );
+        assert_eq!(
+            classify_install_failure(wrong_release.status.code(), stderr).kind,
+            InstallFailureKind::InvalidState
+        );
+        assert!(!Path::new(&format!("{target}.nrm-install-lease.release.{TOKEN_TWO}")).exists());
+
+        let released = run_script(&plan.lease_release_command(TOKEN_ONE).unwrap(), None);
+        let (stdout, stderr) = output_text(&released);
+        assert!(released.status.success(), "lease release failed: {stderr}");
+        plan.parse_lease_release_stdout(TOKEN_ONE, stdout).unwrap();
+        let holder = holder.wait_with_output().unwrap();
+        assert!(
+            holder.status.success(),
+            "lease holder failed: {}",
+            String::from_utf8_lossy(&holder.stderr)
+        );
+        for path in [
+            format!("{target}.nrm-install-lease"),
+            format!("{target}.nrm-install-lease.owner.{TOKEN_ONE}"),
+            format!("{target}.nrm-install-lease.release.{TOKEN_ONE}"),
+        ] {
+            assert!(!Path::new(&path).exists(), "lease residue remained: {path}");
+        }
+
+        let watchdog_target = directory.path().join("watchdog-agent.exe");
+        let watchdog_target = watchdog_target.to_str().unwrap();
+        let watchdog_plan =
+            WindowsInstallPlan::new(watchdog_target, VERSION, PROTOCOL, true).unwrap();
+        let watchdog_holder =
+            start_lease_holder(&watchdog_plan, TOKEN_ONE, Duration::from_millis(100));
+        let watchdog_output = watchdog_holder.wait_with_output().unwrap();
+        let stderr = String::from_utf8_lossy(&watchdog_output.stderr);
+        assert_eq!(
+            classify_install_failure(watchdog_output.status.code(), &stderr).kind,
+            InstallFailureKind::CleanupFailed
+        );
+        assert!(!Path::new(&format!("{watchdog_target}.nrm-install-lease")).exists());
+        assert!(!Path::new(&format!(
+            "{watchdog_target}.nrm-install-lease.owner.{TOKEN_ONE}"
+        ))
+        .exists());
+
+        let malformed_target = directory.path().join("malformed-agent.exe");
+        let malformed_target = malformed_target.to_str().unwrap();
+        let malformed_plan =
+            WindowsInstallPlan::new(malformed_target, VERSION, PROTOCOL, true).unwrap();
+        let malformed_holder =
+            start_lease_holder(&malformed_plan, TOKEN_ONE, Duration::from_secs(5));
+        let malformed_release = format!("{malformed_target}.nrm-install-lease.release.{TOKEN_ONE}");
+        fs::write(&malformed_release, b"wrong release record").unwrap();
+        let malformed_output = malformed_holder.wait_with_output().unwrap();
+        let stderr = String::from_utf8_lossy(&malformed_output.stderr);
+        assert_eq!(
+            classify_install_failure(malformed_output.status.code(), &stderr).kind,
+            InstallFailureKind::InvalidState
+        );
+        for path in [
+            format!("{malformed_target}.nrm-install-lease"),
+            format!("{malformed_target}.nrm-install-lease.owner.{TOKEN_ONE}"),
+            malformed_release,
+        ] {
+            assert!(!Path::new(&path).exists(), "lease residue remained: {path}");
+        }
     }
 
     #[cfg(windows)]
