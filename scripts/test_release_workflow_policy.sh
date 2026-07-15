@@ -72,6 +72,8 @@ move_trap_after_validation() {
 }
 
 cp "$production" "$case_production"
+# This sed expression intentionally matches literal workflow variables.
+# shellcheck disable=SC2016
 apply_sed_mutation \
   's#"repos/$GITHUB_REPOSITORY/releases" --input -#"repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" --input -#'
 expect_rejected 'draft lookup through the published-release-by-tag endpoint'
