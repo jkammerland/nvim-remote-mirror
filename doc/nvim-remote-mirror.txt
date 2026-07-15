@@ -570,6 +570,17 @@ absolute file:// URL and contain exactly one {version} placeholder. Configure
 trusted 32-byte Ed25519 public keys with out-of-band key IDs; the default
 signature threshold is one. Registry responses can never add trusted keys.
 
+To use the project's signed GitHub releases: >
+  require("nvim_remote_mirror").setup({
+    remote_agent_auto_install = true,
+    remote_agent_registry_url =
+      "https://github.com/jkammerland/nvim-remote-mirror/releases/download/v{version}/nrm-agent-manifest-v1.json",
+    remote_agent_registry_public_keys = {
+      ["release-2026-q3"] = "o70a35HCIieJ/B0jatGVvNB/6l3X2W4InbioQjIFHbY=",
+    },
+  })
+<
+
 Automatic or explicit install/update detects Linux, macOS, or Windows
 x64/ARM64, verifies detached signatures and the strict manifest locally,
 rechecks the selected artifact size and SHA-256, and then uploads it through

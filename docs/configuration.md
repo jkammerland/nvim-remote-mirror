@@ -129,9 +129,9 @@ keys are bootstrapped out of band; a registry response cannot add trust.
 require("nvim_remote_mirror").setup({
   remote_agent_auto_install = true,
   remote_agent_registry_url =
-    "https://github.com/owner/repo/releases/download/v{version}/nrm-agent-manifest-v1.json",
+    "https://github.com/jkammerland/nvim-remote-mirror/releases/download/v{version}/nrm-agent-manifest-v1.json",
   remote_agent_registry_public_keys = {
-    ["release-2026-q3"] = "<standard-base64-encoded-32-byte-Ed25519-key>",
+    ["release-2026-q3"] = "o70a35HCIieJ/B0jatGVvNB/6l3X2W4InbioQjIFHbY=",
   },
   remote_agent_registry_signature_threshold = 1,
   remote_agent_registry_cache_dir = nil,

@@ -151,9 +151,9 @@ require("nvim_remote_mirror").setup({
   -- Automatic repair is active only for SSH when this trusted registry is set.
   remote_agent_auto_install = true,
   remote_agent_registry_url =
-    "https://github.com/owner/repo/releases/download/v{version}/nrm-agent-manifest-v1.json",
+    "https://github.com/jkammerland/nvim-remote-mirror/releases/download/v{version}/nrm-agent-manifest-v1.json",
   remote_agent_registry_public_keys = {
-    ["release-2026-q3"] = "<standard-base64-encoded-32-byte-Ed25519-key>",
+    ["release-2026-q3"] = "o70a35HCIieJ/B0jatGVvNB/6l3X2W4InbioQjIFHbY=",
   },
 })
 ```

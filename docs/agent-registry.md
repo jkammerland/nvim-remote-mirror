@@ -16,13 +16,16 @@ key is a canonical, nonweak Ed25519 curve point before any registry retrieval.
 require("nvim_remote_mirror").setup({
   remote_agent_auto_install = true,
   remote_agent_registry_url =
-    "https://github.com/owner/repo/releases/download/v{version}/nrm-agent-manifest-v1.json",
+    "https://github.com/jkammerland/nvim-remote-mirror/releases/download/v{version}/nrm-agent-manifest-v1.json",
   remote_agent_registry_public_keys = {
-    ["release-2026-q3"] = "<standard-base64-encoded-32-byte-Ed25519-key>",
+    ["release-2026-q3"] = "o70a35HCIieJ/B0jatGVvNB/6l3X2W4InbioQjIFHbY=",
   },
   remote_agent_registry_signature_threshold = 1,
 })
 ```
+
+The SHA-256 fingerprint of the raw 32-byte `release-2026-q3` public key is
+`6b95a597aca67e9a52c51b69f1d7538262ce439ff03997c6e9f3a80b87509966`.
 
 Automatic bootstrap and explicit install/update both fail closed in registry
 mode: they never fall back to an unsigned local executable. Without a registry
