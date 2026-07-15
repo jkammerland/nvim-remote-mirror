@@ -936,6 +936,10 @@ while [ "$active_attempt" -lt 4 ]; do
 done
 if [ "$active_owned" != 1 ]; then fail install_in_progress 24; fi
 if ! mkdir "$starting" 2>/dev/null; then fail install_in_progress 24; fi
+# POSIX shells may attach /dev/null to an asynchronous list's standard input.
+# Preserve the upload stream before backgrounding, then make it the guarded
+# action's stdin explicitly. Close the saved descriptor in both processes.
+exec 3<&0
 (
   cd "$starting" || exit 40
   : >ready || exit 40
@@ -945,9 +949,10 @@ if ! mkdir "$starting" 2>/dev/null; then fail install_in_progress 24; fi
     [ "$gate_attempt" -lt 30 ] || exit 40
     sleep 1
   done
-  exec sh -c "$action"
+  exec sh -c "$action" <&3 3<&-
 ) &
 action_pid=$!
+exec 3<&-
 while [ ! -f "$starting/ready" ]; do
   kill -0 "$action_pid" 2>/dev/null || fail invalid_state 40
   sleep 1
@@ -2893,6 +2898,56 @@ mod tests {
         plan.parse_lease_ready_stdout(token, &stdout(&recovered))
             .unwrap();
         recovered
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn guarded_stage_preserves_upload_stdin_under_dash() {
+        use std::os::unix::fs::symlink;
+
+        const TOKEN: &str = "0123456789abcdef0123456789abcdef";
+
+        let directory = tempdir().unwrap();
+        let target = directory.path().join("nrm-agent");
+        let candidate = fake_agent(VERSION);
+        let mut plan = plan_for_candidate(target.to_str().unwrap(), true, &candidate);
+        let mut holder = acquire_lease_holder(&plan, TOKEN);
+        plan.set_lease_token(TOKEN).unwrap();
+
+        let command = plan.stage_command();
+        assert!(command.contains("exec 3<&0"));
+        assert!(command.contains("<&3 3<&-"));
+
+        let dash = ["/bin/dash", "/usr/bin/dash"]
+            .into_iter()
+            .map(std::path::Path::new)
+            .find(|path| path.is_file());
+        if let Some(dash) = dash {
+            let fake_bin = directory.path().join("dash-bin");
+            fs::create_dir(&fake_bin).unwrap();
+            symlink(dash, fake_bin.join("sh")).unwrap();
+            let search_path = std::path::PathBuf::from(format!(
+                "{}:{}",
+                fake_bin.display(),
+                std::env::var("PATH").unwrap_or_default()
+            ));
+
+            let staged_output = run_with_env(&command, &candidate, Some(("PATH", &search_path)));
+            assert!(staged_output.status.success(), "{}", stderr(&staged_output));
+            let staged = plan.parse_stage_stdout(&stdout(&staged_output)).unwrap();
+            assert_eq!(fs::read(&staged.stage_path).unwrap(), candidate);
+
+            let cleanup = run_with_env(
+                &plan.cleanup_command(&staged),
+                &[],
+                Some(("PATH", &search_path)),
+            );
+            assert!(cleanup.status.success(), "{}", stderr(&cleanup));
+        }
+
+        drop(holder.stdin.take());
+        let released = holder.wait_with_output().unwrap();
+        assert!(released.status.success(), "{}", stderr(&released));
     }
 
     #[cfg(unix)]
