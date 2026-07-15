@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-production=.github/workflows/release.yml
-dry_run=.github/workflows/release-dry-run.yml
+production=${NRM_RELEASE_WORKFLOW_PRODUCTION:-.github/workflows/release.yml}
+dry_run=${NRM_RELEASE_WORKFLOW_DRY_RUN:-.github/workflows/release-dry-run.yml}
 
 fail() {
   printf 'release workflow policy: %s\n' "$1" >&2
@@ -17,6 +17,26 @@ line_of_single_literal() {
   count=$(grep -Fc -- "$literal" "$path" || true)
   [[ "$count" -eq 1 ]] || fail "$description must occur exactly once, found $count"
   grep -nF -- "$literal" "$path" | cut -d: -f1
+}
+
+line_of_single_block_literal() {
+  local description=$1
+  local literal=$2
+  local block=$3
+  local count
+  count=$(grep -Fc -- "$literal" <<< "$block" || true)
+  [[ "$count" -eq 1 ]] || fail "$description must occur exactly once, found $count"
+  grep -nF -- "$literal" <<< "$block" | cut -d: -f1
+}
+
+line_of_single_block_exact_literal() {
+  local description=$1
+  local literal=$2
+  local block=$3
+  local count
+  count=$(grep -Fxc -- "$literal" <<< "$block" || true)
+  [[ "$count" -eq 1 ]] || fail "$description must occur exactly once, found $count"
+  grep -nFx -- "$literal" <<< "$block" | cut -d: -f1
 }
 
 for workflow in "$production" "$dry_run"; do
@@ -120,6 +140,86 @@ grep -F 'needs: [prepare, sign]' "$production" >/dev/null \
 if sed -n '/^  publish:/,$p' "$production" | grep -F 'environment: release'; then
   fail 'publish job must not receive the release environment secrets'
 fi
+
+draft_create_line=$(line_of_single_literal \
+  'draft-creation step' '      - name: Create draft release' "$production")
+draft_populate_line=$(line_of_single_literal \
+  'draft-population step' '      - name: Populate draft release' "$production")
+draft_verify_line=$(line_of_single_literal \
+  'draft-verification step' '      - name: Re-download and verify complete draft' "$production")
+draft_cleanup_line=$(line_of_single_literal \
+  'failed-draft cleanup step' "      - name: Remove this run's failed draft" "$production")
+if ! ((draft_create_line < draft_populate_line \
+    && draft_populate_line < draft_verify_line \
+    && draft_verify_line < draft_cleanup_line)); then
+  fail 'draft creation, population, verification, and cleanup steps are out of order'
+fi
+
+draft_create_block="$(
+  sed -n '/^      - name: Create draft release$/,/^      - name: Populate draft release$/p' \
+    "$production" | sed '$d'
+)"
+draft_populate_block="$(
+  sed -n '/^      - name: Populate draft release$/,/^      - name: Re-download and verify complete draft$/p' \
+    "$production" | sed '$d'
+)"
+grep -F 'id: draft' <<< "$draft_create_block" >/dev/null \
+  || fail 'draft creation does not expose the release identity to later cleanup'
+grep -F 'generate_release_notes: true' <<< "$draft_create_block" >/dev/null \
+  || fail 'draft creation does not request generated release notes'
+grep -F '**Work in progress.**' <<< "$draft_create_block" >/dev/null \
+  || fail 'draft creation does not mark the public release as work in progress'
+grep -F '"repos/$GITHUB_REPOSITORY/releases" --input -' <<< "$draft_create_block" >/dev/null \
+  || fail 'draft creation does not capture the create-release API response'
+grep -F 'draft_id="$(jq -er' <<< "$draft_create_block" >/dev/null \
+  || fail 'draft creation does not derive its cleanup ID from the create response'
+grep -F 'trap cleanup_incomplete_draft_create EXIT' <<< "$draft_create_block" >/dev/null \
+  || fail 'draft creation cannot clean up a post-create validation failure'
+draft_id_line=$(line_of_single_block_literal 'draft response ID capture' \
+  '          draft_id="$(jq -er' "$draft_create_block")
+draft_trap_line=$(line_of_single_block_literal 'draft inline cleanup trap installation' \
+  '          trap cleanup_incomplete_draft_create EXIT' "$draft_create_block")
+draft_validation_line=$(line_of_single_block_literal 'draft response validation' \
+  "            --arg warning '**Work in progress.**' \\" "$draft_create_block")
+draft_created_output_line=$(line_of_single_block_literal 'draft-created output' \
+  '          echo "created=true" >> "$GITHUB_OUTPUT"' "$draft_create_block")
+draft_id_output_line=$(line_of_single_block_literal 'draft-ID output' \
+  '          echo "id=$draft_id" >> "$GITHUB_OUTPUT"' "$draft_create_block")
+draft_trap_release_line=$(line_of_single_block_exact_literal 'draft inline cleanup trap release' \
+  '          trap - EXIT' "$draft_create_block")
+if ! ((draft_id_line < draft_trap_line \
+    && draft_trap_line < draft_validation_line \
+    && draft_validation_line < draft_created_output_line \
+    && draft_created_output_line < draft_id_output_line \
+    && draft_id_output_line < draft_trap_release_line)); then
+  fail 'draft inline cleanup trap does not cover validation and output publication'
+fi
+[[ "$(grep -Fc '"repos/$GITHUB_REPOSITORY/releases/$draft_id"' \
+  <<< "$draft_create_block")" -eq 2 ]] \
+  || fail 'draft-creation cleanup must retrieve and delete only the exact response release ID'
+grep -F 'if ! gh api --method DELETE \' <<< "$draft_create_block" >/dev/null \
+  || fail 'draft-creation cleanup does not delete its exact incomplete draft'
+if grep -F 'gh release upload' <<< "$draft_create_block"; then
+  fail 'draft creation and asset upload must be separate failure domains'
+fi
+line_of_single_literal 'draft asset upload' \
+  '          gh release upload "$RELEASE_TAG" "${assets[@]}"' "$production" >/dev/null
+grep -F '          gh release upload "$RELEASE_TAG" "${assets[@]}"' \
+  <<< "$draft_populate_block" >/dev/null \
+  || fail 'draft population does not contain the sole asset upload'
+if grep -F 'releases/tags/$RELEASE_TAG' "$production"; then
+  fail 'draft identity must not use the published-release-by-tag endpoint'
+fi
+
+cleanup_block="$(sed -n \
+  "/^      - name: Remove this run's failed draft\$/,\$p" "$production")"
+grep -F "steps.draft.outputs.created == 'true'" <<< "$cleanup_block" >/dev/null \
+  || fail 'failed-draft cleanup is not gated on successful draft creation'
+grep -F 'steps.draft.outputs.id' <<< "$cleanup_block" >/dev/null \
+  || fail 'failed-draft cleanup does not use the captured release ID'
+grep -F '"repos/$GITHUB_REPOSITORY/releases/$EXPECTED_RELEASE_ID"' \
+  <<< "$cleanup_block" >/dev/null \
+  || fail 'failed-draft cleanup does not retrieve the exact release by ID'
 
 if grep -F 'retention-days: 1' "$dry_run"; then
   fail 'dry-run artifacts can expire before a delayed ARM64 aggregate job'

@@ -95,9 +95,13 @@ scope, retention, and monitoring expectations.
 `just check` also runs `scripts/check_release_workflows.sh`. This static policy
 gate rejects mutable action references, drift in the checksum-pinned GitHub CLI,
 one-day dry-run artifacts, signing-secret references outside the isolated
-signer, or any checkout/Cargo/repository-script execution in that secret-bearing
-job. Run actionlint with ShellCheck integration as an additional workflow syntax
-gate before publishing release-workflow changes.
+signer, draft IDs recovered through the published-release-by-tag endpoint, or
+any checkout/Cargo/repository-script execution in that secret-bearing job. A
+mutation test also proves the draft-lifecycle checks reject combined
+create/upload failure domains, missing WIP labeling, and missing cleanup
+identity or inline post-create cleanup. Run actionlint with ShellCheck
+integration as an additional workflow syntax gate before publishing
+release-workflow changes.
 
 ## Sanitizer Position
 

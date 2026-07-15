@@ -35,6 +35,7 @@ shell-syntax:
 
 release-workflow-policy: shell-syntax
     scripts/check_release_workflows.sh
+    scripts/test_release_workflow_policy.sh
 
 whitespace:
     git diff --check
