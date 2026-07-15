@@ -2915,7 +2915,15 @@ impl AgentInterrupt {
 
     fn set_abort_handle(&self, handle: Arc<dyn AgentAbortHandle>) {
         if let Ok(mut current) = self.current_abort.lock() {
-            current.push(handle);
+            current.push(Arc::clone(&handle));
+        }
+        // Close the registration race with request_shutdown(): shutdown can
+        // snapshot an empty handle list after a worker's initial shutdown
+        // check but before that worker publishes its process handle. Checking
+        // again after publication guarantees that either request_shutdown()
+        // observes the handle or this registration aborts it directly.
+        if self.is_shutdown_requested() {
+            handle.abort();
         }
     }
 
@@ -15871,6 +15879,7 @@ mod tests {
     #[test]
     fn automatic_post_lease_probe_timeout_releases_lease_without_staging() {
         const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(3);
+        const RECOVERY_TIMEOUT: Duration = Duration::from_secs(5);
 
         let dir = tempdir().unwrap();
         let remote_dir = dir.path().join("remote-bin");
@@ -15946,20 +15955,25 @@ mod tests {
         recovery_plan.set_expected_sha256(&source_sha256).unwrap();
         let recovery_token = "fedcba9876543210fedcba9876543210";
         let recovery_started = Instant::now();
-        // A native macOS process launch can exceed 200 ms on a busy hosted
-        // runner. Keep each attempt bounded, and retain a separate total
-        // bound so a genuinely live stale owner still fails the test.
+        // A native process launch can be delayed on a busy hosted runner.
+        // Budget every attempt cumulatively so a genuinely live stale owner
+        // still fails the test without imposing an unrelated per-attempt cap.
         let (mut recovery_lease, readiness) = loop {
+            let recovery_remaining = remaining_timeout_since(recovery_started, RECOVERY_TIMEOUT);
+            assert!(
+                !recovery_remaining.is_zero(),
+                "next lease acquisition exceeded its recovery deadline"
+            );
             match RemoteInstallLease::acquire(
                 &recovery_ssh,
                 recovery_plan.lease_command(recovery_token).unwrap(),
                 None,
-                Duration::from_secs(1),
+                recovery_remaining,
             ) {
                 Ok(acquired) => break acquired,
                 Err(error)
                     if error.to_string().contains("install_in_progress")
-                        && recovery_started.elapsed() < Duration::from_secs(5) =>
+                        && recovery_started.elapsed() < RECOVERY_TIMEOUT =>
                 {
                     thread::sleep(Duration::from_millis(10));
                 }
@@ -15969,7 +15983,12 @@ mod tests {
         recovery_plan
             .parse_lease_ready_stdout(recovery_token, &readiness)
             .unwrap();
-        recovery_lease.release(Duration::from_secs(1)).unwrap();
+        let release_remaining = remaining_timeout_since(recovery_started, RECOVERY_TIMEOUT);
+        assert!(
+            !release_remaining.is_zero(),
+            "recovered lease exceeded its release deadline"
+        );
+        recovery_lease.release(release_remaining).unwrap();
 
         let lease_path = PathBuf::from(format!("{}.nrm-install-lease", target.display()));
         assert!(fs::read_dir(&remote_dir).unwrap().next().is_none());
@@ -17184,6 +17203,40 @@ mod tests {
         assert!(handle.aborts.load(Ordering::SeqCst) >= 1);
         assert_eq!(handle.waits.load(Ordering::SeqCst), 0);
 
+        interrupt.clear_abort_handle(&handle_trait);
+        assert!(!interrupt.has_current_abort());
+    }
+
+    #[test]
+    fn agent_interrupt_aborts_handle_registered_after_shutdown() {
+        let interrupt = AgentInterrupt::default();
+        let handle = Arc::new(TestAbortHandle::default());
+        let handle_trait: Arc<dyn AgentAbortHandle> = handle.clone();
+
+        interrupt.request_shutdown();
+        interrupt.set_abort_handle(Arc::clone(&handle_trait));
+
+        assert_eq!(handle.aborts.load(Ordering::SeqCst), 1);
+        assert!(interrupt.has_current_abort());
+        interrupt.clear_abort_handle(&handle_trait);
+        assert!(!interrupt.has_current_abort());
+    }
+
+    #[test]
+    fn agent_interrupt_aborts_late_handle_after_shutdown_misses_locked_registry() {
+        let interrupt = AgentInterrupt::default();
+        let registry_guard = interrupt.current_abort.lock().unwrap();
+
+        // request_shutdown() uses a nonblocking snapshot so it cannot see a
+        // handle registered while another path temporarily owns this lock.
+        interrupt.request_shutdown();
+        drop(registry_guard);
+
+        let handle = Arc::new(TestAbortHandle::default());
+        let handle_trait: Arc<dyn AgentAbortHandle> = handle.clone();
+        interrupt.set_abort_handle(Arc::clone(&handle_trait));
+
+        assert_eq!(handle.aborts.load(Ordering::SeqCst), 1);
         interrupt.clear_abort_handle(&handle_trait);
         assert!(!interrupt.has_current_abort());
     }
