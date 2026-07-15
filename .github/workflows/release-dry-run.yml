@@ -157,8 +157,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y musl-tools
+          sudo sed -i \
+            's|http://ports.ubuntu.com/ubuntu-ports|https://ports.ubuntu.com/ubuntu-ports|g' \
+            /etc/apt/sources.list.d/ubuntu.sources
+          if grep -F 'http://ports.ubuntu.com/ubuntu-ports' /etc/apt/sources.list.d/ubuntu.sources; then
+            echo "Ubuntu ports source was not upgraded to HTTPS" >&2
+            exit 1
+          fi
+          sudo apt-get -o Acquire::Retries=5 -o Acquire::ForceIPv4=true update
+          sudo apt-get -o Acquire::Retries=5 -o Acquire::ForceIPv4=true install -y musl-tools
           rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --target "$TARGET"
           rustup default "$RUST_TOOLCHAIN"
           rustc -vV

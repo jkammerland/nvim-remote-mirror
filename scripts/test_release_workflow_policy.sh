@@ -33,6 +33,54 @@ apply_sed_mutation() {
   mv "$mutated" "$case_production"
 }
 
+apply_dry_run_sed_mutation() {
+  local expression=$1
+  sed "$expression" "$case_dry_run" > "$mutated"
+  mv "$mutated" "$case_dry_run"
+}
+
+insert_before_line() {
+  local path=$1
+  local needle=$2
+  local insertion=$3
+  awk -v needle="$needle" -v insertion="$insertion" '
+    $0 == needle {
+      print insertion
+      inserted = 1
+    }
+    {
+      print
+    }
+    END {
+      if (!inserted) {
+        exit 42
+      }
+    }
+  ' "$path" > "$mutated"
+  mv "$mutated" "$path"
+}
+
+insert_after_line() {
+  local path=$1
+  local needle=$2
+  local insertion=$3
+  awk -v needle="$needle" -v insertion="$insertion" '
+    {
+      print
+    }
+    $0 == needle {
+      print insertion
+      inserted = 1
+    }
+    END {
+      if (!inserted) {
+        exit 42
+      }
+    }
+  ' "$path" > "$mutated"
+  mv "$mutated" "$path"
+}
+
 insert_upload_into_create() {
   awk '
     /^      - name: Create draft release$/ {
@@ -70,6 +118,56 @@ move_trap_after_validation() {
   ' "$case_production" > "$mutated"
   mv "$mutated" "$case_production"
 }
+
+cp "$production" "$case_production"
+apply_sed_mutation \
+  's#https://ports.ubuntu.com/ubuntu-ports#http://ports.ubuntu.com/ubuntu-ports#'
+expect_rejected 'production Ubuntu ports source left on plaintext HTTP'
+
+cp "$production" "$case_production"
+apply_sed_mutation 's/Acquire::Retries=5/Acquire::Retries=0/'
+expect_rejected 'production APT operations without the bounded retry policy'
+
+cp "$production" "$case_production"
+apply_sed_mutation 's/Acquire::ForceIPv4=true/Acquire::ForceIPv4=false/'
+expect_rejected 'production APT operations without the IPv4 policy'
+
+cp "$production" "$case_production"
+apply_sed_mutation '/Acquire::ForceIPv4=true update/s/$/ || true/'
+expect_rejected 'fail-open production APT index update'
+
+cp "$production" "$case_production"
+insert_before_line "$case_production" \
+  '          sudo apt-get -o Acquire::Retries=5 -o Acquire::ForceIPv4=true update' \
+  '          set +e'
+expect_rejected 'production APT setup with errexit disabled'
+
+cp "$production" "$case_production"
+insert_before_line "$case_production" \
+  '          sudo apt-get -o Acquire::Retries=5 -o Acquire::ForceIPv4=true update' \
+  '          {'
+insert_after_line "$case_production" \
+  '          sudo apt-get -o Acquire::Retries=5 -o Acquire::ForceIPv4=true install -y musl-tools' \
+  '          } || true'
+expect_rejected 'production APT setup guarded by fail-open shell control flow'
+
+cp "$production" "$case_production"
+cp "$dry_run" "$case_dry_run"
+apply_dry_run_sed_mutation 's/Acquire::Retries=5/Acquire::Retries=0/'
+expect_rejected 'dry-run APT operations without the bounded retry policy'
+
+cp "$production" "$case_production"
+cp "$dry_run" "$case_dry_run"
+apply_dry_run_sed_mutation '/Acquire::ForceIPv4=true install -y musl-tools/s/$/ || true/'
+expect_rejected 'fail-open dry-run musl installation'
+
+cp "$production" "$case_production"
+cp "$dry_run" "$case_dry_run"
+insert_before_line "$case_dry_run" \
+  '          sudo apt-get -o Acquire::Retries=5 -o Acquire::ForceIPv4=true update' \
+  "          sudo sed -i 's|https://ports.ubuntu.com/ubuntu-ports|http://ports.ubuntu.com/ubuntu-ports|g' /etc/apt/sources.list.d/ubuntu.sources"
+expect_rejected 'dry-run source downgrade after the HTTPS guard'
+cp "$dry_run" "$case_dry_run"
 
 cp "$production" "$case_production"
 # This sed expression intentionally matches literal workflow variables.
