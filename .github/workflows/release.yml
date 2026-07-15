@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing SemVer tag to publish (for example v0.1.0)
+        description: Existing SemVer tag to publish (for example v0.1.2)
         required: true
         type: string
 
@@ -912,7 +912,7 @@ jobs:
             release-assets/nrm-agent-manifest-v1.json
             release-assets/nrm-agent-manifest-v1.json.sig
 
-      - name: Create and populate draft release
+      - name: Create draft release
         id: draft
         env:
           GH_TOKEN: ${{ github.token }}
@@ -963,23 +963,84 @@ jobs:
             exit 1
           fi
 
-          release_flags=(
-            --draft
-            --verify-tag
-            --title "$RELEASE_TAG"
-            --generate-notes
-          )
-          if [[ "$PRERELEASE" == true ]]; then
-            release_flags+=(--prerelease --latest=false)
-          fi
-          gh release create "$RELEASE_TAG" "${release_flags[@]}"
+          release_body=$'> [!WARNING]\n> **Work in progress.** This release is public for cross-platform testing and may change incompatibly.'
+          draft_json="$(
+            jq -nc \
+              --arg tag "$RELEASE_TAG" \
+              --arg source "$SOURCE_COMMIT" \
+              --arg body "$release_body" \
+              --argjson prerelease "$PRERELEASE" \
+              '{
+                tag_name: $tag,
+                target_commitish: $source,
+                name: $tag,
+                body: $body,
+                draft: true,
+                prerelease: $prerelease,
+                generate_release_notes: true
+              }' \
+            | gh api --method POST \
+                --header 'Accept: application/vnd.github+json' \
+                --header 'X-GitHub-Api-Version: 2026-03-10' \
+                "repos/$GITHUB_REPOSITORY/releases" --input -
+          )"
+          draft_id="$(jq -er '.id | select(type == "number" and . > 0)' <<< "$draft_json")"
+          cleanup_incomplete_draft_create() {
+            local status=$?
+            local release_json
+            trap - EXIT
+            if [[ "$status" -eq 0 ]]; then
+              return 0
+            fi
+            echo "draft creation did not complete; checking exact release $draft_id for cleanup" >&2
+            if ! release_json="$(gh api \
+              --header 'Accept: application/vnd.github+json' \
+              --header 'X-GitHub-Api-Version: 2026-03-10' \
+              "repos/$GITHUB_REPOSITORY/releases/$draft_id")"; then
+              echo "could not retrieve the incomplete draft; inspect release ID $draft_id manually" >&2
+              return "$status"
+            fi
+            if ! jq -e --arg tag "$RELEASE_TAG" --argjson id "$draft_id" \
+              '.id == $id
+                and .tag_name == $tag
+                and .draft == true
+                and .immutable == false
+                and .published_at == null' \
+              <<< "$release_json" >/dev/null; then
+              echo "refusing to delete release $draft_id because its identity or state changed" >&2
+              return "$status"
+            fi
+            if ! gh api --method DELETE \
+              "repos/$GITHUB_REPOSITORY/releases/$draft_id"; then
+              echo "could not delete incomplete draft $draft_id; inspect it manually" >&2
+            fi
+            return "$status"
+          }
+          trap cleanup_incomplete_draft_create EXIT
+          jq -e \
+            --arg tag "$RELEASE_TAG" \
+            --arg warning '**Work in progress.**' \
+            --argjson prerelease "$PRERELEASE" \
+            '.id > 0
+              and .tag_name == $tag
+              and .name == $tag
+              and (.body | contains($warning))
+              and .draft == true
+              and .prerelease == $prerelease
+              and .immutable == false
+              and .published_at == null
+              and (.assets | length) == 0' \
+            <<< "$draft_json" >/dev/null
           echo "created=true" >> "$GITHUB_OUTPUT"
-          draft_id="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" --jq '.id')"
-          if [[ ! "$draft_id" =~ ^[0-9]+$ ]]; then
-            echo "created draft returned an invalid release ID" >&2
-            exit 1
-          fi
           echo "id=$draft_id" >> "$GITHUB_OUTPUT"
+          trap - EXIT
+
+      - name: Populate draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
           mapfile -t assets < <(find release-assets -maxdepth 1 -type f -print | LC_ALL=C sort)
           if [[ "${#assets[@]}" -ne 8 ]]; then
             echo "expected exactly eight release assets, found ${#assets[@]}" >&2
@@ -1133,10 +1194,16 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          release_json="$(gh release view "$RELEASE_TAG" \
-            --json databaseId,tagName,isDraft,isImmutable)"
+          release_json="$(gh api \
+            --header 'Accept: application/vnd.github+json' \
+            --header 'X-GitHub-Api-Version: 2026-03-10' \
+            "repos/$GITHUB_REPOSITORY/releases/$EXPECTED_RELEASE_ID")"
           jq -e --arg tag "$RELEASE_TAG" --argjson id "$EXPECTED_RELEASE_ID" \
-            '.databaseId == $id and .tagName == $tag and .isDraft == true and .isImmutable == false' \
+            '.id == $id
+              and .tag_name == $tag
+              and .draft == true
+              and .immutable == false
+              and .published_at == null' \
             <<< "$release_json" >/dev/null
           gh api --method DELETE \
             "repos/$GITHUB_REPOSITORY/releases/$EXPECTED_RELEASE_ID"

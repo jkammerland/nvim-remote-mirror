@@ -53,11 +53,11 @@ attestations](https://docs.github.com/en/actions/how-tos/secure-your-work/use-ar
 
 1. Set the workspace version to the intended SemVer value and complete the
    normal release review and quality gates.
-2. Create and push an exact version tag such as `v0.1.1`. Moving or reusing a
+2. Create and push an exact version tag such as `v0.1.2`. Moving or reusing a
    tag associated with a published immutable release is unsupported.
 3. Dispatch **Signed agent release** from that exact tag and enter the same tag
    as its input. For example, use
-   `gh workflow run release.yml --ref v0.1.1 -f tag=v0.1.1`. The workflow
+   `gh workflow run release.yml --ref v0.1.2 -f tag=v0.1.2`. The workflow
    requires its invocation commit and the peeled tag commit to match so GitHub
    provenance identifies the bytes' actual source. Approve the protected
    `release` environment only after reviewing the tag and workflow changes.
@@ -132,6 +132,12 @@ a run fails after draft creation, the workflow deletes only the exact release
 ID it created, and only while that release is still an unpublished, mutable
 draft. If cleanup cannot prove all of those conditions, inspect the draft
 manually before rerunning.
+Draft creation and asset population are separate steps. The creation step
+captures the release ID directly from GitHub's create response, so a later
+upload or verification failure cannot hide the identity needed by cleanup.
+An inline failure trap covers validation or output errors inside the creation
+step itself and applies the same exact-ID, draft, publication, and mutability
+checks before deleting anything.
 The workflow refuses to replace any existing draft or release. A published
 release must never be edited, replaced, or recreated under the same version.
 After publication it allows up to five minutes for immutable-release and
@@ -187,7 +193,7 @@ that directory because the tool rejects unexpected artifact-directory entries.
 cargo build -p nrm-registry --bin nrm-registry-release --release --locked
 
 tool=target/release/nrm-registry-release
-version=0.1.1
+version=0.1.2
 protocol_version=7
 source_commit="$(git rev-parse HEAD)"
 
