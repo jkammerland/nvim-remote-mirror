@@ -426,6 +426,8 @@ pub enum RuntimeValidationError {
     DuplicateEnvironmentName(String),
     #[error("{0} contains a NUL byte")]
     ContainsNul(&'static str),
+    #[error("{0} contains a control character")]
+    ContainsControl(&'static str),
     #[error("workspace path is empty")]
     EmptyWorkspacePath,
     #[error("workspace path length {0} exceeds maximum {RUNTIME_MAX_PATH_BYTES}")]
@@ -1325,6 +1327,7 @@ fn validate_process_spec(spec: &RuntimeProcessSpec) -> Result<(), RuntimeValidat
     }
     for arg in &spec.argv {
         reject_nul("runtime argument", arg)?;
+        reject_control("runtime argument", arg)?;
     }
     if let RuntimeCwd::WorkspaceRelative(path) = &spec.cwd {
         validate_workspace_path(path)?;
@@ -1363,6 +1366,12 @@ fn validate_spec_for_capability(
                 return Err(RuntimeStateError::InvalidProcessSpec {
                     capability,
                     reason: "PTY processes require a terminal size",
+                });
+            }
+            if spec.max_output_bytes.is_some() {
+                return Err(RuntimeStateError::InvalidProcessSpec {
+                    capability,
+                    reason: "PTY live streams must not include a pipe output limit",
                 });
             }
         }
@@ -1479,6 +1488,13 @@ fn validate_optional_data_chunk(data: &[u8]) -> Result<(), RuntimeValidationErro
 fn reject_nul(name: &'static str, value: &str) -> Result<(), RuntimeValidationError> {
     if value.contains('\0') {
         return Err(RuntimeValidationError::ContainsNul(name));
+    }
+    Ok(())
+}
+
+fn reject_control(name: &'static str, value: &str) -> Result<(), RuntimeValidationError> {
+    if value.chars().any(char::is_control) {
+        return Err(RuntimeValidationError::ContainsControl(name));
     }
     Ok(())
 }
@@ -2195,6 +2211,33 @@ mod tests {
                 data: vec![1],
             }),
             Err(RuntimeStateError::WrongOutputStream { .. })
+        ));
+    }
+
+    #[test]
+    fn runtime_argv_is_control_free_and_pty_limits_are_explicitly_unsupported() {
+        for argument in ["line\nfeed", "tab\tvalue", "c1\u{0085}value"] {
+            let mut spec = pipe_spec();
+            spec.argv.push(argument.to_string());
+            assert!(matches!(
+                RuntimeMessage::StartProcess {
+                    request_id: 1,
+                    spec,
+                }
+                .validate(),
+                Err(RuntimeValidationError::ContainsControl("runtime argument"))
+            ));
+        }
+
+        let mut machine = client(RuntimeCapability::ProcessPtyV1);
+        let mut spec = attached_pty_spec();
+        spec.max_output_bytes = Some(1024);
+        assert!(matches!(
+            machine.observe_outbound(&RuntimeMessage::StartProcess {
+                request_id: 1,
+                spec,
+            }),
+            Err(RuntimeStateError::InvalidProcessSpec { .. })
         ));
     }
 

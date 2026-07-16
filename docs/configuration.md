@@ -214,6 +214,52 @@ does not overwrite the health of an unchanged agent.
 See [Signed agent registry operations](agent-registry.md) for cache policy,
 manifest format, trust limitations, and safe key rotation.
 
+## Workspace Runtime
+
+The runtime is an explicit execution API for workspace-aware plugins and
+`:RemoteTerminal`; enabling it does not run an arbitrary command during
+connect. The default prompt policy requires the user to authorize a workspace
+before its first process or PTY is started.
+
+```lua
+require("nvim_remote_mirror").setup({
+  remote_runtime = {
+    enabled = true,
+    trust = "prompt",
+    detached_ttl_ms = 24 * 60 * 60 * 1000,
+    ticket_create_timeout_ms = 5000,
+  },
+})
+```
+
+| Option | Default | Notes |
+| --- | --- | --- |
+| `remote_runtime.enabled` | `true` | Allow explicit attached process and PTY requests |
+| `remote_runtime.trust` | `"prompt"` | `prompt` persists explicit per-workspace decisions; `always` bypasses that prompt; `never` denies execution |
+| `remote_runtime.detached_ttl_ms` | `86400000` | Reserved lifetime for future detached sessions; detached execution is unavailable today |
+| `remote_runtime.ticket_create_timeout_ms` | `5000` | Timeout for private local runtime-state and single-use ticket operations |
+
+`remote_runtime` is replaced as a nested configuration snapshot, like the
+other setup options. Unknown fields and values outside the documented ranges
+are rejected. `:RemoteTrustWorkspace`, `:RemoteTrustWorkspace!`, and
+`:RemoteUntrustWorkspace` manage persisted trust for the resolved workspace.
+Trust permits arbitrary code execution as the authority account and is not a
+sandbox.
+
+Runtime trust, tickets, signals, and exit records live below private local
+sidecar state. On Windows this fails closed if any existing `state_dir`
+ancestor grants an untrusted principal write-data, write-attributes, delete,
+child-delete, DACL, or owner mutation. A machine with permissive or stale
+profile ACLs must use a pre-provisioned protected `state_dir` whose inheritance
+is disabled and whose access is limited to the current user and `SYSTEM`, or
+repair the unsafe ancestor. Production code deliberately does not create a
+drive-root state directory as a workaround.
+
+Attached pipe processes and PTYs are advertised as `runtime_process_v1` and
+`runtime_pty_v1`. Detached/reconnectable sessions and `workspace_watch_v1` are
+not advertised. See [Workspace Runtime API v1](workspace-runtime.md) for the
+provider-neutral Lua contract and plugin integration examples.
+
 ## Transport
 
 | Option | Default | Notes |

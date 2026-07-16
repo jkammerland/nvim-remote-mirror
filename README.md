@@ -27,7 +27,8 @@ but it is not a polished replacement for SSHFS or VS Code Remote yet.
 | Remote agent health/install/update | Signed automatic repair on SSH connect when opted into a registry; explicit commands retained |
 | Remote LSP proxy | Basic |
 | Remote git status/diff/blame | Basic |
-| Terminals, DAP, plugin remoting | Not built |
+| Workspace process runtime | Attached pipe processes and PTYs on local/Linux/macOS/Windows hosts |
+| Detached terminals, workspace watch, DAP | Not built |
 | Non-SSH transports | Not built |
 
 ## Requirements
@@ -233,6 +234,16 @@ For cwd-based local plugins, switch the current tab to the mirror files root:
 :RemoteCd
 ```
 
+Open the remote account's default shell in an attached terminal (the new split
+enters terminal-input mode immediately):
+
+```vim
+:RemoteTerminal
+```
+
+The first runtime request prompts to trust the workspace by default. Connect
+itself never runs an arbitrary workspace command or grants that trust.
+
 Use the UI commands for normal work:
 
 | Command | Purpose |
@@ -270,6 +281,10 @@ Dashboard keys:
 | `:RemoteDisconnect` | Close the current client session |
 | `:RemoteReconnect` | Reconnect to the last target |
 | `:RemoteCd` | Set the current tab cwd to the mirror files root |
+| `:RemoteTrustWorkspace[!]` | Persist runtime trust for the current workspace; `[!]` skips confirmation |
+| `:RemoteUntrustWorkspace` | Remove persisted runtime trust for the current workspace |
+| `:RemoteTerminal [cmd...]` | Open an attached remote PTY; no arguments start the default remote shell |
+| `:RemoteTerminal! [cmd...]` | Request detached persistence; currently fails closed until the persistent broker is implemented |
 | `:RemoteOpen {path}` | Open a workspace-relative file |
 | `:RemoteOpen! {path}` | Force remote rehydrate for clean cached files |
 | `:RemoteScan [limit]` | Scan remote metadata into the local mirror index |
@@ -322,6 +337,9 @@ Dashboard keys:
 | `open_prefetch_related` | `false` | Prefetch nearby known files after open |
 | `adoption_policy` | `"tracked_or_explicit"` | Require `:RemoteAdopt` for untracked mirror files |
 | `background_mirror` | `true` | Gradually scan, hydrate, and validate in idle batches |
+| `remote_runtime.enabled` | `true` | Expose explicit workspace process/terminal execution; connect still runs no arbitrary command |
+| `remote_runtime.trust` | `"prompt"` | Runtime authorization policy: `prompt`, `always`, or `never` |
+| `remote_runtime.ticket_create_timeout_ms` | `5000` | Bound private local bridge-ticket creation |
 
 See [docs/configuration.md](docs/configuration.md) for the larger option list.
 
@@ -351,6 +369,43 @@ Mirror files live under the sidecar state directory, typically below
 `~/.local/state/nvim-remote-mirror` on Linux when `state_dir` is unset. Open
 `:RemoteWorkspace` to inspect the active mirror root and files root.
 
+## Workspace Runtime API
+
+The provider-neutral Lua API resolves an immutable workspace context, maps
+editor paths/URIs to authority paths/URIs, authorizes execution, and provides
+three integration surfaces:
+
+```lua
+local context = assert(require("nvim_remote_mirror").workspace({ bufnr = 0 }))
+
+context:authorize("process", function(err, granted)
+  if err or not granted then
+    return
+  end
+
+  local handle = assert(context:spawn({
+    command = { argv = { "cargo", "check" } },
+    cwd = { space = "workspace", path = "" },
+  }))
+  -- handle:signal("interrupt")
+end)
+```
+
+Use `context:job_spec()` when another plugin owns the local job lifecycle,
+including argv- or string-only terminal APIs, and `context:open_pty()` for a
+managed PTY. Arguments and environment values remain structured until the
+private sidecar bridge; they are never interpolated into the SSH command.
+Arguments are control-free UTF-8. Pipe output defaults to a 4 MiB cumulative
+limit; PTYs are live backpressured streams and reject that pipe-only option.
+
+Contexts become stale across reconnect epochs. Integrations can resolve again
+on `NrmWorkspaceConnected`, `NrmWorkspaceDisconnected`, and
+`NrmWorkspaceEpochChanged` `User` events. Only attached execution is available
+today: detached/reconnectable sessions and workspace watching are not
+advertised. See [Workspace Runtime API v1](docs/workspace-runtime.md) for the
+complete contract and a ToggleTerm example that needs no plugin-specific nrm
+patch.
+
 ## Troubleshooting
 
 | Symptom | Check |
@@ -360,6 +415,7 @@ Mirror files live under the sidecar state directory, typically below
 | Remote agent missing | With a signed registry configured, check the automatic-bootstrap state in `:RemoteWorkspace`; otherwise run `:RemoteHealth`, then `:RemoteInstallAgent` |
 | Automatic registry install fails | The local mirror remains connected but remote work is degraded; check `:RemoteWorkspace` Bootstrap/Registry state and the stable error code; unsigned fallback remains forbidden |
 | Windows target is rejected | Use `ssh://host/B:/absolute/path`, not UNC, drive-relative, or backslash syntax |
+| Windows runtime rejects local state ACLs | Point `state_dir` at a pre-provisioned directory with inheritance disabled and access limited to the current user and `SYSTEM`, or repair the unsafe ancestor; runtime state fails closed and does not create a drive-root workaround |
 | Opens are stale | Use `:RemoteValidate` or `:RemoteOpen! path` |
 | Saves are queued | Open `:RemoteQueue`, then retry with `:RemoteFlushQueue` |
 | Save conflict | Open `:RemoteConflicts`; accept-local uploads the saved local snapshot, accept-remote is blocked for partial remote copies |

@@ -60,7 +60,7 @@ release output is deterministic.
   "schema_version": 1,
   "package": "nrm-agent",
   "version": "0.1.0",
-  "protocol_version": 7,
+  "protocol_version": 8,
   "source_commit": "0123456789abcdef0123456789abcdef01234567",
   "artifacts": [
     {

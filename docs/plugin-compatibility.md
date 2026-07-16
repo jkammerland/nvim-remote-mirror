@@ -12,12 +12,14 @@ workspace through hydration, checksums, and the save queue.
 | Helper | Use |
 | --- | --- |
 | `current_workspace()` | Return the active workspace table, or `nil` |
+| `workspace(query)` | Resolve an immutable provider-neutral workspace API-v1 context |
 | `mirror_root()` | Return the workspace mirror state root |
 | `files_root()` | Return the local mirror files root |
 | `remote_root()` | Return the remote workspace root |
 | `is_remote_buffer(bufnr)` | Test whether a buffer belongs to a remote mirror workspace |
 | `remote_path(bufnr_or_local_path)` | Convert a remote buffer or mirror-local path to a workspace-relative path |
 | `local_path(remote_path)` | Convert a workspace-relative path to a mirror-local path |
+| `open_terminal(opts)` | Open an authorized attached remote PTY in a split |
 
 Path helpers intentionally operate on the current connected workspace. They
 return `nil` for disconnected sessions, paths outside the mirror files root, or
@@ -47,8 +49,38 @@ root. This makes cwd-based plugins behave like they are inside the project:
 | LSP | Run remote server through the LSP proxy with path translation |
 | Formatters/linters | May edit hydrated mirror buffers locally; saves still flow through the mirror save queue |
 | Git plugins | Use `:RemoteGitStatus`, `:RemoteGitDiff`, and `:RemoteGitBlame` for remote repository state |
-| Terminals | Need remote PTY/session support |
+| Terminals and command runners | Use workspace API v1 for attached pipe processes or PTYs |
 | DAP | Need remote debug adapter and path mapping |
+
+## Generic Workspace Runtime
+
+Plugins should not detect SSH targets or build remote shell commands. Resolve a
+provider-neutral context with `require("nvim_remote_mirror").workspace()`, ask
+it to authorize `process` or `terminal`, and then choose the narrowest runtime
+surface:
+
+| Surface | Use |
+| --- | --- |
+| `context:job_spec(process)` | A plugin already owns the local job or terminal and accepts argv or a command string |
+| `context:spawn(process, handlers)` | The integration needs a managed attached pipe process and exit metadata |
+| `context:open_pty(process, handlers)` | The integration needs a managed attached PTY |
+| `:RemoteTerminal [cmd...]` | A user wants a terminal split without writing an adapter |
+
+`job_spec()` returns authoritative local bridge `argv` plus a canonical
+`command` rendering for string-only APIs. Remote argv, cwd, and environment
+remain structured in a private single-use ticket until the sidecar bridge; do
+not append shell text to the returned command. This lets ToggleTerm and similar
+plugins consume one generic contract instead of requiring core patches for
+each terminal UI.
+
+Contexts are epoch-bound. Resolve again after `stale_context`, disconnect, or
+reconnect, or invalidate cached contexts on the `NrmWorkspaceConnected`,
+`NrmWorkspaceDisconnected`, and `NrmWorkspaceEpochChanged` `User` events.
+
+Only attached processes and PTYs are available today. Detached/reconnectable
+sessions and workspace watching are not advertised. See
+[Workspace Runtime API v1](workspace-runtime.md), including the ToggleTerm
+adapter example, trust model, path/URI mapping, handles, and failure modes.
 
 ## Formatter, Linter, And Git Policy
 

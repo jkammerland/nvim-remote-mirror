@@ -49,6 +49,35 @@ vim.api.nvim_create_user_command("RemoteCd", function()
   nrm.cd()
 end, {})
 
+vim.api.nvim_create_user_command("RemoteTrustWorkspace", function(opts)
+  local ok, err = nrm.trust_workspace({ force = opts.bang })
+  if not ok then
+    error(tostring(err))
+  end
+end, {
+  bang = true,
+})
+
+vim.api.nvim_create_user_command("RemoteUntrustWorkspace", function()
+  local ok, err = nrm.untrust_workspace()
+  if not ok then
+    error(tostring(err))
+  end
+end, {})
+
+vim.api.nvim_create_user_command("RemoteTerminal", function(opts)
+  local handle, err = nrm.open_terminal({
+    command = opts.fargs,
+    persistence = opts.bang and "detached" or "attached",
+  })
+  if not handle then
+    error(tostring(err))
+  end
+end, {
+  nargs = "*",
+  bang = true,
+})
+
 vim.api.nvim_create_user_command("RemoteOpen", function(opts)
   nrm.open(opts.args, { force = opts.bang })
 end, {

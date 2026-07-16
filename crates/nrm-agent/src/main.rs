@@ -2,8 +2,8 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use ignore::{Walk, WalkBuilder};
 use nrm_protocol::{
-    read_frame, write_frame, BatchReadError, BatchReadFile, BatchValidateFile, CapabilitySet,
-    FileMeta, GitCommandOutput, Request, Response, RpcError, RpcMessage, SaveApplied, SaveConflict,
+    read_frame, write_frame, BatchReadError, BatchReadFile, BatchValidateFile, FileMeta,
+    GitCommandOutput, Request, Response, RpcError, RpcMessage, SaveApplied, SaveConflict,
     SaveOutcome, SearchHit, WriteStartOutcome, WriteStarted, MAX_CONFLICT_CONTENT_BYTES,
     MAX_FRAME_LEN, PROTOCOL_VERSION,
 };
@@ -27,6 +27,8 @@ use std::sync::{
 };
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+mod runtime;
 
 const AGENT_READ_RESPONSE_MAX_BYTES: u64 = (MAX_FRAME_LEN - (1024 * 1024)) as u64;
 const AGENT_BATCH_TOTAL_MAX_BYTES: u64 = AGENT_READ_RESPONSE_MAX_BYTES;
@@ -205,12 +207,18 @@ enum Command {
         #[arg(long)]
         root: PathBuf,
     },
+    /// Serve one streaming process/PTY connection over stdin and stdout.
+    Runtime {
+        #[arg(long)]
+        root: PathBuf,
+    },
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Serve { root } => serve(root),
+        Command::Runtime { root } => runtime::serve(root),
     }
 }
 
@@ -298,7 +306,7 @@ fn handle_request(state: &mut AgentState, request: Request) -> Result<Response> 
             Ok(Response::Hello {
                 agent_version: env!("CARGO_PKG_VERSION").to_string(),
                 protocol_version: PROTOCOL_VERSION,
-                capabilities: CapabilitySet::v1_agent(),
+                capabilities: runtime::capabilities(),
             })
         }
         Request::Scan { limit, after } => scan(&state.root, limit, after.as_deref()),

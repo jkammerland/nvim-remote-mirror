@@ -15,9 +15,9 @@ changing Neovim commands.
 | Part | Runs | Job |
 | --- | --- | --- |
 | Neovim plugin | local | UI, commands, buffers, quickfix, LSP client setup |
-| `nrm-sidecar` | local | Mirror database, save queue, caching, scheduling |
+| `nrm-sidecar` | local | Mirror database, save queue, caching, scheduling, private runtime bridge |
 | `nrm-registry` | local library | Strict manifest/signature policy, HTTPS/file retrieval, verified cache |
-| `nrm-agent` | remote or local | Filesystem reads, scans, hashes, grep, writes |
+| `nrm-agent` | remote or local | Filesystem operations plus attached process/PTY execution |
 | Mirror directory | local | Hydrated file bytes and conflict/snapshot files |
 | SQLite state | local | Metadata, indexes, queue state, scan progress |
 
@@ -33,6 +33,7 @@ changing Neovim commands.
 | Background mirror | Scan, prefetch, and validate in small idle batches |
 | Reconnect | Reuse mirror state and retry queued saves |
 | Agent install/update | Opt-in signed repair on SSH connect plus explicit commands; verify locally, activate transactionally, roll back failures |
+| Workspace runtime | Resolve one provider-neutral context, require explicit trust, and execute structured attached processes or PTYs beside the authority root |
 
 ## Remote Host and Agent Distribution
 
@@ -88,6 +89,37 @@ candidate/previous digests agree. A newer request's verified digest is applied
 only to its subsequent transaction; malformed or file-hash-mismatched state
 still fails closed and remains available for diagnosis.
 
+## Workspace Runtime Boundary
+
+Lua workspace API v1 separates plugin integration from transport details. A
+resolved immutable context identifies the provider, workspace, reconnect
+epoch, editor/authority roots, path style, state, and capabilities. It maps
+contained paths and file URIs, authorizes `process` or `terminal`, and exposes:
+
+- a private single-use local `job_spec` bridge for job APIs owned by another
+  plugin;
+- a managed attached pipe process; and
+- a managed attached PTY.
+
+Remote argv, cwd, environment changes, timeout, and terminal size remain
+structured until the sidecar consumes the private ticket and speaks the binary
+runtime protocol to the agent. The local bridge command contains only the
+sidecar and an opaque ticket ID. This is the generic extension point for
+ToggleTerm-like terminals and command runners; nrm core should not grow
+plugin-by-plugin execution branches.
+
+Workspace connect never starts an arbitrary runtime command or grants trust.
+The default policy prompts and persists an explicit per-authority decision in
+private local state. Requests fail closed when disabled, untrusted, offline,
+stale, unsupported, or malformed. Reconnect advances the context epoch, and
+`User` lifecycle events let integrations discard cached contexts.
+
+This runtime is orchestration, not a sandbox. Programs run with the authority
+account's privileges; a deliberately daemonized POSIX descendant can escape
+the attached process session. Persistent/detached PTY brokerage and workspace
+watching remain unadvertised until their lifecycle implementations exist. See
+[workspace-runtime.md](workspace-runtime.md) for the public contract.
+
 ## Current Limits
 
 | Limit | Direction |
@@ -95,7 +127,8 @@ still fails closed and remains available for diagnosis.
 | One active client per socket sidecar | `workspace_info` reports `client_mode = "single_writer"`; add multi-client coordination later |
 | No streaming UI | Add incremental picker updates after API settles |
 | Basic LSP proxy only | Harden path translation and server lifecycle |
-| No terminal or DAP remoting | Keep behind the same sidecar boundary |
+| Attached terminals only | Add persistent broker, detach, and reattach before advertising detached sessions |
+| No workspace watch or DAP remoting | Keep behind the same workspace/runtime boundary |
 | SSH only | Add a transport factory after SSH behavior is stable |
 
 ## Next Milestones

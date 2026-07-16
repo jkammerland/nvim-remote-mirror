@@ -195,7 +195,7 @@ The sidecar sends framed binary RPC to `nrm-agent`. Each request has an ID and
 each response carries the same ID. Current SSH transport runs the agent process
 over stdio.
 
-Current agent protocol version: `7`.
+Current agent protocol version: `8`.
 
 Remote git primitives are agent RPCs, not local mirror operations:
 
@@ -219,6 +219,61 @@ Future transports must preserve:
 | Timeout-compatible errors | Preserve reconnect/backoff behavior |
 | Abort support | Replace active read/background work when preempted |
 | Same agent command model | Avoid changing Neovim-facing APIs |
+
+## Workspace Runtime Boundary
+
+Workspace runtime execution is intentionally separate from the ordinary
+newline-JSON sidecar server and serial filesystem lanes. Lua workspace API v1
+validates the structured process specification and explicit workspace trust,
+then asks a short-lived local sidecar command to publish a private single-use
+ticket. The consumer starts only:
+
+```text
+nrm-sidecar runtime-proxy [--state-dir <private-state>] --ticket <opaque-id>
+```
+
+The ticket, not the local argv, carries the authority identity, remote argv,
+contained cwd, environment delta, capability, limits, and transport metadata.
+The proxy atomically consumes it, launches `nrm-agent runtime --root ...`
+locally or through the platform SSH planner, completes an exact
+package/protocol/capability Hello, and relays framed runtime messages and raw
+stdio. Remote user values are never interpolated into an SSH command.
+
+Runtime frames are length-prefixed and bounded separately from ordinary agent
+RPC. API-v1 attached execution uses `ClientHello`/`ServerHello`,
+`StartProcess`, `ProcessStarted`, offset-checked `Input`/`Output` plus
+acknowledgements, `CloseInput`, `Resize`, `Signal`, and `Exited`. Pipe output
+keeps stdout and stderr distinct; PTY output uses one PTY stream. The sidecar
+acknowledges output only after the corresponding local write and flush. The
+agent limits each stream to 1 MiB of unacknowledged output and, after process
+exit, waits up to two seconds for worker completion and final acknowledgements.
+A missed drain deadline produces a typed runtime error rather than a successful
+exit with silently truncated output. The sidecar's bounded local-output pump
+keeps signal/control polling independent from a stalled terminal consumer.
+The sidecar
+publishes a bounded private structured result so managed Lua `on_exit`
+callbacks can distinguish the local bridge status from the authority process
+status.
+
+The runtime wire and sidecar bridge preserve raw stdio bytes. The convenience
+Lua `Context:spawn()` callbacks deliberately inherit Neovim's line/list job
+semantics and are not the binary API; `job_spec()` is the escape hatch for a
+consumer that can own raw local process streams.
+
+Capabilities fail closed. Compatible agents currently advertise only
+`runtime_process_v1` and `runtime_pty_v1`, corresponding to attached pipe and
+PTY execution. The protocol reserves detach/attach and workspace-watch message
+types, but the agent returns `PersistenceUnavailable` for detachment and does
+not advertise `workspace_watch_v1` until the persistent broker and watcher
+lifecycle exist. Clients must check advertised capability bits rather than
+inferring support from protocol types.
+
+Runtime trust/ticket/control/result files are private local state with bounded
+sizes, entry counts, ages, atomic publication/consumption, and fail-closed
+permissions. Control messages carry only the opaque ticket identity, nonce,
+and typed signal; process argv and environment are not repeated in signal
+helper command lines. See [Workspace Runtime API v1](workspace-runtime.md) for
+the editor-facing contract.
 
 ## Compatibility
 

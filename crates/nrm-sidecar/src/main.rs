@@ -4,6 +4,7 @@ mod agent_install;
 mod bom_reader;
 mod lsp_rewrite;
 mod remote_host;
+mod runtime_proxy;
 mod windows_agent_install;
 use bom_reader::LeadingBomReader;
 use lsp_rewrite::rewrite_lsp_body;
@@ -17,9 +18,10 @@ use nrm_registry::{
     FetchedArtifact, ManifestSource, RegistryUrlTemplate, TrustedKeySet,
 };
 use remote_host::{
-    local_host_info, parse_posix_probe, parse_powershell_probe, posix_probe_command,
-    powershell_agent_process_command, powershell_probe_command, powershell_process_command,
-    validate_remote_root, PowerShellProcessCommand, RemoteHostInfo, RemotePathStyle,
+    local_host_info, parse_posix_probe as parse_legacy_posix_probe, parse_powershell_probe,
+    posix_probe_command as legacy_posix_probe_command, powershell_agent_process_command,
+    powershell_probe_command, powershell_process_command, validate_remote_root,
+    PowerShellProcessCommand, RemoteHostInfo, RemotePathStyle,
 };
 use rusqlite::Row;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -273,6 +275,52 @@ enum CommandKind {
         ssh_connect_timeout_seconds: u64,
         #[arg(last = true, required = true)]
         command: Vec<String>,
+    },
+    RuntimeTicketCreate {
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+    },
+    RuntimeProxy {
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        #[arg(long)]
+        ticket: String,
+    },
+    RuntimeResultRead {
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        #[arg(long)]
+        ticket: String,
+    },
+    RuntimeSignal {
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        #[arg(long)]
+        ticket: String,
+        #[arg(long)]
+        signal: String,
+    },
+    RuntimeStatePrepare {
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+    },
+    RuntimeTrustCheck {
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        #[arg(long)]
+        digest: String,
+    },
+    RuntimeTrustAdd {
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        #[arg(long)]
+        digest: String,
+    },
+    RuntimeTrustRemove {
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        #[arg(long)]
+        digest: String,
     },
 }
 
@@ -2495,14 +2543,47 @@ impl RemoteTransport {
         remote_root: &Path,
         host: &RemoteHostInfo,
     ) -> Result<ProcessLaunchPlan> {
+        self.agent_subcommand_plan(
+            agent,
+            remote_root,
+            host,
+            vec![
+                "serve".to_string(),
+                "--root".to_string(),
+                remote_root.to_string_lossy().to_string(),
+            ],
+        )
+    }
+
+    fn runtime_plan(
+        &self,
+        agent: &str,
+        remote_root: &Path,
+        host: &RemoteHostInfo,
+    ) -> Result<ProcessLaunchPlan> {
+        self.agent_subcommand_plan(
+            agent,
+            remote_root,
+            host,
+            vec![
+                "runtime".to_string(),
+                "--root".to_string(),
+                remote_root.to_string_lossy().to_string(),
+            ],
+        )
+    }
+
+    fn agent_subcommand_plan(
+        &self,
+        agent: &str,
+        remote_root: &Path,
+        host: &RemoteHostInfo,
+        args: Vec<String>,
+    ) -> Result<ProcessLaunchPlan> {
         match self {
             Self::Local => Ok(ProcessLaunchPlan {
                 program: agent.to_string(),
-                args: vec![
-                    "serve".to_string(),
-                    "--root".to_string(),
-                    remote_root.to_string_lossy().to_string(),
-                ],
+                args,
                 current_dir: None,
                 stdin_prefix: Vec::new(),
             }),
@@ -2512,11 +2593,12 @@ impl RemoteTransport {
                 }
                 validate_remote_root(host, remote_root)?;
                 let (remote_command, stdin_prefix) = match host.path_style {
-                    RemotePathStyle::Posix => {
-                        (posix_agent_remote_command(agent, remote_root), Vec::new())
-                    }
+                    RemotePathStyle::Posix => (
+                        posix_agent_remote_subcommand(agent, remote_root, &args),
+                        Vec::new(),
+                    ),
                     RemotePathStyle::Windows => {
-                        let launch = powershell_agent_remote_command(agent, remote_root, host)?;
+                        let launch = powershell_agent_remote_subcommand(agent, host, &args)?;
                         (launch.command, launch.stdin_prefix)
                     }
                 };
@@ -2722,6 +2804,55 @@ fn validate_agent_hello(
         });
     }
     Ok(())
+}
+
+const POSIX_SHELL_PATH_MAX_BYTES: usize = 4_096;
+
+fn is_safe_posix_shell_path(shell: &str) -> bool {
+    if shell.len() < 2
+        || shell.len() > POSIX_SHELL_PATH_MAX_BYTES
+        || !shell.starts_with('/')
+        || !shell.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'+' | b'-')
+        })
+    {
+        return false;
+    }
+    shell[1..]
+        .split('/')
+        .all(|component| !component.is_empty() && !matches!(component, "." | ".."))
+}
+
+fn parse_posix_probe(stdout: &str) -> Result<RemoteHostInfo> {
+    let normalized = stdout.strip_suffix('\n').unwrap_or(stdout);
+    let fields: Vec<_> = normalized.split('\n').collect();
+    if fields.len() != 4 && fields.len() != 5 {
+        bail!("POSIX host probe returned an invalid response");
+    }
+
+    // Preserve the v1 platform fields and parser while treating the appended
+    // shell value as untrusted data. Legacy four-field probes remain valid.
+    let legacy = format!(
+        "{}\n{}\n{}\n{}\n",
+        fields[0], fields[1], fields[2], fields[3]
+    );
+    let mut host = parse_legacy_posix_probe(&legacy)?;
+    host.shell = fields
+        .get(4)
+        .copied()
+        .filter(|shell| is_safe_posix_shell_path(shell))
+        .unwrap_or("/bin/sh")
+        .to_string();
+    Ok(host)
+}
+
+fn posix_probe_command() -> String {
+    // The platform probe stays byte-for-byte compatible. A second constant
+    // command appends the account shell as quoted data only after it succeeds.
+    format!(
+        "{} && 'sh' '-c' 'printf \"%s\\n\" \"${{SHELL-}}\"'",
+        legacy_posix_probe_command()
+    )
 }
 
 fn detect_remote_host_info(
@@ -7076,6 +7207,10 @@ fn workspace_info_value(
             "remote_agent_bootstrap": true,
             "remote_agent_automatic_bootstrap_v1": true,
             "transport_neutral_agent_frames": true,
+            "runtime_ticket_v1": true,
+            "runtime_process_v1": true,
+            "runtime_pty_v1": true,
+            "workspace_watch_v1": false,
             "agent_abort_handle": true,
             "agent_abort_scope": "lane_worker",
             "sidecar_socket_listener": cfg!(unix),
@@ -10641,6 +10776,37 @@ fn main() -> Result<()> {
             let remote_root = transport.normalize_remote_root(remote_root)?;
             run_lsp_proxy(remote_root, local_root, transport, command)
         }
+        CommandKind::RuntimeTicketCreate { state_dir } => {
+            runtime_proxy::create_ticket_from_stdin(state_dir)
+        }
+        CommandKind::RuntimeProxy { state_dir, ticket } => {
+            let exit_code = runtime_proxy::run_from_ticket(state_dir, &ticket);
+            if exit_code == 0 {
+                Ok(())
+            } else {
+                std::process::exit(exit_code)
+            }
+        }
+        CommandKind::RuntimeResultRead { state_dir, ticket } => {
+            runtime_proxy::read_result_to_stdout(state_dir, &ticket)
+        }
+        CommandKind::RuntimeSignal {
+            state_dir,
+            ticket,
+            signal,
+        } => runtime_proxy::enqueue_signal(state_dir, &ticket, &signal),
+        CommandKind::RuntimeStatePrepare { state_dir } => {
+            runtime_proxy::prepare_runtime_state(state_dir)
+        }
+        CommandKind::RuntimeTrustCheck { state_dir, digest } => {
+            runtime_proxy::check_workspace_trust(state_dir, &digest)
+        }
+        CommandKind::RuntimeTrustAdd { state_dir, digest } => {
+            runtime_proxy::set_workspace_trust(state_dir, &digest, true)
+        }
+        CommandKind::RuntimeTrustRemove { state_dir, digest } => {
+            runtime_proxy::set_workspace_trust(state_dir, &digest, false)
+        }
     }
 }
 
@@ -12651,7 +12817,7 @@ impl LspLaunch {
     }
 }
 
-fn posix_agent_remote_command(agent: &str, remote_root: &Path) -> String {
+fn posix_agent_remote_subcommand(agent: &str, remote_root: &Path, args: &[String]) -> String {
     const SCRIPT: &str = r#"set -u
 agent=$1
 root=$2
@@ -12674,7 +12840,7 @@ if [ ! -e "$executable" ] && [ ! -L "$executable" ]; then fail missing 127; fi
 if [ ! -f "$executable" ] || [ ! -x "$executable" ]; then fail not_executable 126; fi
 printf 'NRM_AGENT_LAUNCH_V1\tREADY\n' || exit 70
 exec "$executable" "$@""#;
-    [
+    let mut command = vec![
         shell_quote("sh"),
         shell_quote("-c"),
         shell_quote(SCRIPT),
@@ -12686,26 +12852,29 @@ exec "$executable" "$@""#;
         } else {
             "0"
         }),
-        shell_quote("serve"),
-        shell_quote("--root"),
-        shell_quote(remote_root.to_string_lossy()),
-    ]
-    .join(" ")
+    ];
+    command.extend(args.iter().map(shell_quote));
+    command.join(" ")
 }
 
-fn powershell_agent_remote_command(
+#[cfg(all(test, unix))]
+fn posix_agent_remote_command(agent: &str, remote_root: &Path) -> String {
+    posix_agent_remote_subcommand(
+        agent,
+        remote_root,
+        &[
+            "serve".to_string(),
+            "--root".to_string(),
+            remote_root.to_string_lossy().to_string(),
+        ],
+    )
+}
+
+fn powershell_agent_remote_subcommand(
     agent: &str,
-    remote_root: &Path,
     host: &RemoteHostInfo,
+    args: &[String],
 ) -> Result<PowerShellProcessCommand> {
-    let remote_root = remote_root
-        .to_str()
-        .ok_or_else(|| anyhow!("Windows remote root must be valid UTF-8"))?;
-    let args = vec![
-        "serve".to_string(),
-        "--root".to_string(),
-        remote_root.to_string(),
-    ];
     let (program, path_prepend) = if remote_agent_uses_managed_path(agent) {
         let local_app_data = host
             .local_app_data
@@ -12723,7 +12892,7 @@ fn powershell_agent_remote_command(
     } else {
         (agent.to_string(), None)
     };
-    powershell_agent_process_command(&program, &args, None, path_prepend.as_deref())
+    powershell_agent_process_command(&program, args, None, path_prepend.as_deref())
 }
 
 fn remote_agent_uses_managed_path(agent: &str) -> bool {
@@ -13362,6 +13531,82 @@ mod tests {
 
     fn test_posix_host() -> RemoteHostInfo {
         parse_posix_probe("NRM_HOST_INFO_V1\nLinux\nx86_64\n/home/test\n").unwrap()
+    }
+
+    #[test]
+    fn posix_probe_accepts_only_safe_absolute_shell_paths() {
+        for shell in [
+            "/bin/zsh",
+            "/usr/local/bin/bash",
+            "/nix/store/abc123-bash-5.2/bin/bash",
+            "/opt/homebrew/bin/fish",
+        ] {
+            let stdout = format!("NRM_HOST_INFO_V1\nLinux\nx86_64\n/home/test\n{shell}\n");
+            assert_eq!(parse_posix_probe(&stdout).unwrap().shell, shell);
+        }
+
+        for shell in [
+            "",
+            "bin/zsh",
+            "/",
+            "/bin//zsh",
+            "/bin/./zsh",
+            "/bin/../zsh",
+            "/bin/zsh -c id",
+            "/bin/zsh;id",
+            "/bin/$(id)",
+            "/bin/`id`",
+            "/bin/zsh\t--no-rcs",
+            "/bin/zsh\r",
+            "/bin/žsh",
+        ] {
+            let stdout = format!("NRM_HOST_INFO_V1\nLinux\nx86_64\n/home/test\n{shell}\n");
+            assert_eq!(
+                parse_posix_probe(&stdout).unwrap().shell,
+                "/bin/sh",
+                "accepted unsafe shell value {shell:?}"
+            );
+        }
+        assert!(parse_posix_probe(
+            "NRM_HOST_INFO_V1\nLinux\nx86_64\n/home/test\n/bin/zsh\n/bin/sh\n"
+        )
+        .is_err());
+        assert!(
+            parse_posix_probe("NRM_HOST_INFO_V1\nLinux\nx86_64\n/home/test\n/bin/sh\nextra\n")
+                .is_err()
+        );
+
+        let oversized = format!("/bin/{}", "s".repeat(POSIX_SHELL_PATH_MAX_BYTES));
+        let stdout = format!("NRM_HOST_INFO_V1\nLinux\nx86_64\n/home/test\n{oversized}\n");
+        assert_eq!(parse_posix_probe(&stdout).unwrap().shell, "/bin/sh");
+    }
+
+    #[test]
+    fn posix_probe_preserves_v1_legacy_response_with_safe_fallback() {
+        let host = parse_posix_probe("NRM_HOST_INFO_V1\nDarwin\narm64\n/Users/test\n").unwrap();
+        assert_eq!(host.os, "macos");
+        assert_eq!(host.target, "aarch64-apple-darwin");
+        assert_eq!(host.shell, "/bin/sh");
+        assert!(
+            parse_posix_probe("NRM_HOST_INFO_V2\nLinux\nx86_64\n/home/test\n/bin/sh\n").is_err()
+        );
+        assert!(parse_posix_probe("NRM_HOST_INFO_V1\nLinux\nx86_64\nrelative\n/bin/sh\n").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn posix_probe_command_reports_shell_as_quoted_data() {
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg(posix_probe_command())
+            .env("SHELL", "/opt/nrm-test/bin/zsh")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let host = parse_posix_probe(&stdout).unwrap();
+        assert_eq!(host.shell, "/opt/nrm-test/bin/zsh");
+        assert_eq!(stdout.lines().next(), Some("NRM_HOST_INFO_V1"));
     }
 
     fn test_windows_host() -> RemoteHostInfo {

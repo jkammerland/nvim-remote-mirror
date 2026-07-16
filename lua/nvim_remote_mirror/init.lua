@@ -73,6 +73,12 @@ local DEFAULT_CONFIG = {
   picker = {
     provider = "auto",
   },
+  remote_runtime = {
+    enabled = true,
+    trust = "prompt",
+    detached_ttl_ms = 86400000,
+    ticket_create_timeout_ms = 5000,
+  },
 }
 
 M.config = vim.deepcopy(DEFAULT_CONFIG)
@@ -115,6 +121,32 @@ local function notify(message, level)
   vim.schedule(function()
     vim.notify(message, level or vim.log.levels.INFO, { title = "nvim-remote-mirror" })
   end)
+end
+
+local function emit_workspace_event(pattern, client, extra)
+  local hello = client and client.hello or {}
+  local data = {
+    epoch = M.reconnect_generation,
+    workspace_key = type(hello.workspace_key) == "string" and hello.workspace_key ~= "" and hello.workspace_key or nil,
+    target = client and client.target_arg or M.connection_target,
+    state = M.connection_status,
+  }
+  if type(extra) == "table" then
+    for key, value in pairs(extra) do
+      data[key] = value
+    end
+  end
+  pcall(vim.api.nvim_exec_autocmds, "User", {
+    pattern = pattern,
+    modeline = false,
+    data = data,
+  })
+end
+
+local function bump_reconnect_generation(reason, client)
+  M.reconnect_generation = M.reconnect_generation + 1
+  emit_workspace_event("NrmWorkspaceEpochChanged", client, { reason = reason })
+  return M.reconnect_generation
 end
 
 local function optional_string(value)
@@ -493,6 +525,46 @@ local function validate_registry_config(config)
     )
   then
     error("remote agent registry options require remote_agent_registry_url")
+  end
+end
+
+local function validate_remote_runtime_config(config)
+  local runtime = config.remote_runtime
+  if type(runtime) ~= "table" then
+    error("remote_runtime must be a table")
+  end
+  local allowed = {
+    enabled = true,
+    trust = true,
+    detached_ttl_ms = true,
+    ticket_create_timeout_ms = true,
+  }
+  for key in pairs(runtime) do
+    if not allowed[key] then
+      error("remote_runtime contains an unknown option: " .. tostring(key))
+    end
+  end
+  if type(runtime.enabled) ~= "boolean" then
+    error("remote_runtime.enabled must be a boolean")
+  end
+  if runtime.trust ~= "prompt" and runtime.trust ~= "always" and runtime.trust ~= "never" then
+    error("remote_runtime.trust must be 'prompt', 'always', or 'never'")
+  end
+  if
+    type(runtime.detached_ttl_ms) ~= "number"
+    or runtime.detached_ttl_ms ~= math.floor(runtime.detached_ttl_ms)
+    or runtime.detached_ttl_ms < 1
+    or runtime.detached_ttl_ms > 30 * 24 * 60 * 60 * 1000
+  then
+    error("remote_runtime.detached_ttl_ms must be an integer from 1 to 2592000000")
+  end
+  if
+    type(runtime.ticket_create_timeout_ms) ~= "number"
+    or runtime.ticket_create_timeout_ms ~= math.floor(runtime.ticket_create_timeout_ms)
+    or runtime.ticket_create_timeout_ms < 1
+    or runtime.ticket_create_timeout_ms > 120000
+  then
+    error("remote_runtime.ticket_create_timeout_ms must be an integer from 1 to 120000")
   end
 end
 
@@ -1082,7 +1154,9 @@ local schedule_reconnect
 
 local function fail_sidecar_send(client, message)
   local generation = M.reconnect_generation
+  local reconnect = false
   if M.client == client and not client.closing then
+    client.closing = true
     M.client = nil
     clear_mirror_autohydrate()
     M.connection_status = M.config.auto_reconnect and "reconnect_pending" or "disconnected"
@@ -1090,9 +1164,12 @@ local function fail_sidecar_send(client, message)
     M.connection_reason = nil
     M.connection_error = message
     M.reconnect_pending = M.config.auto_reconnect == true
+    generation = bump_reconnect_generation("transport_failure", client)
+    emit_workspace_event("NrmWorkspaceDisconnected", client, { reason = message })
+    reconnect = M.config.auto_reconnect == true
   end
   fail_pending(client, message)
-  if not client.closing then
+  if reconnect then
     schedule_reconnect(client.target_arg, generation, client.connection)
   end
 end
@@ -1788,6 +1865,7 @@ function M.current_workspace()
     return nil
   end
   local hello = client.hello
+  local capabilities = type(hello.capabilities) == "table" and vim.deepcopy(hello.capabilities) or {}
   return {
     workspace_key = optional_string(hello.workspace_key),
     target = M.connection_target or optional_string(client.target_arg),
@@ -1802,7 +1880,21 @@ function M.current_workspace()
     remote_error = optional_string(hello.remote_error),
     retry_after_ms = hello.retry_after_ms,
     registry_health = type(hello.registry_health) == "table" and hello.registry_health or nil,
+    remote_host = type(hello.remote_host) == "table" and vim.deepcopy(hello.remote_host) or nil,
+    capabilities = capabilities,
+    runtime = {
+      enabled = M.config.remote_runtime.enabled == true,
+      trust = M.config.remote_runtime.trust,
+      ticket = capabilities.runtime_ticket_v1 == true,
+      process = capabilities.runtime_process_v1 == true,
+      terminal = capabilities.runtime_pty_v1 == true,
+      watch = capabilities.workspace_watch_v1 == true,
+    },
   }
+end
+
+function M.workspace(query)
+  return require("nvim_remote_mirror.workspace").resolve(query or {})
 end
 
 function M.files_root()
@@ -1888,6 +1980,135 @@ function M.cd()
   vim.cmd("tcd " .. vim.fn.fnameescape(root))
   notify("remote cwd: " .. root)
   return root
+end
+
+function M.trust_workspace(opts)
+  local ok, err = require("nvim_remote_mirror.runtime").trust_workspace(opts)
+  if ok then
+    notify("trusted remote workspace for process execution")
+  end
+  return ok, err
+end
+
+function M.untrust_workspace(opts)
+  local ok, err = require("nvim_remote_mirror.runtime").untrust_workspace(opts)
+  if ok then
+    notify("removed remote workspace process trust")
+  end
+  return ok, err
+end
+
+function M.open_terminal(opts)
+  opts = opts or {}
+  if type(opts) ~= "table" then
+    return nil, "remote terminal options must be a table"
+  end
+  local context, context_err = M.workspace(opts.query)
+  if not context then
+    return nil, context_err
+  end
+
+  local authorization_complete = false
+  local authorization_error
+  local authorized = false
+  context:authorize("terminal", function(err, granted)
+    authorization_complete = true
+    authorization_error = err
+    authorized = granted == true
+  end)
+  if not authorization_complete then
+    return nil, "remote terminal authorization is pending; use a synchronous workspace trust provider"
+  end
+  if not authorized then
+    return nil, authorization_error or "remote terminal authorization was denied"
+  end
+
+  local command = opts.command
+  if command == nil or (type(command) == "table" and #command == 0) then
+    command = { shell = "default" }
+  else
+    command = { argv = vim.deepcopy(command) }
+  end
+  local process = {
+    command = command,
+    cwd = opts.cwd,
+    env = opts.env,
+    persistence = opts.persistence or "attached",
+    max_output_bytes = opts.max_output_bytes,
+    timeout_ms = opts.timeout_ms,
+    initial_size = opts.initial_size,
+  }
+
+  local previous_window = vim.api.nvim_get_current_win()
+  vim.cmd("botright new")
+  local terminal_window = vim.api.nvim_get_current_win()
+  local terminal_buffer = vim.api.nvim_get_current_buf()
+  local function cleanup_terminal_layout()
+    if vim.api.nvim_win_is_valid(terminal_window) then
+      pcall(vim.api.nvim_win_close, terminal_window, true)
+    end
+    if vim.api.nvim_win_is_valid(previous_window) then
+      pcall(vim.api.nvim_set_current_win, previous_window)
+    end
+    if vim.api.nvim_buf_is_valid(terminal_buffer) then
+      pcall(vim.api.nvim_buf_delete, terminal_buffer, { force = true })
+    end
+  end
+  if process.initial_size == nil then
+    process.initial_size = {
+      cols = math.max(vim.api.nvim_win_get_width(terminal_window), 1),
+      rows = math.max(vim.api.nvim_win_get_height(terminal_window), 1),
+    }
+  end
+  local handle, spawn_err = context:open_pty(process, opts.handlers)
+  if not handle then
+    cleanup_terminal_layout()
+    return nil, spawn_err
+  end
+
+  local function fail_started_terminal(cause)
+    if type(handle.kill) == "function" then
+      pcall(handle.kill, handle)
+    end
+    cleanup_terminal_layout()
+    return nil, "failed to activate the remote terminal: " .. tostring(cause)
+  end
+  if
+    not vim.api.nvim_win_is_valid(terminal_window)
+    or not vim.api.nvim_buf_is_valid(terminal_buffer)
+    or vim.api.nvim_win_get_buf(terminal_window) ~= terminal_buffer
+  then
+    return fail_started_terminal("the terminal window or buffer was changed during TermOpen")
+  end
+  local metadata_ok, metadata_err = pcall(function()
+    vim.b[terminal_buffer].nrm_workspace_key = context.workspace_id
+    vim.b[terminal_buffer].nrm_runtime_terminal = true
+  end)
+  if not metadata_ok then
+    return fail_started_terminal(metadata_err)
+  end
+  local focus_ok, focus_err = pcall(vim.api.nvim_set_current_win, terminal_window)
+  if not focus_ok or vim.api.nvim_get_current_win() ~= terminal_window then
+    return fail_started_terminal(focus_err or "could not select the terminal window")
+  end
+  if
+    not vim.api.nvim_win_is_valid(terminal_window)
+    or not vim.api.nvim_buf_is_valid(terminal_buffer)
+    or vim.api.nvim_win_get_buf(terminal_window) ~= terminal_buffer
+  then
+    return fail_started_terminal("the terminal window or buffer was changed while restoring terminal focus")
+  end
+  -- Match Neovim's built-in terminal workflow: a freshly opened interactive
+  -- shell should receive the next key instead of interpreting it as a normal-
+  -- mode command. Provider-level open_pty() remains mode-neutral for plugins
+  -- that own their own terminal UI.
+  local insert_ok, insert_err = pcall(function()
+    vim.cmd("startinsert")
+  end)
+  if not insert_ok then
+    return fail_started_terminal(insert_err)
+  end
+  return handle
 end
 
 local function decorate_status_result(result)
@@ -2350,6 +2571,7 @@ function M.setup(opts)
     merged.remote_agent_registry_public_keys = vim.deepcopy(opts.remote_agent_registry_public_keys)
   end
   validate_registry_config(merged)
+  validate_remote_runtime_config(merged)
   M.config = merged
 end
 
@@ -2433,6 +2655,7 @@ local function finish_connect(client, target_arg, is_reconnect, generation)
   M.connection_error = nil
   M.reconnect_pending = false
   setup_mirror_autohydrate(client)
+  emit_workspace_event("NrmWorkspaceConnected", client, { reconnect = is_reconnect == true })
   if is_reconnect then
     schedule_reconnect_stable_reset(client, generation)
   end
@@ -2554,16 +2777,16 @@ function M.connect(target, opts)
   target = parse_target(target)
   local target_arg = reconnect_arg(target)
   local is_reconnect = opts.reconnect == true
-  if not opts.reconnect then
-    M.reconnect_generation = M.reconnect_generation + 1
-    M.reconnect_attempts = 0
-  end
-  local generation = M.reconnect_generation
   M.connection_status = is_reconnect and "reconnecting" or "connecting"
   M.connection_target = target_arg
   M.connection_reason = nil
   M.connection_error = nil
   M.reconnect_pending = false
+  if not opts.reconnect then
+    M.reconnect_attempts = 0
+    bump_reconnect_generation("connect", nil)
+  end
+  local generation = M.reconnect_generation
 
   if M.client and M.client.job_id then
     M.disconnect({ preserve_last_target = true })
@@ -2586,6 +2809,14 @@ function M.connect(target, opts)
     agent_bootstrap_skip_reason = automatic_bootstrap_skip_reason(connection),
     agent_bootstrap_state = "disabled",
     expected_registry_policy_fingerprint = registry_policy_fingerprint(M.config),
+    runtime_config = {
+      sidecar = M.config.sidecar,
+      agent = M.config.agent,
+      remote_agent = M.config.remote_agent,
+      state_dir = M.config.state_dir,
+      request_timeout_ms = M.config.request_timeout_ms,
+      ssh_connect_timeout_seconds = M.config.ssh_connect_timeout_seconds,
+    },
     -- Requests must use the same timeout policy that was passed to this
     -- sidecar. A later setup() call only applies after reconnecting.
     timeout_config = {
@@ -2634,13 +2865,14 @@ function M.connect(target, opts)
         end
         local unexpected = not client.closing
         if unexpected then
-          local exit_generation = M.reconnect_generation
           fail_pending(client, "sidecar exited with code " .. tostring(code))
           M.connection_status = M.config.auto_reconnect and "reconnect_pending" or "disconnected"
           M.connection_target = client.target_arg
           M.connection_reason = nil
           M.connection_error = "sidecar exited with code " .. tostring(code)
           M.reconnect_pending = M.config.auto_reconnect == true
+          local exit_generation = bump_reconnect_generation("transport_exit", client)
+          emit_workspace_event("NrmWorkspaceDisconnected", client, { reason = M.connection_error })
           notify("sidecar exited with code " .. tostring(code), vim.log.levels.ERROR)
           schedule_reconnect(client.target_arg, exit_generation, client.connection)
         else
@@ -2703,13 +2935,14 @@ function M.disconnect(opts)
   if not M.client then
     clear_mirror_autohydrate()
     if not opts.preserve_last_target then
-      M.reconnect_generation = M.reconnect_generation + 1
       M.reconnect_attempts = 0
       M.connection_status = "disconnected"
       M.connection_target = nil
       M.connection_reason = "explicit disconnect"
       M.connection_error = nil
       M.reconnect_pending = false
+      bump_reconnect_generation("disconnect", nil)
+      emit_workspace_event("NrmWorkspaceDisconnected", nil, { reason = M.connection_reason })
     end
     return
   end
@@ -2744,13 +2977,14 @@ function M.disconnect(opts)
   M.client = nil
   if not opts.preserve_last_target then
     M.stop_background_mirror()
-    M.reconnect_generation = M.reconnect_generation + 1
     M.reconnect_attempts = 0
     M.connection_status = "disconnected"
     M.connection_target = nil
     M.connection_reason = "explicit disconnect"
     M.connection_error = nil
     M.reconnect_pending = false
+    bump_reconnect_generation("disconnect", client)
+    emit_workspace_event("NrmWorkspaceDisconnected", client, { reason = M.connection_reason })
   end
 end
 
@@ -2762,12 +2996,12 @@ function M.reconnect()
     M.disconnect({ preserve_last_target = true })
   end
   M.reconnect_attempts = 0
-  M.reconnect_generation = M.reconnect_generation + 1
   M.connection_status = "reconnecting"
   M.connection_target = M.last_target
   M.connection_reason = nil
   M.connection_error = nil
   M.reconnect_pending = false
+  bump_reconnect_generation("reconnect", nil)
   M.connect(M.last_target, { reconnect = true, connection = M.last_connection })
 end
 

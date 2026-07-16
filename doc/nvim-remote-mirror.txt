@@ -8,9 +8,11 @@ CONTENTS                                      *nvim-remote-mirror-contents*
 3. UI                                        |nvim-remote-mirror-ui|
 4. Commands                                  |nvim-remote-mirror-commands|
 5. Configuration                             |nvim-remote-mirror-config|
-6. Signed agent registry                     |nvim-remote-mirror-registry|
-7. Limits                                    |nvim-remote-mirror-limits|
-8. LSP                                       |nvim-remote-mirror-lsp|
+6. Workspace runtime                         |nvim-remote-mirror-runtime|
+7. Picker API                                |nvim-remote-mirror-pickers|
+8. Signed agent registry                     |nvim-remote-mirror-registry|
+9. Limits                                    |nvim-remote-mirror-limits|
+10. LSP                                      |nvim-remote-mirror-lsp|
 
 ==============================================================================
 GOAL                                            *nvim-remote-mirror-goal*
@@ -153,6 +155,23 @@ COMMANDS                                      *nvim-remote-mirror-commands*
     Set the current tab's working directory to the active workspace's local
     mirror files root. This is useful for cwd-based local plugins that should
     operate on the mirrored project tree.
+
+:RemoteTrustWorkspace[!]
+    Persist process/terminal trust for the resolved workspace. Without [!],
+    confirm first; [!] is an intentional scripted opt-in that skips the
+    confirmation. Connect never grants this trust or starts an arbitrary
+    workspace command.
+
+:RemoteUntrustWorkspace
+    Remove persisted process/terminal trust for the resolved workspace.
+
+:RemoteTerminal[!] [cmd...]
+    Open an attached remote PTY in a bottom split. With no cmd, start the
+    authority account's default shell and enter terminal-input mode; otherwise
+    pass cmd as an argv list, never shell-interpolated text. The local bridge
+    disables its own echo and control-key processing so only the authority PTY
+    handles them. [!] requests detached persistence and currently fails with
+    persistence_unavailable until the persistent runtime broker is implemented.
 
 :RemoteOpen {path}
     Open a workspace-relative file from the local mirror when cached, including
@@ -361,6 +380,12 @@ CONFIGURATION                                  *nvim-remote-mirror-config*
     background_mirror_refresh_limit = 32,
     background_mirror_max_file_bytes = 128 * 1024,
     background_mirror_max_total_bytes = 512 * 1024,
+    remote_runtime = {
+      enabled = true,
+      trust = "prompt",
+      detached_ttl_ms = 24 * 60 * 60 * 1000,
+      ticket_create_timeout_ms = 5000,
+    },
     picker = {
       provider = "auto",
     },
@@ -491,6 +516,23 @@ adoption_policy defaults to "tracked_or_explicit", so new mirror-root files need
 :RemoteAdopt before they are queued for remote creation. Set it to "auto" only
 when mirror-root writes should be adopted as remote files automatically.
 
+remote_runtime.enabled gates explicit process and terminal requests; it does
+not execute a command during connect. remote_runtime.trust is "prompt",
+"always", or "never". An accepted prompt grant is persisted per authority
+in private local sidecar state. remote_runtime.ticket_create_timeout_ms bounds
+local state preparation and private single-use ticket creation.
+remote_runtime.detached_ttl_ms is reserved for the future persistent broker;
+detached sessions are not available yet.
+On Windows runtime state fails closed if an existing state_dir ancestor grants
+an untrusted principal write-data, write-attributes, delete, child-delete,
+DACL, or owner mutation. Use a pre-provisioned protected directory with
+inheritance disabled and access limited to the current user and SYSTEM, or
+repair the unsafe ancestor. Production does not create a drive-root directory
+to bypass this check.
+Private state limits cross-principal exposure; it is not a sandbox against a
+process already running as the same account, or a Windows handle opened before
+an ACL was tightened.
+
 Agent and LSP launch commands share a sidecar transport planner. Local targets
 spawn binaries directly; SSH targets use configured connection options and a
 single shell-quoted remote command. Agent frames pass through an AgentSession
@@ -535,6 +577,130 @@ Workspace state keys preserve the legacy identity material: local for local
 workspaces and the bare SSH target string for SSH workspaces. This keeps
 existing mirrors stable, including the historical collision with an SSH target
 named local. Future non-SSH transports should use namespaced identity material.
+
+==============================================================================
+WORKSPACE RUNTIME                              *nvim-remote-mirror-runtime*
+
+Workspace API v1 is a provider-neutral contract for plugins that need to run
+tools beside the authoritative tree. Resolve an immutable context: >
+  local nrm = require("nvim_remote_mirror")
+  local context, err = nrm.workspace({ bufnr = 0 })
+<
+
+The query accepts at most one of bufnr, path, workspace_id, or workspace_key.
+Without a selector it uses the current remote buffer, then the active
+workspace. Public context fields include api_version, provider, workspace_id,
+epoch, state, mode, authority, roots, and capabilities.
+
+Contexts are tied to a reconnect epoch. context:is_current() checks a retained
+context; execution returns stale_context after connect, disconnect, reconnect,
+or transport replacement advances the epoch. Resolve a new context rather
+than retrying the old object.
+
+context:map_path(path, { from=..., to=... }) crosses between editor,
+authority, editor_uri, and authority_uri spaces. It rejects paths outside the
+workspace, invalid encodings, controls, UNC paths, and invalid Windows roots.
+For example: >
+  local authority_uri = assert(context:map_path(
+    vim.api.nvim_buf_get_name(0),
+    { from = "editor", to = "authority_uri" }
+  ))
+<
+
+Before execution, authorize "process" or "terminal": >
+  context:authorize("process", function(auth_err, granted)
+    if auth_err or not granted then
+      return
+    end
+    -- Create the job inside this callback.
+  end)
+<
+
+job_spec(), spawn(), and open_pty() fail closed when called before trust,
+offline, with a stale context, or without an advertised capability. Connect
+never grants runtime trust or starts an arbitrary workspace command.
+
+Process specs keep command and environment structured: >
+  local process = {
+    command = { argv = { "cargo", "check" } },
+    cwd = { space = "workspace", path = "" },
+    env = { clear = false, set = { NO_COLOR = "1" }, unset = { "PAGER" } },
+    stdio = "pipe",
+    persistence = "attached",
+    timeout_ms = 30000,
+    max_output_bytes = 4 * 1024 * 1024,
+  }
+<
+
+command may instead be { shell = "default" }. Arbitrary shell text is not
+accepted there; use explicit argv such as { "sh", "-lc", "make test" } when
+shell evaluation is intentional. cwd space may be workspace-relative,
+buffer-relative, or an absolute contained editor/authority path.
+
+Arguments are UTF-8 and control-free on every platform. max_output_bytes is a
+pipe-only cumulative limit (4 MiB by default, 128 MiB maximum). Omit it for
+PTYs: PTY output is a live backpressured stream with no cumulative byte limit,
+and a PTY request containing max_output_bytes is rejected.
+
+Use context:job_spec(process) when another plugin owns the local job. It
+returns authoritative bridge argv and a canonical command string for
+string-only APIs. Remote argv, cwd, and environment stay inside a private,
+single-use ticket; the local bridge contains only nrm-sidecar and an opaque
+ticket ID. Create a new job_spec for every start and never append shell text
+containing remote or user-provided values to its command. A string-only plugin
+may add only its own fixed local bookkeeping syntax.
+
+ToggleTerm can consume that generic bridge without an nrm-specific patch: >
+  local Terminal = require("toggleterm.terminal").Terminal
+  local nrm = require("nvim_remote_mirror")
+  local context = assert(nrm.workspace({ bufnr = 0 }))
+
+  context:authorize("terminal", function(err, granted)
+    if err or not granted then
+      return
+    end
+    local bridge = assert(context:job_spec({
+      command = { shell = "default" },
+      cwd = { space = "workspace", path = "" },
+      stdio = "pty",
+      persistence = "attached",
+    }))
+    Terminal:new({
+      cmd = bridge.command,
+      dir = bridge.cwd,
+      close_on_exit = true,
+    }):toggle()
+  end)
+<
+
+ToggleTerm adds a fixed local comment marker to identify its buffer. Every
+respawn must create a new job_spec and Terminal because runtime tickets are
+single-use. Public third-party workspace-provider registration is not exposed
+in API v1 yet.
+
+Use context:spawn(process, handlers) for a managed attached pipe, or
+context:open_pty(process, handlers) for a managed attached PTY. Handles expose
+write(), close_stdin(), signal(), and kill(); PTYs also expose resize().
+Signals are interrupt, terminate, kill, or hangup. on_stdout/on_stderr receive
+Neovim line/list job stream callbacks, not a binary-transparent byte API.
+Embedded NUL bytes are represented as line breaks by Neovim; use job_spec with
+an argv-capable raw process consumer when exact bytes are required. on_exit
+receives the usual id/code/event plus a
+fourth structured authority result when it is available.
+
+User NrmWorkspaceConnected, NrmWorkspaceDisconnected, and
+NrmWorkspaceEpochChanged events contain epoch, workspace_key, target, and
+state plus a reason/reconnect field when applicable. Treat event data as a
+hint, discard cached contexts, and resolve again before execution.
+
+Only attached pipes and PTYs are advertised today. Detached/reconnectable
+sessions and workspace_watch_v1 are unavailable. [!] on :RemoteTerminal
+therefore returns persistence_unavailable. Runtime execution is orchestration,
+not a sandbox: commands run as the authority account, and a deliberately
+daemonized POSIX descendant may outlive attached signal handling.
+
+See docs/workspace-runtime.md in the project checkout for the complete API,
+trust/ACL policy, limits, error codes, and integration guidance.
 
 ==============================================================================
 PICKER API                                      *nvim-remote-mirror-pickers*
@@ -614,8 +780,10 @@ LIMITS                                        *nvim-remote-mirror-limits*
 This is dogfooding software. The local mirror, SSH workspaces, background
 metadata scan, find, grep, save queue, conflicts, socket sidecar mode, and basic
 LSP proxy are implemented. Remote git status/diff/blame primitives are
-implemented. Remote terminals, DAP, full git adapters, and general plugin
-remoting are not built yet.
+implemented. Attached remote pipe processes and PTYs are available through
+workspace API v1 and :RemoteTerminal. Persistent/detached terminals,
+workspace watching, DAP, full git adapters, and general plugin remoting are
+not built yet.
 
 Local plugins operate on hydrated mirror files. Local grep or file pickers can
 only see what is already known or present in the mirror; use :RemoteScan,
