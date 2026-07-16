@@ -17,6 +17,7 @@ local original_notify = vim.notify
 
 local function main()
   nrm.setup({
+    sidecar = vim.fn.fnamemodify(vim.v.progpath, ":p"),
     remote_agent_registry_url = "file:///tmp/releases/v{version}/manifest.json",
     remote_agent_registry_public_keys = { ["release-a"] = KEY },
     auto_reconnect = false,

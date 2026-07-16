@@ -20,6 +20,7 @@ local original_os_get_passwd = uv.os_get_passwd
 
 local function main()
   nrm.setup({
+    sidecar = vim.fn.fnamemodify(vim.v.progpath, ":p"),
     connection = "socket",
     socket_path = "/tmp/nrm-test-sidecar-eof/socket.sock",
     auto_reconnect = false,
