@@ -46,6 +46,8 @@ use windows_sys::Win32::System::Threading::{
 
 const MAX_CREATE_PROCESS_COMMAND_LINE_UNITS: usize = 32_767;
 const MAX_CREATE_PROCESS_ENVIRONMENT_UNITS: usize = 32_767;
+// The terminating NUL also occupies one unit in the legacy MAX_PATH buffer.
+const MAX_ORDINARY_WIN32_PATH_UNITS: usize = 259;
 const DEFAULT_SAFE_PATHEXT: &str = ".COM;.EXE;.BAT;.CMD";
 
 pub(crate) type Input = File;
@@ -789,10 +791,7 @@ pub(crate) fn spawn(command: &PtyCommand, size: PtySize) -> Result<Spawned, PtyE
         mut command_line,
         mut environment,
     } = prepare_launch(command)?;
-    let current_directory = match command.cwd() {
-        Some(path) => Some(wide_nul(path.as_os_str(), "cwd")?),
-        None => None,
-    };
+    let current_directory = process_current_directory(command)?;
     let mut process_info = PROCESS_INFORMATION::default();
     // The child starts suspended so it cannot create untracked descendants
     // before it is assigned to the kill-on-close job.
@@ -921,10 +920,7 @@ pub(crate) fn spawn_pipe(command: &PtyCommand) -> Result<PipeSpawned, PtyError> 
         mut command_line,
         mut environment,
     } = prepare_launch(command)?;
-    let current_directory = match command.cwd() {
-        Some(path) => Some(wide_nul(path.as_os_str(), "cwd")?),
-        None => None,
-    };
+    let current_directory = process_current_directory(command)?;
     let mut process_info = PROCESS_INFORMATION::default();
     // SAFETY: The handle-list attribute restricts inheritance to the three
     // explicitly inheritable stdio pipe ends. The child remains suspended until
@@ -1097,16 +1093,39 @@ fn native_command_line(command: &PtyCommand) -> Result<Vec<u16>, PtyError> {
     Ok(line)
 }
 
+fn process_current_directory(command: &PtyCommand) -> Result<Option<Vec<u16>>, PtyError> {
+    command
+        .cwd()
+        .map(|path| {
+            // `canonicalize()` commonly returns a verbatim path on Windows.
+            // CreateProcessW exposes that spelling as the child's current
+            // directory, and cmd.exe rejects a verbatim drive spelling as an
+            // unsupported UNC path. Use the ordinary spelling only when the
+            // conversion is short, structurally safe, and preserves identity;
+            // otherwise retain the original verbatim path.
+            let path = child_compatible_path(path.as_os_str());
+            wide_nul(path.as_os_str(), "cwd")
+        })
+        .transpose()
+}
+
 fn prepare_launch(command: &PtyCommand) -> Result<Launch, PtyError> {
     let resolved = resolve_application(command)?;
     match resolved.kind {
         ApplicationKind::Native => {
+            // `resolve_application` canonicalizes native images, which commonly
+            // adds a verbatim prefix on Windows. CreateProcessW can launch that
+            // spelling, but Windows PowerShell 5.1 was observed to exit during
+            // ServicePointManager initialization when launched with it here.
+            // Keep argv unchanged and use the ordinary application spelling
+            // only when conversion is short and semantics-preserving.
+            let application = child_compatible_path(resolved.path.as_os_str());
             let command_line = native_command_line(command)?;
             validate_command_line_size(&command_line)?;
             let environment = environment_block(command, &[])?;
             validate_environment_size(&environment)?;
             Ok(Launch {
-                application: wide_nul(resolved.path.as_os_str(), "program")?,
+                application: wide_nul(application.as_os_str(), "program")?,
                 command_line,
                 environment,
             })
@@ -1149,7 +1168,7 @@ fn batch_command_line(
         "batch interpreter",
     )?;
     line.extend(" /d /s /v:off /c \"".encode_utf16());
-    let target = cmd_compatible_path(target.as_os_str());
+    let target = child_compatible_path(target.as_os_str());
     append_batch_value(&mut line, target.as_os_str())?;
     for argument in arguments {
         line.push(b' ' as u16);
@@ -1160,7 +1179,7 @@ fn batch_command_line(
     Ok(line)
 }
 
-fn cmd_compatible_path(path: &OsStr) -> OsString {
+fn child_compatible_path(path: &OsStr) -> OsString {
     let units: Vec<u16> = path.encode_wide().collect();
     let verbatim = [b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16];
     if !units.starts_with(&verbatim) {
@@ -1171,11 +1190,80 @@ fn cmd_compatible_path(path: &OsStr) -> OsString {
         .get(verbatim.len()..verbatim.len() + unc.len())
         .is_some_and(|value| ascii_wide_eq(value, b"UNC\\"))
     {
+        let suffix = &units[verbatim.len() + unc.len()..];
         let mut result = vec![b'\\' as u16, b'\\' as u16];
-        result.extend_from_slice(&units[verbatim.len() + unc.len()..]);
-        return OsString::from_wide(&result);
+        result.extend_from_slice(suffix);
+        if result.len() <= MAX_ORDINARY_WIN32_PATH_UNITS
+            && ordinary_win32_components_are_safe(suffix, 2)
+        {
+            return OsString::from_wide(&result);
+        }
+        return path.to_os_string();
     }
-    OsString::from_wide(&units[verbatim.len()..])
+    let dos_drive_absolute = units
+        .get(verbatim.len()..verbatim.len() + 3)
+        .is_some_and(|prefix| {
+            matches!(prefix[0], 0x41..=0x5a | 0x61..=0x7a)
+                && prefix[1] == b':' as u16
+                && prefix[2] == b'\\' as u16
+        });
+    if dos_drive_absolute {
+        let result = &units[verbatim.len()..];
+        let suffix = &units[verbatim.len() + 3..];
+        if result.len() <= MAX_ORDINARY_WIN32_PATH_UNITS
+            && ordinary_win32_components_are_safe(suffix, 0)
+        {
+            return OsString::from_wide(result);
+        }
+    }
+    path.to_os_string()
+}
+
+fn ordinary_win32_components_are_safe(path: &[u16], required_components: usize) -> bool {
+    if path.is_empty() {
+        return required_components == 0;
+    }
+    let components: Vec<&[u16]> = path.split(|unit| *unit == b'\\' as u16).collect();
+    components.len() >= required_components
+        && components
+            .iter()
+            .all(|component| ordinary_win32_component_is_safe(component))
+}
+
+fn ordinary_win32_component_is_safe(component: &[u16]) -> bool {
+    if component.is_empty()
+        || component
+            .last()
+            .is_some_and(|unit| matches!(*unit, 0x20 | 0x2e))
+        || component.iter().any(|unit| {
+            matches!(
+                *unit,
+                0x00..=0x1f | 0x22 | 0x2a | 0x2f | 0x3a | 0x3c | 0x3e | 0x3f | 0x5c | 0x7c
+            )
+        })
+    {
+        return false;
+    }
+
+    let stem_end = component
+        .iter()
+        .position(|unit| *unit == b'.' as u16)
+        .unwrap_or(component.len());
+    let stem = &component[..stem_end];
+    let reserved = [
+        b"CON".as_slice(),
+        b"PRN",
+        b"AUX",
+        b"NUL",
+        b"CONIN$",
+        b"CONOUT$",
+    ];
+    if reserved.iter().any(|name| ascii_wide_eq(stem, name)) {
+        return false;
+    }
+    stem.len() != 4
+        || !(ascii_wide_eq(&stem[..3], b"COM") || ascii_wide_eq(&stem[..3], b"LPT"))
+        || !matches!(stem[3], 0x31..=0x39 | 0x00b9 | 0x00b2 | 0x00b3)
 }
 
 fn append_batch_value(output: &mut Vec<u16>, value: &OsStr) -> Result<(), PtyError> {
@@ -1586,6 +1674,13 @@ fn insert_environment_entry(
         variables.remove(index);
     }
     if let Some(value) = value {
+        // Windows keeps one hidden `=X:` current-directory entry per drive.
+        // A canonical verbatim value is inherited by children independently
+        // of lpCurrentDirectory, so drive-relative resolution can still
+        // observe the incompatible spelling after the explicit cwd is
+        // normalized.
+        let normalized_value = drive_current_directory.then(|| child_compatible_path(value));
+        let value = normalized_value.as_deref().unwrap_or(value);
         let value: Vec<u16> = value.encode_wide().collect();
         if value.contains(&0) {
             return Err(PtyError::EmbeddedNul {
@@ -1943,6 +2038,79 @@ mod tests {
     }
 
     #[test]
+    fn child_path_conversion_is_limited_to_dos_namespaces() {
+        for (input, expected) in [
+            (r"\\?\B:\repos\workspace", r"B:\repos\workspace"),
+            (
+                r"\\?\UNC\server\share\workspace",
+                r"\\server\share\workspace",
+            ),
+            (
+                r"\\?\Volume{12345678-1234-1234-1234-123456789abc}\workspace",
+                r"\\?\Volume{12345678-1234-1234-1234-123456789abc}\workspace",
+            ),
+            (
+                r"\\?\GLOBALROOT\Device\HarddiskVolume1\workspace",
+                r"\\?\GLOBALROOT\Device\HarddiskVolume1\workspace",
+            ),
+            (r"\\?\B:drive-relative", r"\\?\B:drive-relative"),
+            (r"\\?\malformed", r"\\?\malformed"),
+        ] {
+            let mut command = PtyCommand::new("program.exe");
+            command.current_dir(input);
+
+            let current_directory = process_current_directory(&command)
+                .expect("current directory")
+                .expect("configured current directory");
+
+            assert_eq!(decode(&current_directory), expected);
+        }
+    }
+
+    #[test]
+    fn child_path_conversion_preserves_verbatim_only_names_and_long_paths() {
+        let dos_boundary = format!(r"B:\{}\{}", "x".repeat(128), "y".repeat(127));
+        let dos_long = format!(r"B:\{}\{}", "x".repeat(128), "y".repeat(128));
+        let unc_boundary = format!(r"\\server\share\{}", "x".repeat(244));
+        let unc_long = format!(r"\\server\share\{}", "x".repeat(245));
+        assert_eq!(dos_boundary.encode_utf16().count(), 259);
+        assert_eq!(dos_long.encode_utf16().count(), 260);
+        assert_eq!(unc_boundary.encode_utf16().count(), 259);
+        assert_eq!(unc_long.encode_utf16().count(), 260);
+
+        for (input, expected) in [
+            (format!(r"\\?\{dos_boundary}"), dos_boundary),
+            (
+                format!(r"\\?\UNC\server\share\{}", "x".repeat(244)),
+                unc_boundary,
+            ),
+            (format!(r"\\?\{dos_long}"), format!(r"\\?\{dos_long}")),
+            (
+                format!(r"\\?\UNC\server\share\{}", "x".repeat(245)),
+                format!(r"\\?\UNC\server\share\{}", "x".repeat(245)),
+            ),
+        ] {
+            assert_eq!(
+                child_compatible_path(OsStr::new(&input)),
+                OsString::from(expected)
+            );
+        }
+
+        for input in [
+            r"\\?\B:\repos\trailing.",
+            r"\\?\B:\repos\trailing ",
+            r"\\?\B:\repos\.\workspace",
+            r"\\?\B:\repos\..\workspace",
+            r"\\?\B:\repos\NUL.txt",
+            r"\\?\B:\repos\COM1",
+            r"\\?\UNC\server\share\NUL.txt",
+            r"\\?\B:/repos/workspace",
+        ] {
+            assert_eq!(child_compatible_path(OsStr::new(input)), input);
+        }
+    }
+
+    #[test]
     fn validation_enforces_create_process_command_line_limit() {
         // program + separator + argument + trailing NUL must fit exactly in
         // CreateProcessW's documented 32,767 UTF-16-unit limit.
@@ -2132,6 +2300,17 @@ mod tests {
         )
         .expect("insert inherited drive current directory");
         assert_eq!(values.len(), 1);
+        insert_environment_entry(
+            &mut values,
+            OsStr::new("=D:"),
+            Some(OsStr::new(r"\\?\D:\verbatim\workspace")),
+            true,
+        )
+        .expect("insert inherited verbatim drive current directory");
+        assert_eq!(
+            String::from_utf16_lossy(&values[1].1),
+            r"D:\verbatim\workspace"
+        );
         assert!(matches!(
             insert_environment(
                 &mut values,
@@ -2400,6 +2579,74 @@ mod tests {
         assert!(stdout.contains("standard-output"));
         assert!(stderr.contains("standard-error"));
         assert!(process.wait().expect("wait").success());
+    }
+
+    #[test]
+    fn piped_windows_powershell_starts_from_canonical_paths() {
+        const MARKER: &str = "NRM_PTY_POWERSHELL_OK";
+        let system = system_directory().expect("Windows system directory");
+        let powershell = system
+            .join("WindowsPowerShell")
+            .join("v1.0")
+            .join("powershell.exe");
+        assert!(powershell.is_file(), "Windows PowerShell is missing");
+        let root = tempfile::tempdir().expect("temporary workspace");
+        let canonical_root = fs::canonicalize(root.path()).expect("canonical workspace");
+
+        let mut command = PtyCommand::new(powershell);
+        command.args(["-NoProfile", "-NonInteractive", "-Command"]);
+        command.arg(format!("[Console]::Out.Write('{MARKER}')"));
+        command.current_dir(canonical_root);
+
+        let mut process = crate::PipeProcess::spawn(&command).expect("spawn Windows PowerShell");
+        drop(process.take_input());
+        let mut stdout = process.take_stdout().expect("stdout");
+        let mut stderr = process.take_stderr().expect("stderr");
+        let stdout_reader = thread::spawn(move || {
+            let mut bytes = Vec::new();
+            stdout.read_to_end(&mut bytes).expect("read stdout");
+            bytes
+        });
+        let stderr_reader = thread::spawn(move || {
+            let mut bytes = Vec::new();
+            stderr.read_to_end(&mut bytes).expect("read stderr");
+            bytes
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let status = loop {
+            if let Some(status) = process.try_wait().expect("poll Windows PowerShell") {
+                break Some(status);
+            }
+            if std::time::Instant::now() >= deadline {
+                break None;
+            }
+            thread::sleep(std::time::Duration::from_millis(10));
+        };
+        let timed_out = status.is_none();
+        if timed_out {
+            let _ = process.signal(PtySignal::Kill);
+        }
+        // Dropping the kill-on-close job after the bounded poll guarantees
+        // both pipe readers are released before their diagnostics are joined.
+        drop(process);
+        let stdout = stdout_reader.join().expect("join stdout reader");
+        let stderr = stderr_reader.join().expect("join stderr reader");
+
+        assert!(
+            !timed_out,
+            "Windows PowerShell timed out; stdout: {}; stderr: {}",
+            String::from_utf8_lossy(&stdout),
+            String::from_utf8_lossy(&stderr)
+        );
+        let status = status.expect("status checked above");
+
+        assert!(
+            status.success(),
+            "Windows PowerShell failed with {status:?}: {}",
+            String::from_utf8_lossy(&stderr)
+        );
+        assert_eq!(stdout, MARKER.as_bytes());
+        assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
     }
 
     #[test]
