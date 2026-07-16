@@ -485,7 +485,7 @@ local function active_identity(nrm)
     remote_root = optional_string(hello.remote_root),
     mirror_root = optional_string(hello.mirror_root),
     remote_host = type(hello.remote_host) == "table" and copy(hello.remote_host) or nil,
-    capabilities = type(hello.capabilities) == "table" and copy(hello.capabilities) or {},
+    capabilities = hello.capabilities == nil and {} or copy(hello.capabilities),
     runtime_config = type(client.runtime_config) == "table" and copy(client.runtime_config) or nil,
   }
 end
@@ -567,7 +567,7 @@ local function descriptor_for_identity(nrm, identity)
       editor = source.files_root,
       authority = remote_root,
     },
-    capabilities = source.capabilities or {},
+    capabilities = source.capabilities == nil and {} or source.capabilities,
     relative_path = identity.relative_path,
     _target_arg = source.target_arg,
     _workspace_key = source.workspace_key,
@@ -780,11 +780,16 @@ local function validate_descriptor(descriptor)
   if path_style ~= "posix" and path_style ~= "windows" then
     return nil, workspace_error("invalid_provider_state", "workspace provider returned an invalid path style")
   end
+  if descriptor.capabilities ~= nil and type(descriptor.capabilities) ~= "table" then
+    return nil, workspace_error("invalid_provider_state", "workspace provider returned invalid capabilities")
+  end
   descriptor = copy(descriptor)
   descriptor.authority.label = authority_label or descriptor.authority.id
   descriptor.api_version = M.API_VERSION
   descriptor.provider = optional_string(descriptor.provider) or "nrm"
-  descriptor.capabilities = type(descriptor.capabilities) == "table" and descriptor.capabilities or {}
+  if descriptor.capabilities == nil then
+    descriptor.capabilities = {}
+  end
   return descriptor
 end
 
@@ -967,7 +972,9 @@ end
 
 function Context:map_path(path, opts)
   local record = record_for(self)
-  opts = opts or {}
+  if opts == nil then
+    opts = {}
+  end
   if type(opts) ~= "table" then
     return nil, workspace_error("invalid_argument", "map_path options must be a table")
   end
@@ -1111,7 +1118,9 @@ local function normalize_cwd(record, cwd)
 end
 
 local function normalize_env(record, env)
-  env = env or {}
+  if env == nil then
+    env = {}
+  end
   if type(env) ~= "table" then
     return nil, workspace_error("invalid_process_spec", "env must be a table")
   end
@@ -1122,7 +1131,10 @@ local function normalize_env(record, env)
   if env.clear ~= nil and type(env.clear) ~= "boolean" then
     return nil, workspace_error("invalid_process_spec", "env.clear must be a boolean")
   end
-  local set = env.set or {}
+  local set = env.set
+  if set == nil then
+    set = {}
+  end
   if type(set) ~= "table" then
     return nil, workspace_error("invalid_process_spec", "env.set must be a table")
   end
@@ -1149,7 +1161,10 @@ local function normalize_env(record, env)
     seen[compared] = "set"
     normalized_set[key] = value
   end
-  local unset = env.unset or {}
+  local unset = env.unset
+  if unset == nil then
+    unset = {}
+  end
   local size, list_err = validate_array(unset, "env.unset", true)
   if not size then
     return nil, list_err
@@ -1197,7 +1212,9 @@ local function bounded_integer(value, name, maximum)
 end
 
 local function normalize_initial_size(initial_size)
-  initial_size = initial_size or {}
+  if initial_size == nil then
+    initial_size = {}
+  end
   if type(initial_size) ~= "table" then
     return nil, workspace_error("invalid_process_spec", "initial_size must be a table")
   end
@@ -1210,11 +1227,19 @@ local function normalize_initial_size(initial_size)
   if not fields_ok then
     return nil, workspace_error("invalid_process_spec", "unknown initial_size field: " .. unknown)
   end
-  local cols, cols_err = bounded_integer(initial_size.cols or 80, "initial_size.cols", MAX_TERMINAL_CELLS)
+  local configured_cols = initial_size.cols
+  if configured_cols == nil then
+    configured_cols = 80
+  end
+  local cols, cols_err = bounded_integer(configured_cols, "initial_size.cols", MAX_TERMINAL_CELLS)
   if not cols then
     return nil, cols_err
   end
-  local rows, rows_err = bounded_integer(initial_size.rows or 24, "initial_size.rows", MAX_TERMINAL_CELLS)
+  local configured_rows = initial_size.rows
+  if configured_rows == nil then
+    configured_rows = 24
+  end
+  local rows, rows_err = bounded_integer(configured_rows, "initial_size.rows", MAX_TERMINAL_CELLS)
   if not rows then
     return nil, rows_err
   end
@@ -1279,11 +1304,17 @@ local function normalize_process_spec(record, opts)
   if not env then
     return nil, env_err
   end
-  local stdio = opts.stdio or "pipe"
+  local stdio = opts.stdio
+  if stdio == nil then
+    stdio = "pipe"
+  end
   if stdio ~= "pipe" and stdio ~= "pty" then
     return nil, workspace_error("invalid_process_spec", "stdio must be pipe or pty")
   end
-  local persistence = opts.persistence or "attached"
+  local persistence = opts.persistence
+  if persistence == nil then
+    persistence = "attached"
+  end
   if persistence ~= "attached" and persistence ~= "detached" then
     return nil, workspace_error("invalid_process_spec", "persistence must be attached or detached")
   end
@@ -1300,8 +1331,11 @@ local function normalize_process_spec(record, opts)
       return nil, workspace_error("invalid_process_spec", "max_output_bytes applies only to pipe processes")
     end
   else
-    max_output_bytes, output_err =
-      bounded_integer(opts.max_output_bytes or (4 * 1024 * 1024), "max_output_bytes", MAX_OUTPUT_BYTES)
+    local configured_max_output_bytes = opts.max_output_bytes
+    if configured_max_output_bytes == nil then
+      configured_max_output_bytes = 4 * 1024 * 1024
+    end
+    max_output_bytes, output_err = bounded_integer(configured_max_output_bytes, "max_output_bytes", MAX_OUTPUT_BYTES)
     if not max_output_bytes then
       return nil, output_err
     end
@@ -1578,7 +1612,13 @@ function Context:spawn(opts, handlers)
 end
 
 function Context:open_pty(opts, handlers)
-  opts = copy(opts or {})
+  if opts == nil then
+    opts = {}
+  end
+  if type(opts) ~= "table" then
+    return nil, workspace_error("invalid_process_spec", "process options must be a table")
+  end
+  opts = copy(opts)
   opts.stdio = "pty"
   return self:spawn(opts, handlers)
 end
@@ -1603,7 +1643,9 @@ local CONTEXT_MT = {
 }
 
 function M.resolve(query)
-  query = query or {}
+  if query == nil then
+    query = {}
+  end
   if type(query) ~= "table" then
     return nil, workspace_error("invalid_argument", "workspace query must be a table")
   end
@@ -1680,6 +1722,25 @@ end
 
 function M._normalize_process_spec(context, opts)
   return normalize_process_spec(record_for(context), opts)
+end
+
+function M._runtime_trust_snapshot(context)
+  local record = context_records[context]
+  if not record then
+    return nil
+  end
+  local snapshot = record.snapshot
+  return {
+    authority = {
+      id = snapshot.authority.id,
+      kind = snapshot.authority.kind,
+      label = snapshot.authority.label,
+    },
+    roots = {
+      authority = snapshot.roots.authority,
+    },
+    _runtime_config = copy(snapshot._runtime_config),
+  }
 end
 
 return M

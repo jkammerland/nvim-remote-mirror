@@ -156,6 +156,42 @@ local function optional_string(value)
   return nil
 end
 
+local function contains_control(value)
+  return type(value) ~= "string" or value:find("[%z\1-\31\127]") ~= nil or value:find("\194[\128-\159]") ~= nil
+end
+
+local function absolute_local_executable(path)
+  if vim.fn.has("win32") == 1 then
+    return path:match("^%a:[/\\]") ~= nil and not path:match("^[/\\][/\\]")
+  end
+  return path:sub(1, 1) == "/"
+end
+
+local function resolve_local_executable(value)
+  if not optional_string(value) or contains_control(value) or value:sub(1, 1) == "-" then
+    return nil, "executable must be a non-empty, control-free path that does not begin with '-'"
+  end
+  local path = value
+  if value:find("[/\\]") then
+    if not absolute_local_executable(value) then
+      return nil, "executable paths containing separators must be absolute"
+    end
+  else
+    local ok, resolved = pcall(vim.fn.exepath, value)
+    if not ok or not optional_string(resolved) then
+      return nil, "executable name was not found on PATH"
+    end
+    path = resolved
+  end
+  path = vim.fn.fnamemodify(path, ":p")
+  if not absolute_local_executable(path) then
+    return nil, "executable did not resolve to an absolute local path"
+  end
+  return path
+end
+
+M._resolve_local_executable = resolve_local_executable
+
 local function decode_standard_base64(value)
   if type(value) ~= "string" or #value == 0 or #value % 4 ~= 0 then
     return nil
@@ -1080,18 +1116,19 @@ local function default_socket_dir()
   return path_join(tmp, "nvim-remote-mirror-" .. user)
 end
 
-local function socket_path_for(target_arg, target)
+local function socket_path_for(target_arg, target, resolved_sidecar)
   if optional_string(M.config.socket_path) then
     return M.config.socket_path
   end
+  local sidecar = optional_string(resolved_sidecar) or M.config.sidecar
   local agent = M.config.agent
   if target and target.ssh then
     agent = optional_string(M.config.remote_agent) or "nrm-agent"
   end
   local identity = table.concat({
     target_arg or "",
-    M.config.sidecar or "",
-    executable_file_identity(M.config.sidecar),
+    sidecar or "",
+    executable_file_identity(sidecar),
     agent or "",
     target and target.ssh and (M.config.agent or "") or "",
     M.config.state_dir or "",
@@ -1458,9 +1495,9 @@ local function connect_socket_channel(client, socket_path)
   return nil
 end
 
-local function start_socket_daemon(_client, target, socket_path)
+local function start_socket_daemon(client, target, socket_path)
   prepare_socket_directory(socket_path)
-  local command = vim.list_extend({ M.config.sidecar }, listener_args(target, socket_path))
+  local command = vim.list_extend({ client.runtime_config.sidecar }, listener_args(target, socket_path))
   local job_id = vim.fn.jobstart(command, {
     detach = true,
     stdout_buffered = false,
@@ -1487,7 +1524,7 @@ local function start_socket_daemon(_client, target, socket_path)
 end
 
 local function connect_or_start_socket(client, target)
-  local socket_path = socket_path_for(client.target_arg, target)
+  local socket_path = socket_path_for(client.target_arg, target, client.runtime_config.sidecar)
   client.socket_path = socket_path
   prepare_socket_directory(socket_path)
   local channel = connect_socket_channel(client, socket_path)
@@ -1894,7 +1931,7 @@ function M.current_workspace()
 end
 
 function M.workspace(query)
-  return require("nvim_remote_mirror.workspace").resolve(query or {})
+  return require("nvim_remote_mirror.workspace").resolve(query)
 end
 
 function M.files_root()
@@ -1999,7 +2036,9 @@ function M.untrust_workspace(opts)
 end
 
 function M.open_terminal(opts)
-  opts = opts or {}
+  if opts == nil then
+    opts = {}
+  end
   if type(opts) ~= "table" then
     return nil, "remote terminal options must be a table"
   end
@@ -2033,7 +2072,7 @@ function M.open_terminal(opts)
     command = command,
     cwd = opts.cwd,
     env = opts.env,
-    persistence = opts.persistence or "attached",
+    persistence = opts.persistence == nil and "attached" or opts.persistence,
     max_output_bytes = opts.max_output_bytes,
     timeout_ms = opts.timeout_ms,
     initial_size = opts.initial_size,
@@ -2775,6 +2814,17 @@ end
 function M.connect(target, opts)
   opts = opts or {}
   target = parse_target(target)
+  local resolved_sidecar, sidecar_err = resolve_local_executable(M.config.sidecar)
+  if not resolved_sidecar then
+    error("invalid sidecar executable: " .. sidecar_err)
+  end
+  local captured_state_dir
+  if M.config.state_dir ~= nil then
+    if not optional_string(M.config.state_dir) or contains_control(M.config.state_dir) then
+      error("invalid runtime state directory")
+    end
+    captured_state_dir = normalize_local_root(M.config.state_dir)
+  end
   local target_arg = reconnect_arg(target)
   local is_reconnect = opts.reconnect == true
   M.connection_status = is_reconnect and "reconnecting" or "connecting"
@@ -2810,10 +2860,10 @@ function M.connect(target, opts)
     agent_bootstrap_state = "disabled",
     expected_registry_policy_fingerprint = registry_policy_fingerprint(M.config),
     runtime_config = {
-      sidecar = M.config.sidecar,
+      sidecar = resolved_sidecar,
       agent = M.config.agent,
       remote_agent = M.config.remote_agent,
-      state_dir = M.config.state_dir,
+      state_dir = captured_state_dir,
       request_timeout_ms = M.config.request_timeout_ms,
       ssh_connect_timeout_seconds = M.config.ssh_connect_timeout_seconds,
     },
@@ -2840,7 +2890,7 @@ function M.connect(target, opts)
     client.daemon_job_id = daemon_job_id
   elseif connection == "stdio" then
     client.transport = "stdio"
-    local command = vim.list_extend({ M.config.sidecar }, sidecar_args(target))
+    local command = vim.list_extend({ resolved_sidecar }, sidecar_args(target))
     client.job_id = vim.fn.jobstart(command, {
       stdout_buffered = false,
       stderr_buffered = false,

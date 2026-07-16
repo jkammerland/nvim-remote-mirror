@@ -1013,7 +1013,12 @@ fn apply_message(
             *phase = RuntimePhase::Closed;
         }
         (RuntimePhase::AwaitDetached(process), message) => {
-            if apply_running_server_message(process, message)? {
+            let closed = if matches!(message, RuntimeMessage::OutputAck { .. }) {
+                apply_running_message(process, message)?
+            } else {
+                apply_running_server_message(process, message)?
+            };
+            if closed {
                 *phase = RuntimePhase::Closed;
             }
         }
@@ -1069,7 +1074,7 @@ fn apply_message(
             *phase = RuntimePhase::Closed;
         }
         (RuntimePhase::AwaitWatchStopped(watch), message) => {
-            apply_watch_server_message(watch, message)?;
+            apply_watch_message(watch, message)?;
         }
         _ => {
             return Err(RuntimeStateError::UnexpectedMessage {
@@ -2277,14 +2282,59 @@ mod tests {
                 process_id: PROCESS_ID,
             })
             .unwrap();
+        // Output can finish flushing after the detach request crosses the
+        // transport. Its acknowledgement is still required to release the
+        // server-side flow-control window before Detached can be delivered.
         machine
+            .observe_outbound(&RuntimeMessage::OutputAck {
+                process_id: PROCESS_ID,
+                stream: RuntimeOutputStream::Pty,
+                next_offset: 6,
+            })
+            .unwrap();
+        machine
+            .observe_inbound(&RuntimeMessage::Detached {
+                process_id: PROCESS_ID,
+                session_id: credentials().session_id,
+            })
+            .unwrap();
+        assert!(machine.is_closed());
+
+        let mut exit_race = client(RuntimeCapability::ProcessPtyV1);
+        exit_race
+            .observe_outbound(&RuntimeMessage::StartProcess {
+                request_id: 5,
+                spec: pty_spec(),
+            })
+            .unwrap();
+        exit_race
+            .observe_inbound(&RuntimeMessage::ProcessStarted {
+                request_id: 5,
+                process_id: PROCESS_ID,
+                session: Some(credentials()),
+                output_offset: 0,
+            })
+            .unwrap();
+        exit_race
+            .observe_outbound(&RuntimeMessage::Detach {
+                process_id: PROCESS_ID,
+            })
+            .unwrap();
+        assert!(matches!(
+            exit_race.observe_outbound(&RuntimeMessage::Resize {
+                process_id: PROCESS_ID,
+                size: size(),
+            }),
+            Err(RuntimeStateError::UnexpectedMessage { .. })
+        ));
+        exit_race
             .observe_inbound(&RuntimeMessage::Exited {
                 process_id: PROCESS_ID,
                 status: RuntimeExitStatus::Code(0),
                 output_truncated: false,
             })
             .unwrap();
-        assert!(machine.is_closed());
+        assert!(exit_race.is_closed());
     }
 
     #[test]
@@ -2434,6 +2484,12 @@ mod tests {
                 watch_id: WATCH_ID,
                 sequence: 20,
                 events: vec![watch_event()],
+            })
+            .unwrap();
+        machine
+            .observe_outbound(&RuntimeMessage::WatchAck {
+                watch_id: WATCH_ID,
+                next_sequence: 21,
             })
             .unwrap();
         machine

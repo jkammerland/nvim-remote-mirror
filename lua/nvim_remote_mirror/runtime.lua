@@ -58,6 +58,7 @@ local REMOTE_HOST_TARGETS = {
 local command_runner_override
 local prepare_runtime_state
 local run_trust_helper
+local resolve_sidecar_executable
 
 local ERROR_MT = {
   __tostring = function(err)
@@ -101,6 +102,23 @@ local function config()
   return nrm.config.remote_runtime, nrm.config
 end
 
+local function selected_runtime_config(snapshot, error_code, message)
+  local _, live = config()
+  if type(snapshot) ~= "table" then
+    return live
+  end
+  local captured = rawget(snapshot, "_runtime_config")
+  if captured == nil then
+    return live
+  end
+  if type(captured) ~= "table" then
+    return nil, runtime_error(error_code, message, {
+      reason = "invalid_runtime_config",
+    })
+  end
+  return captured
+end
+
 local function ensure_enabled()
   local runtime = config()
   if type(runtime) ~= "table" or runtime.enabled ~= true then
@@ -109,10 +127,8 @@ local function ensure_enabled()
   return runtime
 end
 
-local function state_root()
-  local _, nrm_config = config()
-  local configured = optional_string(nrm_config.state_dir)
-  if configured then
+local function state_root(configured)
+  if configured ~= nil then
     return absolute_local_path(configured)
   end
   return vim.fs.joinpath(vim.fn.stdpath("state"), "nvim-remote-mirror")
@@ -148,7 +164,7 @@ local function set_trusted(snapshot, trusted)
   if not digest then
     return nil, digest_err
   end
-  return run_trust_helper(trusted and "add" or "remove", digest)
+  return run_trust_helper(trusted and "add" or "remove", digest, snapshot)
 end
 
 local function prompt_for_trust(snapshot, capability)
@@ -185,6 +201,18 @@ local function prompt_for_trust(snapshot, capability)
   return choice == 1
 end
 
+local function runtime_trust_snapshot(context)
+  local workspace = require("nvim_remote_mirror.workspace")
+  if type(workspace._runtime_trust_snapshot) ~= "function" then
+    return context
+  end
+  local ok, snapshot = pcall(workspace._runtime_trust_snapshot, context)
+  if not ok then
+    return nil, runtime_error("invalid_provider_state", "workspace runtime identity is unavailable")
+  end
+  return snapshot or context
+end
+
 function M.is_trusted(snapshot)
   local runtime, enabled_err = ensure_enabled()
   if not runtime then
@@ -196,14 +224,25 @@ function M.is_trusted(snapshot)
   if runtime.trust == "never" then
     return false
   end
+  local selected, selected_err = runtime_trust_snapshot(snapshot)
+  if not selected then
+    return nil, selected_err
+  end
+  snapshot = selected
   local digest, digest_err = trust_digest(snapshot)
   if not digest then
     return nil, digest_err
   end
-  return run_trust_helper("check", digest)
+  return run_trust_helper("check", digest, snapshot)
 end
 
 function M.authorize(snapshot, capability, callback)
+  local selected, selected_err = runtime_trust_snapshot(snapshot)
+  if not selected then
+    callback(selected_err, false)
+    return
+  end
+  snapshot = selected
   local trusted, trust_err = M.is_trusted(snapshot)
   if trust_err then
     callback(trust_err, false)
@@ -326,35 +365,45 @@ local function sorted_environment(snapshot, values)
 end
 
 local function ticket_config(snapshot)
-  local _, nrm_config = config()
-  local captured = type(snapshot._runtime_config) == "table" and snapshot._runtime_config or {}
+  local selected, selected_err =
+    selected_runtime_config(snapshot, "invalid_provider_state", "runtime configuration is invalid")
+  if not selected then
+    return nil, selected_err
+  end
   local ssh = optional_string(snapshot._ssh)
   local agent
   if ssh then
-    agent = optional_string(captured.remote_agent) or optional_string(nrm_config.remote_agent) or "nrm-agent"
+    agent = selected.remote_agent
+    if agent == nil then
+      agent = "nrm-agent"
+    end
   else
-    agent = optional_string(captured.agent) or optional_string(nrm_config.agent)
+    agent = selected.agent
   end
-  local request_timeout_ms = captured.request_timeout_ms or nrm_config.request_timeout_ms
-  local ssh_timeout = captured.ssh_connect_timeout_seconds or nrm_config.ssh_connect_timeout_seconds
   if not optional_string(agent) then
     return nil, runtime_error("invalid_provider_state", "runtime agent executable is not configured")
   end
   if contains_control(agent) or agent:sub(1, 1) == "-" then
     return nil, runtime_error("invalid_provider_state", "runtime agent executable is invalid")
   end
+  local request_timeout_ms = selected.request_timeout_ms
   if not is_integer(request_timeout_ms) or request_timeout_ms < 1 or request_timeout_ms > MAX_RUNTIME_TIMEOUT_MS then
     return nil, runtime_error("invalid_provider_state", "runtime request timeout is invalid")
   end
+  local ssh_timeout = selected.ssh_connect_timeout_seconds
   if not is_integer(ssh_timeout) or ssh_timeout < 1 or ssh_timeout > MAX_SSH_CONNECT_TIMEOUT_SECONDS then
     return nil, runtime_error("invalid_provider_state", "runtime SSH timeout is invalid")
   end
-  local sidecar = optional_string(captured.sidecar) or optional_string(nrm_config.sidecar)
-  if not sidecar or contains_control(sidecar) then
-    return nil, runtime_error("invalid_provider_state", "runtime sidecar executable is invalid")
+  local sidecar, sidecar_err =
+    resolve_sidecar_executable(selected.sidecar, "invalid_provider_state", "runtime sidecar executable is invalid")
+  if not sidecar then
+    return nil, sidecar_err
   end
-  local configured_state_dir = optional_string(captured.state_dir) or optional_string(nrm_config.state_dir)
-  if configured_state_dir and contains_control(configured_state_dir) then
+  local configured_state_dir = selected.state_dir
+  if
+    configured_state_dir ~= nil
+    and (not optional_string(configured_state_dir) or contains_control(configured_state_dir))
+  then
     return nil, runtime_error("invalid_provider_state", "runtime state directory is invalid")
   end
   return {
@@ -451,17 +500,58 @@ local function safe_diagnostic(value)
   return rendered:gsub("[%z\1-\31\127]+", " "):sub(1, 512)
 end
 
-prepare_runtime_state = function()
-  local runtime, nrm_config = config()
-  local sidecar = optional_string(nrm_config.sidecar)
-  if not sidecar or contains_control(sidecar) then
-    return nil, runtime_error("trust_store_error", "runtime sidecar executable is invalid")
+resolve_sidecar_executable = function(value, error_code, message)
+  local nrm = package.loaded["nvim_remote_mirror"] or require("nvim_remote_mirror")
+  if type(nrm._resolve_local_executable) ~= "function" then
+    return nil, runtime_error(error_code, message, {
+      reason = "invalid_executable",
+    })
   end
-  local root = state_root()
+  local ok, resolved, reason = pcall(nrm._resolve_local_executable, value)
+  if not ok or not optional_string(resolved) then
+    return nil,
+      runtime_error(error_code, message, {
+        reason = "invalid_executable",
+        cause = safe_diagnostic(ok and reason or resolved),
+      })
+  end
+  return resolved
+end
+
+local function trust_helper_config(snapshot)
+  local selected, selected_err =
+    selected_runtime_config(snapshot, "trust_store_error", "runtime helper configuration is invalid")
+  if not selected then
+    return nil, selected_err
+  end
+  local sidecar, sidecar_err =
+    resolve_sidecar_executable(selected.sidecar, "trust_store_error", "runtime sidecar executable is invalid")
+  if not sidecar then
+    return nil, sidecar_err
+  end
+  local configured_state_dir = selected.state_dir
+  if
+    configured_state_dir ~= nil
+    and (not optional_string(configured_state_dir) or contains_control(configured_state_dir))
+  then
+    return nil,
+      runtime_error("trust_store_error", "runtime state directory is invalid", {
+        reason = "invalid_state_directory",
+      })
+  end
+  local root = state_root(configured_state_dir)
   if not optional_string(root) or contains_control(root) then
-    return nil, runtime_error("trust_store_error", "runtime state directory is invalid")
+    return nil,
+      runtime_error("trust_store_error", "runtime state directory is invalid", {
+        reason = "invalid_state_directory",
+      })
   end
-  local argv = { sidecar, "runtime-state-prepare", "--state-dir", root }
+  return { sidecar = sidecar, state_dir = root }
+end
+
+prepare_runtime_state = function(helper)
+  local runtime = config()
+  local argv = { helper.sidecar, "runtime-state-prepare", "--state-dir", helper.state_dir }
   local runner = command_runner_override or default_command_runner
   local ok, result, run_err = pcall(runner, argv, nil, runtime.ticket_create_timeout_ms)
   if not ok then
@@ -502,25 +592,27 @@ prepare_runtime_state = function()
   return true
 end
 
-run_trust_helper = function(action, digest)
+run_trust_helper = function(action, digest, snapshot)
   if action ~= "check" and action ~= "add" and action ~= "remove" then
     return nil, runtime_error("trust_store_error", "invalid workspace trust operation")
   end
   if type(digest) ~= "string" or #digest ~= 64 or not digest:match("^[0-9a-f]+$") then
     return nil, runtime_error("trust_store_error", "invalid workspace trust digest")
   end
-  local prepared, prepare_err = prepare_runtime_state()
+  local helper, helper_err = trust_helper_config(snapshot)
+  if not helper then
+    return nil, helper_err
+  end
+  local prepared, prepare_err = prepare_runtime_state(helper)
   if not prepared then
     return nil, prepare_err
   end
-  local runtime, nrm_config = config()
-  local sidecar = optional_string(nrm_config.sidecar)
-  local root = state_root()
+  local runtime = config()
   local argv = {
-    sidecar,
+    helper.sidecar,
     "runtime-trust-" .. action,
     "--state-dir",
-    root,
+    helper.state_dir,
     "--digest",
     digest,
   }
@@ -1047,11 +1139,16 @@ end
 
 local function resolve_context(query)
   local workspace = require("nvim_remote_mirror.workspace")
-  return workspace.resolve(query or {})
+  return workspace.resolve(query)
 end
 
 function M.trust_workspace(opts)
-  opts = opts or {}
+  if opts == nil then
+    opts = {}
+  end
+  if type(opts) ~= "table" then
+    return nil, runtime_error("invalid_argument", "workspace trust options must be a table")
+  end
   local runtime, enabled_err = ensure_enabled()
   if not runtime then
     return nil, enabled_err
@@ -1063,8 +1160,12 @@ function M.trust_workspace(opts)
   if not context then
     return nil, context_err
   end
+  local snapshot, snapshot_err = runtime_trust_snapshot(context)
+  if not snapshot then
+    return nil, snapshot_err
+  end
   if opts.force ~= true then
-    local granted, prompt_err = prompt_for_trust(context, "process and terminal")
+    local granted, prompt_err = prompt_for_trust(snapshot, "process and terminal")
     if prompt_err then
       return nil, prompt_err
     end
@@ -1072,7 +1173,7 @@ function M.trust_workspace(opts)
       return nil, runtime_error("workspace_untrusted", "remote workspace authorization was denied")
     end
   end
-  local persisted, persist_err = set_trusted(context, true)
+  local persisted, persist_err = set_trusted(snapshot, true)
   if not persisted then
     return nil, persist_err
   end
@@ -1080,7 +1181,12 @@ function M.trust_workspace(opts)
 end
 
 function M.untrust_workspace(opts)
-  opts = opts or {}
+  if opts == nil then
+    opts = {}
+  end
+  if type(opts) ~= "table" then
+    return nil, runtime_error("invalid_argument", "workspace trust options must be a table")
+  end
   local context, context_err = opts.context, nil
   if context == nil then
     context, context_err = resolve_context(opts.query)
@@ -1088,7 +1194,11 @@ function M.untrust_workspace(opts)
   if not context then
     return nil, context_err
   end
-  local persisted, persist_err = set_trusted(context, false)
+  local snapshot, snapshot_err = runtime_trust_snapshot(context)
+  if not snapshot then
+    return nil, snapshot_err
+  end
+  local persisted, persist_err = set_trusted(snapshot, false)
   if not persisted then
     return nil, persist_err
   end

@@ -10,13 +10,15 @@ use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::{
     atomic::{AtomicBool, Ordering as AtomicOrdering},
-    mpsc, Arc,
+    mpsc, Arc, Condvar, Mutex,
 };
 use std::thread;
 use windows_sys::Win32::Foundation::{
     CloseHandle, SetHandleInformation, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, S_OK,
     WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
+#[cfg(test)]
+use windows_sys::Win32::Foundation::{DuplicateHandle, DUPLICATE_SAME_ACCESS};
 use windows_sys::Win32::Globalization::{CompareStringOrdinal, CSTR_EQUAL, CSTR_GREATER_THAN};
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 use windows_sys::Win32::System::Console::{
@@ -28,7 +30,11 @@ use windows_sys::Win32::System::JobObjects::{
     JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
 };
 use windows_sys::Win32::System::Pipes::CreatePipe;
+#[cfg(test)]
+use windows_sys::Win32::System::Pipes::PeekNamedPipe;
 use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
+#[cfg(test)]
+use windows_sys::Win32::System::Threading::GetCurrentProcess;
 use windows_sys::Win32::System::Threading::{
     CreateProcessW, DeleteProcThreadAttributeList, GetExitCodeProcess,
     InitializeProcThreadAttributeList, ResumeThread, TerminateProcess, UpdateProcThreadAttribute,
@@ -56,7 +62,53 @@ pub(crate) fn prepare_pipe_input_cancellation(_input: &PipeInput) -> io::Result<
 
 pub(crate) struct Output {
     file: File,
-    taken: Arc<AtomicBool>,
+    ownership: Arc<OutputOwnership>,
+}
+
+struct OutputOwnership {
+    taken: AtomicBool,
+    release_lock: Mutex<()>,
+    released: Condvar,
+}
+
+impl OutputOwnership {
+    fn new() -> Self {
+        Self {
+            taken: AtomicBool::new(false),
+            release_lock: Mutex::new(()),
+            released: Condvar::new(),
+        }
+    }
+
+    fn mark_taken(&self) {
+        self.taken.store(true, AtomicOrdering::Release);
+    }
+
+    fn is_taken(&self) -> bool {
+        self.taken.load(AtomicOrdering::Acquire)
+    }
+
+    fn release(&self) {
+        let _guard = self
+            .release_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.taken.store(false, AtomicOrdering::Release);
+        self.released.notify_all();
+    }
+
+    fn wait_until_released(&self) {
+        let mut guard = self
+            .release_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while self.is_taken() {
+            guard = self
+                .released
+                .wait(guard)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
 }
 
 impl Read for Output {
@@ -67,7 +119,7 @@ impl Read for Output {
 
 impl Output {
     pub(crate) fn mark_taken(&self) {
-        self.taken.store(true, AtomicOrdering::Release);
+        self.ownership.mark_taken();
     }
 }
 
@@ -86,7 +138,7 @@ pub(crate) fn prepare_pipe_output_cancellation(_output: &PipeOutput) -> io::Resu
 
 impl Drop for Output {
     fn drop(&mut self) {
-        self.taken.store(false, AtomicOrdering::Release);
+        self.ownership.release();
     }
 }
 
@@ -189,6 +241,32 @@ impl OwnedHandle {
         }
         Ok(())
     }
+
+    #[cfg(test)]
+    fn duplicate_file(&self) -> Result<File, PtyError> {
+        let process = unsafe { GetCurrentProcess() };
+        let mut duplicate = INVALID_HANDLE_VALUE;
+        // SAFETY: The source handle and pseudo-process handles are valid. The
+        // returned duplicate is non-inheritable and receives the same access.
+        if unsafe {
+            DuplicateHandle(
+                process,
+                self.0,
+                process,
+                &mut duplicate,
+                0,
+                0,
+                DUPLICATE_SAME_ACCESS,
+            )
+        } == 0
+        {
+            return Err(PtyError::io(
+                "duplicate pseudoconsole test output",
+                io::Error::last_os_error(),
+            ));
+        }
+        OwnedHandle::new(duplicate, "open pseudoconsole test output").map(OwnedHandle::into_file)
+    }
 }
 
 impl Drop for OwnedHandle {
@@ -212,27 +290,82 @@ fn close_raw_handle(handle: HANDLE) {
 }
 
 struct PseudoConsole {
-    handle: HPCON,
-    closed: bool,
+    handle: Option<HPCON>,
     creation_input: Option<OwnedHandle>,
     creation_output: Option<OwnedHandle>,
     teardown_output: Option<File>,
-    output_taken: Arc<AtomicBool>,
+    output_ownership: Arc<OutputOwnership>,
     drain_worker: DrainWorker,
+    close_worker: CloseWorker,
+    #[cfg(test)]
+    test_output_writer: Option<File>,
+    #[cfg(test)]
+    test_close_gate: Option<TestCloseGate>,
+}
+
+#[cfg(test)]
+struct TestCloseGate {
+    entered: mpsc::SyncSender<()>,
+    release: mpsc::Receiver<()>,
+}
+
+struct CloseRequest {
+    // HPCON is a process-wide opaque handle value. PseudoConsole moves its
+    // sole Option value here before this request crosses to the close thread.
+    handle: HPCON,
+    #[cfg(test)]
+    gate: Option<TestCloseGate>,
+}
+
+impl CloseRequest {
+    fn new(handle: HPCON) -> Self {
+        Self {
+            handle,
+            #[cfg(test)]
+            gate: None,
+        }
+    }
+}
+
+fn close_pseudo_console(request: CloseRequest) {
+    #[cfg(test)]
+    if let Some(gate) = request.gate {
+        gate.entered.send(()).expect("report test close entry");
+        gate.release.recv().expect("release test close");
+    }
+    // SAFETY: Each request uniquely owns the HPCON close responsibility.
+    unsafe {
+        ClosePseudoConsole(request.handle);
+    }
+}
+
+enum DrainRequest {
+    Immediate(File),
+    AfterOutputRelease {
+        output: File,
+        ownership: Arc<OutputOwnership>,
+    },
 }
 
 struct DrainWorker {
-    sender: Option<mpsc::SyncSender<File>>,
+    sender: Option<mpsc::SyncSender<DrainRequest>>,
     thread: Option<thread::JoinHandle<()>>,
 }
 
 impl DrainWorker {
     fn new() -> Result<Self, PtyError> {
-        let (sender, receiver) = mpsc::sync_channel::<File>(1);
+        let (sender, receiver) = mpsc::sync_channel::<DrainRequest>(1);
         let thread = thread::Builder::new()
             .name("nrm-conpty-drain".to_string())
             .spawn(move || {
-                if let Ok(mut output) = receiver.recv() {
+                if let Ok(request) = receiver.recv() {
+                    let mut output = match request {
+                        DrainRequest::Immediate(output) => output,
+                        DrainRequest::AfterOutputRelease { output, ownership } => {
+                            ownership.wait_until_released();
+                            output
+                        }
+                    };
                     let _ = io::copy(&mut output, &mut io::sink());
                 }
             })
@@ -244,9 +377,26 @@ impl DrainWorker {
     }
 
     fn start(&mut self, output: File) -> bool {
+        self.send(DrainRequest::Immediate(output))
+    }
+
+    fn start_after_output_release(
+        &mut self,
+        output: File,
+        ownership: Arc<OutputOwnership>,
+    ) -> bool {
+        self.send(DrainRequest::AfterOutputRelease { output, ownership })
+    }
+
+    fn send(&mut self, request: DrainRequest) -> bool {
         self.sender
             .take()
-            .is_some_and(|sender| sender.send(output).is_ok())
+            .is_some_and(|sender| sender.send(request).is_ok())
+    }
+
+    fn detach(&mut self) {
+        drop(self.sender.take());
+        drop(self.thread.take());
     }
 
     fn join(&mut self) {
@@ -263,28 +413,80 @@ impl Drop for DrainWorker {
     }
 }
 
+struct CloseWorker {
+    sender: Option<mpsc::SyncSender<CloseRequest>>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl CloseWorker {
+    fn new() -> Result<Self, PtyError> {
+        let (sender, receiver) = mpsc::sync_channel::<CloseRequest>(1);
+        let thread = thread::Builder::new()
+            .name("nrm-conpty-close".to_string())
+            .spawn(move || {
+                if let Ok(request) = receiver.recv() {
+                    close_pseudo_console(request);
+                }
+            })
+            .map_err(|source| PtyError::io("start pseudoconsole close worker", source))?;
+        Ok(Self {
+            sender: Some(sender),
+            thread: Some(thread),
+        })
+    }
+
+    fn start(&mut self, request: CloseRequest) -> bool {
+        self.sender
+            .take()
+            .is_some_and(|sender| sender.send(request).is_ok())
+    }
+
+    fn detach(&mut self) {
+        drop(self.sender.take());
+        drop(self.thread.take());
+    }
+
+    fn join(&mut self) {
+        self.sender.take();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for CloseWorker {
+    fn drop(&mut self) {
+        self.join();
+    }
+}
+
 impl PseudoConsole {
     fn new(
         handle: HPCON,
         creation_input: OwnedHandle,
         creation_output: OwnedHandle,
         teardown_output: File,
-        output_taken: Arc<AtomicBool>,
+        output_ownership: Arc<OutputOwnership>,
         drain_worker: DrainWorker,
+        close_worker: CloseWorker,
     ) -> Self {
         Self {
-            handle,
-            closed: false,
+            handle: Some(handle),
             creation_input: Some(creation_input),
             creation_output: Some(creation_output),
             teardown_output: Some(teardown_output),
-            output_taken,
+            output_ownership,
             drain_worker,
+            close_worker,
+            #[cfg(test)]
+            test_output_writer: None,
+            #[cfg(test)]
+            test_close_gate: None,
         }
     }
 
     fn raw(&self) -> HPCON {
-        self.handle
+        self.handle.expect("open pseudoconsole handle")
     }
 
     fn release_creation_pipes(&mut self) {
@@ -292,33 +494,71 @@ impl PseudoConsole {
         self.creation_output.take();
     }
 
+    fn close_request(&mut self) -> CloseRequest {
+        let request = CloseRequest::new(self.handle.take().expect("open pseudoconsole handle"));
+        #[cfg(test)]
+        let request = CloseRequest {
+            gate: self.test_close_gate.take(),
+            ..request
+        };
+        request
+    }
+
+    fn release_test_output_writer(&mut self) {
+        #[cfg(test)]
+        {
+            self.test_output_writer.take();
+        }
+    }
+
     fn close_after_process_exit(&mut self) {
-        if self.closed {
+        if self.handle.is_none() {
             return;
         }
         self.release_creation_pipes();
-        if !self.output_taken.load(AtomicOrdering::Acquire) {
+        self.release_test_output_writer();
+        if !self.output_ownership.is_taken() {
             self.close_with_drain();
             return;
         }
 
-        // The caller-owned output stream is being drained concurrently by the
-        // runtime. Let that reader receive the final ConPTY bytes instead of
-        // racing it with the emergency teardown reader.
-        // SAFETY: This wrapper uniquely owns the HPCON, and the output stream
-        // remains alive while ClosePseudoConsole emits its final bytes.
-        unsafe {
-            ClosePseudoConsole(self.handle);
+        let Some(output) = self.teardown_output.take() else {
+            return;
+        };
+        if !self
+            .drain_worker
+            .start_after_output_release(output, Arc::clone(&self.output_ownership))
+        {
+            // No safe synchronous fallback exists here: it could either steal
+            // caller-owned bytes or block forever on a full pipe. As in the
+            // emergency-drain failure path below, leak the opaque HPCON after
+            // process-tree termination rather than violating those contracts.
+            return;
         }
-        self.closed = true;
-        self.teardown_output.take();
+        // The deferred reader owns its teardown handle now. It remains dormant
+        // while the caller owns output, then drains only if that stream is
+        // dropped before ConPTY has finished closing.
+        self.drain_worker.detach();
+
+        let request = self.close_request();
+        if !self.close_worker.start(request) {
+            // The preallocated worker can fail only after an unexpected thread
+            // exit. Its request owned the sole close responsibility, so avoid
+            // retrying synchronously and risking a caller-visible deadlock.
+            return;
+        }
+        // ClosePseudoConsole can wait for output consumption before Windows 11
+        // 24H2. Transfer close ownership to the preallocated worker so process
+        // teardown never waits for the caller to begin draining.
+        self.close_worker.detach();
     }
 
     fn close_with_drain(&mut self) {
-        if self.closed {
+        if self.handle.is_none() {
             return;
         }
         self.release_creation_pipes();
+        self.release_test_output_writer();
 
         let Some(output) = self.teardown_output.take() else {
             return;
@@ -332,13 +572,8 @@ impl PseudoConsole {
             return;
         }
 
-        // SAFETY: This wrapper uniquely owns the HPCON returned by
-        // `CreatePseudoConsole`, and a concurrent reader is draining the final
-        // frame that close may emit.
-        unsafe {
-            ClosePseudoConsole(self.handle);
-        }
-        self.closed = true;
+        // A concurrent reader is draining the final frame that close may emit.
+        close_pseudo_console(self.close_request());
         self.drain_worker.join();
     }
 }
@@ -462,9 +697,10 @@ impl Drop for AttributeList {
 }
 
 pub(crate) fn spawn(command: &PtyCommand, size: PtySize) -> Result<Spawned, PtyError> {
-    // Allocate the teardown reader before an HPCON exists. ClosePseudoConsole
-    // may synchronously emit a final frame, so teardown must never depend on
-    // successfully allocating a thread after the console has been created.
+    // Allocate both teardown workers before an HPCON exists. ClosePseudoConsole
+    // may synchronously wait for output consumption on older Windows builds,
+    // so teardown must never depend on allocating a thread after creation.
+    let close_worker = CloseWorker::new()?;
     let drain_worker = DrainWorker::new()?;
     let (pty_input_read, input_write) = create_pipe()?;
     let (output_read, pty_output_write) = create_pipe()?;
@@ -505,22 +741,34 @@ pub(crate) fn spawn(command: &PtyCommand, size: PtySize) -> Result<Spawned, PtyE
                 pty_input_read,
                 pty_output_write,
                 output,
-                Arc::new(AtomicBool::new(false)),
+                Arc::new(OutputOwnership::new()),
                 drain_worker,
+                close_worker,
             );
             drop(pseudo_console);
             return Err(PtyError::io("duplicate pseudoconsole output", source));
         }
     };
-    let output_taken = Arc::new(AtomicBool::new(false));
+    let output_ownership = Arc::new(OutputOwnership::new());
     let mut pseudo_console = PseudoConsole::new(
         pseudo_console,
         pty_input_read,
         pty_output_write,
         teardown_output,
-        Arc::clone(&output_taken),
+        Arc::clone(&output_ownership),
         drain_worker,
+        close_worker,
     );
+    #[cfg(test)]
+    {
+        pseudo_console.test_output_writer = Some(
+            pseudo_console
+                .creation_output
+                .as_ref()
+                .expect("test output writer exists before creation-pipe release")
+                .duplicate_file()?,
+        );
+    }
 
     let job = create_kill_job()?;
 
@@ -648,7 +896,7 @@ pub(crate) fn spawn(command: &PtyCommand, size: PtySize) -> Result<Spawned, PtyE
         input,
         output: Output {
             file: output,
-            taken: output_taken,
+            ownership: output_ownership,
         },
     })
 }
@@ -1396,6 +1644,22 @@ impl Process {
         self.process_id
     }
 
+    #[cfg(test)]
+    fn take_test_output_writer(&mut self) -> File {
+        self.pseudo_console
+            .as_mut()
+            .and_then(|pseudo_console| pseudo_console.test_output_writer.take())
+            .expect("test output writer")
+    }
+
+    #[cfg(test)]
+    fn set_test_close_gate(&mut self, gate: TestCloseGate) {
+        self.pseudo_console
+            .as_mut()
+            .expect("test pseudoconsole")
+            .test_close_gate = Some(gate);
+    }
+
     pub(crate) fn resize(&self, size: PtySize) -> Result<(), PtyError> {
         let Some(pseudo_console) = &self.pseudo_console else {
             return Ok(());
@@ -1545,7 +1809,11 @@ impl Drop for Process {
         }
         // Close the ConPTY after its process tree has exited. This ordering
         // avoids both leaked conhost instances and children blocked on output.
-        self.pseudo_console.take();
+        // Honor caller ownership here just as `read_exit_status` does: the
+        // emergency reader must not race a stream returned by `take_output`.
+        if let Some(mut pseudo_console) = self.pseudo_console.take() {
+            pseudo_console.close_after_process_exit();
+        }
     }
 }
 
@@ -1902,6 +2170,194 @@ mod tests {
         let mut process = crate::PtyProcess::spawn(&command, PtySize::default()).expect("spawn");
 
         assert!(process.wait().expect("wait").success());
+    }
+
+    #[test]
+    fn dropping_live_conpty_preserves_taken_output_for_caller() {
+        use std::time::{Duration, Instant};
+
+        const MARKER: &str = "nrm-caller-owned-output-5f5de9e6";
+        let root = tempfile::tempdir().expect("temporary root");
+        let ready = root.path().join("output-written");
+        let script = root.path().join("writer.cmd");
+        fs::write(
+            &script,
+            format!(
+                "@echo off\r\necho {MARKER}\r\n>\"{}\" type nul\r\nset /p \"_hold=\"\r\n",
+                ready.display()
+            ),
+        )
+        .expect("write command script");
+
+        let command = PtyCommand::new(&script);
+        let mut process = crate::PtyProcess::spawn(&command, PtySize::default()).expect("spawn");
+        let mut output = process.take_output().expect("caller-owned output");
+
+        // The child creates this file only after writing MARKER to its console.
+        // This is a semantic handoff, rather than a sleep that merely hopes the
+        // output has been produced before the live process is dropped.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ready.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "child did not report writing its output"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(process.try_wait().expect("poll live process"), None);
+
+        // Process teardown must not activate the emergency reader while the
+        // caller still owns the output stream. Otherwise that reader drains the
+        // marker before this handle can observe it.
+        drop(process);
+        let mut bytes = Vec::new();
+        output.read_to_end(&mut bytes).expect("read caller output");
+        assert!(
+            String::from_utf8_lossy(&bytes).contains(MARKER),
+            "caller-owned output was drained during process teardown: {:?}",
+            String::from_utf8_lossy(&bytes)
+        );
+    }
+
+    #[test]
+    fn dropping_live_conpty_with_full_taken_output_returns_before_caller_drains() {
+        use std::os::windows::io::AsRawHandle as _;
+        use std::time::{Duration, Instant};
+
+        const MARKER: &str = "nrm-full-caller-output-950b96de";
+        const FILL_BYTES: usize = 16 * 1024 * 1024;
+        let root = tempfile::tempdir().expect("temporary root");
+        let ready = root.path().join("writer-started");
+        let script = root.path().join("fill-output.cmd");
+        fs::write(
+            &script,
+            format!(
+                "@echo off\r\necho {MARKER}\r\n>\"{}\" type nul\r\nset /p \"_hold=\"\r\n",
+                ready.display()
+            ),
+        )
+        .expect("write output-filler script");
+
+        let command = PtyCommand::new(&script);
+        let mut process = crate::PtyProcess::spawn(&command, PtySize::default()).expect("spawn");
+        let mut output = process.take_output().expect("caller-owned output");
+        let mut output_writer = process.inner.take_test_output_writer();
+        let output_handle = output.0.file.as_raw_handle() as HANDLE;
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ready.exists() {
+            assert!(Instant::now() < deadline, "output writer did not start");
+            thread::yield_now();
+        }
+        assert_eq!(process.try_wait().expect("poll live writer"), None);
+
+        // A single synchronous write much larger than the anonymous-pipe quota
+        // cannot complete without a reader. Once PeekNamedPipe observes part of
+        // that write while the completion channel remains empty, the writer is
+        // blocked on caller-owned output rather than merely scheduled late.
+        let (write_started_tx, write_started_rx) = mpsc::sync_channel(1);
+        let (write_done_tx, write_done_rx) = mpsc::sync_channel(1);
+        let filler_bytes = vec![b'Z'; FILL_BYTES];
+        let filler = thread::spawn(move || {
+            write_started_tx.send(()).expect("report filler start");
+            let result = output_writer.write_all(&filler_bytes);
+            drop(output_writer);
+            write_done_tx
+                .send(result)
+                .expect("report filler completion");
+        });
+        write_started_rx.recv().expect("wait for filler start");
+        loop {
+            let mut peeked = [0u8; 64 * 1024];
+            let mut bytes_read = 0u32;
+            let mut available = 0u32;
+            // SAFETY: The pipe handle is live and the byte-count output pointer
+            // and peek buffer are valid. PeekNamedPipe does not consume bytes.
+            assert_ne!(
+                unsafe {
+                    PeekNamedPipe(
+                        output_handle,
+                        peeked.as_mut_ptr().cast::<c_void>(),
+                        peeked.len() as u32,
+                        &mut bytes_read,
+                        &mut available,
+                        ptr::null_mut(),
+                    )
+                },
+                0,
+                "inspect ConPTY output pipe: {}",
+                io::Error::last_os_error()
+            );
+            let filler_is_buffered = peeked[..bytes_read as usize]
+                .windows(1_024)
+                .any(|window| window.iter().all(|&byte| byte == b'Z'));
+            if filler_is_buffered {
+                match write_done_rx.try_recv() {
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Ok(result) => panic!(
+                        "synchronous filler completed without a reader: {result:?}; {available} bytes buffered"
+                    ),
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        panic!("synchronous filler completion channel disconnected")
+                    }
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "synchronous filler did not block with bytes in the output pipe"
+            );
+            thread::yield_now();
+        }
+
+        // Windows 11 24H2 makes ClosePseudoConsole return immediately, while
+        // earlier supported builds can wait for output consumption. Hold the
+        // close call at its entry point to deterministically model that older
+        // behavior and prove Process::drop itself no longer waits on it.
+        let (close_entered_tx, close_entered_rx) = mpsc::sync_channel(1);
+        let (close_release_tx, close_release_rx) = mpsc::sync_channel(1);
+        process.inner.set_test_close_gate(TestCloseGate {
+            entered: close_entered_tx,
+            release: close_release_rx,
+        });
+        let (dropped_tx, dropped_rx) = mpsc::sync_channel(1);
+        let dropper = thread::spawn(move || {
+            drop(process);
+            dropped_tx.send(()).expect("report process drop");
+        });
+        close_entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("wait for pseudoconsole close entry");
+        let returned_before_drain = dropped_rx.recv_timeout(Duration::from_secs(2)).is_ok();
+        close_release_tx
+            .send(())
+            .expect("release pseudoconsole close");
+        if !returned_before_drain {
+            // Unblock the old synchronous close so the failing regression test
+            // cleans up its process and thread before reporting the failure.
+            let _ = io::copy(&mut output, &mut io::sink());
+        }
+        dropper.join().expect("join process dropper");
+        assert!(
+            returned_before_drain,
+            "dropping the process blocked on a full caller-owned output pipe"
+        );
+
+        let mut bytes = Vec::new();
+        output.read_to_end(&mut bytes).expect("drain caller output");
+        write_done_rx
+            .recv()
+            .expect("wait for filler completion")
+            .expect("write filler output");
+        filler.join().expect("join output filler");
+        assert!(
+            String::from_utf8_lossy(&bytes).contains(MARKER),
+            "caller lost full-pipe output after asynchronous process drop"
+        );
+        assert_eq!(
+            bytes.iter().filter(|&&byte| byte == b'Z').count(),
+            FILL_BYTES,
+            "caller lost bytes from the saturated output pipe"
+        );
     }
 
     #[test]

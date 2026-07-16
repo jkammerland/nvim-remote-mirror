@@ -108,6 +108,8 @@ local function main()
   assert_eq(context._remote_host, nil, "workspace context exposed its private remote host hint")
   assert_eq(context.authority.home, nil, "workspace authority exposed private remote home metadata")
   assert_eq(context.authority.label, "ssh://build.example.test")
+  local value, err = nrm.workspace(false)
+  assert_error(value, err, "invalid_argument")
   nrm.client.hello.remote_host.home = "C:\\Users\\mutated-after-resolve"
   local state_prepare_calls = {}
   local state_prepare_response = { code = 0, stdout = "", stderr = "" }
@@ -172,7 +174,7 @@ local function main()
     ticket_runs = ticket_runs + 1
     return { code = 0, stdout = string.rep("0a", 32) .. "\n", stderr = "" }
   end)
-  local value, err = context:job_spec({ command = { argv = { "true" } } })
+  value, err = context:job_spec({ command = { argv = { "true" } } })
   assert_error(value, err, "workspace_untrusted")
   assert_eq(ticket_runs, 0, "untrusted execution created a ticket")
   assert_eq(state_prepare_calls[1], {
@@ -400,6 +402,13 @@ local function main()
     persistence = "attached",
     stdio = "pty",
   }
+  local valid_runtime_config = posix_snapshot._runtime_config
+  for _, invalid_config in ipairs({ false, "corrupt" }) do
+    posix_snapshot._runtime_config = invalid_config
+    value, err = runtime._ticket_for_test(posix_snapshot, default_shell_request)
+    assert_error(value, err, "invalid_provider_state")
+  end
+  posix_snapshot._runtime_config = valid_runtime_config
   ticket = assert(runtime._ticket_for_test(posix_snapshot, default_shell_request))
   assert_eq(ticket.spec.argv, { "/usr/bin/zsh" })
   assert_eq(ticket.remote_host, nil, "incomplete remote host hint was serialized")
@@ -838,6 +847,11 @@ local function main()
   end)
   local window_before_terminal = vim.api.nvim_get_current_win()
   termopen_switch_window = window_before_terminal
+  value, err = nrm.open_terminal(false)
+  assert_eq(value, nil, "false terminal options unexpectedly succeeded")
+  assert_contains(err, "remote terminal options must be a table")
+  value, err = nrm.open_terminal({ command = { "printf", "false-persistence" }, persistence = false })
+  assert_error(value, err, "invalid_process_spec")
   local terminal_handle = assert(nrm.open_terminal({ command = { "printf", "%s", "$(terminal-metachar)" } }))
   termopen_switch_window = nil
   assert_eq(vim.api.nvim_get_current_win(), started.pty.window, "TermOpen window switch stole terminal focus")

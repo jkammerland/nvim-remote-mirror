@@ -1,6 +1,4 @@
-use super::{
-    default_state_dir, validate_managed_remote_agent_name, workspace_key, RemoteTransport,
-};
+use super::{default_state_dir, workspace_key, RemoteTransport};
 use anyhow::{anyhow, bail, Context, Result};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
@@ -11,9 +9,9 @@ use nrm_protocol::{
     RUNTIME_MAX_DATA_CHUNK_LEN,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufReader, Read, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::ops::{Deref, DerefMut};
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
@@ -1531,15 +1529,6 @@ fn validate_ticket(ticket: &RuntimeTicket) -> Result<()> {
     {
         bail!("runtime ticket workspace key is invalid");
     }
-    if ticket.agent.is_empty()
-        || ticket.agent.chars().any(char::is_control)
-        || ticket.agent.starts_with('-')
-    {
-        bail!("runtime ticket agent is invalid");
-    }
-    if !ticket.agent.contains(['/', '\\', ':']) {
-        validate_managed_remote_agent_name(&ticket.agent)?;
-    }
     if ticket.ssh_connect_timeout_seconds == 0
         || ticket.ssh_connect_timeout_seconds > MAX_SSH_CONNECT_TIMEOUT_SECONDS
     {
@@ -1559,12 +1548,26 @@ fn validate_ticket(ticket: &RuntimeTicket) -> Result<()> {
     let transport =
         RemoteTransport::from_ssh(ticket.ssh.clone(), ticket.ssh_connect_timeout_seconds)?;
     let remote_root = transport.normalize_remote_root(PathBuf::from(&ticket.remote_root))?;
-    if let Some(host) = &ticket.remote_host {
-        if !matches!(transport, RemoteTransport::Ssh(_)) {
-            bail!("local runtime ticket must not include remote host metadata");
+    match (&transport, &ticket.remote_host) {
+        (RemoteTransport::Local, Some(_)) => {
+            bail!("local runtime ticket must not include remote host metadata")
         }
-        super::remote_host::validate_remote_host_info(host)?;
-        super::validate_remote_root(host, &remote_root)?;
+        (RemoteTransport::Local, None) => {
+            let path_style = if cfg!(windows) {
+                super::RemotePathStyle::Windows
+            } else {
+                super::RemotePathStyle::Posix
+            };
+            super::validate_remote_agent_reference_for_style(&ticket.agent, path_style)?;
+        }
+        (RemoteTransport::Ssh(_), Some(host)) => {
+            super::remote_host::validate_remote_host_info(host)?;
+            super::validate_remote_root(host, &remote_root)?;
+            super::validate_remote_agent_reference(&ticket.agent, host)?;
+        }
+        (RemoteTransport::Ssh(_), None) => {
+            super::validate_unresolved_remote_agent_reference(&ticket.agent)?;
+        }
     }
     let expected_key = workspace_key(&transport, &remote_root);
     if ticket.workspace_key != expected_key {
@@ -3436,6 +3439,7 @@ enum RuntimeReaderEvent {
     Message(RuntimeMessage),
     LaunchFailure(super::RemoteAgentLaunchFailure),
     ReadError(String),
+    Closed,
 }
 
 enum RuntimeLocalEvent {
@@ -3644,6 +3648,28 @@ fn run_proxy(
     state_dir: Option<&Path>,
     ticket_id: &str,
 ) -> Result<RuntimeProxyResult> {
+    run_proxy_with_output(
+        ticket,
+        state_dir,
+        ticket_id,
+        io::stdout(),
+        io::stderr(),
+        RUNTIME_OUTPUT_SHUTDOWN_TIMEOUT,
+    )
+}
+
+fn run_proxy_with_output<Stdout, Stderr>(
+    ticket: RuntimeTicket,
+    state_dir: Option<&Path>,
+    ticket_id: &str,
+    stdout: Stdout,
+    stderr: Stderr,
+    output_shutdown_timeout: Duration,
+) -> Result<RuntimeProxyResult>
+where
+    Stdout: Write + Send + 'static,
+    Stderr: Write + Send + 'static,
+{
     let launch_started = Instant::now();
     let transport =
         RemoteTransport::from_ssh(ticket.ssh.clone(), ticket.ssh_connect_timeout_seconds)?;
@@ -3663,8 +3689,10 @@ fn run_proxy(
             timeout.as_millis()
         );
     }
-    let attempt = |host: &super::RemoteHostInfo,
-                   process_request_sent: &mut bool|
+    let mut stdout = Some(stdout);
+    let mut stderr = Some(stderr);
+    let mut attempt = |host: &super::RemoteHostInfo,
+                       process_request_sent: &mut bool|
      -> Result<RuntimeProxyResult> {
         let plan = transport.runtime_plan(&ticket.agent, &remote_root, host)?;
         let mut command = plan.command();
@@ -3820,8 +3848,17 @@ fn run_proxy(
             local_tx,
         )?;
 
-        let mut output_pump = RuntimeOutputPump::new(io::stdout(), io::stderr())?;
-        let mut pending_output = None;
+        let mut output_pump = RuntimeOutputPump::new(
+            stdout
+                .take()
+                .ok_or_else(|| anyhow!("local runtime stdout was already attached"))?,
+            stderr
+                .take()
+                .ok_or_else(|| anyhow!("local runtime stderr was already attached"))?,
+        )?;
+        let mut pending_outputs = VecDeque::new();
+        let mut in_flight_outputs = 0_usize;
+        let mut pending_output_deadline: Option<Instant> = None;
         let mut terminal_message = None;
         let mut output_finish_sent = false;
         let mut output_shutdown_deadline: Option<Instant> = None;
@@ -3847,6 +3884,7 @@ fn run_proxy(
             }
 
             while let Some(event) = output_pump.try_event()? {
+                let output_progressed = matches!(&event, RuntimeOutputEvent::Written { .. });
                 if forward_runtime_output_event(&writer, event)? {
                     let terminal = terminal_message.take().ok_or_else(|| {
                         anyhow!("local runtime output relay stopped before remote completion")
@@ -3855,23 +3893,150 @@ fn run_proxy(
                     observe_shared(&writer, &terminal)?;
                     break 'runtime runtime_terminal_result(terminal)?;
                 }
+                record_runtime_output_progress(
+                    output_progressed,
+                    terminal_message.is_some(),
+                    &mut in_flight_outputs,
+                    !pending_outputs.is_empty(),
+                    &mut pending_output_deadline,
+                    output_shutdown_timeout,
+                )?;
             }
 
-            if let Some(chunk) = pending_output.take() {
-                pending_output = output_pump.try_write(chunk)?;
-                if pending_output.is_some() {
-                    if let Some(event) = output_pump.wait_event(RUNTIME_EVENT_POLL_INTERVAL)? {
+            if let Some(chunk) = pending_outputs.pop_front() {
+                match output_pump.try_write(chunk)? {
+                    Some(chunk) => pending_outputs.push_front(chunk),
+                    None => record_runtime_output_submission(
+                        terminal_message.is_some(),
+                        &mut in_flight_outputs,
+                        &mut pending_output_deadline,
+                        output_shutdown_timeout,
+                    )?,
+                }
+                if !pending_outputs.is_empty() {
+                    let pending_deadline = *pending_output_deadline
+                        .get_or_insert_with(|| Instant::now() + output_shutdown_timeout);
+                    let deadline = output_shutdown_deadline.unwrap_or(pending_deadline);
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        stop_runtime_bridge(&mut child);
+                        if terminal_message.is_some() {
+                            bail!(
+                                "local runtime output did not drain within {} ms after remote completion",
+                                output_shutdown_timeout.as_millis()
+                            );
+                        }
+                        bail!(
+                            "local runtime output remained blocked for {} ms before remote completion",
+                            output_shutdown_timeout.as_millis()
+                        );
+                    }
+                    if let Some(event) =
+                        output_pump.wait_event(remaining.min(RUNTIME_EVENT_POLL_INTERVAL))?
+                    {
+                        let output_progressed =
+                            matches!(&event, RuntimeOutputEvent::Written { .. });
                         if forward_runtime_output_event(&writer, event)? {
                             bail!("local runtime output relay stopped while output was pending");
+                        }
+                        record_runtime_output_progress(
+                            output_progressed,
+                            terminal_message.is_some(),
+                            &mut in_flight_outputs,
+                            !pending_outputs.is_empty(),
+                            &mut pending_output_deadline,
+                            output_shutdown_timeout,
+                        )?;
+                    }
+                    // Once a terminal frame is decoded, preserve every later
+                    // reader event for the post-completion validator. The
+                    // protocol boundary must not move merely because local
+                    // output happened to be backpressured.
+                    if terminal_message.is_none()
+                        && pending_outputs.len() < RUNTIME_READER_QUEUE_DEPTH
+                    {
+                        match reader_rx.try_recv() {
+                            Ok(RuntimeReaderEvent::Message(message))
+                                if matches!(
+                                    &message,
+                                    RuntimeMessage::Exited { .. }
+                                        | RuntimeMessage::Detached { .. }
+                                        | RuntimeMessage::Error(_)
+                                ) =>
+                            {
+                                input_flow.stop();
+                                terminal_message = Some(message);
+                                output_shutdown_deadline =
+                                    Some(Instant::now() + output_shutdown_timeout);
+                            }
+                            Ok(RuntimeReaderEvent::Message(
+                                message @ RuntimeMessage::Output { .. },
+                            )) => {
+                                observe_shared(&writer, &message)?;
+                                let RuntimeMessage::Output {
+                                    process_id,
+                                    stream,
+                                    offset,
+                                    data,
+                                } = message
+                                else {
+                                    unreachable!("matched runtime output above")
+                                };
+                                pending_outputs.push_back(RuntimeOutputChunk {
+                                    process_id,
+                                    stream,
+                                    offset,
+                                    data,
+                                });
+                            }
+                            Ok(RuntimeReaderEvent::Message(message)) => {
+                                observe_shared(&writer, &message)?;
+                                match message {
+                                    RuntimeMessage::InputAck { next_offset, .. } => {
+                                        input_flow.acknowledge(next_offset)?;
+                                    }
+                                    _ => {
+                                        stop_runtime_bridge(&mut child);
+                                        bail!("runtime agent sent an unexpected process message");
+                                    }
+                                }
+                            }
+                            Ok(RuntimeReaderEvent::LaunchFailure(failure)) => {
+                                stop_runtime_bridge(&mut child);
+                                bail!("runtime agent launch failed: {}", failure.detail());
+                            }
+                            Ok(RuntimeReaderEvent::ReadError(error)) => {
+                                stop_runtime_bridge(&mut child);
+                                bail!(
+                                    "runtime agent stream failed: {}",
+                                    super::sanitize_agent_error_text(&error)
+                                );
+                            }
+                            Ok(RuntimeReaderEvent::Closed) => {
+                                stop_runtime_bridge(&mut child);
+                                bail!(
+                                    "runtime agent stream closed before the remote process completed"
+                                );
+                            }
+                            Err(mpsc::TryRecvError::Empty) => {}
+                            Err(mpsc::TryRecvError::Disconnected) => {
+                                stop_runtime_bridge(&mut child);
+                                bail!(
+                                    "runtime agent stream closed before the remote process completed"
+                                );
+                            }
                         }
                     }
                     continue;
                 }
             }
+            if in_flight_outputs == 0 && pending_outputs.is_empty() {
+                pending_output_deadline = None;
+            }
 
             if terminal_message.is_some() {
                 let deadline = *output_shutdown_deadline
-                    .get_or_insert_with(|| Instant::now() + RUNTIME_OUTPUT_SHUTDOWN_TIMEOUT);
+                    .get_or_insert_with(|| Instant::now() + output_shutdown_timeout);
                 if !output_finish_sent {
                     output_finish_sent = output_pump.try_finish()?;
                 }
@@ -3880,12 +4045,13 @@ fn run_proxy(
                     stop_runtime_bridge(&mut child);
                     bail!(
                         "local runtime output did not drain within {} ms after remote completion",
-                        RUNTIME_OUTPUT_SHUTDOWN_TIMEOUT.as_millis()
+                        output_shutdown_timeout.as_millis()
                     );
                 }
                 if let Some(event) =
                     output_pump.wait_event(remaining.min(RUNTIME_EVENT_POLL_INTERVAL))?
                 {
+                    let output_progressed = matches!(&event, RuntimeOutputEvent::Written { .. });
                     if forward_runtime_output_event(&writer, event)? {
                         let terminal = terminal_message.take().ok_or_else(|| {
                             anyhow!("local runtime output relay stopped before remote completion")
@@ -3894,11 +4060,34 @@ fn run_proxy(
                         observe_shared(&writer, &terminal)?;
                         break 'runtime runtime_terminal_result(terminal)?;
                     }
+                    record_runtime_output_progress(
+                        output_progressed,
+                        true,
+                        &mut in_flight_outputs,
+                        false,
+                        &mut pending_output_deadline,
+                        output_shutdown_timeout,
+                    )?;
                 }
                 continue;
             }
 
-            match reader_rx.recv_timeout(RUNTIME_EVENT_POLL_INTERVAL) {
+            let reader_wait = if in_flight_outputs == 0 {
+                RUNTIME_EVENT_POLL_INTERVAL
+            } else {
+                let deadline = *pending_output_deadline
+                    .get_or_insert_with(|| Instant::now() + output_shutdown_timeout);
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    stop_runtime_bridge(&mut child);
+                    bail!(
+                        "local runtime output remained blocked for {} ms before remote completion",
+                        output_shutdown_timeout.as_millis()
+                    );
+                }
+                remaining.min(RUNTIME_EVENT_POLL_INTERVAL)
+            };
+            match reader_rx.recv_timeout(reader_wait) {
                 Ok(RuntimeReaderEvent::Message(message)) => {
                     if matches!(
                         &message,
@@ -3908,8 +4097,7 @@ fn run_proxy(
                     ) {
                         input_flow.stop();
                         terminal_message = Some(message);
-                        output_shutdown_deadline =
-                            Some(Instant::now() + RUNTIME_OUTPUT_SHUTDOWN_TIMEOUT);
+                        output_shutdown_deadline = Some(Instant::now() + output_shutdown_timeout);
                         continue;
                     }
                     observe_shared(&writer, &message)?;
@@ -3920,12 +4108,20 @@ fn run_proxy(
                             offset,
                             data,
                         } => {
-                            pending_output = output_pump.try_write(RuntimeOutputChunk {
+                            match output_pump.try_write(RuntimeOutputChunk {
                                 process_id,
                                 stream,
                                 offset,
                                 data,
-                            })?;
+                            })? {
+                                Some(chunk) => pending_outputs.push_back(chunk),
+                                None => record_runtime_output_submission(
+                                    false,
+                                    &mut in_flight_outputs,
+                                    &mut pending_output_deadline,
+                                    output_shutdown_timeout,
+                                )?,
+                            }
                         }
                         RuntimeMessage::InputAck { next_offset, .. } => {
                             input_flow.acknowledge(next_offset)?;
@@ -3947,6 +4143,10 @@ fn run_proxy(
                         super::sanitize_agent_error_text(&error)
                     );
                 }
+                Ok(RuntimeReaderEvent::Closed) => {
+                    stop_runtime_bridge(&mut child);
+                    bail!("runtime agent stream closed before the remote process completed");
+                }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
                     if let Some(status) =
                         child.try_wait().context("failed to poll runtime bridge")?
@@ -3967,6 +4167,7 @@ fn run_proxy(
         close_shared(&writer)?;
         let bridge_status = wait_runtime_bridge(&mut child, RUNTIME_BRIDGE_EXIT_GRACE)?;
         let bridge_stderr = bridge_diagnostics.finish();
+        validate_runtime_reader_closed_after_completion(&reader_rx, RUNTIME_BRIDGE_EXIT_GRACE)?;
         if !bridge_status.success()
             && !matches!(
                 result.kind,
@@ -4082,6 +4283,43 @@ fn forward_runtime_output_event(
     }
 }
 
+fn record_runtime_output_submission(
+    terminal_seen: bool,
+    in_flight_outputs: &mut usize,
+    pending_output_deadline: &mut Option<Instant>,
+    output_shutdown_timeout: Duration,
+) -> Result<()> {
+    *in_flight_outputs = in_flight_outputs
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("local runtime output in-flight count overflow"))?;
+    if !terminal_seen {
+        pending_output_deadline.get_or_insert_with(|| Instant::now() + output_shutdown_timeout);
+    }
+    Ok(())
+}
+
+fn record_runtime_output_progress(
+    output_progressed: bool,
+    terminal_seen: bool,
+    in_flight_outputs: &mut usize,
+    has_pending_output: bool,
+    pending_output_deadline: &mut Option<Instant>,
+    output_shutdown_timeout: Duration,
+) -> Result<()> {
+    if !output_progressed {
+        return Ok(());
+    }
+    *in_flight_outputs = in_flight_outputs
+        .checked_sub(1)
+        .ok_or_else(|| anyhow!("local runtime output completed without an in-flight chunk"))?;
+    if *in_flight_outputs == 0 && !has_pending_output {
+        *pending_output_deadline = None;
+    } else if !terminal_seen {
+        *pending_output_deadline = Some(Instant::now() + output_shutdown_timeout);
+    }
+    Ok(())
+}
+
 fn runtime_terminal_result(message: RuntimeMessage) -> Result<RuntimeProxyResult> {
     match message {
         RuntimeMessage::Exited {
@@ -4126,6 +4364,17 @@ fn spawn_runtime_reader(
                 }
             }
             loop {
+                match reader.fill_buf() {
+                    Ok([]) => {
+                        let _ = sender.send(RuntimeReaderEvent::Closed);
+                        return;
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        let _ = sender.send(RuntimeReaderEvent::ReadError(error.to_string()));
+                        return;
+                    }
+                }
                 match read_runtime_frame(&mut reader) {
                     Ok(message) => {
                         if sender.send(RuntimeReaderEvent::Message(message)).is_err() {
@@ -4141,6 +4390,33 @@ fn spawn_runtime_reader(
         })
         .context("failed to start runtime protocol reader")?;
     Ok(())
+}
+
+fn validate_runtime_reader_closed_after_completion(
+    receiver: &mpsc::Receiver<RuntimeReaderEvent>,
+    timeout: Duration,
+) -> Result<()> {
+    match receiver.recv_timeout(timeout) {
+        Ok(RuntimeReaderEvent::Closed) => Ok(()),
+        Ok(RuntimeReaderEvent::Message(_)) => {
+            bail!("runtime agent sent a protocol message after remote completion")
+        }
+        Ok(RuntimeReaderEvent::LaunchFailure(failure)) => bail!(
+            "runtime agent launch failed after remote completion: {}",
+            failure.detail()
+        ),
+        Ok(RuntimeReaderEvent::ReadError(error)) => bail!(
+            "runtime agent stream failed after remote completion: {}",
+            super::sanitize_agent_error_text(&error)
+        ),
+        Err(mpsc::RecvTimeoutError::Timeout) => bail!(
+            "runtime agent stream did not close within {} ms after remote completion",
+            timeout.as_millis()
+        ),
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            bail!("runtime agent stream disconnected without a clean close after remote completion")
+        }
+    }
 }
 
 fn receive_runtime_message(
@@ -4161,6 +4437,10 @@ fn receive_runtime_message(
                 "{context} failed: {}",
                 super::sanitize_agent_error_text(&error)
             )
+        }
+        Ok(RuntimeReaderEvent::Closed) => {
+            stop_runtime_bridge(child);
+            bail!("runtime agent stream closed during {context}")
         }
         Err(mpsc::RecvTimeoutError::Timeout) => {
             stop_runtime_bridge(child);
@@ -4912,6 +5192,81 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    fn fake_pipe_ticket(root: &Path, agent: &Path) -> RuntimeTicket {
+        let mut ticket = ticket(root);
+        ticket.agent = agent.to_string_lossy().into_owned();
+        ticket.capability = RuntimeCapability::ProcessPipeV1;
+        ticket.spec.terminal_size = None;
+        ticket
+    }
+
+    #[cfg(unix)]
+    fn runtime_agent_response_prefix() -> Vec<u8> {
+        let mut bytes = Vec::new();
+        write_runtime_frame(
+            &mut bytes,
+            &RuntimeMessage::ServerHello {
+                package_version: env!("CARGO_PKG_VERSION").to_owned(),
+                protocol_version: PROTOCOL_VERSION,
+                capability: RuntimeCapability::ProcessPipeV1,
+            },
+        )
+        .unwrap();
+        write_runtime_frame(
+            &mut bytes,
+            &RuntimeMessage::ProcessStarted {
+                request_id: 1,
+                process_id: 7,
+                session: None,
+                output_offset: 0,
+            },
+        )
+        .unwrap();
+        bytes
+    }
+
+    #[cfg(unix)]
+    fn write_fake_runtime_agent(directory: &Path, response: &[u8]) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        fs::write(directory.join("response.bin"), response).unwrap();
+        let agent = directory.join("fake-runtime-agent");
+        fs::write(
+            &agent,
+            b"#!/bin/sh\ndirectory=$(dirname \"$0\")\ncat \"$directory/response.bin\"\ncat >/dev/null\n",
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&agent).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&agent, permissions).unwrap();
+        agent
+    }
+
+    #[cfg(unix)]
+    fn write_gated_fake_runtime_agent(
+        directory: &Path,
+        prefix: &[u8],
+        response: &[u8],
+    ) -> (PathBuf, PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        fs::write(directory.join("prefix.bin"), prefix).unwrap();
+        fs::write(directory.join("response.bin"), response).unwrap();
+        let release = directory.join("release-response");
+        let response_written = directory.join("response-written");
+        let agent = directory.join("fake-runtime-agent");
+        fs::write(
+            &agent,
+            b"#!/bin/sh\ndirectory=$(dirname \"$0\")\ncat \"$directory/prefix.bin\"\ncount=0\nwhile [ ! -e \"$directory/release-response\" ]; do\n  count=$((count + 1))\n  [ \"$count\" -lt 500 ] || exit 2\n  sleep 0.01\ndone\ncat \"$directory/response.bin\"\n: >\"$directory/response-written\"\ncat >/dev/null\n",
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&agent).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&agent, permissions).unwrap();
+        (agent, release, response_written)
+    }
+
     #[derive(Clone, Default)]
     struct CapturedRuntimeFrames(Arc<Mutex<Vec<u8>>>);
 
@@ -5045,6 +5400,34 @@ mod tests {
 
         fn flush(&mut self) -> io::Result<()> {
             self.0 .0.lock().unwrap().flushes += 1;
+            Ok(())
+        }
+    }
+
+    struct SteadilyProgressingOutput {
+        write_delay: Duration,
+        writes_remaining: usize,
+        release_response: PathBuf,
+        released: bool,
+    }
+
+    impl Write for SteadilyProgressingOutput {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if self.writes_remaining == 0 {
+                return Err(io::Error::other(
+                    "local output received more writes than the test agent sent",
+                ));
+            }
+            thread::sleep(self.write_delay);
+            self.writes_remaining -= 1;
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            if self.writes_remaining == 0 && !self.released {
+                fs::write(&self.release_response, b"")?;
+                self.released = true;
+            }
             Ok(())
         }
     }
@@ -5775,6 +6158,397 @@ mod tests {
         assert!(writer.close().is_err());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn runtime_proxy_accepts_clean_close_after_exited() {
+        let directory = test_directory();
+        let mut response = runtime_agent_response_prefix();
+        write_runtime_frame(
+            &mut response,
+            &RuntimeMessage::Exited {
+                process_id: 7,
+                status: RuntimeExitStatus::Code(0),
+                output_truncated: false,
+            },
+        )
+        .unwrap();
+        let agent = write_fake_runtime_agent(directory.path(), &response);
+
+        let result = run_proxy(
+            fake_pipe_ticket(directory.path(), &agent),
+            Some(directory.path()),
+            &"b".repeat(TICKET_ID_HEX_LEN),
+        )
+        .unwrap();
+        assert_eq!(result.kind, RuntimeResultKind::ProcessExit);
+        assert_eq!(result.exit_code, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_proxy_rejects_message_after_exited() {
+        let directory = test_directory();
+        let mut response = runtime_agent_response_prefix();
+        write_runtime_frame(
+            &mut response,
+            &RuntimeMessage::Exited {
+                process_id: 7,
+                status: RuntimeExitStatus::Code(0),
+                output_truncated: false,
+            },
+        )
+        .unwrap();
+        write_runtime_frame(
+            &mut response,
+            &RuntimeMessage::Output {
+                process_id: 7,
+                stream: RuntimeOutputStream::Stdout,
+                offset: 0,
+                data: b"late".to_vec(),
+            },
+        )
+        .unwrap();
+        let agent = write_fake_runtime_agent(directory.path(), &response);
+
+        let error = run_proxy(
+            fake_pipe_ticket(directory.path(), &agent),
+            Some(directory.path()),
+            &"c".repeat(TICKET_ID_HEX_LEN),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("after remote completion"),
+            "{error:#}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_proxy_rejects_malformed_frame_after_exited() {
+        let directory = test_directory();
+        let mut response = runtime_agent_response_prefix();
+        write_runtime_frame(
+            &mut response,
+            &RuntimeMessage::Exited {
+                process_id: 7,
+                status: RuntimeExitStatus::Code(0),
+                output_truncated: false,
+            },
+        )
+        .unwrap();
+        response.extend_from_slice(&4_u32.to_be_bytes());
+        response.extend_from_slice(&[0xff, 0xff]);
+        let agent = write_fake_runtime_agent(directory.path(), &response);
+
+        let error = run_proxy(
+            fake_pipe_ticket(directory.path(), &agent),
+            Some(directory.path()),
+            &"d".repeat(TICKET_ID_HEX_LEN),
+        )
+        .unwrap_err();
+        assert!(
+            error.to_string().contains("after remote completion"),
+            "{error:#}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn full_local_output_queue_observes_remote_error_and_stops_boundedly() {
+        let directory = test_directory();
+        let mut prefix = runtime_agent_response_prefix();
+        write_runtime_frame(
+            &mut prefix,
+            &RuntimeMessage::Output {
+                process_id: 7,
+                stream: RuntimeOutputStream::Stdout,
+                offset: 0,
+                data: vec![b'x'],
+            },
+        )
+        .unwrap();
+        let mut response = Vec::new();
+        // One chunk blocks the writer, the next queue-depth chunks fill its
+        // channel, and two more exercise the bounded relay backlog before the
+        // terminal error arrives.
+        for offset in 1..=(RUNTIME_OUTPUT_QUEUE_DEPTH as u64 + 2) {
+            write_runtime_frame(
+                &mut response,
+                &RuntimeMessage::Output {
+                    process_id: 7,
+                    stream: RuntimeOutputStream::Stdout,
+                    offset,
+                    data: vec![b'x'],
+                },
+            )
+            .unwrap();
+        }
+        write_runtime_frame(
+            &mut response,
+            &RuntimeMessage::Error(nrm_protocol::RuntimeError {
+                code: nrm_protocol::RuntimeErrorCode::Internal,
+                message: "remote runtime failed".to_owned(),
+                retryable: false,
+            }),
+        )
+        .unwrap();
+        let (agent, release_response, _response_written) =
+            write_gated_fake_runtime_agent(directory.path(), &prefix, &response);
+        let blocking = BlockingOutput::default();
+        let worker_output = blocking.clone();
+        let state_dir = directory.path().to_path_buf();
+        let ticket = fake_pipe_ticket(directory.path(), &agent);
+        let (completed_tx, completed_rx) = mpsc::sync_channel(1);
+        let worker = thread::spawn(move || {
+            let result = run_proxy_with_output(
+                ticket,
+                Some(&state_dir),
+                &"e".repeat(TICKET_ID_HEX_LEN),
+                worker_output,
+                io::sink(),
+                Duration::from_millis(200),
+            );
+            completed_tx.send(result).unwrap();
+        });
+
+        blocking.wait_until_blocked();
+        fs::write(release_response, b"").unwrap();
+        let early = completed_rx.recv_timeout(Duration::from_secs(2));
+        let completed_while_output_was_blocked = early.is_ok();
+        blocking.release();
+        let result = match early {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => completed_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("runtime proxy did not stop after releasing its blocked output"),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("runtime proxy result channel disconnected")
+            }
+        };
+        worker.join().unwrap();
+
+        assert!(
+            completed_while_output_was_blocked,
+            "a full local output queue starved the queued remote error"
+        );
+        let error = result.unwrap_err();
+        assert!(
+            error.to_string().contains("after remote completion"),
+            "{error:#}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn accepted_in_flight_output_stalls_boundedly_without_pending_backlog() {
+        let directory = test_directory();
+        let mut prefix = runtime_agent_response_prefix();
+        write_runtime_frame(
+            &mut prefix,
+            &RuntimeMessage::Output {
+                process_id: 7,
+                stream: RuntimeOutputStream::Stdout,
+                offset: 0,
+                data: vec![b'x'],
+            },
+        )
+        .unwrap();
+        let mut terminal = Vec::new();
+        write_runtime_frame(
+            &mut terminal,
+            &RuntimeMessage::Exited {
+                process_id: 7,
+                status: RuntimeExitStatus::Code(0),
+                output_truncated: false,
+            },
+        )
+        .unwrap();
+        let (agent, release_response, _response_written) =
+            write_gated_fake_runtime_agent(directory.path(), &prefix, &terminal);
+        let blocking = BlockingOutput::default();
+        let worker_output = blocking.clone();
+        let state_dir = directory.path().to_path_buf();
+        let ticket = fake_pipe_ticket(directory.path(), &agent);
+        let (completed_tx, completed_rx) = mpsc::sync_channel(1);
+        let worker = thread::spawn(move || {
+            let result = run_proxy_with_output(
+                ticket,
+                Some(&state_dir),
+                &"2".repeat(TICKET_ID_HEX_LEN),
+                worker_output,
+                io::sink(),
+                Duration::from_millis(100),
+            );
+            completed_tx.send(result).unwrap();
+        });
+
+        blocking.wait_until_blocked();
+        let early = completed_rx.recv_timeout(Duration::from_secs(1));
+        let completed_while_output_was_blocked = early.is_ok();
+        blocking.release();
+        fs::write(release_response, b"").unwrap();
+        let result = match early {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => completed_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("runtime proxy did not stop after releasing its in-flight output"),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("runtime proxy result channel disconnected")
+            }
+        };
+        worker.join().unwrap();
+
+        assert!(
+            completed_while_output_was_blocked,
+            "an accepted in-flight output without a pending backlog waited indefinitely"
+        );
+        let error = result.unwrap_err();
+        assert!(
+            error.to_string().contains("before remote completion"),
+            "{error:#}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn steadily_progressing_output_backlog_outlives_stall_timeout() {
+        let directory = test_directory();
+        let output_chunks = RUNTIME_OUTPUT_QUEUE_DEPTH + 16;
+        let mut prefix = runtime_agent_response_prefix();
+        for offset in 0..output_chunks as u64 {
+            write_runtime_frame(
+                &mut prefix,
+                &RuntimeMessage::Output {
+                    process_id: 7,
+                    stream: RuntimeOutputStream::Stdout,
+                    offset,
+                    data: vec![b'x'],
+                },
+            )
+            .unwrap();
+        }
+        let mut terminal = Vec::new();
+        write_runtime_frame(
+            &mut terminal,
+            &RuntimeMessage::Exited {
+                process_id: 7,
+                status: RuntimeExitStatus::Code(0),
+                output_truncated: false,
+            },
+        )
+        .unwrap();
+        let (agent, release_response, _response_written) =
+            write_gated_fake_runtime_agent(directory.path(), &prefix, &terminal);
+        let output_shutdown_timeout = Duration::from_millis(100);
+        let stdout = SteadilyProgressingOutput {
+            write_delay: Duration::from_millis(20),
+            writes_remaining: output_chunks,
+            release_response,
+            released: false,
+        };
+        let started = Instant::now();
+
+        let result = run_proxy_with_output(
+            fake_pipe_ticket(directory.path(), &agent),
+            Some(directory.path()),
+            &"1".repeat(TICKET_ID_HEX_LEN),
+            stdout,
+            io::sink(),
+            output_shutdown_timeout,
+        )
+        .unwrap();
+
+        assert_eq!(result.kind, RuntimeResultKind::ProcessExit);
+        assert_eq!(result.exit_code, 0);
+        assert!(
+            started.elapsed() >= output_shutdown_timeout * 4,
+            "test output did not remain backlogged beyond its stall timeout"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backpressured_proxy_rejects_output_after_exited() {
+        let directory = test_directory();
+        let mut prefix = runtime_agent_response_prefix();
+        write_runtime_frame(
+            &mut prefix,
+            &RuntimeMessage::Output {
+                process_id: 7,
+                stream: RuntimeOutputStream::Stdout,
+                offset: 0,
+                data: vec![b'x'],
+            },
+        )
+        .unwrap();
+        let mut response = Vec::new();
+        for offset in 1..=(RUNTIME_OUTPUT_QUEUE_DEPTH as u64 + 2) {
+            write_runtime_frame(
+                &mut response,
+                &RuntimeMessage::Output {
+                    process_id: 7,
+                    stream: RuntimeOutputStream::Stdout,
+                    offset,
+                    data: vec![b'x'],
+                },
+            )
+            .unwrap();
+        }
+        write_runtime_frame(
+            &mut response,
+            &RuntimeMessage::Exited {
+                process_id: 7,
+                status: RuntimeExitStatus::Code(0),
+                output_truncated: false,
+            },
+        )
+        .unwrap();
+        write_runtime_frame(
+            &mut response,
+            &RuntimeMessage::Output {
+                process_id: 7,
+                stream: RuntimeOutputStream::Stdout,
+                offset: RUNTIME_OUTPUT_QUEUE_DEPTH as u64 + 3,
+                data: b"late".to_vec(),
+            },
+        )
+        .unwrap();
+        let (agent, release_response, response_written) =
+            write_gated_fake_runtime_agent(directory.path(), &prefix, &response);
+        let blocking = BlockingOutput::default();
+        let worker_output = blocking.clone();
+        let state_dir = directory.path().to_path_buf();
+        let ticket = fake_pipe_ticket(directory.path(), &agent);
+        let worker = thread::spawn(move || {
+            run_proxy_with_output(
+                ticket,
+                Some(&state_dir),
+                &"f".repeat(TICKET_ID_HEX_LEN),
+                worker_output,
+                io::sink(),
+                Duration::from_secs(2),
+            )
+        });
+
+        blocking.wait_until_blocked();
+        fs::write(release_response, b"").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !response_written.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "fake runtime agent did not finish writing its gated response"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        blocking.release();
+
+        let error = worker.join().unwrap().unwrap_err();
+        assert!(
+            error.to_string().contains("after remote completion"),
+            "{error:#}"
+        );
+    }
+
     #[test]
     fn blocked_local_output_does_not_starve_control_and_ack_waits_for_flush() {
         let frames = CapturedRuntimeFrames::default();
@@ -5972,6 +6746,43 @@ mod tests {
         let mut wrong = ticket(root.path());
         wrong.workspace_key = "0".repeat(24);
         assert!(validate_ticket(&wrong).is_err());
+
+        for invalid_agent in [
+            "/",
+            "./nrm-agent",
+            "bin/nrm-agent",
+            r".\nrm-agent.exe",
+            "C:relative.exe",
+        ] {
+            let mut invalid = ticket(root.path());
+            invalid.agent = invalid_agent.to_owned();
+            assert!(
+                validate_ticket(&invalid).is_err(),
+                "accepted noncanonical runtime ticket agent {invalid_agent:?}"
+            );
+        }
+
+        let mut unresolved_remote = ticket(root.path());
+        unresolved_remote.ssh = Some("runtime.example.test".to_owned());
+        unresolved_remote.remote_root = "/srv/runtime".to_owned();
+        let unresolved_transport = RemoteTransport::from_ssh(
+            unresolved_remote.ssh.clone(),
+            unresolved_remote.ssh_connect_timeout_seconds,
+        )
+        .unwrap();
+        unresolved_remote.workspace_key = workspace_key(
+            &unresolved_transport,
+            &unresolved_transport
+                .normalize_remote_root(PathBuf::from(&unresolved_remote.remote_root))
+                .unwrap(),
+        );
+        for valid_agent in ["/opt/nrm/bin/nrm-agent", r"D:\tools\nrm-agent.exe"] {
+            unresolved_remote.agent = valid_agent.to_owned();
+            assert!(
+                validate_ticket(&unresolved_remote).is_ok(),
+                "rejected canonical unresolved runtime ticket agent {valid_agent:?}"
+            );
+        }
 
         let mut value = serde_json::to_value(ticket(root.path())).unwrap();
         value

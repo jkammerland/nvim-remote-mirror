@@ -93,7 +93,7 @@ fn validate_canonical_posix_path(name: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_canonical_posix_executable(name: &str, value: &str) -> Result<()> {
+pub(crate) fn validate_canonical_posix_executable(name: &str, value: &str) -> Result<()> {
     validate_canonical_posix_path(name, value)?;
     if !value.bytes().all(|byte| {
         byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'+' | b'-')
@@ -103,7 +103,7 @@ fn validate_canonical_posix_executable(name: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_canonical_windows_path(name: &str, value: &str) -> Result<()> {
+pub(crate) fn validate_canonical_windows_path(name: &str, value: &str) -> Result<()> {
     reject_field_controls(name, value)?;
     if value.len() > REMOTE_HOST_PATH_MAX_BYTES || value.len() < 3 {
         bail!("{name} must be a bounded absolute Windows path");

@@ -2580,6 +2580,7 @@ impl RemoteTransport {
         host: &RemoteHostInfo,
         args: Vec<String>,
     ) -> Result<ProcessLaunchPlan> {
+        validate_remote_agent_reference(agent, host)?;
         match self {
             Self::Local => Ok(ProcessLaunchPlan {
                 program: agent.to_string(),
@@ -2588,9 +2589,6 @@ impl RemoteTransport {
                 stdin_prefix: Vec::new(),
             }),
             Self::Ssh(ssh) => {
-                if remote_agent_uses_managed_path(agent) {
-                    validate_managed_remote_agent_name(agent)?;
-                }
                 validate_remote_root(host, remote_root)?;
                 let (remote_command, stdin_prefix) = match host.path_style {
                     RemotePathStyle::Posix => (
@@ -12912,8 +12910,65 @@ fn validate_managed_remote_agent_name(agent: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_remote_agent_reference_for_style(
+    agent: &str,
+    path_style: RemotePathStyle,
+) -> Result<()> {
+    if remote_agent_uses_managed_path(agent) {
+        return validate_managed_remote_agent_name(agent);
+    }
+    if agent.is_empty() || agent.chars().any(char::is_control) || agent.starts_with('-') {
+        bail!("remote_agent executable path is invalid");
+    }
+
+    match path_style {
+        RemotePathStyle::Posix => {
+            remote_host::validate_canonical_posix_executable("remote_agent executable", agent)?;
+            if agent == "/" {
+                bail!("remote_agent executable must name a file");
+            }
+            Ok(())
+        }
+        RemotePathStyle::Windows => {
+            remote_host::validate_canonical_windows_path("remote_agent executable", agent)?;
+            if agent.len() == 3 {
+                bail!("remote_agent executable must name a file");
+            }
+            let separator = agent.as_bytes()[2] as char;
+            for component in agent[3..].split(separator) {
+                if component.contains(':')
+                    || component.ends_with(['.', ' '])
+                    || component
+                        .bytes()
+                        .any(|byte| matches!(byte, b'<' | b'>' | b'"' | b'|' | b'?' | b'*'))
+                {
+                    bail!("remote_agent executable contains an invalid Windows path segment");
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+fn validate_remote_agent_reference(agent: &str, host: &RemoteHostInfo) -> Result<()> {
+    validate_remote_agent_reference_for_style(agent, host.path_style)
+}
+
+fn validate_unresolved_remote_agent_reference(agent: &str) -> Result<()> {
+    if remote_agent_uses_managed_path(agent) {
+        return validate_managed_remote_agent_name(agent);
+    }
+    let path_style = if agent.starts_with('/') {
+        RemotePathStyle::Posix
+    } else {
+        RemotePathStyle::Windows
+    };
+    validate_remote_agent_reference_for_style(agent, path_style)
+}
+
 fn default_posix_remote_agent_install_path(agent: &str) -> Result<String> {
     if agent.starts_with('/') {
+        validate_remote_agent_reference_for_style(agent, RemotePathStyle::Posix)?;
         return Ok(agent.to_string());
     }
     if !remote_agent_uses_managed_path(agent) {
@@ -12924,6 +12979,7 @@ fn default_posix_remote_agent_install_path(agent: &str) -> Result<String> {
 }
 
 fn default_remote_agent_install_path(agent: &str, host: &RemoteHostInfo) -> Result<String> {
+    validate_remote_agent_reference(agent, host)?;
     match host.path_style {
         RemotePathStyle::Posix => default_posix_remote_agent_install_path(agent),
         RemotePathStyle::Windows if !remote_agent_uses_managed_path(agent) => Ok(agent.to_string()),
@@ -14888,6 +14944,7 @@ mod tests {
             "/opt/bin/nrm-agent"
         );
         for invalid in [
+            "/",
             "./nrm-agent",
             "bin/nrm-agent",
             "-nrm-agent",
@@ -14908,18 +14965,51 @@ mod tests {
             );
         }
         let ssh = RemoteTransport::from_ssh(Some("example.test".to_owned()), 1).unwrap();
-        for invalid in ["*.exe", "agent?.exe", "[ab].exe"] {
+        for invalid in [
+            "./nrm-agent",
+            "bin/nrm-agent",
+            "bad:name",
+            r".\nrm-agent",
+            "*.exe",
+            "agent?.exe",
+            "[ab].exe",
+        ] {
             assert!(
                 ssh.agent_plan(invalid, Path::new("/repo"), &test_posix_host())
                     .is_err(),
                 "accepted unsafe POSIX launch name {invalid:?}"
             );
+        }
+        for invalid in [
+            r".\nrm-agent.exe",
+            r"bin\nrm-agent.exe",
+            "C:relative.exe",
+            "bad:name",
+            r"\\server\share\nrm-agent.exe",
+            "*.exe",
+            "agent?.exe",
+            "[ab].exe",
+        ] {
             assert!(
                 ssh.agent_plan(invalid, Path::new("B:/repo"), &test_windows_host())
                     .is_err(),
                 "accepted wildcard-aware PowerShell launch name {invalid:?}"
             );
         }
+        assert!(ssh
+            .agent_plan(
+                "/opt/nrm/bin/nrm-agent",
+                Path::new("/repo"),
+                &test_posix_host(),
+            )
+            .is_ok());
+        assert!(ssh
+            .agent_plan(
+                r"D:\tools\nrm-agent.exe",
+                Path::new("B:/repo"),
+                &test_windows_host(),
+            )
+            .is_ok());
         assert_eq!(
             default_remote_agent_install_path("nrm-agent", &test_windows_host()).unwrap(),
             r"C:\Users\test\AppData\Local\nrm\bin\nrm-agent.exe"

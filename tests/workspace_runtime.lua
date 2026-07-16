@@ -61,6 +61,9 @@ end
 
 local function test_offline_resolution_and_paths()
   workspace._reset_for_test()
+  assert_call_error(function()
+    return workspace.resolve(false)
+  end, "invalid_argument")
   local old_client = nrm.client
   local old_status = nrm.connection_status
   local old_generation = nrm.reconnect_generation
@@ -395,6 +398,28 @@ local function test_process_contract()
     return context:job_spec({ command = { argv = { "git" } }, persistence = "detached" })
   end, "invalid_process_spec")
   assert_call_error(function()
+    return context:job_spec({ command = { argv = { "git" } }, env = false })
+  end, "invalid_process_spec")
+  assert_call_error(function()
+    return context:job_spec({ command = { argv = { "git" } }, persistence = false })
+  end, "invalid_process_spec")
+  assert_call_error(function()
+    return context:job_spec({ command = { argv = { "git" } }, stdio = "pty", initial_size = false })
+  end, "invalid_process_spec")
+  for _, false_option in ipairs({
+    { env = { set = false } },
+    { env = { unset = false } },
+    { stdio = false },
+    { max_output_bytes = false },
+    { stdio = "pty", initial_size = { cols = false } },
+    { stdio = "pty", initial_size = { rows = false } },
+  }) do
+    false_option.command = { argv = { "git" } }
+    assert_call_error(function()
+      return context:job_spec(false_option)
+    end, "invalid_process_spec")
+  end
+  assert_call_error(function()
     return context:job_spec({
       command = { argv = { "git" } },
       stdio = "pty",
@@ -723,6 +748,17 @@ local function test_capabilities_and_provider_failures()
   assert_call_error(function()
     return workspace.resolve()
   end, "provider_error")
+
+  workspace._set_backend({
+    resolve = function()
+      local invalid_descriptor = online_descriptor()
+      invalid_descriptor.capabilities = false
+      return invalid_descriptor
+    end,
+  })
+  assert_call_error(function()
+    return workspace.resolve()
+  end, "invalid_provider_state")
   workspace._reset_for_test()
 end
 
