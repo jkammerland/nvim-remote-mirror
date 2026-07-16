@@ -3,7 +3,11 @@
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
 
-pub const PROTOCOL_VERSION: u16 = 7;
+mod runtime;
+
+pub use runtime::*;
+
+pub const PROTOCOL_VERSION: u16 = 8;
 pub const MAX_FRAME_LEN: usize = 64 * 1024 * 1024;
 pub const MAX_CONFLICT_CONTENT_BYTES: usize = 4 * 1024 * 1024;
 
@@ -25,6 +29,9 @@ pub struct CapabilitySet {
     pub streaming: bool,
     pub multiplexing: bool,
     pub git: bool,
+    pub runtime_process_v1: bool,
+    pub runtime_pty_v1: bool,
+    pub workspace_watch_v1: bool,
 }
 
 impl CapabilitySet {
@@ -44,6 +51,17 @@ impl CapabilitySet {
             streaming: false,
             multiplexing: false,
             git: true,
+            runtime_process_v1: false,
+            runtime_pty_v1: false,
+            workspace_watch_v1: false,
+        }
+    }
+
+    pub fn supports_runtime(&self, capability: RuntimeCapability) -> bool {
+        match capability {
+            RuntimeCapability::ProcessPipeV1 => self.runtime_process_v1,
+            RuntimeCapability::ProcessPtyV1 => self.runtime_pty_v1,
+            RuntimeCapability::WorkspaceWatchV1 => self.workspace_watch_v1,
         }
     }
 }
