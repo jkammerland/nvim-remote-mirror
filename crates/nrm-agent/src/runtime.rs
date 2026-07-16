@@ -1010,6 +1010,12 @@ fn read_output_chunk(
             Ok(0) => return Ok((read != 0).then_some(read)),
             Ok(count) => {
                 read += count;
+                // Windows runtime pipe and ConPTY outputs are synchronous
+                // pipes. Reading again can block after a partial prompt and
+                // prevent its delivery.
+                #[cfg(windows)]
+                return Ok(Some(read));
+                #[cfg(not(windows))]
                 if read == buffer.len() {
                     return Ok(Some(read));
                 }
@@ -1290,6 +1296,38 @@ mod tests {
     use std::sync::Condvar;
 
     const REQUEST_ID: u64 = 41;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_output_chunk_returns_after_the_first_successful_read() {
+        struct PromptThenBlock {
+            prompt: &'static [u8],
+            read: bool,
+        }
+
+        impl Read for PromptThenBlock {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                assert!(!self.read, "output chunk attempted a second blocking read");
+                self.read = true;
+                let read = self.prompt.len().min(buffer.len());
+                buffer[..read].copy_from_slice(&self.prompt[..read]);
+                Ok(read)
+            }
+        }
+
+        const PROMPT: &[u8] = b"interactive prompt>";
+        let mut output = PromptThenBlock {
+            prompt: PROMPT,
+            read: false,
+        };
+        let mut buffer = [0_u8; 64];
+        let stopped = AtomicBool::new(false);
+
+        let read = read_output_chunk(&mut output, &mut buffer, &stopped).unwrap();
+
+        assert_eq!(read, Some(PROMPT.len()));
+        assert_eq!(&buffer[..PROMPT.len()], PROMPT);
+    }
 
     #[derive(Default)]
     struct GateState {
@@ -1847,7 +1885,7 @@ mod tests {
         let collected = collect_process_from(&mut harness.client, process_id, collected);
         assert_eq!(
             collected.stdout.iter().filter(|byte| **byte == 0).count(),
-            OUTPUT_FLOW_WINDOW_BYTES as usize + RUNTIME_MAX_DATA_CHUNK_LEN / 2
+            OUTPUT_FLOW_WINDOW_BYTES as usize + 1
         );
         assert_eq!(collected.status, Some(RuntimeExitStatus::Code(0)));
         assert!(!collected.output_truncated);
@@ -1938,6 +1976,96 @@ mod tests {
 
         let collected = collect_process(&mut harness.client, process_id);
         assert!(!collected.pty.is_empty());
+        assert_eq!(collected.status, Some(RuntimeExitStatus::Code(0)));
+        assert!(!collected.output_truncated);
+        harness.finish();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn attached_pty_interactive_cmd_streams_prompt_accepts_input_and_exits() {
+        const PROMPT: &[u8] = b"NRM_RUNTIME_PROMPT>";
+        const MARKER: &[u8] = b"NRM_RUNTIME_INTERACTIVE_OK";
+        let mut harness = RuntimeHarness::new(RuntimeCapability::ProcessPtyV1);
+        let spec = RuntimeProcessSpec {
+            argv: vec!["cmd.exe".to_string(), "/d".to_string(), "/q".to_string()],
+            cwd: RuntimeCwd::WorkspaceRoot,
+            env: RuntimeEnvironment {
+                clear: false,
+                set: vec![RuntimeEnvVar {
+                    name: "PROMPT".to_string(),
+                    value: "NRM_RUNTIME_PROMPT$G".to_string(),
+                }],
+                unset: Vec::new(),
+            },
+            persistence: RuntimePersistence::Attached,
+            terminal_size: Some(TerminalSize {
+                columns: 80,
+                rows: 24,
+                pixel_width: None,
+                pixel_height: None,
+            }),
+            timeout_ms: Some(20_000),
+            max_output_bytes: None,
+        };
+        let process_id = harness.start(spec);
+        let mut pty = Vec::new();
+        while !pty.windows(PROMPT.len()).any(|window| window == PROMPT) {
+            match read_runtime_frame(&mut harness.client).expect("read interactive prompt frame") {
+                RuntimeMessage::Output {
+                    process_id: actual,
+                    stream: RuntimeOutputStream::Pty,
+                    offset,
+                    data,
+                } => {
+                    assert_eq!(actual, process_id);
+                    assert_eq!(offset, pty.len() as u64);
+                    pty.extend_from_slice(&data);
+                    write_runtime_frame(
+                        &mut harness.client,
+                        &RuntimeMessage::OutputAck {
+                            process_id,
+                            stream: RuntimeOutputStream::Pty,
+                            next_offset: pty.len() as u64,
+                        },
+                    )
+                    .unwrap();
+                }
+                message => panic!(
+                    "unexpected message before prompt: {message:?}; output: {:?}",
+                    String::from_utf8_lossy(&pty)
+                ),
+            }
+        }
+
+        let input = b"echo NRM_RUNTIME_INTERACTIVE_OK\r\nexit /b 0\r\n";
+        write_runtime_frame(
+            &mut harness.client,
+            &RuntimeMessage::Input {
+                process_id,
+                offset: 0,
+                data: input.to_vec(),
+            },
+        )
+        .unwrap();
+        let collected = collect_process_from(
+            &mut harness.client,
+            process_id,
+            CollectedProcess {
+                pty,
+                ..CollectedProcess::default()
+            },
+        );
+
+        assert_eq!(collected.input_ack, input.len() as u64);
+        assert!(
+            collected
+                .pty
+                .windows(MARKER.len())
+                .any(|window| window == MARKER),
+            "missing interactive marker: {:?}",
+            String::from_utf8_lossy(&collected.pty)
+        );
         assert_eq!(collected.status, Some(RuntimeExitStatus::Code(0)));
         assert!(!collected.output_truncated);
         harness.finish();
@@ -2135,7 +2263,10 @@ mod tests {
     #[test]
     #[ignore = "runtime subprocess fixture"]
     fn subprocess_exits_with_more_than_output_window() {
-        let output = vec![0; OUTPUT_FLOW_WINDOW_BYTES as usize + RUNTIME_MAX_DATA_CHUNK_LEN / 2];
+        // Keep the tail small enough for a synchronous pipe to drain so this
+        // child exits before the deliberate post-exit ACK stall. Backpressure
+        // before exit is expected when a client does not acknowledge output.
+        let output = vec![0; OUTPUT_FLOW_WINDOW_BYTES as usize + 1];
         io::stdout().write_all(&output).unwrap();
         io::stdout().flush().unwrap();
     }
