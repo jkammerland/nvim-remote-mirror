@@ -2833,6 +2833,7 @@ mod tests {
         plan
     }
 
+    #[cfg(unix)]
     fn state_path(staged: &StagedInstall) -> String {
         format!("{}.nrm-install-state", staged.target_path)
     }

@@ -73,7 +73,7 @@ miri-protocol:
 fuzz-protocol:
     if ! command -v cargo-fuzz >/dev/null 2>&1; then echo "cargo-fuzz is required: cargo install cargo-fuzz --version {{cargo_fuzz_version}} --locked"; exit 127; fi
     if ! command -v clang >/dev/null 2>&1; then echo "clang is required for sanitizer-backed cargo-fuzz builds"; exit 127; fi
-    host_triple="$(rustup run nightly rustc -vV | awk '/^host:/ { print $2 }')"; linker_env="CARGO_TARGET_$(printf '%s' "$host_triple" | tr '[:lower:]-' '[:upper:]_')_LINKER"; if [ -z "${!linker_env:-}" ]; then printf -v "$linker_env" '%s' clang; export "$linker_env"; fi; nightly_bin="$(dirname "$(rustup which --toolchain nightly cargo)")"; PATH="$nightly_bin:$PATH" cargo fuzz run protocol_frame -- -max_total_time=30
+    host_triple="$(rustup run nightly rustc -vV | awk '/^host:/ { print $2 }')"; linker_env="CARGO_TARGET_$(printf '%s' "$host_triple" | tr '[:lower:]-' '[:upper:]_')_LINKER"; if [ -z "${!linker_env:-}" ]; then printf -v "$linker_env" '%s' clang; export "$linker_env"; fi; nightly_bin="$(dirname "$(rustup which --toolchain nightly cargo)")"; for target in protocol_frame runtime_frame; do PATH="$nightly_bin:$PATH" cargo fuzz run "$target" -- -max_total_time=30; done
 
 fuzz-registry:
     if ! command -v cargo-fuzz >/dev/null 2>&1; then echo "cargo-fuzz is required: cargo install cargo-fuzz --version {{cargo_fuzz_version}} --locked"; exit 127; fi

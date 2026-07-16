@@ -20,6 +20,28 @@ local function arg_after(args, name)
   return nil
 end
 
+local function agent_capabilities()
+  return {
+    scan = true,
+    read = true,
+    write_cas = true,
+    checksum = true,
+    grep = true,
+    lsp_proxy = false,
+    batch_read = true,
+    batch_validate = true,
+    chunked_write = true,
+    request_ids = true,
+    cancellation = false,
+    streaming = false,
+    multiplexing = false,
+    git = true,
+    runtime_process_v1 = true,
+    runtime_pty_v1 = true,
+    workspace_watch_v1 = false,
+  }
+end
+
 local original_sockconnect = vim.fn.sockconnect
 local original_jobstart = vim.fn.jobstart
 local original_chansend = vim.fn.chansend
@@ -36,6 +58,7 @@ local original_os_get_passwd = uv.os_get_passwd
 
 local function main()
   nrm.setup({
+    sidecar = vim.fn.fnamemodify(vim.v.progpath, ":p"),
     connection = "socket",
     socket_path = "/tmp/nrm-test-sidecar/socket.sock",
     agent = "/local/build/nrm-agent",
@@ -154,6 +177,11 @@ local function main()
           remote_agent_bootstrap = true,
           remote_agent_automatic_bootstrap_v1 = true,
         },
+        runtime = {
+          contract_version = 2,
+          support = { process = true, terminal = true, watch = false },
+          authority = { state = "unchecked", revision = 0 },
+        },
       }
     elseif decoded.method == "remote_agent_update" then
       assert_eq(decoded.params.automatic, true)
@@ -173,6 +201,18 @@ local function main()
           expected_agent_version = "0.1.0",
           protocol_version = 7,
           expected_protocol_version = 7,
+          runtime = {
+            contract_version = 2,
+            support = { process = true, terminal = true, watch = false },
+            authority = {
+              state = "ready",
+              revision = 1,
+              agent_version = "0.1.0",
+              protocol_version = 7,
+              capabilities = agent_capabilities(),
+              effective = { process = true, terminal = true, watch = false },
+            },
+          },
         },
       }
     else
@@ -284,6 +324,18 @@ local function main()
       expected_agent_version = "0.1.0",
       protocol_version = 7,
       expected_protocol_version = 7,
+      runtime = {
+        contract_version = 2,
+        support = { process = true, terminal = true, watch = false },
+        authority = {
+          state = "ready",
+          revision = 1,
+          agent_version = "0.1.0",
+          protocol_version = 7,
+          capabilities = agent_capabilities(),
+          effective = { process = true, terminal = true, watch = false },
+        },
+      },
     },
   })
   assert_eq(nrm.client, nil)

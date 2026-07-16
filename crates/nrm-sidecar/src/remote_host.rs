@@ -7,15 +7,17 @@ const PROBE_SCHEMA_VERSION: u8 = 1;
 const WINDOWS_REMOTE_COMMAND_MAX_CHARS: usize = 8_191;
 const POWERSHELL_BOOTSTRAP_MAGIC: [u8; 4] = *b"NRM1";
 const POWERSHELL_BOOTSTRAP_MAX_BYTES: usize = 64 * 1024;
+const REMOTE_HOST_PATH_MAX_BYTES: usize = 16 * 1024;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub(crate) enum RemotePathStyle {
     Posix,
     Windows,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct RemoteHostInfo {
     pub(crate) os: String,
     pub(crate) arch: String,
@@ -24,6 +26,113 @@ pub(crate) struct RemoteHostInfo {
     pub(crate) local_app_data: Option<String>,
     pub(crate) path_style: RemotePathStyle,
     pub(crate) target: String,
+}
+
+pub(crate) fn validate_remote_host_info(info: &RemoteHostInfo) -> Result<()> {
+    let expected_style = if info.os == "windows" {
+        RemotePathStyle::Windows
+    } else {
+        RemotePathStyle::Posix
+    };
+    if info.path_style != expected_style {
+        bail!("remote host path style does not match its operating system");
+    }
+    if (info.path_style == RemotePathStyle::Windows) != info.local_app_data.is_some() {
+        bail!("remote host local app-data metadata does not match its platform");
+    }
+    if info.shell.is_empty() || info.shell.chars().any(char::is_control) {
+        bail!("remote host shell must not be empty or contain control characters");
+    }
+    if info.path_style == RemotePathStyle::Windows && info.shell != "powershell" {
+        bail!("Windows remote host must use the PowerShell planner");
+    }
+    match info.path_style {
+        RemotePathStyle::Posix => {
+            validate_canonical_posix_path("remote host home", &info.home)?;
+            validate_canonical_posix_executable("remote host shell", &info.shell)?;
+        }
+        RemotePathStyle::Windows => {
+            validate_canonical_windows_path("remote host home", &info.home)?;
+            validate_canonical_windows_path(
+                "remote host local app-data",
+                info.local_app_data
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("Windows remote host has no local app-data path"))?,
+            )?;
+        }
+    }
+    let rebuilt = build_host_info(
+        &info.os,
+        &info.arch,
+        &info.shell,
+        info.home.clone(),
+        info.local_app_data.clone(),
+        info.path_style,
+    )?;
+    if rebuilt != *info {
+        bail!("remote host metadata is not canonical");
+    }
+    Ok(())
+}
+
+fn validate_canonical_posix_path(name: &str, value: &str) -> Result<()> {
+    reject_field_controls(name, value)?;
+    if value.len() > REMOTE_HOST_PATH_MAX_BYTES || !value.starts_with('/') {
+        bail!("{name} must be a bounded absolute POSIX path");
+    }
+    if value != "/" && value.ends_with('/') {
+        bail!("{name} must not have a trailing separator");
+    }
+    if value.len() > 1
+        && value[1..]
+            .split('/')
+            .any(|component| component.is_empty() || matches!(component, "." | ".."))
+    {
+        bail!("{name} must be a canonical POSIX path");
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_canonical_posix_executable(name: &str, value: &str) -> Result<()> {
+    validate_canonical_posix_path(name, value)?;
+    if !value.bytes().all(|byte| {
+        byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'+' | b'-')
+    }) {
+        bail!("{name} contains characters outside the safe executable-path set");
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_canonical_windows_path(name: &str, value: &str) -> Result<()> {
+    reject_field_controls(name, value)?;
+    if value.len() > REMOTE_HOST_PATH_MAX_BYTES || value.len() < 3 {
+        bail!("{name} must be a bounded absolute Windows path");
+    }
+    let bytes = value.as_bytes();
+    let separator = bytes[2];
+    if !bytes[0].is_ascii_uppercase()
+        || bytes[1] != b':'
+        || !matches!(separator, b'/' | b'\\')
+        || value.starts_with("//")
+        || value.starts_with("\\\\")
+    {
+        bail!("{name} must use an absolute local drive root");
+    }
+    let other_separator = if separator == b'/' { '\\' } else { '/' };
+    if value.contains(other_separator) {
+        bail!("{name} must use one canonical separator style");
+    }
+    if value.len() > 3 && value.ends_with(separator as char) {
+        bail!("{name} must not have a trailing separator");
+    }
+    if value.len() > 3
+        && value[3..]
+            .split(separator as char)
+            .any(|component| component.is_empty() || matches!(component, "." | ".."))
+    {
+        bail!("{name} must be a canonical Windows path");
+    }
+    Ok(())
 }
 
 #[derive(Debug, Deserialize)]
@@ -116,6 +225,8 @@ private static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds)
 private static extern bool GetExitCodeProcess(IntPtr process, out uint exitCode);
 [DllImport("kernel32.dll", SetLastError=true)]
 private static extern bool TerminateProcess(IntPtr process, uint exitCode);
+[DllImport("kernel32.dll", SetLastError=true)]
+private static extern bool TerminateJobObject(IntPtr job, uint exitCode);
 [DllImport("kernel32.dll", SetLastError=true)]
 private static extern IntPtr GetStdHandle(int standardHandle);
 [DllImport("kernel32.dll", SetLastError=true)]
@@ -393,8 +504,17 @@ public static int Run(
         Close(ref thread);
         if (WaitForSingleObject(process, UInt32.MaxValue) != WAIT_OBJECT_0)
             throw Error("process wait failed");
+        uint exitCode;
+        if (!GetExitCodeProcess(process, out exitCode))
+            throw Error("exit-code read failed");
         lock (state.Gate)
             state.Exited = true;
+
+        // The primary process has exited, but descendants can still retain
+        // inherited output handles. Preserve its status first, then terminate
+        // the complete job before waiting for EOF from the pump threads.
+        if (!TerminateJobObject(job, 1))
+            throw Error("terminate remaining process job failed");
         outputPump.Join();
         errorPump.Join();
         lock (state.Gate)
@@ -402,13 +522,15 @@ public static int Run(
             if (state.Failure != null)
                 throw new System.IO.IOException("standard stream relay failed", state.Failure);
         }
-        uint exitCode;
-        if (!GetExitCodeProcess(process, out exitCode))
-            throw Error("exit-code read failed");
         return unchecked((int)exitCode);
     }
     finally
     {
+        // Exceptions can occur before the primary process is reaped. Kill the
+        // complete job before joining pumps so descendants cannot retain the
+        // anonymous pipe handles and deadlock relay teardown.
+        if (job != IntPtr.Zero)
+            TerminateJobObject(job, 1);
         if (process != IntPtr.Zero &&
             WaitForSingleObject(process, 0) == WAIT_TIMEOUT)
         {
@@ -486,12 +608,18 @@ try {
     [string]::Equals($extension, '.bat', [StringComparison]::OrdinalIgnoreCase)
   if ($isBatch) {
     # CreateProcessW cannot execute a batch file directly. Keep the resolved
-    # batch path and argv as data, quote every value, and reject the two cmd.exe
-    # expansion characters that cannot be represented safely in this fixed
-    # trampoline. Other metacharacters remain inert inside their own quotes.
+    # batch path and argv as data, quote every value, and reject cmd.exe
+    # expansion characters and controls that cannot be represented safely in
+    # this fixed trampoline. Other metacharacters remain inert in their quotes.
     $batchValues = @([string]$applicationName) + @($payload.arguments)
     foreach ($value in $batchValues) {
       $text = [string]$value
+      foreach ($character in $text.ToCharArray()) {
+        $code = [int][char]$character
+        if ($code -le 0x1f -or ($code -ge 0x7f -and $code -le 0x9f)) {
+          throw 'batch application paths and arguments must not contain control characters'
+        }
+      }
       if ($text.IndexOf([char]34) -ge 0 -or $text.IndexOf('%') -ge 0) {
         throw 'batch application paths and arguments must not contain double quotes or percent signs'
       }
@@ -527,7 +655,7 @@ try {
 exit $exitCode"#;
 
 // Deterministic gzip (`mtime = 0`) of `POWERSHELL_PROCESS_SCRIPT_SOURCE`.
-const POWERSHELL_PROCESS_SCRIPT_GZIP_BASE64: &str = "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";
+const POWERSHELL_PROCESS_SCRIPT_GZIP_BASE64: &str = "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";
 
 pub(crate) fn local_host_info() -> Result<RemoteHostInfo> {
     let os = std::env::consts::OS;
@@ -543,10 +671,18 @@ pub(crate) fn local_host_info() -> Result<RemoteHostInfo> {
         .then(|| std::env::var("LOCALAPPDATA"))
         .transpose()
         .context("LOCALAPPDATA is not available")?;
+    let shell = if windows {
+        "powershell".to_owned()
+    } else {
+        std::env::var("SHELL")
+            .ok()
+            .filter(|shell| validate_canonical_posix_executable("local shell", shell).is_ok())
+            .unwrap_or_else(|| "/bin/sh".to_owned())
+    };
     build_host_info(
         os,
         arch,
-        if windows { "powershell" } else { "sh" },
+        &shell,
         home,
         local_app_data,
         if windows {
@@ -847,9 +983,19 @@ fn build_host_info(
         ("windows", "aarch64") => "aarch64-pc-windows-msvc",
         _ => unreachable!("validated OS and architecture pair"),
     };
+    reject_field_controls("shell", shell)?;
     reject_field_controls("home", &home)?;
     if let Some(local_app_data) = &local_app_data {
         reject_field_controls("local_app_data", local_app_data)?;
+    }
+    match path_style {
+        RemotePathStyle::Posix => validate_canonical_posix_path("home", &home)?,
+        RemotePathStyle::Windows => {
+            validate_canonical_windows_path("home", &home)?;
+            if let Some(local_app_data) = &local_app_data {
+                validate_canonical_windows_path("local_app_data", local_app_data)?;
+            }
+        }
     }
     Ok(RemoteHostInfo {
         os: os.to_string(),
@@ -981,7 +1127,15 @@ mod tests {
             } else {
                 RemotePathStyle::Posix
             };
-            let info = build_host_info(os, arch, "test", "/home".to_string(), None, style).unwrap();
+            let (home, local_app_data) = if style == RemotePathStyle::Windows {
+                (
+                    r"C:\Users\test".to_owned(),
+                    Some(r"C:\Users\test\AppData\Local".to_owned()),
+                )
+            } else {
+                ("/home".to_owned(), None)
+            };
+            let info = build_host_info(os, arch, "test", home, local_app_data, style).unwrap();
             assert_eq!(info.target, target);
         }
         assert!(build_host_info(
@@ -1002,6 +1156,83 @@ mod tests {
             RemotePathStyle::Posix
         )
         .is_err());
+    }
+
+    #[test]
+    fn validates_canonical_cached_remote_host_metadata() {
+        let posix = build_host_info(
+            "linux",
+            "x86_64",
+            "/bin/zsh",
+            "/home/test".to_owned(),
+            None,
+            RemotePathStyle::Posix,
+        )
+        .unwrap();
+        validate_remote_host_info(&posix).unwrap();
+        let mut posix_root = posix.clone();
+        posix_root.home = "/".to_owned();
+        validate_remote_host_info(&posix_root).unwrap();
+
+        let windows = build_host_info(
+            "windows",
+            "aarch64",
+            "powershell",
+            r"C:\Users\test".to_owned(),
+            Some(r"C:\Users\test\AppData\Local".to_owned()),
+            RemotePathStyle::Windows,
+        )
+        .unwrap();
+        validate_remote_host_info(&windows).unwrap();
+        let mut windows_root = windows.clone();
+        windows_root.home = r"C:\".to_owned();
+        windows_root.local_app_data = Some(r"D:\".to_owned());
+        validate_remote_host_info(&windows_root).unwrap();
+
+        let mut invalid = windows.clone();
+        invalid.target = "x86_64-pc-windows-msvc".to_owned();
+        assert!(validate_remote_host_info(&invalid).is_err());
+        invalid = windows.clone();
+        invalid.path_style = RemotePathStyle::Posix;
+        assert!(validate_remote_host_info(&invalid).is_err());
+        invalid = windows.clone();
+        invalid.local_app_data = None;
+        assert!(validate_remote_host_info(&invalid).is_err());
+        invalid = windows.clone();
+        invalid.shell = "cmd".to_owned();
+        assert!(validate_remote_host_info(&invalid).is_err());
+
+        for invalid_home in [
+            "relative/home",
+            "/home/test/",
+            "/home//test",
+            "/home/../test",
+        ] {
+            let mut invalid = posix.clone();
+            invalid.home = invalid_home.to_owned();
+            assert!(validate_remote_host_info(&invalid).is_err());
+        }
+        let mut invalid = posix;
+        invalid.shell = "/bin/sh -c id".to_owned();
+        assert!(validate_remote_host_info(&invalid).is_err());
+
+        for invalid_home in [
+            r"relative\home",
+            r"\\server\share",
+            r"c:\Users\test",
+            r"C:/Users\test",
+            r"C:\Users\..\test",
+        ] {
+            let mut invalid = windows.clone();
+            invalid.home = invalid_home.to_owned();
+            assert!(validate_remote_host_info(&invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn locally_detected_host_metadata_is_valid_as_a_cached_hint() {
+        let local = local_host_info().unwrap();
+        validate_remote_host_info(&local).unwrap();
     }
 
     #[test]
@@ -1181,6 +1412,9 @@ mod tests {
         assert!(script.contains("ReadFile(input"));
         assert!(script.contains("WriteFile(destination"));
         assert!(script.contains("FlushFileBuffers(destination)"));
+        assert!(script.contains("private static extern bool TerminateJobObject"));
+        assert!(script.contains("if (!TerminateJobObject(job, 1))"));
+        assert!(script.contains("if (job != IntPtr.Zero)\n            TerminateJobObject(job, 1);"));
         assert!(script.contains("GetStdHandle(-10)"));
         assert!(script.contains("PumpOutput(output, -11"));
         assert!(script.contains("PumpOutput(error, -12"));
@@ -1216,6 +1450,8 @@ mod tests {
         assert!(script.contains(
             "batch application paths and arguments must not contain double quotes or percent signs"
         ));
+        assert!(script
+            .contains("batch application paths and arguments must not contain control characters"));
 
         let (compressed, payload_bytes) = bootstrap_documents(&launch.stdin_prefix);
         assert_eq!(
@@ -1831,6 +2067,196 @@ fn main() {
 
     #[cfg(windows)]
     #[test]
+    fn powershell_process_reaps_pipe_holding_descendants_after_exit_or_relay_failure() {
+        use std::io::{Read as _, Write as _};
+        use std::process::{Command, Stdio};
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        const DESCENDANTS: usize = 6;
+        const ITERATIONS: usize = 3;
+        let directory = tempfile::tempdir().unwrap();
+        let fixture_source = directory.path().join("nrm-descendant-fixture.rs");
+        let fixture = directory.path().join("nrm-descendant-fixture.exe");
+        std::fs::write(
+            &fixture_source,
+            r#"use std::fs::{self, OpenOptions};
+use std::os::windows::fs::OpenOptionsExt as _;
+use std::process::Command;
+use std::time::{Duration, Instant};
+
+const DESCENDANTS: usize = 6;
+
+fn main() {
+    let mut arguments = std::env::args_os().skip(1);
+    if arguments.next().as_deref() == Some(std::ffi::OsStr::new("child")) {
+        let lock_path = arguments.next().unwrap();
+        let ready_path = arguments.next().unwrap();
+        let _lock = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .share_mode(0)
+            .open(lock_path)
+            .unwrap();
+        fs::write(ready_path, std::process::id().to_string()).unwrap();
+        loop { std::thread::sleep(Duration::from_secs(60)); }
+    }
+
+    let root = arguments.next().unwrap();
+    let executable = std::env::current_exe().unwrap();
+    for index in 0..DESCENDANTS {
+        let lock = std::path::Path::new(&root).join(format!("child-{index}.lock"));
+        let ready = std::path::Path::new(&root).join(format!("child-{index}.ready"));
+        Command::new(&executable)
+            .args([std::ffi::OsStr::new("child"), lock.as_os_str(), ready.as_os_str()])
+            .spawn()
+            .unwrap();
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if (0..DESCENDANTS).all(|index| {
+            std::path::Path::new(&root)
+                .join(format!("child-{index}.ready"))
+                .exists()
+        }) {
+            break;
+        }
+        if Instant::now() >= deadline { std::process::exit(90); }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    println!("primary-output");
+    eprintln!("primary-error");
+    std::process::exit(37);
+}"#,
+        )
+        .unwrap();
+        let compile = Command::new("rustc")
+            .arg(&fixture_source)
+            .arg("-o")
+            .arg(&fixture)
+            .output()
+            .unwrap();
+        assert!(
+            compile.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compile.stderr)
+        );
+
+        for iteration in 0..ITERATIONS {
+            let run_directory = directory.path().join(format!("run-{iteration}"));
+            std::fs::create_dir(&run_directory).unwrap();
+            let launch = powershell_process_command(
+                &fixture.to_string_lossy(),
+                &[
+                    "parent".to_string(),
+                    run_directory.to_string_lossy().into_owned(),
+                ],
+                None,
+                None,
+            )
+            .unwrap();
+            let encoded = launch.command.split_whitespace().last().unwrap();
+            let mut wrapper = Command::new("powershell.exe")
+                .args([
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-EncodedCommand",
+                    encoded,
+                ])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut stdin = wrapper.stdin.take().unwrap();
+            stdin.write_all(&launch.stdin_prefix).unwrap();
+            stdin.flush().unwrap();
+            drop(stdin);
+            let force_relay_failure = iteration == ITERATIONS - 1;
+            let stdout_reader = if force_relay_failure {
+                drop(wrapper.stdout.take().unwrap());
+                None
+            } else {
+                let mut stdout = wrapper.stdout.take().unwrap();
+                Some(thread::spawn(move || {
+                    let mut bytes = Vec::new();
+                    stdout.read_to_end(&mut bytes).map(|_| bytes)
+                }))
+            };
+            let mut stderr = wrapper.stderr.take().unwrap();
+            let stderr_reader = thread::spawn(move || {
+                let mut bytes = Vec::new();
+                stderr.read_to_end(&mut bytes).map(|_| bytes)
+            });
+
+            let timeout = Duration::from_secs(15);
+            let deadline = Instant::now() + timeout;
+            let status = loop {
+                if let Some(status) = wrapper.try_wait().unwrap() {
+                    break status;
+                }
+                if Instant::now() >= deadline {
+                    let _ = wrapper.kill();
+                    let _ = wrapper.wait();
+                    for index in 0..DESCENDANTS {
+                        let ready = run_directory.join(format!("child-{index}.ready"));
+                        if let Ok(pid) = std::fs::read_to_string(ready) {
+                            let _ = Command::new("taskkill")
+                                .args(["/PID", pid.trim(), "/T", "/F"])
+                                .output();
+                        }
+                    }
+                    panic!(
+                        "PowerShell relay retained descendant pipes after primary exit or relay failure in iteration {iteration}"
+                    );
+                }
+                thread::sleep(Duration::from_millis(10));
+            };
+            let stdout = stdout_reader
+                .map(|reader| reader.join().unwrap().unwrap())
+                .unwrap_or_default();
+            let stderr = stderr_reader.join().unwrap().unwrap();
+            if force_relay_failure {
+                assert!(!status.success(), "iteration {iteration}");
+                assert!(stdout.is_empty(), "iteration {iteration}");
+                assert!(
+                    String::from_utf8_lossy(&stderr).contains("standard stream relay failed"),
+                    "iteration {iteration}: {}",
+                    String::from_utf8_lossy(&stderr)
+                );
+            } else {
+                assert_eq!(status.code(), Some(37), "iteration {iteration}");
+                assert_eq!(stdout, b"primary-output\n", "iteration {iteration}");
+                assert_eq!(stderr, b"primary-error\n", "iteration {iteration}");
+            }
+
+            for index in 0..DESCENDANTS {
+                let ready = run_directory.join(format!("child-{index}.ready"));
+                assert!(ready.exists(), "descendant {index} never became ready");
+                let lock = run_directory.join(format!("child-{index}.lock"));
+                let cleanup_deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    match std::fs::remove_file(&lock) {
+                        Ok(()) => break,
+                        Err(error) if Instant::now() < cleanup_deadline => {
+                            let _ = error;
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(error) => panic!(
+                            "descendant {index} still held its lock after relay exit: {error}"
+                        ),
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn powershell_process_runs_batch_applications_without_cmd_injection() {
         use std::io::{Read as _, Write as _};
         use std::process::{Command, Stdio};
@@ -1985,20 +2411,84 @@ fn main() {
         );
         assert_eq!(bare_stdout, expected);
 
-        for hostile in [r#"quote" & whoami"#, "%PATH% & whoami"] {
-            let launch = powershell_process_command(
-                &batch.to_string_lossy(),
-                &[hostile.to_string()],
-                Some(&directory.path().to_string_lossy()),
-                None,
-            )
-            .unwrap();
+        let sentinel = directory.path().join("nrm-batch-injection-sentinel");
+        let sentinel_text = sentinel.to_string_lossy();
+        assert!(!sentinel_text
+            .chars()
+            .any(|character| { character.is_whitespace() || matches!(character, '"' | '%') }));
+        let hostile = [
+            (
+                r#"quote" & whoami"#.to_string(),
+                "double quotes or percent signs",
+            ),
+            (
+                "%PATH% & whoami".to_string(),
+                "double quotes or percent signs",
+            ),
+            (
+                format!("line\r\n&echo injected>{sentinel_text}"),
+                "control characters",
+            ),
+            (
+                format!("c1\u{0085}&echo injected>{sentinel_text}"),
+                "control characters",
+            ),
+        ];
+        for (hostile, expected_error) in hostile {
+            let batch_text = batch.to_string_lossy();
+            let directory_text = directory.path().to_string_lossy();
+            let arguments = vec![hostile];
+            let launch = if arguments[0].chars().any(char::is_control) {
+                assert!(
+                    powershell_process_command(
+                        &batch_text,
+                        &arguments,
+                        Some(&directory_text),
+                        None,
+                    )
+                    .is_err(),
+                    "the Rust planner must reject control characters before transport"
+                );
+
+                // Exercise the embedded relay independently of the Rust-side
+                // preflight. A malformed or non-Rust peer must not be able to
+                // turn JSON controls followed by cmd metacharacters into code.
+                let template =
+                    powershell_process_command(&batch_text, &[], Some(&directory_text), None)
+                        .unwrap();
+                let command_arguments = [vec![batch_text.into_owned()], arguments.clone()].concat();
+                let payload = serde_json::to_vec(&ProcessPayload {
+                    program: &command_arguments[0],
+                    arguments: &arguments,
+                    command_line: windows_join_arguments(&command_arguments),
+                    cwd: Some(&directory_text),
+                    path_prepend: None,
+                    agent_launch_diagnostics: false,
+                    agent_root: None,
+                })
+                .unwrap();
+                let compressed = STANDARD
+                    .decode(POWERSHELL_PROCESS_SCRIPT_GZIP_BASE64)
+                    .unwrap();
+                let mut stdin_prefix = Vec::with_capacity(12 + compressed.len() + payload.len());
+                stdin_prefix.extend_from_slice(&POWERSHELL_BOOTSTRAP_MAGIC);
+                stdin_prefix.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
+                stdin_prefix.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+                stdin_prefix.extend_from_slice(&compressed);
+                stdin_prefix.extend_from_slice(&payload);
+                PowerShellProcessCommand {
+                    command: template.command,
+                    stdin_prefix,
+                }
+            } else {
+                powershell_process_command(&batch_text, &arguments, Some(&directory_text), None)
+                    .unwrap()
+            };
             let (status, stdout, stderr) = run(&launch);
             assert!(!status.success(), "hostile batch argument was accepted");
             assert!(stdout.is_empty(), "rejected batch command unexpectedly ran");
-            assert!(String::from_utf8_lossy(&stderr).contains(
-                "batch application paths and arguments must not contain double quotes or percent signs"
-            ));
+            assert!(String::from_utf8_lossy(&stderr).contains(expected_error));
+            assert!(!sentinel.exists(), "hostile batch argument executed");
         }
     }
 

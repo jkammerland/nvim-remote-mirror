@@ -45,6 +45,7 @@ local function main()
   end
 
   nrm.setup({
+    sidecar = vim.fn.fnamemodify(vim.v.progpath, ":p"),
     auto_reconnect = false,
     background_mirror = false,
     recover_local_edits_on_connect = false,
@@ -64,6 +65,7 @@ local function main()
   end
   workspace_error = "workspace_info timed out"
   nrm.setup({
+    sidecar = vim.fn.fnamemodify(vim.v.progpath, ":p"),
     auto_reconnect = true,
     reconnect_delay_ms = 7,
     reconnect_max_attempts = 3,

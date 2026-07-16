@@ -16,8 +16,10 @@ local original_chansend = vim.fn.chansend
 local original_jobstop = vim.fn.jobstop
 local original_notify = vim.notify
 local original_defer_fn = vim.defer_fn
+local test_sidecar = vim.fn.fnamemodify(vim.v.progpath, ":p")
 
 local job_opts = nil
+local job_command = nil
 local next_job_id = 40
 local stopped_jobs = {}
 
@@ -46,6 +48,11 @@ local function workspace_info(capabilities)
     remote_checked = false,
     remote_available = false,
     capabilities = capabilities,
+    runtime = {
+      contract_version = 2,
+      support = { process = true, terminal = true, watch = false },
+      authority = { state = "unchecked", revision = 0 },
+    },
   }
 end
 
@@ -56,12 +63,58 @@ local function automatic_capabilities()
   }
 end
 
+local function agent_capabilities()
+  return {
+    scan = true,
+    read = true,
+    write_cas = true,
+    checksum = true,
+    grep = true,
+    lsp_proxy = true,
+    batch_read = true,
+    batch_validate = true,
+    chunked_write = true,
+    request_ids = true,
+    cancellation = true,
+    streaming = true,
+    multiplexing = true,
+    git = true,
+    runtime_process_v1 = true,
+    runtime_pty_v1 = true,
+    workspace_watch_v1 = false,
+  }
+end
+
+local function ready_runtime(revision)
+  return {
+    contract_version = 2,
+    support = { process = true, terminal = true, watch = false },
+    authority = {
+      state = "ready",
+      revision = revision,
+      agent_version = "0.1.0",
+      protocol_version = 7,
+      capabilities = agent_capabilities(),
+      effective = { process = true, terminal = true, watch = false },
+    },
+  }
+end
+
+local function unavailable_runtime(revision, reason)
+  return {
+    contract_version = 2,
+    support = { process = true, terminal = true, watch = false },
+    authority = { state = "unavailable", revision = revision, reason = reason },
+  }
+end
+
 local function quiet_options(overrides)
   return vim.tbl_extend("force", {
     auto_reconnect = false,
     background_mirror = false,
     recover_local_edits_on_connect = false,
     flush_queue_on_connect = false,
+    sidecar = test_sidecar,
   }, overrides or {})
 end
 
@@ -97,8 +150,9 @@ end
 
 local function main()
   vim.notify = function() end
-  vim.fn.jobstart = function(_, opts)
+  vim.fn.jobstart = function(command, opts)
     next_job_id = next_job_id + 1
+    job_command = command
     job_opts = opts
     return next_job_id
   end
@@ -114,6 +168,7 @@ local function main()
     reply(request, workspace_info(automatic_capabilities()))
   end, "ssh://host/repo")
   assert_eq(disabled_methods, { "workspace_info" }, "registry-disabled connect attempted bootstrap")
+  assert_eq(job_command[1], test_sidecar, "test connection did not use its explicit sidecar fixture")
   assert_eq(nrm.connection_state().agent_bootstrap_state, "disabled")
   reset_client()
 
@@ -171,6 +226,7 @@ local function main()
         expected_agent_version = "0.1.0",
         protocol_version = 7,
         expected_protocol_version = 7,
+        runtime = ready_runtime(1),
       },
     })
   end, "ssh://host/repo")
@@ -182,6 +238,34 @@ local function main()
   assert_eq(nrm.connection_state().agent_bootstrap_state, "ready")
   assert_eq(nrm.connection_state().agent_bootstrap_result, "updated")
   assert_eq(nrm.connection_state().agent_status, "ok")
+  assert_eq(nrm.client.runtime_readiness.authority.state, "ready")
+  assert_eq(nrm.client.runtime_readiness.authority.revision, 1)
+  reset_client()
+
+  local missing_runtime_methods = connect_with(function(request)
+    if request.method == "workspace_info" then
+      reply(request, workspace_info(automatic_capabilities()))
+      return
+    end
+    reply(request, {
+      status = "updated",
+      automatic = true,
+      remote_health = {
+        remote_status = "connected",
+        remote_checked = true,
+        remote_available = true,
+        agent_status = "ok",
+        agent_version = "0.1.0",
+        expected_agent_version = "0.1.0",
+        protocol_version = 7,
+        expected_protocol_version = 7,
+      },
+    })
+  end, "ssh://host/repo")
+  assert_eq(missing_runtime_methods, { "workspace_info", "remote_agent_update" })
+  assert_eq(nrm.connection_state().agent_bootstrap_state, "error")
+  assert_eq(nrm.client.runtime_readiness.authority.state, "unchecked")
+  assert_eq(nrm.client.runtime_readiness.authority.revision, 0)
   reset_client()
 
   nrm.setup(registry_options({ remote_agent_install_path = "/opt/nrm/bin/connected-agent" }))
@@ -206,6 +290,7 @@ local function main()
         expected_agent_version = "0.1.0",
         protocol_version = 7,
         expected_protocol_version = 7,
+        runtime = ready_runtime(1),
       },
     })
   end, "ssh://host/repo")
@@ -239,6 +324,7 @@ local function main()
         expected_agent_version = "0.1.0",
         protocol_version = 7,
         expected_protocol_version = 7,
+        runtime = ready_runtime(1),
       },
     })
   end, "ssh://host/repo")
@@ -269,6 +355,7 @@ local function main()
         expected_agent_version = "0.1.0",
         protocol_version = 7,
         expected_protocol_version = 8,
+        runtime = ready_runtime(1),
       },
     })
   end, "ssh://host/repo")
@@ -290,6 +377,7 @@ local function main()
         remote_checked = true,
         remote_available = false,
         agent_status = "remote_root_missing",
+        runtime = unavailable_runtime(1, "remote_root_missing"),
       },
     })
   end, "ssh://host/repo")
@@ -368,6 +456,7 @@ local function main()
         expected_agent_version = "0.2.0",
         protocol_version = 7,
         expected_protocol_version = 7,
+        runtime = unavailable_runtime(1, "version_mismatch"),
       },
     })
   end, "ssh://host/repo")
@@ -389,6 +478,11 @@ local function main()
         expected_agent_version = "0.1.0",
         protocol_version = 7,
         expected_protocol_version = 7,
+        runtime = {
+          contract_version = 2,
+          support = { process = true, terminal = true, watch = false },
+          authority = { state = "unchecked", revision = 0 },
+        },
       },
     },
     {
@@ -402,6 +496,7 @@ local function main()
         expected_agent_version = "0.1.0",
         protocol_version = 7,
         expected_protocol_version = 7,
+        runtime = unavailable_runtime(1, "unavailable"),
       },
     },
     {
@@ -415,6 +510,7 @@ local function main()
         expected_agent_version = "0.1.0",
         protocol_version = 7,
         expected_protocol_version = 8,
+        runtime = unavailable_runtime(1, "protocol_mismatch"),
       },
     },
   }) do

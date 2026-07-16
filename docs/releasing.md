@@ -195,7 +195,7 @@ cargo build -p nrm-registry --bin nrm-registry-release --release --locked
 
 tool=target/release/nrm-registry-release
 version=0.1.3
-protocol_version=7
+protocol_version=8
 source_commit="$(git rev-parse HEAD)"
 
 "$tool" assemble \

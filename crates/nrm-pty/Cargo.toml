@@ -1,20 +1,14 @@
 [package]
-name = "nrm-agent"
+name = "nrm-pty"
 edition.workspace = true
 license.workspace = true
 version.workspace = true
 
 [dependencies]
-anyhow.workspace = true
-blake3.workspace = true
-clap.workspace = true
-fs4.workspace = true
-ignore.workspace = true
+thiserror.workspace = true
+
+[target.'cfg(unix)'.dependencies]
 libc.workspace = true
-nrm-pty = { path = "../nrm-pty" }
-nrm-protocol = { path = "../nrm-protocol" }
-serde.workspace = true
-walkdir.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [
@@ -22,14 +16,12 @@ windows-sys = { workspace = true, features = [
     "Win32_Globalization",
     "Win32_Security",
     "Win32_Storage_FileSystem",
-    "Win32_System_IO",
+    "Win32_System_Console",
+    "Win32_System_JobObjects",
     "Win32_System_Pipes",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
 ] }
 
 [dev-dependencies]
-criterion.workspace = true
 tempfile.workspace = true
-
-[[bench]]
-name = "agent_cli"
-harness = false

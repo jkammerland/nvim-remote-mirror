@@ -28,6 +28,7 @@ local original_os_get_passwd = uv.os_get_passwd
 
 local function main()
   nrm.setup({
+    sidecar = vim.fn.fnamemodify(vim.v.progpath, ":p"),
     connection = "stdio",
     socket_path = SOCKET_PATH,
     auto_reconnect = true,
@@ -109,6 +110,11 @@ local function main()
             capabilities = {
               remote_agent_bootstrap = true,
               remote_agent_automatic_bootstrap_v1 = true,
+            },
+            runtime = {
+              contract_version = 2,
+              support = { process = true, terminal = true, watch = false },
+              authority = { state = "unchecked", revision = 0 },
             },
           },
         }),

@@ -15,9 +15,9 @@ changing Neovim commands.
 | Part | Runs | Job |
 | --- | --- | --- |
 | Neovim plugin | local | UI, commands, buffers, quickfix, LSP client setup |
-| `nrm-sidecar` | local | Mirror database, save queue, caching, scheduling |
+| `nrm-sidecar` | local | Mirror database, save queue, caching, scheduling, private runtime bridge |
 | `nrm-registry` | local library | Strict manifest/signature policy, HTTPS/file retrieval, verified cache |
-| `nrm-agent` | remote or local | Filesystem reads, scans, hashes, grep, writes |
+| `nrm-agent` | remote or local | Filesystem operations plus attached process/PTY execution |
 | Mirror directory | local | Hydrated file bytes and conflict/snapshot files |
 | SQLite state | local | Metadata, indexes, queue state, scan progress |
 
@@ -33,6 +33,7 @@ changing Neovim commands.
 | Background mirror | Scan, prefetch, and validate in small idle batches |
 | Reconnect | Reuse mirror state and retry queued saves |
 | Agent install/update | Opt-in signed repair on SSH connect plus explicit commands; verify locally, activate transactionally, roll back failures |
+| Workspace runtime | Resolve one provider-neutral context, require explicit trust, and execute structured attached processes or PTYs beside the authority root |
 
 ## Remote Host and Agent Distribution
 
@@ -88,6 +89,64 @@ candidate/previous digests agree. A newer request's verified digest is applied
 only to its subsequent transaction; malformed or file-hash-mismatched state
 still fails closed and remains available for diagnosis.
 
+## Workspace Runtime Boundary
+
+Workspace Runtime Readiness API v2 separates plugin integration from transport
+details and separates three planes that must not be collapsed into one
+boolean:
+
+- provider support is static and local;
+- authority readiness is dynamic, revisioned, and based on a read-only probe;
+- authorization is an explicit per-workspace trust decision.
+
+This is a strict breaking WIP migration boundary. The v2 support, readiness,
+preparation, facade, and callback guarantees are one contract; there is no
+API-v1 compatibility layer or fallback.
+
+A resolved immutable context identifies the provider, workspace, reconnect
+epoch, editor/authority roots, path style, and control-plane state. It maps
+contained paths and file URIs and exposes local `supports()` and
+`capability_status()` queries. Its callback-based `prepare()` method probes
+readiness, negotiates the requested capability, applies trust policy, and
+delivers a revision-bound prepared facade. That recommended facade exposes:
+
+- a private single-use local `job_spec` bridge for job APIs owned by another
+  plugin;
+- a managed attached pipe process; and
+- a managed attached PTY.
+
+Direct context execution remains as a late-check v2 path. It allows
+only `unchecked` or ready-and-effective capability state after existing trust;
+known checking, unavailable, disabled, unsupported, and unnegotiated states
+fail closed. A facade used for the wrong capability returns `unsupported`, and
+workspace epoch or readiness-revision changes return `stale_preparation` from
+an unused facade. The proxy still repeats capability negotiation at process
+launch to close the race after preparation.
+
+Remote argv, cwd, environment changes, timeout, and terminal size remain
+structured until the sidecar consumes the private ticket and speaks the binary
+runtime protocol to the agent. The local bridge command contains only the
+sidecar and an opaque ticket ID. This is the generic extension point for
+ToggleTerm-like terminals and command runners; nrm core should not grow
+plugin-by-plugin execution branches.
+
+Workspace connect never starts an arbitrary runtime command or grants trust.
+The default policy prompts and persists an explicit per-authority decision in
+private local state. A prepare probe is read-only with respect to the authority
+and never installs or updates an agent. The only automatic repair is the
+existing connect-time path gated by SSH, a trusted signed registry, and the
+explicit automatic-install option. Requests fail closed when disabled,
+untrusted, not ready, offline, stale, unsupported, or malformed. Reconnect
+advances the context epoch; readiness changes advance a separate revision and
+emit `NrmWorkspaceReadinessChanged` so plugins discard prepared facades without
+invalidating path-mapping contexts.
+
+This runtime is orchestration, not a sandbox. Programs run with the authority
+account's privileges; a deliberately daemonized POSIX descendant can escape
+the attached process session. Persistent/detached PTY brokerage and workspace
+watching remain unadvertised until their lifecycle implementations exist. See
+[workspace-runtime.md](workspace-runtime.md) for the public contract.
+
 ## Current Limits
 
 | Limit | Direction |
@@ -95,7 +154,8 @@ still fails closed and remains available for diagnosis.
 | One active client per socket sidecar | `workspace_info` reports `client_mode = "single_writer"`; add multi-client coordination later |
 | No streaming UI | Add incremental picker updates after API settles |
 | Basic LSP proxy only | Harden path translation and server lifecycle |
-| No terminal or DAP remoting | Keep behind the same sidecar boundary |
+| Attached terminals only | Add persistent broker, detach, and reattach before advertising detached sessions |
+| No workspace watch or DAP remoting | Keep behind the same workspace/runtime boundary |
 | SSH only | Add a transport factory after SSH behavior is stable |
 
 ## Next Milestones

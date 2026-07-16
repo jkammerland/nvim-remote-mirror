@@ -356,7 +356,8 @@ ssh host 'command -v nrm-agent'
 ## Post-V1 Backlog
 
 - Multi-client socket write coordination.
-- Remote terminal PTY/session support.
+- Persistent remote terminal broker with detach, reattach, and replay.
+- Provider-neutral workspace watch implementation.
 - DAP launch and path mapping.
 - Non-SSH transport factory and transport abstraction tests.
 - Full plugin-specific adapters beyond the first picker/search integrations.

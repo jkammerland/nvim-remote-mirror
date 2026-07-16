@@ -20,6 +20,7 @@ local original_os_get_passwd = uv.os_get_passwd
 
 local function main()
   nrm.setup({
+    sidecar = vim.fn.fnamemodify(vim.v.progpath, ":p"),
     connection = "socket",
     socket_path = "/tmp/nrm-test-sidecar-eof/socket.sock",
     auto_reconnect = false,
@@ -79,6 +80,11 @@ local function main()
             remote_available = false,
             commands = { "workspace_info", "status" },
             notifications = { "workspace/remote_health" },
+            runtime = {
+              contract_version = 2,
+              support = { process = true, terminal = true, watch = false },
+              authority = { state = "unchecked", revision = 0 },
+            },
           },
         }),
         "",

@@ -66,6 +66,11 @@ local function find_buf_map(lhs)
 end
 
 local function fake_client()
+  local runtime = {
+    contract_version = 2,
+    support = { process = true, terminal = true, watch = false },
+    authority = { state = "unchecked", revision = 0 },
+  }
   return {
     job_id = 1,
     transport = "socket",
@@ -75,7 +80,9 @@ local function fake_client()
       mirror_root = "/mirror/workspace",
       files_root = "/mirror/workspace/files",
       remote_status = "unchecked",
+      runtime = vim.deepcopy(runtime),
     },
+    runtime_readiness = runtime,
   }
 end
 
@@ -118,6 +125,11 @@ local function main()
         remote_status = "available",
         remote_checked = true,
         remote_available = true,
+        runtime = {
+          contract_version = 2,
+          support = { process = true, terminal = true, watch = false },
+          authority = { state = "unchecked", revision = 0 },
+        },
         registry_health = {
           state = "verified",
           source = "registry",

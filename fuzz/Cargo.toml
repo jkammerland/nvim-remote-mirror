@@ -22,6 +22,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "runtime_frame"
+path = "fuzz_targets/runtime_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "registry_manifest"
 path = "fuzz_targets/registry_manifest.rs"
 test = false

@@ -73,6 +73,12 @@ local DEFAULT_CONFIG = {
   picker = {
     provider = "auto",
   },
+  remote_runtime = {
+    enabled = true,
+    trust = "prompt",
+    detached_ttl_ms = 86400000,
+    ticket_create_timeout_ms = 5000,
+  },
 }
 
 M.config = vim.deepcopy(DEFAULT_CONFIG)
@@ -117,12 +123,306 @@ local function notify(message, level)
   end)
 end
 
+local function emit_workspace_event(pattern, client, extra)
+  local hello = client and client.hello or {}
+  local data = {
+    epoch = M.reconnect_generation,
+    workspace_key = type(hello.workspace_key) == "string" and hello.workspace_key ~= "" and hello.workspace_key or nil,
+    target = client and client.target_arg or M.connection_target,
+    state = M.connection_status,
+  }
+  if type(extra) == "table" then
+    for key, value in pairs(extra) do
+      data[key] = value
+    end
+  end
+  pcall(vim.api.nvim_exec_autocmds, "User", {
+    pattern = pattern,
+    modeline = false,
+    data = data,
+  })
+end
+
+local function bump_reconnect_generation(reason, client)
+  M.reconnect_generation = M.reconnect_generation + 1
+  emit_workspace_event("NrmWorkspaceEpochChanged", client, { reason = reason })
+  return M.reconnect_generation
+end
+
 local function optional_string(value)
   if type(value) == "string" and value ~= "" then
     return value
   end
   return nil
 end
+
+local contains_control
+local RUNTIME_CAPABILITY_NAMES = { "process", "terminal", "watch" }
+local RUNTIME_AUTHORITY_STATES = { unchecked = true, ready = true, unavailable = true }
+local RUNTIME_AGENT_CAPABILITIES = {
+  "scan",
+  "read",
+  "write_cas",
+  "checksum",
+  "grep",
+  "lsp_proxy",
+  "batch_read",
+  "batch_validate",
+  "chunked_write",
+  "request_ids",
+  "cancellation",
+  "streaming",
+  "multiplexing",
+  "git",
+  "runtime_process_v1",
+  "runtime_pty_v1",
+  "workspace_watch_v1",
+}
+
+local function normalize_runtime_contract(value)
+  if type(value) ~= "table" or value.contract_version ~= 2 then
+    return nil, "runtime contract_version must be 2"
+  end
+  if type(value.support) ~= "table" or type(value.authority) ~= "table" then
+    return nil, "runtime contract is missing support or authority"
+  end
+  for key in pairs(value) do
+    if key ~= "contract_version" and key ~= "support" and key ~= "authority" then
+      return nil, "runtime contract contains an unknown field"
+    end
+  end
+  local support = {}
+  for _, name in ipairs(RUNTIME_CAPABILITY_NAMES) do
+    if type(value.support[name]) ~= "boolean" then
+      return nil, "runtime support." .. name .. " must be a boolean"
+    end
+    support[name] = value.support[name]
+  end
+  for key in pairs(value.support) do
+    if key ~= "process" and key ~= "terminal" and key ~= "watch" then
+      return nil, "runtime support contains an unknown capability"
+    end
+  end
+  local source = value.authority
+  local authority_fields = {
+    state = true,
+    revision = true,
+    agent_version = true,
+    protocol_version = true,
+    capabilities = true,
+    effective = true,
+    reason = true,
+    retry_after_ms = true,
+  }
+  for key in pairs(source) do
+    if not authority_fields[key] then
+      return nil, "runtime authority contains an unknown field"
+    end
+  end
+  if not RUNTIME_AUTHORITY_STATES[source.state] then
+    return nil, "runtime authority state is invalid"
+  end
+  if type(source.revision) ~= "number" or source.revision ~= math.floor(source.revision) or source.revision < 0 then
+    return nil, "runtime authority revision is invalid"
+  end
+  if
+    source.reason ~= nil
+    and (not optional_string(source.reason) or contains_control(source.reason) or #source.reason > 8192)
+  then
+    return nil, "runtime authority reason is invalid"
+  end
+  if
+    source.retry_after_ms ~= nil
+    and (
+      type(source.retry_after_ms) ~= "number"
+      or source.retry_after_ms ~= math.floor(source.retry_after_ms)
+      or source.retry_after_ms < 0
+      or source.retry_after_ms > 24 * 60 * 60 * 1000
+    )
+  then
+    return nil, "runtime authority retry_after_ms is invalid"
+  end
+  local authority = {
+    state = source.state,
+    revision = source.revision,
+    reason = source.reason,
+    retry_after_ms = source.retry_after_ms,
+  }
+  if source.state ~= "unavailable" and (source.reason ~= nil or source.retry_after_ms ~= nil) then
+    return nil, "only unavailable runtime authority may report a failure"
+  end
+  if source.state == "ready" then
+    if
+      not optional_string(source.agent_version)
+      or contains_control(source.agent_version)
+      or type(source.protocol_version) ~= "number"
+      or source.protocol_version ~= math.floor(source.protocol_version)
+      or source.protocol_version < 1
+      or type(source.capabilities) ~= "table"
+      or type(source.effective) ~= "table"
+    then
+      return nil, "ready runtime authority is incomplete"
+    end
+    local effective = {}
+    for _, name in ipairs(RUNTIME_CAPABILITY_NAMES) do
+      if type(source.effective[name]) ~= "boolean" then
+        return nil, "runtime authority effective." .. name .. " must be a boolean"
+      end
+      effective[name] = source.effective[name]
+      if effective[name] and not support[name] then
+        return nil, "runtime authority enabled an unsupported capability"
+      end
+    end
+    for key in pairs(source.effective) do
+      if key ~= "process" and key ~= "terminal" and key ~= "watch" then
+        return nil, "runtime authority effective contains an unknown capability"
+      end
+    end
+    local known_agent_capabilities = {}
+    for _, key in ipairs(RUNTIME_AGENT_CAPABILITIES) do
+      known_agent_capabilities[key] = true
+      if type(source.capabilities[key]) ~= "boolean" then
+        return nil, "runtime authority capabilities are incomplete"
+      end
+    end
+    for key in pairs(source.capabilities) do
+      if not known_agent_capabilities[key] then
+        return nil, "runtime authority capabilities contain an unknown field"
+      end
+    end
+    if
+      effective.process ~= (support.process and source.capabilities.runtime_process_v1)
+      or effective.terminal ~= (support.terminal and source.capabilities.runtime_pty_v1)
+      or effective.watch ~= (support.watch and source.capabilities.workspace_watch_v1)
+    then
+      return nil, "runtime authority effective capabilities are inconsistent"
+    end
+    authority.agent_version = source.agent_version
+    authority.protocol_version = source.protocol_version
+    authority.capabilities = vim.deepcopy(source.capabilities)
+    authority.effective = effective
+  elseif
+    source.effective ~= nil
+    or source.capabilities ~= nil
+    or source.agent_version ~= nil
+    or source.protocol_version ~= nil
+  then
+    return nil, "non-ready runtime authority must not publish negotiated capabilities"
+  end
+  return {
+    contract_version = 2,
+    support = support,
+    authority = authority,
+  }
+end
+
+local function runtime_event_view(runtime, checking)
+  local authority = runtime and runtime.authority or { state = "unchecked", revision = 0 }
+  return {
+    state = checking and "checking" or authority.state,
+    revision = authority.revision,
+    effective = authority.effective and vim.deepcopy(authority.effective) or nil,
+  }
+end
+
+local function runtime_event_changed(before, after)
+  return before.state ~= after.state
+    or before.revision ~= after.revision
+    or not vim.deep_equal(before.effective, after.effective)
+end
+
+local function runtime_semantically_equal(left, right)
+  local left_copy = vim.deepcopy(left)
+  local right_copy = vim.deepcopy(right)
+  if type(left_copy.authority) == "table" then
+    left_copy.authority.retry_after_ms = nil
+  end
+  if type(right_copy.authority) == "table" then
+    right_copy.authority.retry_after_ms = nil
+  end
+  return vim.deep_equal(left_copy, right_copy)
+end
+
+local function emit_runtime_readiness(client, before)
+  local after = runtime_event_view(client.runtime_readiness, client.runtime_checking == true)
+  if runtime_event_changed(before, after) then
+    emit_workspace_event("NrmWorkspaceReadinessChanged", client, {
+      readiness_state = after.state,
+      readiness_revision = after.revision,
+      effective = after.effective,
+    })
+  end
+end
+
+local function runtime_transition(client, value)
+  local normalized, normalize_err = normalize_runtime_contract(value)
+  if not normalized then
+    return nil, normalize_err
+  end
+  local current = client.runtime_readiness
+  if type(current) == "table" and type(current.authority) == "table" then
+    local current_revision = current.authority.revision
+    local next_revision = normalized.authority.revision
+    if next_revision < current_revision then
+      return normalized, nil, "stale"
+    end
+    if next_revision == current_revision and not runtime_semantically_equal(normalized, current) then
+      return nil, "runtime authority changed without advancing its revision"
+    end
+  end
+  return normalized, nil, "current"
+end
+
+local function apply_runtime_contract(client, normalized, emit, complete_runtime_probe)
+  local before = runtime_event_view(client.runtime_readiness, client.runtime_checking == true)
+  client.runtime_readiness = normalized
+  if complete_runtime_probe or client.runtime_probe_in_flight ~= true then
+    client.runtime_checking = false
+  end
+  if client.hello then
+    client.hello.runtime = vim.deepcopy(normalized)
+  end
+  if emit ~= false then
+    emit_runtime_readiness(client, before)
+  end
+  return normalized
+end
+
+contains_control = function(value)
+  return type(value) ~= "string" or value:find("[%z\1-\31\127]") ~= nil or value:find("\194[\128-\159]") ~= nil
+end
+
+local function absolute_local_executable(path)
+  if vim.fn.has("win32") == 1 then
+    return path:match("^%a:[/\\]") ~= nil and not path:match("^[/\\][/\\]")
+  end
+  return path:sub(1, 1) == "/"
+end
+
+local function resolve_local_executable(value)
+  if not optional_string(value) or contains_control(value) or value:sub(1, 1) == "-" then
+    return nil, "executable must be a non-empty, control-free path that does not begin with '-'"
+  end
+  local path = value
+  if value:find("[/\\]") then
+    if not absolute_local_executable(value) then
+      return nil, "executable paths containing separators must be absolute"
+    end
+  else
+    local ok, resolved = pcall(vim.fn.exepath, value)
+    if not ok or not optional_string(resolved) then
+      return nil, "executable name was not found on PATH"
+    end
+    path = resolved
+  end
+  path = vim.fn.fnamemodify(path, ":p")
+  if not absolute_local_executable(path) then
+    return nil, "executable did not resolve to an absolute local path"
+  end
+  return path
+end
+
+M._resolve_local_executable = resolve_local_executable
 
 local function decode_standard_base64(value)
   if type(value) ~= "string" or #value == 0 or #value % 4 ~= 0 then
@@ -496,6 +796,46 @@ local function validate_registry_config(config)
   end
 end
 
+local function validate_remote_runtime_config(config)
+  local runtime = config.remote_runtime
+  if type(runtime) ~= "table" then
+    error("remote_runtime must be a table")
+  end
+  local allowed = {
+    enabled = true,
+    trust = true,
+    detached_ttl_ms = true,
+    ticket_create_timeout_ms = true,
+  }
+  for key in pairs(runtime) do
+    if not allowed[key] then
+      error("remote_runtime contains an unknown option: " .. tostring(key))
+    end
+  end
+  if type(runtime.enabled) ~= "boolean" then
+    error("remote_runtime.enabled must be a boolean")
+  end
+  if runtime.trust ~= "prompt" and runtime.trust ~= "always" and runtime.trust ~= "never" then
+    error("remote_runtime.trust must be 'prompt', 'always', or 'never'")
+  end
+  if
+    type(runtime.detached_ttl_ms) ~= "number"
+    or runtime.detached_ttl_ms ~= math.floor(runtime.detached_ttl_ms)
+    or runtime.detached_ttl_ms < 1
+    or runtime.detached_ttl_ms > 30 * 24 * 60 * 60 * 1000
+  then
+    error("remote_runtime.detached_ttl_ms must be an integer from 1 to 2592000000")
+  end
+  if
+    type(runtime.ticket_create_timeout_ms) ~= "number"
+    or runtime.ticket_create_timeout_ms ~= math.floor(runtime.ticket_create_timeout_ms)
+    or runtime.ticket_create_timeout_ms < 1
+    or runtime.ticket_create_timeout_ms > 120000
+  then
+    error("remote_runtime.ticket_create_timeout_ms must be an integer from 1 to 120000")
+  end
+end
+
 local function sorted_registry_keys(config)
   local entries = {}
   for key_id, key in pairs(config.remote_agent_registry_public_keys or {}) do
@@ -863,7 +1203,10 @@ local function handle_response(client, line)
 
   if decoded.id == nil and decoded.method then
     if decoded.method == "workspace/remote_health" then
-      update_remote_state(client, decoded.params or {})
+      local params = decoded.params
+      if type(params) == "table" and params.runtime ~= nil then
+        update_remote_state(client, params)
+      end
     end
     return
   end
@@ -1008,18 +1351,19 @@ local function default_socket_dir()
   return path_join(tmp, "nvim-remote-mirror-" .. user)
 end
 
-local function socket_path_for(target_arg, target)
+local function socket_path_for(target_arg, target, resolved_sidecar)
   if optional_string(M.config.socket_path) then
     return M.config.socket_path
   end
+  local sidecar = optional_string(resolved_sidecar) or M.config.sidecar
   local agent = M.config.agent
   if target and target.ssh then
     agent = optional_string(M.config.remote_agent) or "nrm-agent"
   end
   local identity = table.concat({
     target_arg or "",
-    M.config.sidecar or "",
-    executable_file_identity(M.config.sidecar),
+    sidecar or "",
+    executable_file_identity(sidecar),
     agent or "",
     target and target.ssh and (M.config.agent or "") or "",
     M.config.state_dir or "",
@@ -1082,7 +1426,9 @@ local schedule_reconnect
 
 local function fail_sidecar_send(client, message)
   local generation = M.reconnect_generation
+  local reconnect = false
   if M.client == client and not client.closing then
+    client.closing = true
     M.client = nil
     clear_mirror_autohydrate()
     M.connection_status = M.config.auto_reconnect and "reconnect_pending" or "disconnected"
@@ -1090,9 +1436,12 @@ local function fail_sidecar_send(client, message)
     M.connection_reason = nil
     M.connection_error = message
     M.reconnect_pending = M.config.auto_reconnect == true
+    generation = bump_reconnect_generation("transport_failure", client)
+    emit_workspace_event("NrmWorkspaceDisconnected", client, { reason = message })
+    reconnect = M.config.auto_reconnect == true
   end
   fail_pending(client, message)
-  if not client.closing then
+  if reconnect then
     schedule_reconnect(client.target_arg, generation, client.connection)
   end
 end
@@ -1381,9 +1730,9 @@ local function connect_socket_channel(client, socket_path)
   return nil
 end
 
-local function start_socket_daemon(_client, target, socket_path)
+local function start_socket_daemon(client, target, socket_path)
   prepare_socket_directory(socket_path)
-  local command = vim.list_extend({ M.config.sidecar }, listener_args(target, socket_path))
+  local command = vim.list_extend({ client.runtime_config.sidecar }, listener_args(target, socket_path))
   local job_id = vim.fn.jobstart(command, {
     detach = true,
     stdout_buffered = false,
@@ -1410,7 +1759,7 @@ local function start_socket_daemon(_client, target, socket_path)
 end
 
 local function connect_or_start_socket(client, target)
-  local socket_path = socket_path_for(client.target_arg, target)
+  local socket_path = socket_path_for(client.target_arg, target, client.runtime_config.sidecar)
   client.socket_path = socket_path
   prepare_socket_directory(socket_path)
   local channel = connect_socket_channel(client, socket_path)
@@ -1588,9 +1937,24 @@ function M.format_save_queue_entry(entry)
   return save_queue_entry_text(entry or {})
 end
 
-update_remote_state = function(client, result)
-  if not client or not client.hello or not result then
-    return
+update_remote_state = function(client, result, opts)
+  if not client or not client.hello or type(result) ~= "table" then
+    return nil, "remote state is incomplete"
+  end
+  if result.runtime == nil then
+    return nil, "remote state is missing its v2 runtime contract"
+  end
+  local normalized_runtime, runtime_err, transition = runtime_transition(client, result.runtime)
+  if not normalized_runtime then
+    return nil, runtime_err
+  end
+  if transition == "stale" then
+    if opts and opts.complete_runtime_probe == true and client.runtime_checking == true then
+      local before = runtime_event_view(client.runtime_readiness, true)
+      client.runtime_checking = false
+      emit_runtime_readiness(client, before)
+    end
+    return true
   end
   client.hello.remote_status = result.remote_status
   client.hello.remote_checked = result.remote_checked
@@ -1626,6 +1990,12 @@ update_remote_state = function(client, result)
       client.hello[field] = result[field]
     end
   end
+  apply_runtime_contract(client, normalized_runtime, true, opts and opts.complete_runtime_probe == true)
+  return true
+end
+
+local function invalid_remote_state_error(cause)
+  return "invalid v2 remote state: " .. tostring(cause)
 end
 
 local function registry_summary(result)
@@ -1782,12 +2152,25 @@ function M.connection_state()
   }
 end
 
+local active_runtime_status
+
 function M.current_workspace()
   local client = M.client
   if not client or not client.job_id or not client.hello then
     return nil
   end
   local hello = client.hello
+  local capabilities = type(hello.capabilities) == "table" and vim.deepcopy(hello.capabilities) or {}
+  local runtime = type(client.runtime_readiness) == "table" and vim.deepcopy(client.runtime_readiness)
+    or {
+      contract_version = 2,
+      support = { process = true, terminal = true, watch = false },
+      authority = { state = "unchecked", revision = 0 },
+    }
+  local runtime_statuses = {}
+  for _, capability in ipairs(RUNTIME_CAPABILITY_NAMES) do
+    runtime_statuses[capability] = active_runtime_status({ workspace_id = hello.workspace_key }, capability)
+  end
   return {
     workspace_key = optional_string(hello.workspace_key),
     target = M.connection_target or optional_string(client.target_arg),
@@ -1802,7 +2185,202 @@ function M.current_workspace()
     remote_error = optional_string(hello.remote_error),
     retry_after_ms = hello.retry_after_ms,
     registry_health = type(hello.registry_health) == "table" and hello.registry_health or nil,
+    remote_host = type(hello.remote_host) == "table" and vim.deepcopy(hello.remote_host) or nil,
+    capabilities = capabilities,
+    runtime = {
+      contract_version = 2,
+      policy = {
+        enabled = M.config.remote_runtime.enabled == true,
+        trust = M.config.remote_runtime.trust,
+      },
+      trust = { mode = M.config.remote_runtime.trust },
+      support = runtime.support,
+      authority = runtime.authority,
+      capabilities = runtime_statuses,
+    },
   }
+end
+
+local WORKSPACE_PROVIDER_ERROR_MT = {
+  __tostring = function(err)
+    return err.message
+  end,
+}
+
+local function workspace_provider_error(code, message, details)
+  return setmetatable({ code = code, message = message, details = details }, WORKSPACE_PROVIDER_ERROR_MT)
+end
+
+active_runtime_status = function(snapshot, capability)
+  local client = M.client
+  if not client or not client.job_id or not client.hello or type(client.runtime_readiness) ~= "table" then
+    return nil, workspace_provider_error("provider_error", "active workspace has no valid runtime readiness contract")
+  end
+  if snapshot.workspace_id ~= client.hello.workspace_key then
+    return nil, workspace_provider_error("stale_context", "workspace context no longer names the active workspace")
+  end
+  local runtime = client.runtime_readiness
+  local supported = runtime.support[capability] == true
+  local enabled = M.config.remote_runtime.enabled == true
+  local authority = runtime.authority
+  local status = {
+    name = capability,
+    state = authority.state,
+    supported = supported,
+    enabled = enabled,
+    revision = authority.revision,
+    reason = authority.reason,
+    retry_after_ms = authority.retry_after_ms,
+  }
+  if not supported then
+    status.state = "unsupported"
+    status.effective = false
+    status.reason = "unsupported"
+  elseif not enabled then
+    status.state = "disabled"
+    status.effective = false
+    status.reason = "disabled_by_policy"
+  elseif client.runtime_checking == true then
+    status.state = "checking"
+  elseif authority.state == "ready" then
+    if authority.effective[capability] == true then
+      status.state = "ready"
+      status.effective = true
+      status.reason = nil
+      status.retry_after_ms = nil
+    else
+      status.state = "unavailable"
+      status.effective = false
+      status.reason = "not_negotiated"
+      status.retry_after_ms = nil
+    end
+  end
+  return status
+end
+
+function M._workspace_capability_status(snapshot, capability)
+  return active_runtime_status(snapshot, capability)
+end
+
+local function deliver_runtime_probe_waiters(client, err)
+  local waiters = client.runtime_probe_waiters or {}
+  client.runtime_probe_waiters = nil
+  client.runtime_probe_in_flight = false
+  for _, waiter in ipairs(waiters) do
+    local callback_err = err
+    if callback_err == nil then
+      if
+        M.client ~= client
+        or M.reconnect_generation ~= waiter.epoch
+        or not client.hello
+        or client.hello.workspace_key ~= waiter.workspace_id
+      then
+        callback_err = workspace_provider_error("stale_context", "workspace changed while checking runtime readiness")
+      end
+    end
+    local ok, callback_failure = pcall(waiter.callback, callback_err)
+    if not ok then
+      notify("workspace runtime readiness callback failed: " .. tostring(callback_failure), vim.log.levels.ERROR)
+    end
+  end
+end
+
+function M._workspace_prepare_capability(snapshot, capability, callback)
+  if type(callback) ~= "function" then
+    return nil, workspace_provider_error("invalid_argument", "runtime preparation requires a callback")
+  end
+  local client = M.client
+  local status, status_err = active_runtime_status(snapshot, capability)
+  if not status then
+    callback(status_err)
+    return true
+  end
+  if status.state == "ready" and status.effective == true then
+    callback(nil)
+    return true
+  end
+  if status.state == "unsupported" or status.state == "disabled" then
+    callback(nil)
+    return true
+  end
+  client.runtime_probe_waiters = client.runtime_probe_waiters or {}
+  table.insert(client.runtime_probe_waiters, {
+    callback = callback,
+    epoch = snapshot.epoch,
+    workspace_id = snapshot.workspace_id,
+  })
+  if client.runtime_probe_in_flight then
+    return true
+  end
+  client.runtime_probe_in_flight = true
+  local before = runtime_event_view(client.runtime_readiness, client.runtime_checking == true)
+  client.runtime_checking = true
+  emit_runtime_readiness(client, before)
+  local invoke_ok, invoke_err = pcall(M.request, "remote_health", {}, function(err, result)
+    if
+      M.client ~= client
+      or client.closing == true
+      or M.reconnect_generation ~= snapshot.epoch
+      or not client.hello
+      or client.hello.workspace_key ~= snapshot.workspace_id
+    then
+      deliver_runtime_probe_waiters(
+        client,
+        workspace_provider_error("stale_context", "workspace changed while checking runtime readiness")
+      )
+      return
+    end
+    if err then
+      local checking_before = runtime_event_view(client.runtime_readiness, client.runtime_checking == true)
+      client.runtime_checking = false
+      emit_runtime_readiness(client, checking_before)
+      deliver_runtime_probe_waiters(
+        client,
+        workspace_provider_error("capability_not_ready", "runtime health probe failed", { cause = tostring(err) })
+      )
+      return
+    end
+    if type(result) ~= "table" or result.runtime == nil then
+      local checking_before = runtime_event_view(client.runtime_readiness, client.runtime_checking == true)
+      client.runtime_checking = false
+      emit_runtime_readiness(client, checking_before)
+      deliver_runtime_probe_waiters(
+        client,
+        workspace_provider_error("provider_error", "remote_health returned no v2 runtime contract")
+      )
+      return
+    end
+    local updated, update_err = update_remote_state(client, result, { complete_runtime_probe = true })
+    if not updated then
+      local checking_before = runtime_event_view(client.runtime_readiness, client.runtime_checking == true)
+      client.runtime_checking = false
+      emit_runtime_readiness(client, checking_before)
+      deliver_runtime_probe_waiters(
+        client,
+        workspace_provider_error("provider_error", "remote_health returned a malformed runtime contract", {
+          cause = update_err,
+        })
+      )
+      return
+    end
+    deliver_runtime_probe_waiters(client, nil)
+  end)
+  if not invoke_ok then
+    local checking_before = runtime_event_view(client.runtime_readiness, client.runtime_checking == true)
+    client.runtime_checking = false
+    emit_runtime_readiness(client, checking_before)
+    deliver_runtime_probe_waiters(
+      client,
+      workspace_provider_error("capability_not_ready", "failed to request runtime health", {
+        cause = tostring(invoke_err),
+      })
+    )
+  end
+  return true
+end
+
+function M.workspace(query)
+  return require("nvim_remote_mirror.workspace").resolve(query)
 end
 
 function M.files_root()
@@ -1888,6 +2466,166 @@ function M.cd()
   vim.cmd("tcd " .. vim.fn.fnameescape(root))
   notify("remote cwd: " .. root)
   return root
+end
+
+function M.trust_workspace(opts)
+  local ok, err = require("nvim_remote_mirror.runtime").trust_workspace(opts)
+  if ok then
+    notify("trusted remote workspace for process execution")
+  end
+  return ok, err
+end
+
+function M.untrust_workspace(opts)
+  local ok, err = require("nvim_remote_mirror.runtime").untrust_workspace(opts)
+  if ok then
+    notify("removed remote workspace process trust")
+  end
+  return ok, err
+end
+
+function M.open_terminal(opts, callback)
+  if opts == nil then
+    opts = {}
+  end
+  if type(opts) ~= "table" then
+    return nil, workspace_provider_error("invalid_argument", "remote terminal options must be a table")
+  end
+  if type(callback) ~= "function" then
+    return nil, workspace_provider_error("invalid_argument", "remote terminal requires a callback")
+  end
+  local context, context_err = M.workspace(opts.query)
+  if not context then
+    return nil, context_err
+  end
+  local delivered = false
+  local function deliver(err, handle)
+    if delivered then
+      return
+    end
+    delivered = true
+    local ok, callback_err = pcall(callback, err, handle)
+    if not ok then
+      notify("remote terminal callback failed: " .. tostring(callback_err), vim.log.levels.ERROR)
+    end
+  end
+  local preparation_finished = false
+  local accepted, prepare_err = context:prepare("terminal", function(readiness_err, prepared)
+    if preparation_finished then
+      return
+    end
+    preparation_finished = true
+    if readiness_err then
+      deliver(readiness_err)
+      return
+    end
+    local command = opts.command
+    if command == nil or (type(command) == "table" and #command == 0) then
+      command = { shell = "default" }
+    else
+      command = { argv = vim.deepcopy(command) }
+    end
+    local process = {
+      command = command,
+      cwd = opts.cwd,
+      env = opts.env,
+      persistence = opts.persistence == nil and "attached" or opts.persistence,
+      max_output_bytes = opts.max_output_bytes,
+      timeout_ms = opts.timeout_ms,
+      initial_size = opts.initial_size,
+    }
+    local previous_window = vim.api.nvim_get_current_win()
+    local split_ok, split_err = pcall(vim.cmd, "botright new")
+    if not split_ok then
+      deliver(
+        workspace_provider_error(
+          "terminal_open_failed",
+          "failed to open a remote terminal split: " .. tostring(split_err),
+          { cause = tostring(split_err) }
+        )
+      )
+      return
+    end
+    local terminal_window = vim.api.nvim_get_current_win()
+    local terminal_buffer = vim.api.nvim_get_current_buf()
+    local function cleanup_terminal_layout()
+      if vim.api.nvim_win_is_valid(terminal_window) then
+        pcall(vim.api.nvim_win_close, terminal_window, true)
+      end
+      if vim.api.nvim_win_is_valid(previous_window) then
+        pcall(vim.api.nvim_set_current_win, previous_window)
+      end
+      if vim.api.nvim_buf_is_valid(terminal_buffer) then
+        pcall(vim.api.nvim_buf_delete, terminal_buffer, { force = true })
+      end
+    end
+    if process.initial_size == nil then
+      process.initial_size = {
+        cols = math.max(vim.api.nvim_win_get_width(terminal_window), 1),
+        rows = math.max(vim.api.nvim_win_get_height(terminal_window), 1),
+      }
+    end
+    local handle, spawn_err = prepared:open_pty(process, opts.handlers)
+    if not handle then
+      cleanup_terminal_layout()
+      deliver(spawn_err)
+      return
+    end
+    local function fail_started_terminal(cause)
+      if type(handle.kill) == "function" then
+        pcall(handle.kill, handle)
+      end
+      cleanup_terminal_layout()
+      deliver(
+        workspace_provider_error(
+          "terminal_activation_failed",
+          "failed to activate the remote terminal: " .. tostring(cause),
+          { cause = tostring(cause) }
+        )
+      )
+    end
+    if
+      not vim.api.nvim_win_is_valid(terminal_window)
+      or not vim.api.nvim_buf_is_valid(terminal_buffer)
+      or vim.api.nvim_win_get_buf(terminal_window) ~= terminal_buffer
+    then
+      fail_started_terminal("the terminal window or buffer was changed during TermOpen")
+      return
+    end
+    local metadata_ok, metadata_err = pcall(function()
+      vim.b[terminal_buffer].nrm_workspace_key = context.workspace_id
+      vim.b[terminal_buffer].nrm_runtime_terminal = true
+    end)
+    if not metadata_ok then
+      fail_started_terminal(metadata_err)
+      return
+    end
+    local focus_ok, focus_err = pcall(vim.api.nvim_set_current_win, terminal_window)
+    if not focus_ok or vim.api.nvim_get_current_win() ~= terminal_window then
+      fail_started_terminal(focus_err or "could not select the terminal window")
+      return
+    end
+    if
+      not vim.api.nvim_win_is_valid(terminal_window)
+      or not vim.api.nvim_buf_is_valid(terminal_buffer)
+      or vim.api.nvim_win_get_buf(terminal_window) ~= terminal_buffer
+    then
+      fail_started_terminal("the terminal window or buffer was changed while restoring terminal focus")
+      return
+    end
+    local insert_ok, insert_err = pcall(function()
+      vim.cmd("startinsert")
+    end)
+    if not insert_ok then
+      fail_started_terminal(insert_err)
+      return
+    end
+    deliver(nil, handle)
+  end)
+  if not accepted then
+    return nil, prepare_err
+  end
+  return true
 end
 
 local function decorate_status_result(result)
@@ -2189,8 +2927,8 @@ local function schedule_save_recovery_on_connect(client, generation)
       if err or not result or result.preempted or not still_current() then
         return
       end
-      update_remote_state(client, result)
-      if result.remote_available then
+      local updated = update_remote_state(client, result)
+      if updated and result.remote_available then
         replay_once()
       end
     end)
@@ -2350,6 +3088,7 @@ function M.setup(opts)
     merged.remote_agent_registry_public_keys = vim.deepcopy(opts.remote_agent_registry_public_keys)
   end
   validate_registry_config(merged)
+  validate_remote_runtime_config(merged)
   M.config = merged
 end
 
@@ -2406,7 +3145,7 @@ local function fail_workspace_info_connect(client, generation, message)
   schedule_reconnect(client.target_arg, generation, client.connection)
 end
 
-local function automatic_health_is_compatible(health)
+local function automatic_health_is_compatible(client, health)
   local agent_version = optional_string(health.agent_version)
   local expected_agent_version = optional_string(health.expected_agent_version)
   local protocol_version = health.protocol_version
@@ -2420,6 +3159,9 @@ local function automatic_health_is_compatible(health)
     and type(protocol_version) == "number"
     and type(expected_protocol_version) == "number"
     and protocol_version == expected_protocol_version
+    and type(client.runtime_readiness) == "table"
+    and type(client.runtime_readiness.authority) == "table"
+    and client.runtime_readiness.authority.state == "ready"
 end
 
 local function finish_connect(client, target_arg, is_reconnect, generation)
@@ -2433,6 +3175,7 @@ local function finish_connect(client, target_arg, is_reconnect, generation)
   M.connection_error = nil
   M.reconnect_pending = false
   setup_mirror_autohydrate(client)
+  emit_workspace_event("NrmWorkspaceConnected", client, { reconnect = is_reconnect == true })
   if is_reconnect then
     schedule_reconnect_stable_reset(client, generation)
   end
@@ -2468,7 +3211,19 @@ local function finish_workspace_info(client, result, target_arg, is_reconnect, g
   if not current_connect_client(client, generation) then
     return
   end
+  local runtime, runtime_err = normalize_runtime_contract(type(result) == "table" and result.runtime or nil)
+  if not runtime then
+    fail_workspace_info_connect(
+      client,
+      generation,
+      "workspace_info returned an invalid runtime contract: " .. runtime_err
+    )
+    return
+  end
   client.hello = result
+  client.runtime_readiness = runtime
+  client.runtime_checking = false
+  client.hello.runtime = vim.deepcopy(runtime)
   M.last_workspace_identity = client_identity(client)
 
   if not client.agent_bootstrap_automatic then
@@ -2529,15 +3284,21 @@ local function finish_workspace_info(client, result, target_arg, is_reconnect, g
     local bootstrap_agent_status = optional_string(health.agent_status)
     local requires_compatible_health = bootstrap_result.status == "updated"
       or (bootstrap_result.status == "skipped" and bootstrap_agent_status == "ok")
-    if requires_compatible_health and not automatic_health_is_compatible(health) then
+    local health_updated, health_update_err = update_remote_state(client, health)
+    if not health_updated then
+      client.agent_bootstrap_state = "error"
+      client.agent_bootstrap_error = "automatic agent bootstrap returned invalid v2 remote health: "
+        .. tostring(health_update_err)
+      finish_connect(client, target_arg, is_reconnect, generation)
+      return
+    end
+    if requires_compatible_health and not automatic_health_is_compatible(client, health) then
       client.agent_bootstrap_state = "error"
       client.agent_bootstrap_error = "automatic agent bootstrap completed without compatible remote health"
-      update_remote_state(client, health)
       finish_connect(client, target_arg, is_reconnect, generation)
       return
     end
 
-    update_remote_state(client, health)
     client.agent_bootstrap_result = bootstrap_result.status
     client.agent_bootstrap_reason = optional_string(bootstrap_result.reason)
     if client.agent_bootstrap_result == "skipped" and bootstrap_agent_status ~= "ok" then
@@ -2552,18 +3313,29 @@ end
 function M.connect(target, opts)
   opts = opts or {}
   target = parse_target(target)
+  local resolved_sidecar, sidecar_err = resolve_local_executable(M.config.sidecar)
+  if not resolved_sidecar then
+    error("invalid sidecar executable: " .. sidecar_err)
+  end
+  local captured_state_dir
+  if M.config.state_dir ~= nil then
+    if not optional_string(M.config.state_dir) or contains_control(M.config.state_dir) then
+      error("invalid runtime state directory")
+    end
+    captured_state_dir = normalize_local_root(M.config.state_dir)
+  end
   local target_arg = reconnect_arg(target)
   local is_reconnect = opts.reconnect == true
-  if not opts.reconnect then
-    M.reconnect_generation = M.reconnect_generation + 1
-    M.reconnect_attempts = 0
-  end
-  local generation = M.reconnect_generation
   M.connection_status = is_reconnect and "reconnecting" or "connecting"
   M.connection_target = target_arg
   M.connection_reason = nil
   M.connection_error = nil
   M.reconnect_pending = false
+  if not opts.reconnect then
+    M.reconnect_attempts = 0
+    bump_reconnect_generation("connect", nil)
+  end
+  local generation = M.reconnect_generation
 
   if M.client and M.client.job_id then
     M.disconnect({ preserve_last_target = true })
@@ -2586,6 +3358,14 @@ function M.connect(target, opts)
     agent_bootstrap_skip_reason = automatic_bootstrap_skip_reason(connection),
     agent_bootstrap_state = "disabled",
     expected_registry_policy_fingerprint = registry_policy_fingerprint(M.config),
+    runtime_config = {
+      sidecar = resolved_sidecar,
+      agent = M.config.agent,
+      remote_agent = M.config.remote_agent,
+      state_dir = captured_state_dir,
+      request_timeout_ms = M.config.request_timeout_ms,
+      ssh_connect_timeout_seconds = M.config.ssh_connect_timeout_seconds,
+    },
     -- Requests must use the same timeout policy that was passed to this
     -- sidecar. A later setup() call only applies after reconnecting.
     timeout_config = {
@@ -2609,7 +3389,7 @@ function M.connect(target, opts)
     client.daemon_job_id = daemon_job_id
   elseif connection == "stdio" then
     client.transport = "stdio"
-    local command = vim.list_extend({ M.config.sidecar }, sidecar_args(target))
+    local command = vim.list_extend({ resolved_sidecar }, sidecar_args(target))
     client.job_id = vim.fn.jobstart(command, {
       stdout_buffered = false,
       stderr_buffered = false,
@@ -2634,13 +3414,14 @@ function M.connect(target, opts)
         end
         local unexpected = not client.closing
         if unexpected then
-          local exit_generation = M.reconnect_generation
           fail_pending(client, "sidecar exited with code " .. tostring(code))
           M.connection_status = M.config.auto_reconnect and "reconnect_pending" or "disconnected"
           M.connection_target = client.target_arg
           M.connection_reason = nil
           M.connection_error = "sidecar exited with code " .. tostring(code)
           M.reconnect_pending = M.config.auto_reconnect == true
+          local exit_generation = bump_reconnect_generation("transport_exit", client)
+          emit_workspace_event("NrmWorkspaceDisconnected", client, { reason = M.connection_error })
           notify("sidecar exited with code " .. tostring(code), vim.log.levels.ERROR)
           schedule_reconnect(client.target_arg, exit_generation, client.connection)
         else
@@ -2703,13 +3484,14 @@ function M.disconnect(opts)
   if not M.client then
     clear_mirror_autohydrate()
     if not opts.preserve_last_target then
-      M.reconnect_generation = M.reconnect_generation + 1
       M.reconnect_attempts = 0
       M.connection_status = "disconnected"
       M.connection_target = nil
       M.connection_reason = "explicit disconnect"
       M.connection_error = nil
       M.reconnect_pending = false
+      bump_reconnect_generation("disconnect", nil)
+      emit_workspace_event("NrmWorkspaceDisconnected", nil, { reason = M.connection_reason })
     end
     return
   end
@@ -2744,13 +3526,14 @@ function M.disconnect(opts)
   M.client = nil
   if not opts.preserve_last_target then
     M.stop_background_mirror()
-    M.reconnect_generation = M.reconnect_generation + 1
     M.reconnect_attempts = 0
     M.connection_status = "disconnected"
     M.connection_target = nil
     M.connection_reason = "explicit disconnect"
     M.connection_error = nil
     M.reconnect_pending = false
+    bump_reconnect_generation("disconnect", client)
+    emit_workspace_event("NrmWorkspaceDisconnected", client, { reason = M.connection_reason })
   end
 end
 
@@ -2762,12 +3545,12 @@ function M.reconnect()
     M.disconnect({ preserve_last_target = true })
   end
   M.reconnect_attempts = 0
-  M.reconnect_generation = M.reconnect_generation + 1
   M.connection_status = "reconnecting"
   M.connection_target = M.last_target
   M.connection_reason = nil
   M.connection_error = nil
   M.reconnect_pending = false
+  bump_reconnect_generation("reconnect", nil)
   M.connect(M.last_target, { reconnect = true, connection = M.last_connection })
 end
 
@@ -2871,7 +3654,11 @@ function M.status_async(callback)
       return
     end
     if M.client == client then
-      update_remote_state(client, result)
+      local updated, update_err = update_remote_state(client, result)
+      if not updated then
+        callback(invalid_remote_state_error(update_err), decorate_status_result({}))
+        return
+      end
     end
     callback(nil, decorate_status_result(result or {}))
   end)
@@ -2885,7 +3672,10 @@ function M.remote_probe(callback)
 
   M.request("remote_probe", {}, function(err, result)
     if not err and M.client == client and not (result and result.preempted) then
-      update_remote_state(client, result)
+      local updated, update_err = update_remote_state(client, result)
+      if not updated then
+        err = invalid_remote_state_error(update_err)
+      end
     end
     if callback then
       callback(err, result)
@@ -2901,7 +3691,10 @@ function M.remote_health(callback)
 
   M.request("remote_health", {}, function(err, result)
     if not err and M.client == client and not (result and result.preempted) then
-      update_remote_state(client, result)
+      local updated, update_err = update_remote_state(client, result)
+      if not updated then
+        err = invalid_remote_state_error(update_err)
+      end
     end
     if callback then
       callback(err, result)
@@ -2944,8 +3737,15 @@ local function remote_agent_bootstrap(method, opts, callback)
 
   M.request(method, remote_agent_bootstrap_params(opts), function(err, result)
     local health = result and result.remote_health or nil
-    if not err and M.client == client and health then
-      update_remote_state(client, health)
+    if not err and M.client == client then
+      if not health then
+        err = invalid_remote_state_error("agent bootstrap result is missing remote_health")
+      else
+        local updated, update_err = update_remote_state(client, health)
+        if not updated then
+          err = invalid_remote_state_error(update_err)
+        end
+      end
     end
     if callback then
       callback(err, result)
@@ -4280,7 +5080,11 @@ function M.status()
       notify(err, vim.log.levels.ERROR)
       return
     end
-    update_remote_state(M.client, result)
+    local updated, update_err = update_remote_state(M.client, result)
+    if not updated then
+      notify(invalid_remote_state_error(update_err), vim.log.levels.ERROR)
+      return
+    end
     local scan_summary = background_scan_summary(result)
     notify(
       string.format(

@@ -25,6 +25,11 @@ local function next_notification()
 end
 
 local function fake_client()
+  local runtime = {
+    contract_version = 2,
+    support = { process = true, terminal = true, watch = false },
+    authority = { state = "unchecked", revision = 0 },
+  }
   return {
     job_id = 1,
     closing = false,
@@ -32,7 +37,9 @@ local function fake_client()
     hello = {
       workspace_key = "workspace",
       files_root = "/mirror/workspace/files",
+      runtime = vim.deepcopy(runtime),
     },
+    runtime_readiness = runtime,
   }
 end
 
@@ -52,6 +59,11 @@ local function status_result()
     remote_available = false,
     remote_error = "ssh connect failed",
     retry_after_ms = 1500,
+    runtime = {
+      contract_version = 2,
+      support = { process = true, terminal = true, watch = false },
+      authority = { state = "unavailable", revision = 1, reason = "ssh connect failed", retry_after_ms = 1500 },
+    },
     registry_health = {
       state = "error",
       source = "registry",

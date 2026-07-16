@@ -10,6 +10,8 @@ base64.workspace = true
 blake3.workspace = true
 clap.workspace = true
 flate2.workspace = true
+fs4.workspace = true
+getrandom.workspace = true
 libc.workspace = true
 nrm-protocol = { path = "../nrm-protocol" }
 nrm-registry = { path = "../nrm-registry" }
@@ -20,6 +22,20 @@ serde_json.workspace = true
 sha2.workspace = true
 url.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Security_Cryptography",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_Threading",
+] }
+
 [dev-dependencies]
 ed25519-dalek.workspace = true
 tempfile.workspace = true
+
+[target.'cfg(windows)'.dev-dependencies]
+nrm-pty = { path = "../nrm-pty" }

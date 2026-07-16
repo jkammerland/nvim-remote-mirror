@@ -14,6 +14,8 @@ local original_notify = vim.notify
 
 local function main()
   nrm.setup({
+    sidecar = "nvim",
+    state_dir = "target/test-runtime-state",
     auto_reconnect = false,
     background_mirror = false,
     recover_local_edits_on_connect = false,
@@ -21,11 +23,13 @@ local function main()
     request_timeout_ms = 10000,
   })
 
+  local job_command = nil
   local job_opts = nil
   local sent_method = nil
 
   vim.notify = function() end
-  vim.fn.jobstart = function(_, opts)
+  vim.fn.jobstart = function(command, opts)
+    job_command = command
     job_opts = opts
     return 42
   end
@@ -49,6 +53,11 @@ local function main()
           remote_available = false,
           commands = { "workspace_info", "open" },
           notifications = { "workspace/remote_health" },
+          runtime = {
+            contract_version = 2,
+            support = { process = true, terminal = true, watch = false },
+            authority = { state = "unchecked", revision = 0 },
+          },
         },
       }),
       "",
@@ -58,6 +67,11 @@ local function main()
 
   nrm.connect("/remote/repo")
 
+  local resolved_sidecar = vim.fn.exepath("nvim")
+  local resolved_state_dir = vim.fn.fnamemodify("target/test-runtime-state", ":p"):gsub("[/\\]+$", "")
+  assert_eq(job_command[1], resolved_sidecar)
+  assert_eq(nrm.client.runtime_config.sidecar, resolved_sidecar)
+  assert_eq(nrm.client.runtime_config.state_dir, resolved_state_dir)
   assert_eq(sent_method, "workspace_info")
   assert_eq(nrm.connection_status, "connected")
   assert_eq(nrm.client.hello.workspace_key, "workspace")
