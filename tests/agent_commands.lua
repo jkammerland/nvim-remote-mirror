@@ -14,6 +14,39 @@ local function assert_contains(text, needle, message)
   end
 end
 
+local function ready_runtime(revision)
+  return {
+    contract_version = 2,
+    support = { process = true, terminal = true, watch = false },
+    authority = {
+      state = "ready",
+      revision = revision,
+      agent_version = "0.1.0",
+      protocol_version = 7,
+      capabilities = {
+        scan = true,
+        read = true,
+        write_cas = true,
+        checksum = true,
+        grep = true,
+        lsp_proxy = true,
+        batch_read = true,
+        batch_validate = true,
+        chunked_write = true,
+        request_ids = true,
+        cancellation = true,
+        streaming = true,
+        multiplexing = true,
+        git = true,
+        runtime_process_v1 = true,
+        runtime_pty_v1 = true,
+        workspace_watch_v1 = false,
+      },
+      effective = { process = true, terminal = true, watch = false },
+    },
+  }
+end
+
 local function main()
   local original_request = nrm.request
   vim.notify = function() end
@@ -27,9 +60,18 @@ local function main()
   nrm.connection_status = "connected"
 
   local requests = {}
+  local malformed_health = false
   nrm.request = function(method, params, callback)
     table.insert(requests, { method = method, params = params or {} })
     if method == "remote_health" then
+      if malformed_health then
+        callback(nil, {
+          remote_status = "unavailable",
+          remote_checked = true,
+          remote_available = false,
+        })
+        return
+      end
       callback(nil, {
         remote_status = "connected",
         remote_checked = true,
@@ -42,6 +84,7 @@ local function main()
           source = "registry",
           manifest_url = "https://registry.example.test/<redacted>",
         },
+        runtime = ready_runtime(1),
       })
       return
     end
@@ -63,6 +106,7 @@ local function main()
             signing_key_ids = { "release-a" },
             artifact_sha256 = string.rep("a", 64),
           },
+          runtime = ready_runtime(method == "remote_agent_install" and 2 or 3),
         },
       })
       return
@@ -79,6 +123,19 @@ local function main()
   assert_eq(health_result.agent_status, "ok")
   assert_eq(nrm.connection_state().agent_status, "ok")
   assert_eq(nrm.connection_state().registry_health.state, "not_checked")
+
+  local before_malformed_health = vim.deepcopy(nrm.client.hello)
+  malformed_health = true
+  local malformed_health_err
+  nrm.remote_health(function(err)
+    malformed_health_err = err
+  end)
+  assert_contains(malformed_health_err, "v2 runtime")
+  assert(
+    vim.deep_equal(nrm.client.hello, before_malformed_health),
+    "malformed synchronous health partially replaced the last valid observation"
+  )
+  malformed_health = false
 
   nrm.setup({ remote_agent_install_path = "$HOME/.local/bin/nrm-agent" })
   local install_result

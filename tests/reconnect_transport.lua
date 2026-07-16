@@ -110,6 +110,11 @@ local function main()
               remote_agent_bootstrap = true,
               remote_agent_automatic_bootstrap_v1 = true,
             },
+            runtime = {
+              contract_version = 2,
+              support = { process = true, terminal = true, watch = false },
+              authority = { state = "unchecked", revision = 0 },
+            },
           },
         }),
         "",

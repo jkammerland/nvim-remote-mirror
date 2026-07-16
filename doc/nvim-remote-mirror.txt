@@ -166,12 +166,14 @@ COMMANDS                                      *nvim-remote-mirror-commands*
     Remove persisted process/terminal trust for the resolved workspace.
 
 :RemoteTerminal[!] [cmd...]
-    Open an attached remote PTY in a bottom split. With no cmd, start the
-    authority account's default shell and enter terminal-input mode; otherwise
-    pass cmd as an argv list, never shell-interpolated text. The local bridge
-    disables its own echo and control-key processing so only the authority PTY
-    handles them. [!] requests detached persistence and currently fails with
-    persistence_unavailable until the persistent runtime broker is implemented.
+    Prepare terminal readiness and open an attached remote PTY in a bottom
+    split. With no cmd, start the authority account's default shell
+    and enter terminal-input mode; otherwise pass cmd as an argv list, never
+    shell-interpolated text. A later prepare or launch failure is reported by
+    notification. The local bridge disables its own echo and control-key
+    processing so only the authority PTY handles them. [!] requests detached
+    persistence and currently fails with persistence_unavailable until the
+    persistent runtime broker is implemented.
 
 :RemoteOpen {path}
     Open a workspace-relative file from the local mirror when cached, including
@@ -410,6 +412,10 @@ does not mutate remote_root_missing, unavailable, or unclassified states. Set
 remote_agent_auto_install=false to keep registry operations explicit. A failed
 automatic bootstrap leaves the mirror connected in a degraded state and is
 reported separately in :RemoteWorkspace.
+Workspace runtime prepare() never invokes this repair path. It performs a
+read-only authority probe and may persist only an explicit local trust
+decision. Missing or incompatible agents fail preparation until connect-time
+signed repair or an explicit :RemoteInstallAgent/:RemoteUpdateAgent succeeds.
 On POSIX, a safe bare remote_agent installs under $HOME/.local/bin with the
 same command name and SSH launch prepends that directory to PATH. On Windows
 it installs under %LOCALAPPDATA%\nrm\bin and gains an .exe suffix when needed.
@@ -555,7 +561,10 @@ Sidecar command responses are newline-delimited JSON objects with an id, ok,
 and result or error. The sidecar may also send id-less notification lines such
 as workspace/remote_health; Neovim consumes those to keep last-known remote
 health current, and future clients can ignore them without affecting command
-responses.
+responses. Runtime-v2 health is atomic: every active response/notification must
+carry its complete runtime object. Malformed or conflicting equal-revision
+objects are rejected, and lower revisions in the same workspace epoch are
+ignored without partially updating legacy health fields.
 The workspace_info command returns workspace identity, mirror paths, transport
 metadata, supported command names, notification names, capabilities, and
 last-known remote health from local state without starting or probing SSH.
@@ -581,21 +590,35 @@ named local. Future non-SSH transports should use namespaced identity material.
 ==============================================================================
 WORKSPACE RUNTIME                              *nvim-remote-mirror-runtime*
 
-Workspace API v1 is a provider-neutral contract for plugins that need to run
-tools beside the authoritative tree. Resolve an immutable context: >
+Workspace Runtime Readiness API v2 is the breaking provider-neutral contract
+for plugins that need to run tools beside the authoritative tree. API v2
+separates static provider support, dynamic authority readiness, and explicit
+workspace authorization. The v2 support, readiness, preparation, facade, and
+callback guarantees are one strict contract; there is no API-v1 compatibility
+layer or fallback. Resolve an immutable context: >
   local nrm = require("nvim_remote_mirror")
   local context, err = nrm.workspace({ bufnr = 0 })
 <
 
+Migration is breaking: replace the old context:authorize() plus direct-call
+pattern with context:prepare() and methods on the returned prepared facade.
+Never retry through legacy authorization or capability assumptions after a v2
+readiness, trust, or stale-state error. API-v2 direct calls remain defined by
+the strict state matrix below; they are not an API-v1 adapter.
+
 The query accepts at most one of bufnr, path, workspace_id, or workspace_key.
 Without a selector it uses the current remote buffer, then the active
 workspace. Public context fields include api_version, provider, workspace_id,
-epoch, state, mode, authority, roots, and capabilities.
+epoch, state, mode, authority, and roots. Public context.capabilities was
+removed; query support and readiness through methods instead.
+An offline-buffer context reports supported capabilities as unchecked (or
+disabled by policy), but prepare() and execution fail with workspace_offline.
 
-Contexts are tied to a reconnect epoch. context:is_current() checks a retained
-context; execution returns stale_context after connect, disconnect, reconnect,
-or transport replacement advances the epoch. Resolve a new context rather
-than retrying the old object.
+Contexts are tied to a reconnect epoch. Readiness has a separate monotonic
+revision. context:is_current() checks a retained context; reconnect or
+transport replacement returns stale_context from a context, while an epoch or
+readiness change returns stale_preparation from a prepared facade. Resolve and
+prepare again rather than retrying stale state.
 
 context:map_path(path, { from=..., to=... }) crosses between editor,
 authority, editor_uri, and authority_uri spaces. It rejects paths outside the
@@ -607,18 +630,51 @@ For example: >
   ))
 <
 
-Before execution, authorize "process" or "terminal": >
-  context:authorize("process", function(auth_err, granted)
-    if auth_err or not granted then
+Use supports() for static local support, capability_status() for the latest
+local readiness snapshot, and prepare() for execution: >
+  if not context:supports("process") then
+    return
+  end
+  local status = assert(context:capability_status("process"))
+  -- state: unsupported, disabled, unchecked, checking, ready, or unavailable.
+
+  context:prepare("process", function(prepare_err, prepared)
+    if prepare_err then
       return
     end
-    -- Create the job inside this callback.
+    local handle = assert(prepared:spawn({
+      command = { argv = { "cargo", "check" } },
+      cwd = { space = "workspace", path = "" },
+    }))
   end)
 <
 
-job_spec(), spawn(), and open_pty() fail closed when called before trust,
-offline, with a stale context, or without an advertised capability. Connect
-never grants runtime trust or starts an arbitrary workspace command.
+For every well-formed accepted prepare call, its callback runs exactly once.
+It may run inline when readiness and trust are cached, or later after a probe
+or prompt. Initialize callback-visible state before invoking prepare(). Invalid
+arguments return nil,error synchronously and do not invoke the callback.
+Preparation performs a read-only agent probe, verifies the negotiated
+capability, applies trust policy, and rechecks epoch and readiness revision. It
+may persist an explicit local trust decision, but never installs or updates the
+remote agent.
+
+Automatic signed repair remains connect-only and requires SSH, a trusted
+configured registry, and remote_agent_auto_install=true. Missing or
+incompatible agents otherwise produce a typed readiness error; explicit
+:RemoteInstallAgent and :RemoteUpdateAgent remain separate actions.
+
+The prepared facade is the recommended revision-bound receiver. A process
+facade can start only pipe stdio and a terminal facade only PTY stdio; a
+mismatch returns unsupported, and a later epoch/readiness change returns
+stale_preparation.
+
+Direct context:job_spec(), context:spawn(), and context:open_pty() are retained
+as a v2 late-check path. They allow unchecked or ready-and-effective state
+after existing trust. Checking or unavailable authority returns
+capability_not_ready; disabled, unsupported, and explicitly unnegotiated
+capabilities return capability_disabled, unsupported, and
+capability_unavailable. The proxy always repeats the definitive Hello at
+launch.
 
 Process specs keep command and environment structured: >
   local process = {
@@ -642,7 +698,7 @@ pipe-only cumulative limit (4 MiB by default, 128 MiB maximum). Omit it for
 PTYs: PTY output is a live backpressured stream with no cumulative byte limit,
 and a PTY request containing max_output_bytes is rejected.
 
-Use context:job_spec(process) when another plugin owns the local job. It
+Use prepared:job_spec(process) when another plugin owns the local job. It
 returns authoritative bridge argv and a canonical command string for
 string-only APIs. Remote argv, cwd, and environment stay inside a private,
 single-use ticket; the local bridge contains only nrm-sidecar and an opaque
@@ -655,11 +711,11 @@ ToggleTerm can consume that generic bridge without an nrm-specific patch: >
   local nrm = require("nvim_remote_mirror")
   local context = assert(nrm.workspace({ bufnr = 0 }))
 
-  context:authorize("terminal", function(err, granted)
-    if err or not granted then
+  context:prepare("terminal", function(err, prepared)
+    if err then
       return
     end
-    local bridge = assert(context:job_spec({
+    local bridge = assert(prepared:job_spec({
       command = { shell = "default" },
       cwd = { space = "workspace", path = "" },
       stdio = "pty",
@@ -675,11 +731,11 @@ ToggleTerm can consume that generic bridge without an nrm-specific patch: >
 
 ToggleTerm adds a fixed local comment marker to identify its buffer. Every
 respawn must create a new job_spec and Terminal because runtime tickets are
-single-use. Public third-party workspace-provider registration is not exposed
-in API v1 yet.
+single-use. A readiness revision change also requires prepare() again. Public
+third-party workspace-provider registration is not exposed by this contract.
 
-Use context:spawn(process, handlers) for a managed attached pipe, or
-context:open_pty(process, handlers) for a managed attached PTY. Handles expose
+Use prepared:spawn(process, handlers) for a managed attached pipe or PTY, or
+prepared:open_pty(process, handlers) for a prepared terminal. Handles expose
 write(), close_stdin(), signal(), and kill(); PTYs also expose resize().
 Signals are interrupt, terminate, kill, or hangup. on_stdout/on_stderr receive
 Neovim line/list job stream callbacks, not a binary-transparent byte API.
@@ -692,6 +748,17 @@ User NrmWorkspaceConnected, NrmWorkspaceDisconnected, and
 NrmWorkspaceEpochChanged events contain epoch, workspace_key, target, and
 state plus a reason/reconnect field when applicable. Treat event data as a
 hint, discard cached contexts, and resolve again before execution.
+
+User NrmWorkspaceReadinessChanged contains the normal epoch, workspace_key,
+target, and connection state fields plus readiness_state, readiness_revision,
+and effective. It does not advance the workspace epoch. Retain the context if
+desired, discard prepared facades, call capability_status(), and prepare again.
+
+The Lua open_terminal(opts, callback) helper is callback-based in API v2.
+Every accepted call invokes callback(err, handle) exactly once. Cached
+readiness and trust may complete inline; otherwise a probe or prompt completes
+later. Initialize callback-visible state before invoking it. :RemoteTerminal
+reports failures through notification regardless of callback timing.
 
 Only attached pipes and PTYs are advertised today. Detached/reconnectable
 sessions and workspace_watch_v1 are unavailable. [!] on :RemoteTerminal
@@ -770,6 +837,10 @@ include automatic state, result/reason/error, selected platform/target,
 redacted manifest URL, verified key IDs, digests, source/cache state, and stable
 error codes. A failed automatic bootstrap leaves connect degraded but complete.
 Registry state remains separate from working-agent health.
+An automatic result is considered ready only when its remote health contains a
+valid ready runtime-v2 observation in addition to exact package/protocol
+compatibility. That observation seeds plugin readiness immediately; missing or
+malformed runtime health leaves bootstrap in the degraded error state.
 
 See docs/agent-registry.md in the project checkout for the exact manifest,
 redirect, cache, trust, and key-rotation policy.
@@ -780,8 +851,10 @@ LIMITS                                        *nvim-remote-mirror-limits*
 This is dogfooding software. The local mirror, SSH workspaces, background
 metadata scan, find, grep, save queue, conflicts, socket sidecar mode, and basic
 LSP proxy are implemented. Remote git status/diff/blame primitives are
-implemented. Attached remote pipe processes and PTYs are available through
-workspace API v1 and :RemoteTerminal. Persistent/detached terminals,
+implemented. Attached remote pipe processes and PTYs are available; the strict
+Workspace Runtime Readiness API-v2 migration is work in progress.
+:RemoteTerminal uses the callback-based readiness path. Persistent/detached
+terminals,
 workspace watching, DAP, full git adapters, and general plugin remoting are
 not built yet.
 

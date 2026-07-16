@@ -3522,6 +3522,8 @@ enum RemoteHealthState {
 #[derive(Debug, Clone)]
 struct RemoteHealth {
     state: RemoteHealthState,
+    revision: u64,
+    negotiated_hello: Option<NegotiatedAgentHello>,
     unavailable_until: Option<Instant>,
     error: Option<String>,
     trusted_failure: Option<TrustedAgentFailure>,
@@ -3762,6 +3764,8 @@ impl Default for RemoteHealth {
     fn default() -> Self {
         Self {
             state: RemoteHealthState::Unchecked,
+            revision: 0,
+            negotiated_hello: None,
             unavailable_until: None,
             error: None,
             trusted_failure: None,
@@ -3770,9 +3774,11 @@ impl Default for RemoteHealth {
 }
 
 impl RemoteHealth {
-    fn connected() -> Self {
+    fn connected(negotiated_hello: NegotiatedAgentHello) -> Self {
         Self {
             state: RemoteHealthState::Connected,
+            revision: 0,
+            negotiated_hello: Some(negotiated_hello),
             unavailable_until: None,
             error: None,
             trusted_failure: None,
@@ -3786,10 +3792,34 @@ impl RemoteHealth {
     ) -> Self {
         Self {
             state: RemoteHealthState::Unavailable,
+            revision: 0,
+            negotiated_hello: None,
             unavailable_until,
             error: Some(error),
             trusted_failure,
         }
+    }
+
+    fn same_observation(&self, other: &Self) -> bool {
+        self.state == other.state
+            && self.negotiated_hello == other.negotiated_hello
+            && self.error == other.error
+            && self.trusted_failure == other.trusted_failure
+    }
+
+    fn observe(&mut self, mut observation: Self) {
+        // Worker retirement and lane preemption clear only that lane's
+        // session Hello. They do not invalidate evidence already published
+        // for the installed agent shared by every lane.
+        if observation.state == RemoteHealthState::Unchecked {
+            return;
+        }
+        observation.revision = if self.same_observation(&observation) {
+            self.revision
+        } else {
+            self.revision.saturating_add(1)
+        };
+        *self = observation;
     }
 
     fn retry_after_ms(&self) -> Option<u64> {
@@ -3812,10 +3842,65 @@ impl RemoteHealth {
         value
     }
 
+    fn runtime_value(&self) -> Value {
+        let mut authority = json!({
+            "state": match self.state {
+                RemoteHealthState::Unchecked => "unchecked",
+                RemoteHealthState::Connected => "ready",
+                RemoteHealthState::Unavailable => "unavailable",
+            },
+            "revision": self.revision,
+        });
+        if let Some(object) = authority.as_object_mut() {
+            match self.state {
+                RemoteHealthState::Connected => {
+                    if let Some(hello) = &self.negotiated_hello {
+                        object.insert("agent_version".to_string(), json!(hello.agent_version));
+                        object.insert(
+                            "protocol_version".to_string(),
+                            json!(hello.protocol_version),
+                        );
+                        object.insert("capabilities".to_string(), json!(hello.capabilities));
+                        object.insert(
+                            "effective".to_string(),
+                            json!({
+                                "process": hello.capabilities.runtime_process_v1,
+                                "terminal": hello.capabilities.runtime_pty_v1,
+                                // The sidecar does not expose a workspace-watch
+                                // runtime yet, even if a future/experimental
+                                // agent advertises the lower-level bit.
+                                "watch": false,
+                            }),
+                        );
+                    }
+                }
+                RemoteHealthState::Unavailable => {
+                    if let Some(reason) = &self.error {
+                        object.insert("reason".to_string(), json!(reason));
+                    }
+                    if let Some(retry_after_ms) = self.retry_after_ms() {
+                        object.insert("retry_after_ms".to_string(), json!(retry_after_ms));
+                    }
+                }
+                RemoteHealthState::Unchecked => {}
+            }
+        }
+        json!({
+            "contract_version": 2,
+            "support": {
+                "process": true,
+                "terminal": true,
+                "watch": false,
+            },
+            "authority": authority,
+        })
+    }
+
     fn insert_into(&self, value: &mut Value) {
         let Some(object) = value.as_object_mut() else {
             return;
         };
+        object.insert("runtime".to_string(), self.runtime_value());
         match self.state {
             RemoteHealthState::Unchecked => {
                 object.insert("remote_status".to_string(), json!("unchecked"));
@@ -3826,6 +3911,13 @@ impl RemoteHealth {
                 object.insert("remote_status".to_string(), json!("connected"));
                 object.insert("remote_checked".to_string(), json!(true));
                 object.insert("remote_available".to_string(), json!(true));
+                if let Some(hello) = &self.negotiated_hello {
+                    object.insert("agent_version".to_string(), json!(hello.agent_version));
+                    object.insert(
+                        "protocol_version".to_string(),
+                        json!(hello.protocol_version),
+                    );
+                }
             }
             RemoteHealthState::Unavailable => {
                 object.insert("remote_status".to_string(), json!("unavailable"));
@@ -3859,7 +3951,7 @@ struct AgentClient {
     worker_generation: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct NegotiatedAgentHello {
     agent_version: String,
     protocol_version: u16,
@@ -4198,6 +4290,7 @@ impl AgentClient {
         self.preempt.clone()
     }
 
+    #[cfg(test)]
     fn handshake_complete(&self) -> bool {
         self.handshake_complete
     }
@@ -4225,8 +4318,8 @@ impl AgentClient {
             return RemoteHealth::unavailable(unavailable_until, error, failure);
         }
         drop(backoff);
-        if self.handshake_complete {
-            return RemoteHealth::connected();
+        if let Some(hello) = &self.negotiated_hello {
+            return RemoteHealth::connected(hello.clone());
         }
         RemoteHealth::default()
     }
@@ -4312,6 +4405,7 @@ impl AgentClient {
         anyhow!(error)
     }
 
+    #[cfg(test)]
     fn clear_remote_unavailable(&mut self) {
         self.remote_backoff_guard().clear_lane(self.backoff_lane);
     }
@@ -4400,7 +4494,7 @@ impl AgentClient {
                         protocol_version,
                         capabilities,
                     });
-                    self.clear_remote_unavailable();
+                    self.clear_all_remote_unavailable();
                     Ok(None)
                 }
                 Err(error) => {
@@ -4437,7 +4531,7 @@ impl AgentClient {
                         protocol_version: *protocol_version,
                         capabilities: capabilities.clone(),
                     });
-                    self.clear_remote_unavailable();
+                    self.clear_all_remote_unavailable();
                     Ok(())
                 }
                 Err(error) => {
@@ -7135,6 +7229,28 @@ fn status_with_remote_health(
     Ok(status)
 }
 
+fn insert_runtime_from_remote_health(result: &mut Value, remote_health: &Value) {
+    let (Some(result), Some(runtime)) = (
+        result.as_object_mut(),
+        remote_health.get("runtime").cloned(),
+    ) else {
+        return;
+    };
+    result.insert("runtime".to_string(), runtime);
+}
+
+fn skipped_agent_install_result(preflight: &AgentInstallPreflight, reason: &str) -> Value {
+    let mut result = json!({
+        "status": "skipped",
+        "reason": reason,
+        "automatic": preflight.automatic,
+        "install_path": preflight.target_path,
+        "remote_health": preflight.before,
+    });
+    insert_runtime_from_remote_health(&mut result, &preflight.before);
+    result
+}
+
 fn sidecar_commands() -> Vec<&'static str> {
     SIDECAR_COMMAND_SPECS
         .iter()
@@ -7205,10 +7321,6 @@ fn workspace_info_value(
             "remote_agent_bootstrap": true,
             "remote_agent_automatic_bootstrap_v1": true,
             "transport_neutral_agent_frames": true,
-            "runtime_ticket_v1": true,
-            "runtime_process_v1": true,
-            "runtime_pty_v1": true,
-            "workspace_watch_v1": false,
             "agent_abort_handle": true,
             "agent_abort_scope": "lane_worker",
             "sidecar_socket_listener": cfg!(unix),
@@ -7220,7 +7332,9 @@ fn workspace_info_value(
     if let (Some(object), Some(remote_host)) = (value.as_object_mut(), remote_host) {
         object.insert("remote_host".to_string(), json!(remote_host));
     }
-    remote_health.insert_into(&mut value);
+    if let (Some(object), Some(health)) = (value.as_object_mut(), remote_health_value.as_object()) {
+        object.extend(health.clone());
+    }
     value
 }
 
@@ -8381,7 +8495,7 @@ impl Sidecar {
 
     fn record_remote_health(&self) {
         if let Ok(mut health) = self.remote_health.lock() {
-            *health = self.agent.remote_health();
+            health.observe(self.agent.remote_health());
         }
     }
 
@@ -8449,38 +8563,15 @@ impl Sidecar {
         preempt_epoch: u64,
         timeout: Option<Duration>,
     ) -> Value {
-        if let Some(hello) = self.agent.negotiated_hello() {
-            return json!({
-                "remote_status": "connected",
-                "remote_checked": true,
-                "remote_available": true,
-                "agent_version": hello.agent_version,
-                "protocol_version": hello.protocol_version,
-                "capabilities": hello.capabilities
-            });
+        if self.agent.negotiated_hello().is_some()
+            && self.remote_health_snapshot().state != RemoteHealthState::Unavailable
+        {
+            self.record_remote_health();
+            return self.remote_health_snapshot().to_value();
         }
-        // Some tests and transitional in-process callers may only retain the
-        // legacy boolean. Production handshakes always retain the complete
-        // negotiated response above.
-        if self.agent.handshake_complete() {
-            return json!({
-                "remote_status": "connected",
-                "remote_checked": true,
-                "remote_available": true
-            });
-        }
-        if let Some((retry_after_ms, error, trusted_failure)) = self.agent.remote_backoff() {
-            let mut value = json!({
-                "remote_status": "unavailable",
-                "remote_checked": true,
-                "remote_available": false,
-                "retry_after_ms": retry_after_ms,
-                "remote_error": error
-            });
-            if let (Some(object), Some(failure)) = (value.as_object_mut(), trusted_failure) {
-                failure.insert_into(object);
-            }
-            return value;
+        if self.agent.remote_backoff().is_some() {
+            self.record_remote_health();
+            return self.remote_health_snapshot().to_value();
         }
 
         let request = Request::Hello {
@@ -8498,27 +8589,21 @@ impl Sidecar {
                 .request_maybe_preemptible_since(request, preempt_epoch),
         };
         match outcome {
-            Ok(AgentRequestOutcome::Response(Response::Hello {
-                agent_version,
-                protocol_version,
-                capabilities,
-            })) => json!({
-                "remote_status": "connected",
-                "remote_checked": true,
-                "remote_available": true,
-                "agent_version": agent_version,
-                "protocol_version": protocol_version,
-                "capabilities": capabilities
-            }),
+            Ok(AgentRequestOutcome::Response(Response::Hello { .. })) => {
+                self.record_remote_health();
+                self.remote_health_snapshot().to_value()
+            }
             Ok(AgentRequestOutcome::Response(other)) => self.remote_probe_unavailable(format!(
                 "unexpected hello response from agent: {other:?}"
             )),
-            Ok(AgentRequestOutcome::Preempted) => json!({
-                "remote_status": "unchecked",
-                "remote_checked": false,
-                "remote_available": false,
-                "preempted": true
-            }),
+            Ok(AgentRequestOutcome::Preempted) => {
+                self.record_remote_health();
+                let mut value = self.remote_health_snapshot().to_value();
+                if let Some(object) = value.as_object_mut() {
+                    object.insert("preempted".to_string(), json!(true));
+                }
+                value
+            }
             Err(error) => self.remote_probe_unavailable(error.to_string()),
         }
     }
@@ -8528,21 +8613,8 @@ impl Sidecar {
         if self.agent.remote_backoff().is_none() {
             let _ = self.agent.mark_remote_unavailable(error.clone());
         }
-        let backoff = self.agent.remote_backoff();
-        let mut value = json!({
-            "remote_status": "unavailable",
-            "remote_checked": true,
-            "remote_available": false,
-            "retry_after_ms": backoff.as_ref().map(|(remaining, _, _)| *remaining).unwrap_or(0),
-            "remote_error": error
-        });
-        if let (Some(object), Some(failure)) = (
-            value.as_object_mut(),
-            backoff.and_then(|(_, _, failure)| failure),
-        ) {
-            failure.insert_into(object);
-        }
-        value
+        self.record_remote_health();
+        self.remote_health_snapshot().to_value()
     }
 
     fn remote_health(&mut self, preempt_epoch: u64) -> Value {
@@ -8670,13 +8742,7 @@ impl Sidecar {
             let preflight =
                 self.remote_agent_install_preflight(&params, update, preempt_epoch, deadline)?;
             if let Some(reason) = preflight.skip_reason.as_deref() {
-                return Ok(json!({
-                    "status": "skipped",
-                    "reason": reason,
-                    "automatic": preflight.automatic,
-                    "install_path": preflight.target_path,
-                    "remote_health": preflight.before
-                }));
+                return Ok(skipped_agent_install_result(&preflight, reason));
             }
             self.record_remote_health();
             let prepared = self.prepare_remote_agent_install(&preflight, deadline)?;
@@ -8893,6 +8959,7 @@ impl Sidecar {
                     {
                         result.extend(details.clone());
                     }
+                    insert_runtime_from_remote_health(&mut result, &fresh);
                     return Ok(RemoteAgentInstallLeaseOutcome::Skipped(result));
                 }
                 effective_force = fresh_decision.effective_force;
@@ -9024,6 +9091,7 @@ impl Sidecar {
         {
             result.extend(details.clone());
         }
+        insert_runtime_from_remote_health(&mut result, &after);
         Ok(result)
     }
 
@@ -11552,13 +11620,7 @@ where
                         &response_tx,
                         result_to_client_response(
                             request_id,
-                            Ok(json!({
-                                "status": "skipped",
-                                "reason": reason,
-                                "automatic": preflight.automatic,
-                                "install_path": preflight.target_path,
-                                "remote_health": preflight.before
-                            })),
+                            Ok(skipped_agent_install_result(&preflight, reason)),
                         ),
                     );
                     send_client_notification(
@@ -13427,6 +13489,14 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use tempfile::tempdir;
 
+    fn test_negotiated_hello() -> NegotiatedAgentHello {
+        NegotiatedAgentHello {
+            agent_version: env!("CARGO_PKG_VERSION").to_string(),
+            protocol_version: PROTOCOL_VERSION,
+            capabilities: nrm_protocol::CapabilitySet::v1_agent(),
+        }
+    }
+
     #[cfg(unix)]
     fn secure_socket_test_directory(path: &Path) {
         fs::set_permissions(path, fs::Permissions::from_mode(LISTENER_DIRECTORY_MODE)).unwrap();
@@ -14361,31 +14431,46 @@ mod tests {
         let dir = tempdir().unwrap();
         let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
         let mut sidecar = test_sidecar(mirror);
-        *sidecar.remote_health.lock().unwrap() = RemoteHealth::connected();
+        *sidecar.remote_health.lock().unwrap() = RemoteHealth::connected(test_negotiated_hello());
 
         let unchanged =
             install_transaction_error(AgentInstallFinalState::TargetUnchanged, "staging failed");
         sidecar.record_agent_install_error_health(&unchanged);
-        assert_eq!(
-            sidecar.remote_health.lock().unwrap().state,
-            RemoteHealthState::Connected
-        );
+        let preserved = sidecar.remote_health_snapshot();
+        assert_eq!(preserved.state, RemoteHealthState::Connected);
+        assert_eq!(preserved.revision, 0);
+        assert!(preserved.runtime_value()["authority"]
+            .get("capabilities")
+            .is_some());
         assert_eq!(sidecar.status().unwrap()["remote_status"], "connected");
+
+        let restored = install_transaction_error(
+            AgentInstallFinalState::PreviousRestored,
+            "activation failed and rollback succeeded",
+        );
+        sidecar.record_agent_install_error_health(&restored);
+        assert_eq!(sidecar.remote_health_snapshot().revision, 0);
 
         sidecar.agent.handshake_complete = true;
         let healthy =
             install_transaction_error(AgentInstallFinalState::CandidateHealthy, "cleanup failed");
         sidecar.record_agent_install_error_health(&healthy);
-        assert_eq!(
-            sidecar.remote_health.lock().unwrap().state,
-            RemoteHealthState::Connected
-        );
+        let candidate = sidecar.remote_health_snapshot();
+        assert_eq!(candidate.state, RemoteHealthState::Connected);
+        assert_eq!(candidate.revision, 0);
 
         let unknown =
             install_transaction_error(AgentInstallFinalState::LiveStateUnknown, "rollback failed");
         sidecar.record_agent_install_error_health(&unknown);
         let health = sidecar.remote_health.lock().unwrap();
         assert_eq!(health.state, RemoteHealthState::Unavailable);
+        assert_eq!(health.revision, 1);
+        assert!(health.runtime_value()["authority"]
+            .get("effective")
+            .is_none());
+        assert!(health.runtime_value()["authority"]
+            .get("capabilities")
+            .is_none());
         assert!(health
             .error
             .as_deref()
@@ -14405,7 +14490,7 @@ mod tests {
         });
         sidecar.agent.launch.request_timeout = Duration::ZERO;
         sidecar.agent.handshake_complete = true;
-        *sidecar.remote_health.lock().unwrap() = RemoteHealth::connected();
+        *sidecar.remote_health.lock().unwrap() = RemoteHealth::connected(test_negotiated_hello());
         *sidecar.agent.launch.remote_host_info.lock().unwrap() = Some(test_posix_host());
 
         let error = sidecar
@@ -14624,7 +14709,7 @@ mod tests {
         );
         drop(cached);
 
-        *sidecar.remote_health.lock().unwrap() = RemoteHealth::connected();
+        *sidecar.remote_health.lock().unwrap() = RemoteHealth::connected(test_negotiated_hello());
         fs::write(&signature_path, b"not a signature document").unwrap();
         assert!(sidecar
             .resolve_agent_source(BootstrapDeadline::new(Duration::from_secs(5)))
@@ -15759,6 +15844,25 @@ mod tests {
     }
 
     #[test]
+    fn skipped_agent_install_result_promotes_the_runtime_contract() {
+        let before = RemoteHealth::default().to_value();
+        let preflight = AgentInstallPreflight {
+            before: before.clone(),
+            target_path: "/home/test/.local/bin/nrm-agent".to_string(),
+            effective_force: false,
+            skip_reason: Some("remote agent is already compatible".to_string()),
+            automatic: true,
+        };
+
+        let result =
+            skipped_agent_install_result(&preflight, preflight.skip_reason.as_deref().unwrap());
+
+        assert_eq!(result["status"], "skipped");
+        assert_eq!(result["runtime"], before["runtime"]);
+        assert_eq!(result["remote_health"]["runtime"], before["runtime"]);
+    }
+
+    #[test]
     fn automatic_agent_bootstrap_requires_signed_registry_before_remote_work() {
         let dir = tempdir().unwrap();
         let mirror = Mirror::open(Some(dir.path().to_path_buf()), "test").unwrap();
@@ -16652,14 +16756,119 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("protocol version mismatch"));
+        assert_eq!(probe["runtime"]["contract_version"], 2);
+        assert_eq!(probe["runtime"]["authority"]["state"], "unavailable");
+        assert_eq!(probe["runtime"]["authority"]["revision"], 1);
+        assert!(probe["runtime"]["authority"].get("effective").is_none());
+        assert!(probe["runtime"]["authority"].get("capabilities").is_none());
 
         let info = sidecar.handle("workspace_info", json!({}), 0).unwrap();
         assert_eq!(info["remote_status"], "unavailable");
         assert_eq!(info["remote_health"]["remote_status"], "unavailable");
+        assert_eq!(info["runtime"], info["remote_health"]["runtime"]);
         assert!(info["remote_error"]
             .as_str()
             .unwrap()
             .contains("protocol version mismatch"));
+    }
+
+    #[test]
+    fn remote_probe_recovers_unavailable_readiness_after_a_valid_hello() {
+        let state_dir = tempdir().unwrap();
+        let mirror = Mirror::open(Some(state_dir.path().to_path_buf()), "test").unwrap();
+        let mut sidecar = test_sidecar_with_agent_reply(
+            mirror,
+            AgentWorkerReply::Response(Response::Hello {
+                agent_version: env!("CARGO_PKG_VERSION").to_string(),
+                protocol_version: PROTOCOL_VERSION + 1,
+                capabilities: nrm_protocol::CapabilitySet::v1_agent(),
+            }),
+        );
+
+        let unavailable = sidecar.handle("remote_probe", json!({}), 0).unwrap();
+        assert_eq!(unavailable["runtime"]["authority"]["state"], "unavailable");
+        assert_eq!(unavailable["runtime"]["authority"]["revision"], 1);
+
+        sidecar.agent.clear_all_remote_unavailable();
+        let (tx, rx) = mpsc::channel::<AgentWorkerCommand>();
+        thread::spawn(move || {
+            if let Ok(command) = rx.recv() {
+                let _ = command
+                    .reply
+                    .send(AgentWorkerReply::Response(Response::Hello {
+                        agent_version: env!("CARGO_PKG_VERSION").to_string(),
+                        protocol_version: PROTOCOL_VERSION,
+                        capabilities: nrm_protocol::CapabilitySet::v1_agent(),
+                    }));
+            }
+        });
+        sidecar.agent.worker = Some(AgentWorker {
+            tx,
+            abort: Arc::new(TestAbortHandle::default()),
+            join: None,
+        });
+
+        let recovered = sidecar.handle("remote_probe", json!({}), 0).unwrap();
+        assert_eq!(recovered["runtime"]["authority"]["state"], "ready");
+        assert_eq!(recovered["runtime"]["authority"]["revision"], 2);
+        assert!(recovered.get("capabilities").is_none());
+        assert!(recovered["runtime"]["authority"]
+            .get("capabilities")
+            .is_some());
+    }
+
+    #[test]
+    fn shared_lane_retirement_preserves_ready_and_another_lane_can_recover_failure() {
+        let state_dir = tempdir().unwrap();
+        let mirror = Mirror::open(Some(state_dir.path().to_path_buf()), "test").unwrap();
+        let mut read = test_sidecar_with_agent_reply(
+            mirror,
+            AgentWorkerReply::Response(Response::Hello {
+                agent_version: env!("CARGO_PKG_VERSION").to_string(),
+                protocol_version: PROTOCOL_VERSION,
+                capabilities: nrm_protocol::CapabilitySet::v1_agent(),
+            }),
+        );
+        let ready = read.handle("remote_probe", json!({}), 0).unwrap();
+        assert_eq!(ready["runtime"]["authority"]["state"], "ready");
+        assert_eq!(ready["runtime"]["authority"]["revision"], 1);
+
+        let mut write = read.clone_for_lane(AgentInterrupt::default()).unwrap();
+        write.record_remote_health();
+        let preserved = read.remote_health_snapshot();
+        assert_eq!(preserved.state, RemoteHealthState::Connected);
+        assert_eq!(preserved.revision, 1);
+
+        let _ = write
+            .agent
+            .mark_remote_unavailable("write lane transport failed");
+        write.record_remote_health();
+        let failed = read.remote_health_snapshot();
+        assert_eq!(failed.state, RemoteHealthState::Unavailable);
+        assert_eq!(failed.revision, 2);
+
+        read.agent.kill_worker();
+        let (tx, rx) = mpsc::channel::<AgentWorkerCommand>();
+        thread::spawn(move || {
+            if let Ok(command) = rx.recv() {
+                let _ = command
+                    .reply
+                    .send(AgentWorkerReply::Response(Response::Hello {
+                        agent_version: env!("CARGO_PKG_VERSION").to_string(),
+                        protocol_version: PROTOCOL_VERSION,
+                        capabilities: nrm_protocol::CapabilitySet::v1_agent(),
+                    }));
+            }
+        });
+        read.agent.worker = Some(AgentWorker {
+            tx,
+            abort: Arc::new(TestAbortHandle::default()),
+            join: None,
+        });
+
+        let recovered = read.handle("remote_probe", json!({}), 0).unwrap();
+        assert_eq!(recovered["runtime"]["authority"]["state"], "ready");
+        assert_eq!(recovered["runtime"]["authority"]["revision"], 3);
     }
 
     #[test]
@@ -16686,8 +16895,110 @@ mod tests {
             assert_eq!(health["protocol_version"], PROTOCOL_VERSION);
             assert_eq!(health["expected_agent_version"], env!("CARGO_PKG_VERSION"));
             assert_eq!(health["expected_protocol_version"], PROTOCOL_VERSION);
-            assert_eq!(health["capabilities"], json!(capabilities));
+            assert!(health.get("capabilities").is_none());
+            assert_eq!(health["runtime"]["contract_version"], 2);
+            assert_eq!(health["runtime"]["authority"]["state"], "ready");
+            assert_eq!(health["runtime"]["authority"]["revision"], 1);
+            assert_eq!(
+                health["runtime"]["authority"]["capabilities"],
+                json!(capabilities)
+            );
+            assert_eq!(
+                health["runtime"]["authority"]["effective"],
+                json!({"process": false, "terminal": false, "watch": false})
+            );
         }
+
+        let expected_runtime = first["runtime"].clone();
+        let info = sidecar.workspace_info();
+        let status = sidecar.status().unwrap();
+        let notification = sidecar.remote_health_notification();
+        assert_eq!(info["runtime"], expected_runtime);
+        assert_eq!(status["runtime"], expected_runtime);
+        assert_eq!(notification.params["runtime"], expected_runtime);
+    }
+
+    #[test]
+    fn runtime_readiness_merges_lane_observations_and_revisions_semantically() {
+        let mut readiness = RemoteHealth::default();
+        let hello = test_negotiated_hello();
+
+        readiness.observe(RemoteHealth::connected(hello.clone()));
+        assert_eq!(readiness.state, RemoteHealthState::Connected);
+        assert_eq!(readiness.revision, 1);
+
+        readiness.observe(RemoteHealth::default());
+        assert_eq!(readiness.state, RemoteHealthState::Connected);
+        assert_eq!(readiness.revision, 1);
+
+        readiness.observe(RemoteHealth::connected(hello.clone()));
+        assert_eq!(readiness.revision, 1);
+
+        let mut changed = hello;
+        changed.capabilities.runtime_process_v1 = true;
+        changed.capabilities.runtime_pty_v1 = true;
+        readiness.observe(RemoteHealth::connected(changed.clone()));
+        assert_eq!(readiness.revision, 2);
+        assert_eq!(
+            readiness.runtime_value()["authority"]["effective"],
+            json!({"process": true, "terminal": true, "watch": false})
+        );
+
+        readiness.observe(RemoteHealth::unavailable(
+            None,
+            "transport failed".to_string(),
+            None,
+        ));
+        assert_eq!(readiness.revision, 3);
+        assert_eq!(
+            readiness.runtime_value()["authority"]["state"],
+            "unavailable"
+        );
+        assert!(readiness.runtime_value()["authority"]
+            .get("effective")
+            .is_none());
+
+        readiness.observe(RemoteHealth::connected(changed));
+        assert_eq!(readiness.revision, 4);
+        assert_eq!(readiness.runtime_value()["authority"]["state"], "ready");
+    }
+
+    #[test]
+    fn runtime_readiness_effective_values_follow_each_negotiated_capability() {
+        for (process, terminal, watch) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (true, true, true),
+        ] {
+            let mut hello = test_negotiated_hello();
+            hello.capabilities.runtime_process_v1 = process;
+            hello.capabilities.runtime_pty_v1 = terminal;
+            hello.capabilities.workspace_watch_v1 = watch;
+            let runtime = RemoteHealth::connected(hello).runtime_value();
+
+            assert_eq!(runtime["authority"]["effective"]["process"], process);
+            assert_eq!(runtime["authority"]["effective"]["terminal"], terminal);
+            assert_eq!(runtime["authority"]["effective"]["watch"], false);
+            assert_eq!(
+                runtime["authority"]["capabilities"]["workspace_watch_v1"],
+                watch
+            );
+        }
+    }
+
+    #[test]
+    fn install_results_copy_the_exact_remote_health_runtime_contract() {
+        let mut health = RemoteHealth::default();
+        health.observe(RemoteHealth::connected(test_negotiated_hello()));
+        let remote_health = health.to_value();
+        let mut result = json!({"status": "skipped", "remote_health": remote_health});
+
+        insert_runtime_from_remote_health(&mut result, &remote_health);
+
+        assert_eq!(result["runtime"], result["remote_health"]["runtime"]);
+        assert_eq!(result["runtime"]["contract_version"], 2);
+        assert_eq!(result["runtime"]["authority"]["state"], "ready");
     }
 
     #[test]
@@ -16730,6 +17041,14 @@ mod tests {
         assert_eq!(info["client_policy"]["write_owner"], "current_session");
         assert_eq!(info["remote_status"], "unchecked");
         assert_eq!(info["remote_health"]["remote_status"], "unchecked");
+        assert_eq!(info["runtime"]["contract_version"], 2);
+        assert_eq!(
+            info["runtime"]["support"],
+            json!({"process": true, "terminal": true, "watch": false})
+        );
+        assert_eq!(info["runtime"]["authority"]["state"], "unchecked");
+        assert_eq!(info["runtime"]["authority"]["revision"], 0);
+        assert_eq!(info["runtime"], info["remote_health"]["runtime"]);
         assert_eq!(info["registry_health"]["state"], "disabled");
         assert_eq!(info["registry_health"]["source"], "local");
         assert_eq!(info["capabilities"]["server_notifications"], true);
@@ -16738,6 +17057,10 @@ mod tests {
         assert_eq!(info["capabilities"]["agent_abort_scope"], "lane_worker");
         assert_eq!(info["capabilities"]["sidecar_socket_listener"], cfg!(unix));
         assert_eq!(info["capabilities"]["single_writer_sessions"], true);
+        assert!(info["capabilities"].get("runtime_ticket_v1").is_none());
+        assert!(info["capabilities"].get("runtime_process_v1").is_none());
+        assert!(info["capabilities"].get("runtime_pty_v1").is_none());
+        assert!(info["capabilities"].get("workspace_watch_v1").is_none());
         assert!(info["commands"]
             .as_array()
             .unwrap()
@@ -16807,6 +17130,9 @@ mod tests {
             .unwrap()
             .iter()
             .any(|method| method.as_str() == Some("workspace/remote_health")));
+
+        let status = sidecar.handle("status", json!({}), 0).unwrap();
+        assert_eq!(status["runtime"], info["runtime"]);
     }
 
     struct FailingRequestReader;
@@ -17780,6 +18106,15 @@ mod tests {
         assert_eq!(notification.params["remote_status"], "unavailable");
         assert_eq!(notification.params["remote_checked"], true);
         assert_eq!(notification.params["remote_available"], false);
+        assert_eq!(notification.params["runtime"]["contract_version"], 2);
+        assert_eq!(
+            notification.params["runtime"]["authority"]["state"],
+            "unavailable"
+        );
+        assert_eq!(notification.params["runtime"]["authority"]["revision"], 1);
+        assert!(notification.params["runtime"]["authority"]
+            .get("effective")
+            .is_none());
         assert_eq!(notification.params["registry_health"]["state"], "disabled");
         assert_eq!(notification.params["registry_health"]["source"], "local");
         assert!(notification.params["retry_after_ms"].as_u64().unwrap() > 0);

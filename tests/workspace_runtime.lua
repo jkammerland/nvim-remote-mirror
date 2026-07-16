@@ -32,6 +32,7 @@ end
 
 local function online_descriptor()
   return {
+    api_version = 2,
     provider = "nrm",
     workspace_id = "workspace-runtime",
     epoch = 4,
@@ -50,12 +51,19 @@ local function online_descriptor()
       editor = "/mirror/runtime/files",
       authority = "B:/repos/runtime",
     },
-    capabilities = {
-      runtime_process_v1 = true,
-      runtime_pty_v1 = true,
-      workspace_watch_v1 = true,
-    },
+    support = { process = true, terminal = true, watch = true },
     relative_path = "src/module/main.lua",
+  }
+end
+
+local function ready_status(name, supported)
+  return {
+    name = name,
+    state = supported == false and "unsupported" or "ready",
+    supported = supported ~= false,
+    enabled = true,
+    effective = supported ~= false,
+    revision = 1,
   }
 end
 
@@ -79,7 +87,7 @@ local function test_offline_resolution_and_paths()
 
   local context, err = workspace.resolve({ bufnr = bufnr })
   assert_eq(err, nil)
-  assert_eq(context.api_version, 1)
+  assert_eq(context.api_version, 2)
   assert_eq(context.provider, "nrm")
   assert_eq(context.workspace_id, "workspace-offline")
   assert_eq(context.epoch, 11)
@@ -89,6 +97,14 @@ local function test_offline_resolution_and_paths()
   assert_eq(context.authority.path_style, "windows")
   assert_eq(context.roots.editor, "/mirror/demo/files")
   assert_eq(context.roots.authority, "B:/repos/demo")
+  local offline_status = assert(context:capability_status("process"))
+  assert_eq(offline_status.state, "unchecked")
+  assert_eq(offline_status.revision, 0)
+  local prepare_err
+  assert(context:prepare("process", function(prepare_result_err)
+    prepare_err = prepare_result_err
+  end))
+  assert_eq(prepare_err.code, "workspace_offline")
 
   assert_throws(function()
     context.state = "online"
@@ -128,11 +144,11 @@ local function test_offline_resolution_and_paths()
   end, "invalid_path")
 
   local callback_err
-  local authorized, authorize_err = context:authorize("process", function(auth_err, granted)
+  local authorized = context:authorize("process", function(auth_err, granted)
     callback_err = auth_err
     assert_eq(granted, false)
   end)
-  assert_error(authorized, authorize_err, "workspace_offline")
+  assert_eq(authorized, true)
   assert_eq(callback_err.code, "workspace_offline")
 
   local plain = vim.api.nvim_create_buf(true, false)
@@ -175,7 +191,8 @@ local function test_offline_resolution_and_paths()
   local connected = assert(workspace.resolve({ path = "/mirror/demo/files/src/main.lua" }))
   assert_eq(connected.state, "online")
   assert_eq(connected.authority.os, "windows")
-  assert_eq(connected.capabilities.runtime_process_v1, true)
+  assert_eq(connected.capabilities, nil)
+  assert_eq(connected:supports("process"), true)
 
   nrm.client = old_client
   nrm.connection_status = old_status
@@ -201,6 +218,13 @@ local function test_process_contract()
     end,
     current_state = function()
       return state
+    end,
+    capability_status = function(_, capability)
+      return ready_status(capability)
+    end,
+    prepare_capability = function(_, _, callback)
+      callback(nil)
+      return true
     end,
     is_trusted = function(_, capability)
       assert_eq(capability == "process" or capability == "terminal", true)
@@ -590,7 +614,7 @@ end
 local function test_capabilities_and_provider_failures()
   workspace._reset_for_test()
   local descriptor = online_descriptor()
-  descriptor.capabilities.runtime_pty_v1 = false
+  descriptor.support.terminal = false
   local provider = {
     resolve = function()
       return descriptor
@@ -600,6 +624,13 @@ local function test_capabilities_and_provider_failures()
     end,
     current_state = function()
       return "online"
+    end,
+    capability_status = function(_, capability)
+      return ready_status(capability, descriptor.support[capability])
+    end,
+    prepare_capability = function(_, _, callback)
+      callback(nil)
+      return true
     end,
     is_trusted = function()
       return true
@@ -751,8 +782,46 @@ local function test_capabilities_and_provider_failures()
 
   workspace._set_backend({
     resolve = function()
+      return online_descriptor()
+    end,
+  })
+  assert_call_error(function()
+    return workspace.resolve()
+  end, "provider_error")
+
+  workspace._set_backend({
+    resolve = function()
       local invalid_descriptor = online_descriptor()
-      invalid_descriptor.capabilities = false
+      invalid_descriptor.support = false
+      return invalid_descriptor
+    end,
+  })
+  assert_call_error(function()
+    return workspace.resolve()
+  end, "invalid_provider_state")
+
+  workspace._set_backend({
+    resolve = function()
+      local invalid_descriptor = online_descriptor()
+      invalid_descriptor.api_version = nil
+      return invalid_descriptor
+    end,
+    capability_status = function(_, capability)
+      return ready_status(capability, true)
+    end,
+    prepare_capability = function(_, _, callback)
+      callback(nil)
+      return true
+    end,
+  })
+  assert_call_error(function()
+    return workspace.resolve()
+  end, "invalid_provider_state")
+
+  workspace._set_backend({
+    resolve = function()
+      local invalid_descriptor = online_descriptor()
+      invalid_descriptor.api_version = 1
       return invalid_descriptor
     end,
   })
@@ -770,7 +839,7 @@ end
 
 local ok, err = xpcall(main, debug.traceback)
 if not ok then
-  vim.api.nvim_err_writeln(err)
+  vim.api.nvim_err_writeln(tostring(err))
   vim.cmd("cquit")
 end
 vim.cmd("qa")

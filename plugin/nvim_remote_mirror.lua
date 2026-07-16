@@ -66,11 +66,15 @@ vim.api.nvim_create_user_command("RemoteUntrustWorkspace", function()
 end, {})
 
 vim.api.nvim_create_user_command("RemoteTerminal", function(opts)
-  local handle, err = nrm.open_terminal({
+  local accepted, err = nrm.open_terminal({
     command = opts.fargs,
     persistence = opts.bang and "detached" or "attached",
-  })
-  if not handle then
+  }, function(terminal_err)
+    if terminal_err then
+      vim.notify("RemoteTerminal: " .. tostring(terminal_err), vim.log.levels.ERROR)
+    end
+  end)
+  if not accepted then
     error(tostring(err))
   end
 end, {

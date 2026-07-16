@@ -53,6 +53,11 @@ local function main()
           remote_available = false,
           commands = { "workspace_info", "open" },
           notifications = { "workspace/remote_health" },
+          runtime = {
+            contract_version = 2,
+            support = { process = true, terminal = true, watch = false },
+            authority = { state = "unchecked", revision = 0 },
+          },
         },
       }),
       "",

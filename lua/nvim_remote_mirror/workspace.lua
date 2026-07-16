@@ -1,6 +1,6 @@
 local M = {}
 
-M.API_VERSION = 1
+M.API_VERSION = 2
 
 local MAX_OUTPUT_BYTES = 128 * 1024 * 1024
 local MAX_TIMEOUT_MS = 24 * 60 * 60 * 1000
@@ -485,7 +485,8 @@ local function active_identity(nrm)
     remote_root = optional_string(hello.remote_root),
     mirror_root = optional_string(hello.mirror_root),
     remote_host = type(hello.remote_host) == "table" and copy(hello.remote_host) or nil,
-    capabilities = hello.capabilities == nil and {} or copy(hello.capabilities),
+    runtime = type(client.runtime_readiness) == "table" and copy(client.runtime_readiness)
+      or (type(hello.runtime) == "table" and copy(hello.runtime) or nil),
     runtime_config = type(client.runtime_config) == "table" and copy(client.runtime_config) or nil,
   }
 end
@@ -567,13 +568,15 @@ local function descriptor_for_identity(nrm, identity)
       editor = source.files_root,
       authority = remote_root,
     },
-    capabilities = source.capabilities == nil and {} or source.capabilities,
+    support = type(source.runtime) == "table" and copy(source.runtime.support)
+      or { process = true, terminal = true, watch = false },
     relative_path = identity.relative_path,
     _target_arg = source.target_arg,
     _workspace_key = source.workspace_key,
     _ssh = target and target.destination or nil,
     _remote_host = type(source.remote_host) == "table" and copy(source.remote_host) or nil,
     _runtime_config = copy(source.runtime_config),
+    _runtime_contract_version = type(source.runtime) == "table" and source.runtime.contract_version or 2,
   }
 end
 
@@ -692,6 +695,32 @@ function default_backend.authorize(snapshot, capability, callback)
   return require("nvim_remote_mirror.runtime").authorize(snapshot, capability, callback)
 end
 
+function default_backend.capability_status(snapshot, capability)
+  local nrm = package.loaded["nvim_remote_mirror"] or require("nvim_remote_mirror")
+  local status, status_err = nrm._workspace_capability_status(snapshot, capability)
+  if status or snapshot.state ~= "offline" then
+    return status, status_err
+  end
+  local enabled = nrm.config.remote_runtime.enabled == true
+  local fallback = {
+    name = capability,
+    state = enabled and "unchecked" or "disabled",
+    supported = true,
+    enabled = enabled,
+    revision = 0,
+  }
+  if not enabled then
+    fallback.effective = false
+    fallback.reason = "disabled_by_policy"
+  end
+  return fallback
+end
+
+function default_backend.prepare_capability(snapshot, capability, callback)
+  local nrm = package.loaded["nvim_remote_mirror"] or require("nvim_remote_mirror")
+  return nrm._workspace_prepare_capability(snapshot, capability, callback)
+end
+
 function default_backend.job_spec(snapshot, request)
   return require("nvim_remote_mirror.runtime").job_spec(snapshot, request)
 end
@@ -710,6 +739,8 @@ local PROVIDER_METHODS = {
   "current_state",
   "is_trusted",
   "authorize",
+  "capability_status",
+  "prepare_capability",
   "job_spec",
   "spawn",
 }
@@ -737,6 +768,9 @@ end
 local function validate_descriptor(descriptor)
   if type(descriptor) ~= "table" then
     return nil, workspace_error("invalid_provider_state", "workspace provider returned no descriptor")
+  end
+  if descriptor.api_version ~= M.API_VERSION then
+    return nil, workspace_error("invalid_provider_state", "workspace provider did not return an API v2 descriptor")
   end
   local workspace_id = optional_string(descriptor.workspace_id)
   if not workspace_id then
@@ -780,16 +814,31 @@ local function validate_descriptor(descriptor)
   if path_style ~= "posix" and path_style ~= "windows" then
     return nil, workspace_error("invalid_provider_state", "workspace provider returned an invalid path style")
   end
-  if descriptor.capabilities ~= nil and type(descriptor.capabilities) ~= "table" then
-    return nil, workspace_error("invalid_provider_state", "workspace provider returned invalid capabilities")
+  if type(descriptor.support) ~= "table" then
+    return nil, workspace_error("invalid_provider_state", "workspace provider returned no v2 capability support map")
+  end
+  local support_ok, support_unknown = has_only_fields(descriptor.support, {
+    process = true,
+    terminal = true,
+    watch = true,
+  })
+  if not support_ok then
+    return nil,
+      workspace_error(
+        "invalid_provider_state",
+        "workspace provider returned unknown capability support: " .. support_unknown
+      )
+  end
+  for _, capability in ipairs({ "process", "terminal", "watch" }) do
+    if type(descriptor.support[capability]) ~= "boolean" then
+      return nil,
+        workspace_error("invalid_provider_state", "workspace provider returned invalid support for " .. capability)
+    end
   end
   descriptor = copy(descriptor)
   descriptor.authority.label = authority_label or descriptor.authority.id
   descriptor.api_version = M.API_VERSION
   descriptor.provider = optional_string(descriptor.provider) or "nrm"
-  if descriptor.capabilities == nil then
-    descriptor.capabilities = {}
-  end
   return descriptor
 end
 
@@ -879,24 +928,149 @@ local function trusted(record, capability)
   return false
 end
 
-local capability_keys = {
-  process = "runtime_process_v1",
-  terminal = "runtime_pty_v1",
-  watch = "workspace_watch_v1",
-}
+local capability_names = { process = true, terminal = true, watch = true }
 
-local function validate_capability(record, capability)
-  local key = capability_keys[capability]
-  if not key then
+local function validate_capability_name(capability)
+  if type(capability) ~= "string" or not capability_names[capability] then
     return nil, workspace_error("invalid_argument", "unknown workspace capability: " .. tostring(capability))
   end
-  if record.snapshot.capabilities[key] ~= true then
+  return true
+end
+
+local function normalized_capability_status(record, capability)
+  local valid, invalid_err = validate_capability_name(capability)
+  if not valid then
+    return nil, invalid_err
+  end
+  if record.snapshot.support[capability] ~= true then
+    return {
+      name = capability,
+      state = "unsupported",
+      supported = false,
+      enabled = true,
+      effective = false,
+      revision = 0,
+      reason = "unsupported",
+    }
+  end
+  local provider = record.provider
+  if type(provider.capability_status) ~= "function" then
+    return nil, workspace_error("provider_error", "workspace provider has no v2 capability status method")
+  end
+  local ok, status, status_err = pcall(provider.capability_status, copy(record.snapshot), capability)
+  if not ok then
+    return nil, normalize_provider_error(status, "workspace provider failed to report capability status")
+  end
+  if status == nil then
+    return nil, normalize_provider_error(status_err, "workspace provider returned no capability status")
+  end
+  if type(status) ~= "table" then
+    return nil, workspace_error("provider_error", "workspace provider returned an invalid capability status")
+  end
+  local fields_ok, unknown = has_only_fields(status, {
+    name = true,
+    state = true,
+    supported = true,
+    enabled = true,
+    effective = true,
+    revision = true,
+    reason = true,
+    retry_after_ms = true,
+  })
+  local states = {
+    unsupported = true,
+    disabled = true,
+    unchecked = true,
+    checking = true,
+    ready = true,
+    unavailable = true,
+  }
+  if
+    not fields_ok
+    or status.name ~= capability
+    or not states[status.state]
+    or type(status.supported) ~= "boolean"
+    or type(status.enabled) ~= "boolean"
+    or (status.effective ~= nil and type(status.effective) ~= "boolean")
+    or not is_integer(status.revision)
+    or status.revision < 0
+    or (status.reason ~= nil and (not optional_string(status.reason) or #status.reason > MAX_ERROR_MESSAGE_BYTES or contains_control(
+      status.reason
+    ) or not valid_utf8(status.reason)))
+    or (status.retry_after_ms ~= nil and (not is_integer(status.retry_after_ms) or status.retry_after_ms < 0 or status.retry_after_ms > MAX_TIMEOUT_MS))
+    or status.supported ~= true
+    or status.state == "unsupported"
+    or (status.state == "disabled" and (status.enabled ~= false or status.effective ~= false))
+    or (status.enabled == false and status.state ~= "disabled")
+    or (status.state == "ready" and status.effective ~= true)
+    or ((status.state == "unchecked" or status.state == "checking") and status.effective ~= nil)
+    or (status.state == "unavailable" and status.effective ~= nil and status.effective ~= false)
+  then
     return nil,
-      workspace_error("unsupported", "workspace provider does not support " .. capability, {
-        capability = key,
+      workspace_error("provider_error", "workspace provider returned an invalid capability status", {
+        field = unknown,
       })
   end
-  return true
+  if status.supported ~= true or record.snapshot.support[capability] ~= true then
+    status.state = "unsupported"
+    status.supported = false
+    status.effective = false
+  elseif status.enabled ~= true then
+    status.state = "disabled"
+    status.effective = false
+  elseif status.state == "ready" and status.effective ~= true then
+    status.state = "unavailable"
+    status.effective = false
+    status.reason = status.reason or "not_negotiated"
+  elseif status.state == "unsupported" or status.state == "disabled" then
+    status.effective = false
+  -- Preserve unavailable/false when a ready authority explicitly did not
+  -- negotiate this capability; other non-ready states remain indeterminate.
+  elseif status.state ~= "ready" and not (status.state == "unavailable" and status.effective == false) then
+    status.effective = nil
+  end
+  return copy(status)
+end
+
+local function readiness_error(status)
+  local details = {
+    capability = status.name,
+    state = status.state,
+    revision = status.revision,
+    reason = status.reason,
+    retry_after_ms = status.retry_after_ms,
+  }
+  if status.state == "unsupported" then
+    return workspace_error("unsupported", "workspace provider does not support " .. status.name, details)
+  end
+  if status.state == "disabled" then
+    return workspace_error("capability_disabled", "workspace capability is disabled: " .. status.name, details)
+  end
+  if status.state == "unavailable" and status.effective == false then
+    return workspace_error(
+      "capability_unavailable",
+      "workspace capability was not negotiated: " .. status.name,
+      details
+    )
+  end
+  return workspace_error("capability_not_ready", "workspace capability is not ready: " .. status.name, details)
+end
+
+function Context:supports(capability)
+  local valid = validate_capability_name(capability)
+  if not valid then
+    return false
+  end
+  return record_for(self).snapshot.support[capability] == true
+end
+
+function Context:capability_status(capability)
+  local record = record_for(self)
+  local ok, err = ensure_current(record)
+  if not ok then
+    return nil, err
+  end
+  return normalized_capability_status(record, capability)
 end
 
 function Context:is_current()
@@ -904,43 +1078,103 @@ function Context:is_current()
   return ok == true, err
 end
 
-function Context:authorize(capability, callback)
-  local record = record_for(self)
-  if type(callback) ~= "function" then
-    return nil, workspace_error("invalid_argument", "authorize requires a callback")
+local function safely_deliver(label, callback, ...)
+  local callback_ok, callback_failure = pcall(callback, ...)
+  if not callback_ok then
+    vim.schedule(function()
+      vim.notify("workspace " .. label .. " callback failed: " .. tostring(callback_failure), vim.log.levels.ERROR)
+    end)
   end
-  local function deliver(callback_err, granted)
-    local callback_ok, callback_failure = pcall(callback, callback_err, granted)
-    if not callback_ok then
-      vim.schedule(function()
-        vim.notify("workspace authorization callback failed: " .. tostring(callback_failure), vim.log.levels.ERROR)
-      end)
+end
+
+local function prepare_readiness(record, capability, callback)
+  local online, online_err = ensure_online(record)
+  if not online then
+    callback(online_err)
+    return
+  end
+  local status, status_err = normalized_capability_status(record, capability)
+  if not status then
+    callback(status_err)
+    return
+  end
+  if status.state == "unsupported" or status.state == "disabled" then
+    callback(readiness_error(status))
+    return
+  end
+  if status.state == "ready" and status.effective == true then
+    callback(nil, status)
+    return
+  end
+  local provider = record.provider
+  if type(provider.prepare_capability) ~= "function" then
+    callback(workspace_error("provider_error", "workspace provider has no v2 capability preparation method"))
+    return
+  end
+  local provider_called = false
+  local function finish(provider_err)
+    if provider_called then
+      return
     end
+    provider_called = true
+    if provider_err ~= nil then
+      callback(normalize_provider_error(provider_err, "workspace capability preparation failed"))
+      return
+    end
+    local current, current_err = ensure_online(record)
+    if not current then
+      callback(current_err)
+      return
+    end
+    local prepared_status, prepared_err = normalized_capability_status(record, capability)
+    if not prepared_status then
+      callback(prepared_err)
+      return
+    end
+    if prepared_status.state ~= "ready" or prepared_status.effective ~= true then
+      callback(readiness_error(prepared_status))
+      return
+    end
+    callback(nil, prepared_status)
   end
-  local ok, err = ensure_online(record)
-  if not ok then
-    deliver(err, false)
-    return nil, err
+  local invoke_ok, accepted, accept_err = pcall(provider.prepare_capability, copy(record.snapshot), capability, finish)
+  if not invoke_ok then
+    finish(normalize_provider_error(accepted, "workspace capability preparation failed"))
+  elseif accepted ~= true then
+    finish(normalize_provider_error(accept_err, "workspace provider did not accept capability preparation"))
   end
-  ok, err = validate_capability(record, capability)
-  if not ok then
-    deliver(err, false)
-    return nil, err
-  end
+end
+
+local function authorize_ready(record, capability, status, callback)
   local is_trusted, trust_err = trusted(record, capability)
   if trust_err then
-    deliver(trust_err, false)
-    return nil, trust_err
+    callback(trust_err, false)
+    return
   end
   if is_trusted then
-    deliver(nil, true)
-    return true
+    local still_online, online_err = ensure_online(record)
+    if not still_online then
+      callback(online_err, false)
+      return
+    end
+    local final_status, final_err = normalized_capability_status(record, capability)
+    if not final_status then
+      callback(final_err, false)
+    elseif
+      final_status.state ~= "ready"
+      or final_status.effective ~= true
+      or final_status.revision ~= status.revision
+    then
+      callback(workspace_error("capability_not_ready", "workspace readiness changed during trust verification"), false)
+    else
+      callback(nil, true, final_status)
+    end
+    return
   end
   local provider = record.provider
   if type(provider.authorize) ~= "function" then
-    err = workspace_error("workspace_untrusted", "remote workspace is not trusted for process execution")
-    deliver(err, false)
-    return nil, err
+    callback(workspace_error("workspace_untrusted", "remote workspace is not trusted for process execution"), false)
+    return
   end
   local called = false
   local function finish(auth_err, granted)
@@ -948,25 +1182,99 @@ function Context:authorize(capability, callback)
       return
     end
     called = true
-    local still_current, stale_err = ensure_current(record)
-    if not still_current then
-      deliver(stale_err, false)
+    local still_online, online_err = ensure_online(record)
+    if not still_online then
+      callback(online_err, false)
       return
     end
     if auth_err then
-      deliver(normalize_provider_error(auth_err, "workspace authorization provider failed"), false)
+      callback(normalize_provider_error(auth_err, "workspace authorization provider failed"), false)
       return
     end
     if granted ~= true then
-      deliver(workspace_error("workspace_untrusted", "remote workspace authorization was denied"), false)
+      callback(workspace_error("workspace_untrusted", "remote workspace authorization was denied"), false)
       return
     end
-    deliver(nil, true)
+    local final_status, final_err = normalized_capability_status(record, capability)
+    if not final_status then
+      callback(final_err, false)
+    elseif
+      final_status.state ~= "ready"
+      or final_status.effective ~= true
+      or final_status.revision ~= status.revision
+    then
+      callback(workspace_error("capability_not_ready", "workspace readiness changed during authorization"), false)
+    else
+      callback(nil, true, final_status)
+    end
   end
-  local invoke_ok, invoke_err = pcall(provider.authorize, copy(record.snapshot), capability, finish)
+  local invoke_ok, accepted, accept_err = pcall(provider.authorize, copy(record.snapshot), capability, finish)
   if not invoke_ok then
-    finish(normalize_provider_error(invoke_err, "workspace authorization provider failed"))
+    finish(normalize_provider_error(accepted, "workspace authorization provider failed"))
+  elseif accepted ~= true then
+    finish(normalize_provider_error(accept_err, "workspace provider did not accept authorization"))
   end
+end
+
+function Context:authorize(capability, callback)
+  local record = record_for(self)
+  local valid, invalid_err = validate_capability_name(capability)
+  if not valid then
+    return nil, invalid_err
+  end
+  if type(callback) ~= "function" then
+    return nil, workspace_error("invalid_argument", "authorize requires a callback")
+  end
+  local delivered = false
+  local function deliver(err, granted)
+    if delivered then
+      return
+    end
+    delivered = true
+    safely_deliver("authorization", callback, err, granted == true)
+  end
+  prepare_readiness(record, capability, function(readiness_err, status)
+    if readiness_err then
+      deliver(readiness_err, false)
+      return
+    end
+    authorize_ready(record, capability, status, deliver)
+  end)
+  return true
+end
+
+local new_prepared
+
+function Context:prepare(capability, callback)
+  local record = record_for(self)
+  local valid, invalid_err = validate_capability_name(capability)
+  if not valid then
+    return nil, invalid_err
+  end
+  if type(callback) ~= "function" then
+    return nil, workspace_error("invalid_argument", "prepare requires a callback")
+  end
+  local delivered = false
+  local function deliver(err, prepared)
+    if delivered then
+      return
+    end
+    delivered = true
+    safely_deliver("preparation", callback, err, prepared)
+  end
+  prepare_readiness(record, capability, function(readiness_err, status)
+    if readiness_err then
+      deliver(readiness_err)
+      return
+    end
+    authorize_ready(record, capability, status, function(auth_err, granted, final_status)
+      if auth_err or granted ~= true then
+        deliver(auth_err or workspace_error("workspace_untrusted", "remote workspace authorization was denied"))
+        return
+      end
+      deliver(nil, new_prepared(self, capability, final_status.revision))
+    end)
+  end)
   return true
 end
 
@@ -1380,9 +1688,12 @@ local function normalize_process_spec(record, opts)
   }
 end
 
-local function prepare_process(record, opts)
+local function prepare_process(record, opts, preparation)
   local ok, err = ensure_online(record)
   if not ok then
+    if preparation and err.code == "stale_context" then
+      return nil, workspace_error("stale_preparation", "prepared workspace runtime belongs to an older epoch")
+    end
     return nil, err
   end
   local request, request_err = normalize_process_spec(record, opts)
@@ -1390,9 +1701,31 @@ local function prepare_process(record, opts)
     return nil, request_err
   end
   local capability = request.stdio == "pty" and "terminal" or "process"
-  ok, err = validate_capability(record, capability)
-  if not ok then
-    return nil, err
+  local status, status_err = normalized_capability_status(record, capability)
+  if not status then
+    return nil, status_err
+  end
+  if preparation then
+    if capability ~= preparation.capability then
+      return nil,
+        workspace_error("unsupported", "prepared runtime is scoped to " .. preparation.capability, {
+          requested = capability,
+        })
+    end
+    if status.state == "unsupported" or status.state == "disabled" then
+      return nil, readiness_error(status)
+    end
+    if status.state ~= "ready" or status.effective ~= true or status.revision ~= preparation.revision then
+      return nil,
+        workspace_error("stale_preparation", "workspace capability readiness changed; prepare it again", {
+          capability = capability,
+          prepared_revision = preparation.revision,
+          current_revision = status.revision,
+          state = status.state,
+        })
+    end
+  elseif status.state ~= "unchecked" and not (status.state == "ready" and status.effective == true) then
+    return nil, readiness_error(status)
   end
   local is_trusted, trust_err = trusted(record, capability)
   if trust_err then
@@ -1401,7 +1734,7 @@ local function prepare_process(record, opts)
   if not is_trusted then
     return nil, workspace_error("workspace_untrusted", "remote workspace is not trusted for process execution")
   end
-  return request
+  return request, capability
 end
 
 local function canonical_bridge_command(argv)
@@ -1486,9 +1819,8 @@ local function validate_bridge_spec(spec)
   return result
 end
 
-function Context:job_spec(opts)
-  local record = record_for(self)
-  local request, request_err = prepare_process(record, opts)
+local function job_spec(record, opts, preparation)
+  local request, request_err = prepare_process(record, opts, preparation)
   if not request then
     return nil, request_err
   end
@@ -1504,6 +1836,10 @@ function Context:job_spec(opts)
     return nil, normalize_provider_error(spec_err, "workspace process provider returned no job specification")
   end
   return validate_bridge_spec(spec)
+end
+
+function Context:job_spec(opts)
+  return job_spec(record_for(self), opts)
 end
 
 local function validate_process_handle(handle, request)
@@ -1587,13 +1923,12 @@ local function normalize_handlers(handlers)
   return result
 end
 
-function Context:spawn(opts, handlers)
-  local record = record_for(self)
+local function spawn(record, opts, handlers, preparation)
   local normalized_handlers, handlers_err = normalize_handlers(handlers)
   if not normalized_handlers then
     return nil, handlers_err
   end
-  local request, request_err = prepare_process(record, opts)
+  local request, request_err = prepare_process(record, opts, preparation)
   if not request then
     return nil, request_err
   end
@@ -1611,6 +1946,10 @@ function Context:spawn(opts, handlers)
   return validate_process_handle(handle, request)
 end
 
+function Context:spawn(opts, handlers)
+  return spawn(record_for(self), opts, handlers)
+end
+
 function Context:open_pty(opts, handlers)
   if opts == nil then
     opts = {}
@@ -1621,6 +1960,72 @@ function Context:open_pty(opts, handlers)
   opts = copy(opts)
   opts.stdio = "pty"
   return self:spawn(opts, handlers)
+end
+
+local Prepared = {}
+local prepared_records = setmetatable({}, { __mode = "k" })
+
+local function prepared_record(prepared)
+  local value = prepared_records[prepared]
+  if not value then
+    error("invalid prepared workspace runtime", 2)
+  end
+  return value
+end
+
+function Prepared:job_spec(opts)
+  local prepared = prepared_record(self)
+  return job_spec(prepared.record, opts, prepared)
+end
+
+function Prepared:spawn(opts, handlers)
+  local prepared = prepared_record(self)
+  return spawn(prepared.record, opts, handlers, prepared)
+end
+
+function Prepared:open_pty(opts, handlers)
+  if opts == nil then
+    opts = {}
+  end
+  if type(opts) ~= "table" then
+    return nil, workspace_error("invalid_process_spec", "process options must be a table")
+  end
+  opts = copy(opts)
+  opts.stdio = "pty"
+  return self:spawn(opts, handlers)
+end
+
+local PREPARED_MT = {
+  __index = function(prepared, key)
+    local method = Prepared[key]
+    if method then
+      return method
+    end
+    local record = prepared_records[prepared]
+    return record and record.public[key] or nil
+  end,
+  __newindex = function()
+    error("prepared workspace runtimes are immutable", 2)
+  end,
+  __metatable = "nrm prepared workspace runtime",
+}
+
+new_prepared = function(context, capability, revision)
+  local prepared = setmetatable({}, PREPARED_MT)
+  prepared_records[prepared] = {
+    context = context,
+    record = record_for(context),
+    capability = capability,
+    revision = revision,
+    public = {
+      capability = capability,
+      workspace = context,
+      workspace_id = record_for(context).snapshot.workspace_id,
+      epoch = record_for(context).snapshot.epoch,
+      revision = revision,
+    },
+  }
+  return prepared
 end
 
 local CONTEXT_MT = {
@@ -1688,6 +2093,11 @@ function M.resolve(query)
   if not descriptor then
     return nil, resolve_err
   end
+  for _, name in ipairs({ "capability_status", "prepare_capability" }) do
+    if type(provider[name]) ~= "function" then
+      return nil, workspace_error("provider_error", "workspace provider is missing required v2 method: " .. name)
+    end
+  end
   local context = setmetatable({}, CONTEXT_MT)
   context_records[context] = {
     provider = provider,
@@ -1701,7 +2111,6 @@ function M.resolve(query)
       mode = descriptor.mode,
       authority = copy(descriptor.authority),
       roots = copy(descriptor.roots),
-      capabilities = copy(descriptor.capabilities),
     },
   }
   return context
@@ -1740,6 +2149,8 @@ function M._runtime_trust_snapshot(context)
       authority = snapshot.roots.authority,
     },
     _runtime_config = copy(snapshot._runtime_config),
+    support = copy(snapshot.support),
+    _runtime_contract_version = snapshot._runtime_contract_version,
   }
 end
 

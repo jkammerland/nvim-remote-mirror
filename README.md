@@ -27,7 +27,7 @@ but it is not a polished replacement for SSHFS or VS Code Remote yet.
 | Remote agent health/install/update | Signed automatic repair on SSH connect when opted into a registry; explicit commands retained |
 | Remote LSP proxy | Basic |
 | Remote git status/diff/blame | Basic |
-| Workspace process runtime | Attached pipe processes and PTYs on local/Linux/macOS/Windows hosts |
+| Workspace process runtime | Attached pipe processes and PTYs; strict readiness API-v2 migration is WIP |
 | Detached terminals, workspace watch, DAP | Not built |
 | Non-SSH transports | Not built |
 
@@ -241,8 +241,10 @@ enters terminal-input mode immediately):
 :RemoteTerminal
 ```
 
-The first runtime request prompts to trust the workspace by default. Connect
-itself never runs an arbitrary workspace command or grants that trust.
+The first runtime preparation prompts to trust the workspace by default.
+`:RemoteTerminal` may therefore complete immediately when readiness and trust
+are cached, or later after the prompt. Connect itself never runs an arbitrary
+workspace command or grants that trust.
 
 Use the UI commands for normal work:
 
@@ -369,21 +371,28 @@ Mirror files live under the sidecar state directory, typically below
 `~/.local/state/nvim-remote-mirror` on Linux when `state_dir` is unset. Open
 `:RemoteWorkspace` to inspect the active mirror root and files root.
 
-## Workspace Runtime API
+## Workspace Runtime Readiness API v2
 
-The provider-neutral Lua API resolves an immutable workspace context, maps
-editor paths/URIs to authority paths/URIs, authorizes execution, and provides
-three integration surfaces:
+> [!IMPORTANT]
+> API v2 is the breaking WIP migration contract. Its
+> `supports()`/`capability_status()`/`prepare()` surface is strict and atomic;
+> there is no API-v1 compatibility layer or fallback after a v2 error.
+
+The provider-neutral Lua API resolves an immutable workspace context and keeps
+static provider support separate from dynamic authority readiness and explicit
+trust. Plugins use `supports()` and `capability_status()` for local UI
+decisions, then call `prepare()` with a capability callback before execution:
 
 ```lua
 local context = assert(require("nvim_remote_mirror").workspace({ bufnr = 0 }))
 
-context:authorize("process", function(err, granted)
-  if err or not granted then
+context:prepare("process", function(err, prepared)
+  if err then
+    vim.notify(err.message, vim.log.levels.ERROR)
     return
   end
 
-  local handle = assert(context:spawn({
+  local handle = assert(prepared:spawn({
     command = { argv = { "cargo", "check" } },
     cwd = { space = "workspace", path = "" },
   }))
@@ -391,20 +400,48 @@ context:authorize("process", function(err, granted)
 end)
 ```
 
-Use `context:job_spec()` when another plugin owns the local job lifecycle,
-including argv- or string-only terminal APIs, and `context:open_pty()` for a
-managed PTY. Arguments and environment values remain structured until the
-private sidecar bridge; they are never interpolated into the SSH command.
-Arguments are control-free UTF-8. Pipe output defaults to a 4 MiB cumulative
-limit; PTYs are live backpressured streams and reject that pipe-only option.
+Use `prepared:job_spec()` when another plugin owns the local job lifecycle,
+including argv- or string-only terminal APIs, and `prepared:open_pty()` on a
+prepared terminal facade for a managed PTY. A prepared facade is bound to one
+workspace epoch, readiness revision, and capability; using it for another
+capability returns `unsupported`, and later epoch/readiness changes return
+`stale_preparation`.
+
+Direct context execution remains as a strict v2 late-check path: it is allowed
+only for an `unchecked` capability or one known `ready` and effective, after
+existing trust is verified. Checking, unavailable, disabled, unsupported, or
+explicitly unnegotiated states fail with stable capability errors. The prepared
+facade is recommended because it binds readiness and authorization to one
+execution receiver.
+
+`prepare()` may perform a read-only agent probe and persist an explicit local
+trust decision. It never installs or updates a remote executable. Signed
+automatic repair remains connect-only and requires the configured registry and
+`remote_agent_auto_install = true`; explicit install/update commands remain
+separate. Every accepted prepare callback runs exactly once, either inline when
+readiness and trust are cached or later after a probe or prompt. Initialize
+callback-visible state before calling `prepare()`.
+
+`require("nvim_remote_mirror").open_terminal(opts, callback)` is likewise
+callback-based in v2. An accepted callback runs exactly once with a ready split
+and PTY or a typed failure; it may run inline or later. `:RemoteTerminal` uses
+that path and reports failures through notification.
+
+Arguments and environment values remain structured until the private sidecar
+bridge; they are never interpolated into the SSH command. Arguments are
+control-free UTF-8. Pipe output defaults to a 4 MiB cumulative limit; PTYs are
+live backpressured streams and reject that pipe-only option.
 
 Contexts become stale across reconnect epochs. Integrations can resolve again
 on `NrmWorkspaceConnected`, `NrmWorkspaceDisconnected`, and
-`NrmWorkspaceEpochChanged` `User` events. Only attached execution is available
+`NrmWorkspaceEpochChanged` `User` events. A separate
+`NrmWorkspaceReadinessChanged` event invalidates prepared facades without
+changing workspace identity or epoch. Only attached execution is available
 today: detached/reconnectable sessions and workspace watching are not
-advertised. See [Workspace Runtime API v1](docs/workspace-runtime.md) for the
-complete contract and a ToggleTerm example that needs no plugin-specific nrm
-patch.
+advertised. See
+[Workspace Runtime Readiness API v2](docs/workspace-runtime.md) for the complete
+contract, migration table, callback rules, and a ToggleTerm example that needs
+no plugin-specific nrm patch.
 
 ## Troubleshooting
 

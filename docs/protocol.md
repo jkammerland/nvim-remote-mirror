@@ -20,7 +20,7 @@ Response:
 Notification:
 
 ```json
-{"method":"workspace/remote_health","params":{"remote_status":"unavailable"}}
+{"method":"workspace/remote_health","params":{"remote_status":"unavailable","runtime":{"contract_version":2,"support":{"process":true,"terminal":true,"watch":false},"authority":{"state":"unavailable","revision":1,"reason":"ssh_failed"}}}}
 ```
 
 Notifications do not have request IDs. Clients may ignore unknown
@@ -31,6 +31,95 @@ notifications.
 `workspace_info` is local-first. It returns mirror paths, workspace identity,
 transport metadata, command names, notification names, capabilities, and the
 last known remote health. It must not block on SSH.
+
+For Workspace Runtime Readiness API v2, the top-level `capabilities` object is
+control-plane feature negotiation, not runtime authority readiness. The
+normative runtime shape is separate and strict:
+
+```json
+{
+  "runtime": {
+    "contract_version": 2,
+    "support": {
+      "process": true,
+      "terminal": true,
+      "watch": false
+    },
+    "authority": {
+      "state": "unchecked",
+      "revision": 0
+    }
+  }
+}
+```
+
+`support` is static for the lifetime of the provider. Wire authority state is
+one of `unchecked`, `ready`, or `unavailable`; `checking` is a client-local
+status and event state while an asynchronous probe is in flight. An unsupported
+capability is derived from `support`, not represented as an authority failure.
+A ready authority adds the exact negotiated agent identity, raw wire
+capabilities, and provider-neutral effective capabilities:
+
+```json
+{
+  "runtime": {
+    "contract_version": 2,
+    "support": { "process": true, "terminal": true, "watch": false },
+    "authority": {
+      "state": "ready",
+      "revision": 1,
+      "agent_version": "0.1.0",
+      "protocol_version": 8,
+      "capabilities": {
+        "scan": true,
+        "read": true,
+        "write_cas": true,
+        "checksum": true,
+        "grep": true,
+        "lsp_proxy": true,
+        "batch_read": true,
+        "batch_validate": true,
+        "chunked_write": true,
+        "request_ids": true,
+        "cancellation": true,
+        "streaming": true,
+        "multiplexing": true,
+        "git": true,
+        "runtime_process_v1": true,
+        "runtime_pty_v1": true,
+        "workspace_watch_v1": false
+      },
+      "effective": { "process": true, "terminal": true, "watch": false }
+    }
+  }
+}
+```
+
+`unchecked` and `unavailable` authority objects omit `agent_version`,
+`protocol_version`, `capabilities`, and `effective`; they never publish these
+fields as `null`. An unavailable object may add a bounded diagnostic `reason`
+and advisory `retry_after_ms`. Clients must not reuse last-known booleans as
+effective readiness. `revision` is a non-negative monotonic counter within one
+workspace epoch and changes when authority state, negotiated identity or
+capabilities, or failure information changes. A retry countdown alone does not
+advance it.
+
+`workspace_info` normally reports `unchecked` because it does no SSH work. An
+active `remote_health` response and every `workspace/remote_health`
+notification include the same complete `runtime` object. A client must apply
+the object atomically, ignore a lower revision in the same epoch, and treat an
+epoch change as a new revision domain. A v2 client rejects a missing runtime
+object, a `contract_version` other than `2`, unknown fields, incomplete ready
+authority data, or negotiated effective support that contradicts `support`.
+It does not silently reinterpret a malformed v2 peer as API v1.
+
+After applying a semantically changed v2 runtime object, the Neovim client
+emits `User NrmWorkspaceReadinessChanged`. Its normal workspace fields are
+`epoch`, `workspace_key`, `target`, and `state`; the event adds
+`readiness_state`, `readiness_revision`, and `effective`. `effective` is absent
+unless the authority has a negotiated capability set. The event is a hint;
+plugins call `capability_status()` or `prepare()` for authoritative behavior.
+It never advances the reconnect epoch by itself.
 
 Clients that understand command metadata should check
 `capabilities.remote_agent_bootstrap == true` before presenting remote agent
@@ -72,9 +161,11 @@ unavailable, and unclassified failures.
 An automatic result echoes `automatic = true` and includes `remote_health`.
 `updated` results, and `skipped` results that claim `agent_status = "ok"`, are
 accepted as ready only when health is checked and available and its actual agent
-and protocol versions exactly match their expected values. Every skipped result
-must include a non-empty reason. Other malformed or inconsistent results leave
-the connection degraded instead of being treated as successful.
+and protocol versions exactly match their expected values, and the complete v2
+runtime observation is valid and `ready`. Applying that observation immediately
+seeds plugin readiness without a second probe. Every skipped result must include
+a non-empty reason. A missing/malformed runtime object or any other inconsistent
+result leaves the connection degraded instead of being treated as successful.
 
 During replacement, the sidecar drains queued remote work, preempts both agent
 lanes, and waits for their workers to exit. It then transfers the candidate to
@@ -223,10 +314,12 @@ Future transports must preserve:
 ## Workspace Runtime Boundary
 
 Workspace runtime execution is intentionally separate from the ordinary
-newline-JSON sidecar server and serial filesystem lanes. Lua workspace API v1
-validates the structured process specification and explicit workspace trust,
-then asks a short-lived local sidecar command to publish a private single-use
-ticket. The consumer starts only:
+newline-JSON sidecar server and serial filesystem lanes. Workspace Runtime
+Readiness API v2 uses a read-only provider probe and explicit workspace trust
+to return a capability-scoped prepared facade. That facade is the recommended
+revision-bound way to ask a short-lived local sidecar command to publish a
+private single-use ticket. Retained direct context calls use the same ticket
+path after their v2 readiness and trust checks. The consumer starts only:
 
 ```text
 nrm-sidecar runtime-proxy [--state-dir <private-state>] --ticket <opaque-id>
@@ -240,7 +333,7 @@ package/protocol/capability Hello, and relays framed runtime messages and raw
 stdio. Remote user values are never interpolated into an SSH command.
 
 Runtime frames are length-prefixed and bounded separately from ordinary agent
-RPC. API-v1 attached execution uses `ClientHello`/`ServerHello`,
+RPC. API-v2 attached execution uses `ClientHello`/`ServerHello`,
 `StartProcess`, `ProcessStarted`, offset-checked `Input`/`Output` plus
 acknowledgements, `CloseInput`, `Resize`, `Signal`, and `Exited`. Pipe output
 keeps stdout and stderr distinct; PTY output uses one PTY stream. The sidecar
@@ -250,10 +343,9 @@ exit, waits up to two seconds for worker completion and final acknowledgements.
 A missed drain deadline produces a typed runtime error rather than a successful
 exit with silently truncated output. The sidecar's bounded local-output pump
 keeps signal/control polling independent from a stalled terminal consumer.
-The sidecar
-publishes a bounded private structured result so managed Lua `on_exit`
-callbacks can distinguish the local bridge status from the authority process
-status.
+The sidecar publishes a bounded private structured result so managed Lua
+`on_exit` callbacks can distinguish the local bridge status from the authority
+process status.
 
 The runtime wire and sidecar bridge preserve raw stdio bytes. The convenience
 Lua `Context:spawn()` callbacks deliberately inherit Neovim's line/list job
@@ -265,14 +357,24 @@ Capabilities fail closed. Compatible agents currently advertise only
 PTY execution. The protocol reserves detach/attach and workspace-watch message
 types, but the agent returns `PersistenceUnavailable` for detachment and does
 not advertise `workspace_watch_v1` until the persistent broker and watcher
-lifecycle exist. Clients must check advertised capability bits rather than
-inferring support from protocol types.
+lifecycle exist. The sidecar translates those wire bits into the v2 runtime
+readiness object. Plugins must use `supports()`, `capability_status()`, and
+`prepare()`; they must not infer authority readiness from protocol types or the
+sidecar's top-level control-plane capabilities.
+
+Preparation may execute a read-only Hello probe and may persist an explicitly
+approved grant in private local trust state. It never invokes agent
+install/update. Automatic signed repair is accepted only during connect when
+the existing registry and automatic-install policy permits it. The runtime
+proxy repeats the exact package/protocol/capability handshake after preparation
+and immediately before `StartProcess`; preparation is not a replacement for
+the definitive wire check.
 
 Runtime trust/ticket/control/result files are private local state with bounded
 sizes, entry counts, ages, atomic publication/consumption, and fail-closed
 permissions. Control messages carry only the opaque ticket identity, nonce,
 and typed signal; process argv and environment are not repeated in signal
-helper command lines. See [Workspace Runtime API v1](workspace-runtime.md) for
+helper command lines. See [Workspace Runtime Readiness API v2](workspace-runtime.md) for
 the editor-facing contract.
 
 ## Compatibility

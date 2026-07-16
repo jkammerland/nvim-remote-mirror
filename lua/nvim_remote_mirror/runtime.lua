@@ -420,8 +420,13 @@ local function runtime_ticket(snapshot, request)
   if not runtime then
     return nil, enabled_err
   end
-  if type(snapshot.capabilities) ~= "table" or snapshot.capabilities.runtime_ticket_v1 ~= true then
-    return nil, runtime_error("unsupported", "connected sidecar does not support private runtime tickets")
+  local capability = request.stdio == "pty" and "terminal" or "process"
+  if
+    snapshot._runtime_contract_version ~= 2
+    or type(snapshot.support) ~= "table"
+    or snapshot.support[capability] ~= true
+  then
+    return nil, runtime_error("unsupported", "connected sidecar does not support the v2 private runtime bridge")
   end
   local workspace_key = optional_string(snapshot._workspace_key) or optional_string(snapshot.workspace_id)
   if not workspace_key or #workspace_key ~= 24 or not workspace_key:match("^[0-9a-f]+$") then

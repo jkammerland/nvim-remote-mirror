@@ -37,7 +37,41 @@ local function assert_setup_error(options, needle)
   assert_contains(err, needle)
 end
 
+local function agent_capabilities()
+  return {
+    scan = true,
+    read = true,
+    write_cas = true,
+    checksum = true,
+    grep = true,
+    lsp_proxy = false,
+    batch_read = true,
+    batch_validate = true,
+    chunked_write = true,
+    request_ids = true,
+    cancellation = false,
+    streaming = false,
+    multiplexing = false,
+    git = true,
+    runtime_process_v1 = true,
+    runtime_pty_v1 = true,
+    workspace_watch_v1 = false,
+  }
+end
+
 local function fake_client(root, workspace_key)
+  local readiness = {
+    contract_version = 2,
+    support = { process = true, terminal = true, watch = false },
+    authority = {
+      state = "ready",
+      revision = 1,
+      agent_version = "0.1.0",
+      protocol_version = 8,
+      capabilities = agent_capabilities(),
+      effective = { process = true, terminal = true, watch = false },
+    },
+  }
   return {
     job_id = 1,
     transport = "stdio",
@@ -56,13 +90,10 @@ local function fake_client(root, workspace_key)
         path_style = "windows",
         target = "aarch64-pc-windows-msvc",
       },
-      capabilities = {
-        runtime_ticket_v1 = true,
-        runtime_process_v1 = true,
-        runtime_pty_v1 = true,
-        workspace_watch_v1 = false,
-      },
+      capabilities = {},
+      runtime = vim.deepcopy(readiness),
     },
+    runtime_readiness = readiness,
   }
 end
 
@@ -93,15 +124,12 @@ local function main()
 
   local current = nrm.current_workspace()
   assert_eq(current.remote_host.target, "aarch64-pc-windows-msvc")
-  assert_eq(current.capabilities.runtime_process_v1, true)
-  assert_eq(current.runtime, {
-    enabled = true,
-    trust = "prompt",
-    ticket = true,
-    process = true,
-    terminal = true,
-    watch = false,
-  })
+  assert_eq(current.capabilities.runtime_process_v1, nil)
+  assert_eq(current.runtime.contract_version, 2)
+  assert_eq(current.runtime.policy, { enabled = true, trust = "prompt" })
+  assert_eq(current.runtime.capabilities.process.state, "ready")
+  assert_eq(current.runtime.capabilities.terminal.effective, true)
+  assert_eq(current.runtime.capabilities.watch.state, "unsupported")
 
   local detected_remote_host = vim.deepcopy(nrm.client.hello.remote_host)
   local context = assert(nrm.workspace())
@@ -384,7 +412,8 @@ local function main()
       path_style = "posix",
       shell = "/usr/bin/zsh",
     },
-    capabilities = { runtime_ticket_v1 = true },
+    support = { process = true, terminal = true, watch = false },
+    _runtime_contract_version = 2,
     roots = { authority = "/srv/runtime-demo" },
     _workspace_key = workspace_key,
     _runtime_config = {
@@ -847,12 +876,27 @@ local function main()
   end)
   local window_before_terminal = vim.api.nvim_get_current_win()
   termopen_switch_window = window_before_terminal
-  value, err = nrm.open_terminal(false)
+  local function open_terminal_sync(options)
+    local callback_err
+    local callback_handle
+    local callback_calls = 0
+    local accepted, immediate_err = nrm.open_terminal(options, function(terminal_err, terminal_process)
+      callback_calls = callback_calls + 1
+      callback_err = terminal_err
+      callback_handle = terminal_process
+    end)
+    if not accepted then
+      return nil, immediate_err, callback_calls
+    end
+    assert_eq(callback_calls, 1, "ready terminal callback did not complete exactly once inline")
+    return callback_handle, callback_err, callback_calls
+  end
+  value, err = nrm.open_terminal(false, function() end)
   assert_eq(value, nil, "false terminal options unexpectedly succeeded")
   assert_contains(err, "remote terminal options must be a table")
-  value, err = nrm.open_terminal({ command = { "printf", "false-persistence" }, persistence = false })
+  value, err = open_terminal_sync({ command = { "printf", "false-persistence" }, persistence = false })
   assert_error(value, err, "invalid_process_spec")
-  local terminal_handle = assert(nrm.open_terminal({ command = { "printf", "%s", "$(terminal-metachar)" } }))
+  local terminal_handle = assert(open_terminal_sync({ command = { "printf", "%s", "$(terminal-metachar)" } }))
   termopen_switch_window = nil
   assert_eq(vim.api.nvim_get_current_win(), started.pty.window, "TermOpen window switch stole terminal focus")
   assert_eq(vim.api.nvim_get_current_buf(), started.pty.buffer)
@@ -864,7 +908,7 @@ local function main()
 
   local signal_count_before_invalid_window = terminal_cleanup_signals
   termopen_close_window = true
-  value, err = nrm.open_terminal({ command = { "printf", "closed-window" } })
+  value, err = open_terminal_sync({ command = { "printf", "closed-window" } })
   termopen_close_window = false
   assert_eq(value, nil, "terminal with a deleted TermOpen window unexpectedly succeeded")
   assert_contains(err, "terminal window or buffer was changed during TermOpen")
@@ -878,7 +922,7 @@ local function main()
   local signal_count_before_replaced_buffer = terminal_cleanup_signals
   termopen_switch_window = window_before_terminal
   termopen_refocus_replacement = replacement_buffer
-  value, err = nrm.open_terminal({ command = { "printf", "replaced-buffer" } })
+  value, err = open_terminal_sync({ command = { "printf", "replaced-buffer" } })
   termopen_switch_window = nil
   termopen_refocus_replacement = nil
   termopen_refocus_armed = false
@@ -905,9 +949,10 @@ local function main()
   assert_eq(vim.fn.exists(":RemoteTerminal"), 2)
   local terminal_options
   local original_open_terminal = nrm.open_terminal
-  nrm.open_terminal = function(options)
+  nrm.open_terminal = function(options, callback)
     terminal_options = options
-    return {}
+    callback(nil, {})
+    return true
   end
   vim.cmd("RemoteTerminal printf %s literal-metachar")
   assert_eq(terminal_options.command, { "printf", "%s", "literal-metachar" })

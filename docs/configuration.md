@@ -218,8 +218,16 @@ manifest format, trust limitations, and safe key rotation.
 
 The runtime is an explicit execution API for workspace-aware plugins and
 `:RemoteTerminal`; enabling it does not run an arbitrary command during
-connect. The default prompt policy requires the user to authorize a workspace
-before its first process or PTY is started.
+connect. Workspace Runtime Readiness API v2 recommends callback-based
+`prepare()` before execution. Preparation checks provider support, performs a
+read-only authority readiness probe, verifies the negotiated capability, and
+applies the trust policy. A strict direct-call v2 path is retained,
+but cannot probe or prompt on behalf of the caller. The default prompt policy
+requires the user to authorize a workspace before its first process or PTY is
+started.
+API v2 is a breaking WIP migration with no API-v1 compatibility layer. Its
+support, readiness, preparation, facade, and callback guarantees form one
+strict contract; consumers must reject an unexpected `context.api_version`.
 
 ```lua
 require("nvim_remote_mirror").setup({
@@ -246,6 +254,21 @@ are rejected. `:RemoteTrustWorkspace`, `:RemoteTrustWorkspace!`, and
 Trust permits arbitrary code execution as the authority account and is not a
 sandbox.
 
+Preparation never installs or updates the remote agent. The only automatic
+repair is performed while connecting, and only when the transport is SSH,
+`remote_agent_auto_install = true`, and a trusted signed registry is configured.
+With that option disabled, or after a connect-time repair failure, `prepare()`
+returns a typed readiness error and leaves repair to the explicit
+`:RemoteInstallAgent` or `:RemoteUpdateAgent` command. It never falls back to
+an unsigned local binary in registry mode.
+
+`require("nvim_remote_mirror").open_terminal(opts, callback)` is callback-based
+in API v2 and uses the same prepare path. A well-formed accepted call invokes
+its callback exactly once. Cached readiness and trust may complete inline;
+otherwise a probe or prompt completes later. Initialize callback-visible state
+before invoking the helper. `:RemoteTerminal` reports preparation or launch
+failures through a notification regardless of callback timing.
+
 Runtime trust, tickets, signals, and exit records live below private local
 sidecar state. On Windows this fails closed if any existing `state_dir`
 ancestor grants an untrusted principal write-data, write-attributes, delete,
@@ -255,9 +278,15 @@ is disabled and whose access is limited to the current user and `SYSTEM`, or
 repair the unsafe ancestor. Production code deliberately does not create a
 drive-root state directory as a workaround.
 
-Attached pipe processes and PTYs are advertised as `runtime_process_v1` and
-`runtime_pty_v1`. Detached/reconnectable sessions and `workspace_watch_v1` are
-not advertised. See [Workspace Runtime API v1](workspace-runtime.md) for the
+The sidecar's `runtime.support` map describes static provider support. Raw
+agent flags such as `runtime_process_v1` and `runtime_pty_v1` appear only in a
+ready `runtime.authority.capabilities` object; the accompanying
+`runtime.authority.effective` map translates them into the generic `process`,
+`terminal`, and `watch` names. API-v2 consumers use `context:supports()`,
+`context:capability_status()`, and `context:prepare()` instead of reading those
+wire fields. Detached/reconnectable sessions and `workspace_watch_v1` are not
+advertised. See
+[Workspace Runtime Readiness API v2](workspace-runtime.md) for the
 provider-neutral Lua contract and plugin integration examples.
 
 ## Transport

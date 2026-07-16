@@ -10,6 +10,14 @@ end
 
 local requests = {}
 
+local function unchecked_runtime()
+  return {
+    contract_version = 2,
+    support = { process = true, terminal = true, watch = false },
+    authority = { state = "unchecked", revision = 0 },
+  }
+end
+
 local function main()
   nrm.client = {
     job_id = 1,
@@ -17,7 +25,9 @@ local function main()
     hello = {
       workspace_key = "workspace",
       files_root = "/mirror/workspace/files",
+      runtime = unchecked_runtime(),
     },
+    runtime_readiness = unchecked_runtime(),
   }
   nrm.config.background_mirror_interval_ms = 1000000
   nrm.config.background_mirror_scan_limit = 12
@@ -35,6 +45,7 @@ local function main()
         remote_available = true,
         remote_status = "connected",
         remote_checked = true,
+        runtime = unchecked_runtime(),
       })
     elseif method == "scan" then
       callback(nil, {

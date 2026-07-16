@@ -12,14 +12,14 @@ workspace through hydration, checksums, and the save queue.
 | Helper | Use |
 | --- | --- |
 | `current_workspace()` | Return the active workspace table, or `nil` |
-| `workspace(query)` | Resolve an immutable provider-neutral workspace API-v1 context |
+| `workspace(query)` | Resolve an immutable provider-neutral workspace API-v2 context |
 | `mirror_root()` | Return the workspace mirror state root |
 | `files_root()` | Return the local mirror files root |
 | `remote_root()` | Return the remote workspace root |
 | `is_remote_buffer(bufnr)` | Test whether a buffer belongs to a remote mirror workspace |
 | `remote_path(bufnr_or_local_path)` | Convert a remote buffer or mirror-local path to a workspace-relative path |
 | `local_path(remote_path)` | Convert a workspace-relative path to a mirror-local path |
-| `open_terminal(opts)` | Open an authorized attached remote PTY in a split |
+| `open_terminal(opts, callback)` | Asynchronously prepare and open an attached remote PTY in a split |
 
 Path helpers intentionally operate on the current connected workspace. They
 return `nil` for disconnected sessions, paths outside the mirror files root, or
@@ -49,37 +49,74 @@ root. This makes cwd-based plugins behave like they are inside the project:
 | LSP | Run remote server through the LSP proxy with path translation |
 | Formatters/linters | May edit hydrated mirror buffers locally; saves still flow through the mirror save queue |
 | Git plugins | Use `:RemoteGitStatus`, `:RemoteGitDiff`, and `:RemoteGitBlame` for remote repository state |
-| Terminals and command runners | Use workspace API v1 for attached pipe processes or PTYs |
+| Terminals and command runners | Use workspace readiness API v2 for attached pipe processes or PTYs |
 | DAP | Need remote debug adapter and path mapping |
 
 ## Generic Workspace Runtime
 
-Plugins should not detect SSH targets or build remote shell commands. Resolve a
-provider-neutral context with `require("nvim_remote_mirror").workspace()`, ask
-it to authorize `process` or `terminal`, and then choose the narrowest runtime
-surface:
+Plugins should not detect SSH targets, call `remote_health`, install an agent,
+or build remote shell commands. Workspace Runtime Readiness API v2 separates
+static provider support from current authority readiness. Resolve a
+provider-neutral context with `require("nvim_remote_mirror").workspace()`, use
+`supports()` or `capability_status()` only for UI decisions, and call
+`prepare()` before execution. The returned prepared facade exposes the
+narrowest runtime surface:
+
+API v2 is the breaking WIP migration target. It has no API-v1 compatibility
+layer: a plugin must require `context.api_version == 2` and must not retry a
+failed v2 operation through legacy authorization or capability assumptions.
 
 | Surface | Use |
 | --- | --- |
-| `context:job_spec(process)` | A plugin already owns the local job or terminal and accepts argv or a command string |
-| `context:spawn(process, handlers)` | The integration needs a managed attached pipe process and exit metadata |
-| `context:open_pty(process, handlers)` | The integration needs a managed attached PTY |
+| `context:supports(capability)` | Synchronously inspect static provider support; never infer readiness |
+| `context:capability_status(capability)` | Read the latest local readiness snapshot without probing |
+| `context:prepare(capability, callback)` | Asynchronously probe readiness, negotiate capability, and authorize trust |
+| `prepared:job_spec(process)` | A plugin already owns the local job or terminal and accepts argv or a command string |
+| `prepared:spawn(process, handlers)` | The integration needs a managed attached pipe or PTY process and exit metadata |
+| `prepared:open_pty(process, handlers)` | The integration needs a managed attached PTY |
 | `:RemoteTerminal [cmd...]` | A user wants a terminal split without writing an adapter |
 
-`job_spec()` returns authoritative local bridge `argv` plus a canonical
+`prepared:job_spec()` returns authoritative local bridge `argv` plus a canonical
 `command` rendering for string-only APIs. Remote argv, cwd, and environment
 remain structured in a private single-use ticket until the sidecar bridge; do
 not append shell text to the returned command. This lets ToggleTerm and similar
 plugins consume one generic contract instead of requiring core patches for
 each terminal UI.
 
+`prepare()` is read-only with respect to the authority: it may probe the agent
+and may persist an explicit decision in the private local trust store, but it
+never installs or updates a remote executable. Configured signed automatic
+repair occurs only as part of connect. A missing or incompatible agent therefore
+completes the plugin's prepare callback once with a typed readiness error; the
+plugin does not implement a repair branch.
+
+For every accepted prepare call, the callback runs exactly once. It may run
+inline when readiness and trust are cached, or later after a probe or prompt;
+initialize callback-visible state before invoking `prepare()`. The prepared
+facade is bound to one workspace epoch, readiness revision, and capability. A
+stale facade fails with `stale_preparation`; using a process facade for PTY
+stdio, or a terminal facade for pipe stdio, fails with `unsupported`.
+
+Direct `context:job_spec()`, `context:spawn()`, and `context:open_pty()` remain
+as a v2 late-check path. They are allowed only while the requested capability
+is `unchecked`, or `ready` with `effective = true`, and after existing trust is
+verified. `checking` or an unavailable authority returns
+`capability_not_ready`; disabled, unsupported, and explicitly unnegotiated
+capabilities return `capability_disabled`, `unsupported`, and
+`capability_unavailable`, respectively. The runtime bridge still performs the
+definitive Hello. New integrations should use the prepared facade so successful
+readiness, authorization, and later execution are bound to one revision.
+
 Contexts are epoch-bound. Resolve again after `stale_context`, disconnect, or
 reconnect, or invalidate cached contexts on the `NrmWorkspaceConnected`,
 `NrmWorkspaceDisconnected`, and `NrmWorkspaceEpochChanged` `User` events.
+`NrmWorkspaceReadinessChanged` does not change identity: retain the context if
+desired, discard prepared facades, inspect `capability_status()`, and prepare
+again.
 
 Only attached processes and PTYs are available today. Detached/reconnectable
 sessions and workspace watching are not advertised. See
-[Workspace Runtime API v1](workspace-runtime.md), including the ToggleTerm
+[Workspace Runtime Readiness API v2](workspace-runtime.md), including the ToggleTerm
 adapter example, trust model, path/URI mapping, handles, and failure modes.
 
 ## Formatter, Linter, And Git Policy
