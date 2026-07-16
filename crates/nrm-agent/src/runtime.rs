@@ -10,6 +10,8 @@ use nrm_pty::{
     PtyProcess, PtySignal, PtySize,
 };
 use std::io::{self, Read, Write};
+#[cfg(windows)]
+use std::os::windows::io::AsRawHandle as _;
 use std::path::{Path, PathBuf};
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
@@ -18,6 +20,11 @@ use std::sync::{
 };
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
+#[cfg(windows)]
+use windows_sys::Win32::{
+    Foundation::{ERROR_NOT_FOUND, HANDLE},
+    System::IO::CancelSynchronousIo,
+};
 
 const INPUT_QUEUE_DEPTH: usize = 16;
 const FRAME_QUEUE_DEPTH: usize = 16;
@@ -26,7 +33,10 @@ const OUTPUT_FLOW_WINDOW_BYTES: u64 = 1024 * 1024;
 const OUTPUT_HARD_MAX_BYTES: u64 = 128 * 1024 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
 const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+const OUTPUT_CANCEL_TIMEOUT: Duration = Duration::from_millis(250);
 const SERVER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
+const OUTPUT_WORKER_READING: u8 = 0;
+const OUTPUT_WORKER_PUBLISHING: u8 = 1;
 const TERMINATION_NONE: u8 = 0;
 const TERMINATION_TIMEOUT: u8 = 1;
 const TERMINATION_OUTPUT_LIMIT: u8 = 2;
@@ -919,8 +929,15 @@ fn spawn_output_worker(
 ) -> OutputWorker {
     let flow = control.output_flows.for_stream(output.stream).clone();
     let (done_sender, done_receiver) = mpsc::sync_channel(1);
+    let force_stop = Arc::new(AtomicBool::new(false));
+    let worker_force_stop = Arc::clone(&force_stop);
+    let phase = Arc::new(AtomicU8::new(OUTPUT_WORKER_READING));
+    let worker_phase = Arc::clone(&phase);
     let join = thread::spawn(move || {
         let _done = OutputWorkerDone(done_sender);
+        if worker_force_stop.load(Ordering::Acquire) {
+            return;
+        }
         if let Err(error) = output.reader.prepare_cancellable_read() {
             let _ = send_error_then_kill(
                 &control.server,
@@ -933,21 +950,34 @@ fn spawn_output_worker(
         }
         let mut buffer = vec![0_u8; RUNTIME_MAX_DATA_CHUNK_LEN];
         'output: loop {
-            let read =
-                match read_output_chunk(output.reader.as_mut(), &mut buffer, &control.io_stop) {
-                    Ok(Some(read)) => read,
-                    Ok(None) => break,
-                    Err(error) => {
-                        let _ = send_error_then_kill(
-                            &control.server,
-                            &control.process,
-                            RuntimeErrorCode::Internal,
-                            &format!("read process output failed: {error}"),
-                            false,
-                        );
-                        break;
-                    }
-                };
+            if worker_force_stop.load(Ordering::Acquire) {
+                break;
+            }
+            worker_phase.store(OUTPUT_WORKER_READING, Ordering::Release);
+            let read = match read_output_chunk(
+                output.reader.as_mut(),
+                &mut buffer,
+                &control.io_stop,
+                &worker_force_stop,
+            ) {
+                Ok(Some(read)) => read,
+                Ok(None) => break,
+                Err(_) if worker_force_stop.load(Ordering::Acquire) => break,
+                Err(error) => {
+                    let _ = send_error_then_kill(
+                        &control.server,
+                        &control.process,
+                        RuntimeErrorCode::Internal,
+                        &format!("read process output failed: {error}"),
+                        false,
+                    );
+                    break;
+                }
+            };
+            if worker_force_stop.load(Ordering::Acquire) {
+                break;
+            }
+            worker_phase.store(OUTPUT_WORKER_PUBLISHING, Ordering::Release);
             let send_len = limit.map_or(read, |limit| {
                 reserve_output(&control.output_total, read, limit)
             });
@@ -961,6 +991,9 @@ fn spawn_output_worker(
             }
             let mut sent = 0;
             while sent < send_len {
+                if worker_force_stop.load(Ordering::Acquire) {
+                    break 'output;
+                }
                 let (offset, chunk_len) = match flow.reserve(send_len - sent) {
                     Ok(Some(reservation)) => reservation,
                     Ok(None) => break 'output,
@@ -996,6 +1029,8 @@ fn spawn_output_worker(
     OutputWorker {
         join,
         done: done_receiver,
+        force_stop,
+        phase,
     }
 }
 
@@ -1003,9 +1038,13 @@ fn read_output_chunk(
     output: &mut dyn Read,
     buffer: &mut [u8],
     io_stop: &AtomicBool,
+    force_stop: &AtomicBool,
 ) -> io::Result<Option<usize>> {
     let mut read = 0;
     loop {
+        if force_stop.load(Ordering::Acquire) {
+            return Ok(None);
+        }
         match output.read(&mut buffer[read..]) {
             Ok(0) => return Ok((read != 0).then_some(read)),
             Ok(count) => {
@@ -1029,7 +1068,11 @@ fn read_output_chunk(
                 }
                 thread::sleep(POLL_INTERVAL);
             }
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                if force_stop.load(Ordering::Acquire) {
+                    return Ok(None);
+                }
+            }
             Err(_error) if read != 0 => return Ok(Some(read)),
             Err(error) => return Err(error),
         }
@@ -1039,6 +1082,8 @@ fn read_output_chunk(
 struct OutputWorker {
     join: JoinHandle<()>,
     done: mpsc::Receiver<()>,
+    force_stop: Arc<AtomicBool>,
+    phase: Arc<AtomicU8>,
 }
 
 struct OutputWorkerDone(SyncSender<()>);
@@ -1047,6 +1092,97 @@ impl Drop for OutputWorkerDone {
     fn drop(&mut self) {
         let _ = self.0.send(());
     }
+}
+
+#[derive(Default)]
+struct OutputWorkerShutdown {
+    panicked: bool,
+    abandoned: bool,
+    cancellation_error: Option<String>,
+}
+
+fn wait_for_output_workers(output_workers: &[OutputWorker], deadline: Instant) -> bool {
+    for worker in output_workers {
+        while !worker.join.is_finished() {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
+            match worker.done.recv_timeout(remaining.min(POLL_INTERVAL)) {
+                Ok(()) | Err(RecvTimeoutError::Disconnected) => {}
+                Err(RecvTimeoutError::Timeout) => {}
+            }
+        }
+    }
+    true
+}
+
+fn finish_output_workers(output_workers: Vec<OutputWorker>) -> OutputWorkerShutdown {
+    let mut shutdown = OutputWorkerShutdown::default();
+    let mut requested_stop = false;
+    for worker in &output_workers {
+        if worker.join.is_finished() {
+            continue;
+        }
+        requested_stop = true;
+        worker.force_stop.store(true, Ordering::Release);
+    }
+    if requested_stop {
+        let cancel_deadline = Instant::now() + OUTPUT_CANCEL_TIMEOUT;
+        loop {
+            for worker in &output_workers {
+                if !worker.join.is_finished() {
+                    if let Err(error) = cancel_output_worker_read(&worker.join) {
+                        shutdown
+                            .cancellation_error
+                            .get_or_insert_with(|| error.to_string());
+                    }
+                }
+            }
+            if wait_for_output_workers(
+                &output_workers,
+                (Instant::now() + POLL_INTERVAL).min(cancel_deadline),
+            ) || Instant::now() >= cancel_deadline
+            {
+                break;
+            }
+        }
+    }
+    for worker in output_workers {
+        if worker.join.is_finished() {
+            shutdown.panicked |= worker.join.join().is_err();
+        } else {
+            // Dropping a JoinHandle detaches the thread. The worker owns its
+            // reader and only shared Arc state; force_stop plus stopped output
+            // flows prevent a late read from publishing another frame.
+            shutdown.abandoned = true;
+            drop(worker.join);
+        }
+    }
+    shutdown
+}
+
+#[cfg(windows)]
+fn cancel_output_worker_read(worker: &JoinHandle<()>) -> io::Result<()> {
+    // SAFETY: Rust keeps the worker thread HANDLE valid for the JoinHandle's
+    // lifetime. CancelSynchronousIo does not close it or transfer ownership.
+    if unsafe { CancelSynchronousIo(worker.as_raw_handle() as HANDLE) } != 0 {
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(ERROR_NOT_FOUND as i32) {
+        // The worker completed or was between synchronous reads. force_stop
+        // requests exit, and the bounded grace loop retries cancellation to
+        // close the race before a just-starting read becomes pending.
+        Ok(())
+    } else {
+        Err(error)
+    }
+}
+
+#[cfg(not(windows))]
+fn cancel_output_worker_read(_worker: &JoinHandle<()>) -> io::Result<()> {
+    Ok(())
 }
 
 fn spawn_waiter(
@@ -1080,33 +1216,24 @@ fn spawn_waiter(
         // bytes through the first empty poll and then bounds worker teardown.
         control.io_stop.store(true, Ordering::Release);
         let drain_deadline = Instant::now() + OUTPUT_DRAIN_TIMEOUT;
-        let mut drain_timed_out = false;
-        for worker in &output_workers {
-            let remaining = drain_deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                drain_timed_out = true;
-            } else {
-                match worker.done.recv_timeout(remaining) {
-                    Ok(()) | Err(RecvTimeoutError::Disconnected) => {}
-                    Err(RecvTimeoutError::Timeout) => drain_timed_out = true,
-                }
-            }
-            if drain_timed_out {
-                control.output_flows.stop();
-                break;
-            }
+        let output_workers_timed_out = !wait_for_output_workers(&output_workers, drain_deadline);
+        let output_reader_timed_out = output_workers_timed_out
+            && output_workers.iter().any(|worker| {
+                !worker.join.is_finished()
+                    && worker.phase.load(Ordering::Acquire) == OUTPUT_WORKER_READING
+            });
+        if output_workers_timed_out {
+            control.output_flows.stop();
         }
-        if !drain_timed_out && !control.server.has_failed() {
-            drain_timed_out = !control
-                .output_flows
-                .wait_drained_until(drain_deadline)
-                .unwrap_or(false);
-        }
+        let acknowledgement_timed_out = (output_workers_timed_out && !output_reader_timed_out)
+            || (!output_workers_timed_out
+                && !control.server.has_failed()
+                && !control
+                    .output_flows
+                    .wait_drained_until(drain_deadline)
+                    .unwrap_or(false));
         control.output_flows.stop();
-        let mut worker_panicked = false;
-        for worker in output_workers {
-            worker_panicked |= worker.join.join().is_err();
-        }
+        let worker_shutdown = finish_output_workers(output_workers);
         // Mark completion before publishing the terminal frame. A client may
         // already have an acknowledgement in flight for the final output
         // chunk; the reader thread must treat that late frame as harmless
@@ -1115,7 +1242,19 @@ fn spawn_waiter(
         if control.server.has_failed() {
             return;
         }
-        if drain_timed_out {
+        if output_reader_timed_out
+            || worker_shutdown.abandoned
+            || worker_shutdown.cancellation_error.is_some()
+        {
+            control.output_truncated.store(true, Ordering::Release);
+            let _ = control.server.send_error(
+                RuntimeErrorCode::Internal,
+                "runtime output worker did not stop before its deadline",
+                false,
+            );
+            return;
+        }
+        if acknowledgement_timed_out {
             control.output_truncated.store(true, Ordering::Release);
             let _ = control.server.send_error(
                 RuntimeErrorCode::Internal,
@@ -1124,7 +1263,7 @@ fn spawn_waiter(
             );
             return;
         }
-        if worker_panicked {
+        if worker_shutdown.panicked {
             let _ = control.server.send_error(
                 RuntimeErrorCode::Internal,
                 "runtime output worker panicked",
@@ -1322,11 +1461,49 @@ mod tests {
         };
         let mut buffer = [0_u8; 64];
         let stopped = AtomicBool::new(false);
+        let force_stopped = AtomicBool::new(false);
 
-        let read = read_output_chunk(&mut output, &mut buffer, &stopped).unwrap();
+        let read = read_output_chunk(&mut output, &mut buffer, &stopped, &force_stopped).unwrap();
 
         assert_eq!(read, Some(PROMPT.len()));
         assert_eq!(&buffer[..PROMPT.len()], PROMPT);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cancelled_interrupted_output_read_does_not_start_another_read() {
+        struct CancelledRead {
+            force_stop: Arc<AtomicBool>,
+            reads: usize,
+        }
+
+        impl Read for CancelledRead {
+            fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+                self.reads += 1;
+                assert_eq!(self.reads, 1, "cancelled output attempted another read");
+                self.force_stop.store(true, Ordering::Release);
+                Err(io::ErrorKind::Interrupted.into())
+            }
+        }
+
+        let force_stop = Arc::new(AtomicBool::new(false));
+        let mut output = CancelledRead {
+            force_stop: Arc::clone(&force_stop),
+            reads: 0,
+        };
+        let mut buffer = [0_u8; 1];
+
+        assert_eq!(
+            read_output_chunk(
+                &mut output,
+                &mut buffer,
+                &AtomicBool::new(false),
+                &force_stop,
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(output.reads, 1);
     }
 
     #[derive(Default)]
@@ -1675,6 +1852,135 @@ mod tests {
         waiter.join().unwrap();
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn output_worker_teardown_is_bounded_when_a_read_cannot_be_cancelled() {
+        let (entered_sender, entered_receiver) = mpsc::sync_channel(1);
+        let (release_sender, release_receiver) = mpsc::sync_channel(1);
+        let (exited_sender, exited_receiver) = mpsc::sync_channel(1);
+        let (done_sender, done_receiver) = mpsc::sync_channel(1);
+        let join = thread::spawn(move || {
+            let done = OutputWorkerDone(done_sender);
+            entered_sender.send(()).unwrap();
+            let _ = release_receiver.recv_timeout(Duration::from_secs(2));
+            drop(done);
+            exited_sender.send(()).unwrap();
+        });
+        let worker = OutputWorker {
+            join,
+            done: done_receiver,
+            force_stop: Arc::new(AtomicBool::new(false)),
+            phase: Arc::new(AtomicU8::new(OUTPUT_WORKER_READING)),
+        };
+        entered_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+
+        let started = Instant::now();
+        let shutdown = finish_output_workers(vec![worker]);
+        assert!(
+            started.elapsed() < OUTPUT_CANCEL_TIMEOUT + Duration::from_secs(1),
+            "output teardown exceeded its cancellation deadline"
+        );
+        assert!(shutdown.abandoned);
+        assert!(!shutdown.panicked);
+        assert_eq!(shutdown.cancellation_error, None);
+
+        // The detached fixture remains owned and can still be released
+        // cleanly after the bounded production helper returns.
+        release_sender.send(()).unwrap();
+        exited_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn output_worker_cancellation_interrupts_a_pipe_with_a_retained_writer() {
+        use std::fs::File;
+        use std::os::windows::io::{FromRawHandle as _, RawHandle};
+        use windows_sys::Win32::Foundation::{ERROR_OPERATION_ABORTED, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Pipes::CreatePipe;
+
+        let mut read_handle = INVALID_HANDLE_VALUE;
+        let mut write_handle = INVALID_HANDLE_VALUE;
+        // SAFETY: Both output pointers are valid and the null security
+        // attributes request the documented defaults.
+        assert_ne!(
+            unsafe { CreatePipe(&mut read_handle, &mut write_handle, std::ptr::null(), 0,) },
+            0,
+            "CreatePipe failed: {}",
+            io::Error::last_os_error()
+        );
+        // SAFETY: CreatePipe returned two uniquely owned valid handles. Each
+        // ownership is transferred exactly once into a File.
+        let mut reader = unsafe { File::from_raw_handle(read_handle as RawHandle) };
+        let mut writer = unsafe { File::from_raw_handle(write_handle as RawHandle) };
+        let _retained_reader = reader.try_clone().unwrap();
+        let (writer_gate_sender, writer_gate_receiver) = mpsc::sync_channel(1);
+        let (writer_result_sender, writer_result_receiver) = mpsc::sync_channel(1);
+        let writer_watchdog = thread::spawn(move || {
+            let released_before_watchdog = writer_gate_receiver
+                .recv_timeout(Duration::from_secs(2))
+                .is_ok();
+            let result = released_before_watchdog
+                .then(|| writer.write_all(b"x"))
+                .transpose();
+            writer_result_sender
+                .send((released_before_watchdog, result))
+                .unwrap();
+            // On a regression, dropping the sole writer after the watchdog
+            // deadline releases the blocked read so the test fails instead of
+            // hanging the entire native test process.
+        });
+        let (entered_sender, entered_receiver) = mpsc::sync_channel(1);
+        let (result_sender, result_receiver) = mpsc::sync_channel(1);
+        let (done_sender, done_receiver) = mpsc::sync_channel(1);
+        let worker = thread::spawn(move || {
+            let _done = OutputWorkerDone(done_sender);
+            entered_sender.send(()).unwrap();
+            let mut byte = [0_u8; 1];
+            let result = reader.read(&mut byte).map_err(|error| error.raw_os_error());
+            result_sender.send(result).unwrap();
+        });
+        let force_stop = Arc::new(AtomicBool::new(false));
+        let worker = OutputWorker {
+            join: worker,
+            done: done_receiver,
+            force_stop: Arc::clone(&force_stop),
+            phase: Arc::new(AtomicU8::new(OUTPUT_WORKER_READING)),
+        };
+        entered_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+
+        let started = Instant::now();
+        let shutdown = finish_output_workers(vec![worker]);
+        let elapsed = started.elapsed();
+        let _ = writer_gate_sender.send(());
+        let (writer_released, writer_result) = writer_result_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        writer_watchdog.join().unwrap();
+        assert!(
+            elapsed < OUTPUT_CANCEL_TIMEOUT + Duration::from_secs(1),
+            "pipe output teardown exceeded its cancellation deadline"
+        );
+        assert!(!shutdown.abandoned);
+        assert!(!shutdown.panicked);
+        assert_eq!(shutdown.cancellation_error, None);
+        assert!(force_stop.load(Ordering::Acquire));
+        let result = result_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(result, Err(Some(ERROR_OPERATION_ABORTED as i32)));
+
+        // Cancellation affects only the pending read. The independently held
+        // writer remains valid and can still place bytes into the pipe.
+        assert!(writer_released);
+        writer_result.unwrap();
+    }
+
     #[test]
     fn runtime_writer_rejects_backpressure_without_blocking_sender() {
         let gate = Arc::new((Mutex::new(GateState::default()), Condvar::new()));
@@ -1992,10 +2298,16 @@ mod tests {
             cwd: RuntimeCwd::WorkspaceRoot,
             env: RuntimeEnvironment {
                 clear: false,
-                set: vec![RuntimeEnvVar {
-                    name: "PROMPT".to_string(),
-                    value: "NRM_RUNTIME_PROMPT$G".to_string(),
-                }],
+                set: vec![
+                    RuntimeEnvVar {
+                        name: "PROMPT".to_string(),
+                        value: "NRM_RUNTIME_PROMPT$G".to_string(),
+                    },
+                    RuntimeEnvVar {
+                        name: "NRM_RUNTIME_RESULT".to_string(),
+                        value: "NRM_RUNTIME_INTERACTIVE_OK".to_string(),
+                    },
+                ],
                 unset: Vec::new(),
             },
             persistence: RuntimePersistence::Attached,
@@ -2038,7 +2350,8 @@ mod tests {
             }
         }
 
-        let input = b"echo NRM_RUNTIME_INTERACTIVE_OK\r\nexit /b 0\r\n";
+        let input = b"echo %NRM_RUNTIME_RESULT%\r\nexit /b 0\r\n";
+        assert!(!input.windows(MARKER.len()).any(|window| window == MARKER));
         write_runtime_frame(
             &mut harness.client,
             &RuntimeMessage::Input {
