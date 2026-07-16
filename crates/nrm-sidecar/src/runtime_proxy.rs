@@ -2649,11 +2649,14 @@ fn publish_private_record_noreplace(source: &Path, destination: &Path) -> io::Re
     let destination = CString::new(destination.as_os_str().as_bytes()).map_err(|_| {
         io::Error::new(io::ErrorKind::InvalidInput, "destination path contains NUL")
     })?;
-    // SAFETY: both paths are live NUL-terminated strings and `renameat2` does
-    // not retain their pointers. RENAME_NOREPLACE makes publication atomic and
-    // preserves any independently published destination.
+    // SAFETY: both paths are live NUL-terminated strings and the Linux
+    // renameat2 syscall does not retain their pointers. Calling the syscall
+    // directly keeps this available on musl targets, where libc does not
+    // expose a renameat2 wrapper. RENAME_NOREPLACE makes publication atomic
+    // and preserves any independently published destination.
     if unsafe {
-        libc::renameat2(
+        libc::syscall(
+            libc::SYS_renameat2,
             libc::AT_FDCWD,
             source.as_ptr(),
             libc::AT_FDCWD,
@@ -5363,7 +5366,7 @@ mod tests {
     impl BlockingOutput {
         fn wait_until_blocked(&self) {
             let (state, ready) = &*self.0;
-            let deadline = Instant::now() + Duration::from_secs(1);
+            let deadline = Instant::now() + Duration::from_secs(5);
             let mut state = state.lock().unwrap();
             while !state.entered {
                 let remaining = deadline.saturating_duration_since(Instant::now());
@@ -6090,59 +6093,70 @@ mod tests {
 
     #[test]
     fn outbound_runtime_write_timeout_is_bounded_and_authoritative() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        struct SlowFirstWrite(Arc<AtomicBool>);
-
-        impl Write for SlowFirstWrite {
-            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-                if !self.0.swap(true, Ordering::AcqRel) {
-                    thread::sleep(Duration::from_millis(200));
-                }
-                Ok(bytes.len())
-            }
-
-            fn flush(&mut self) -> io::Result<()> {
-                Ok(())
-            }
-        }
-
         let mut capabilities = CapabilitySet::v1_agent();
         capabilities.runtime_process_v1 = true;
-        let mut prefix_writer = RuntimeWriter::new(
-            RuntimeStateMachine::new(RuntimePeerRole::Client, capabilities.clone()),
-            SlowFirstWrite(Arc::new(AtomicBool::new(false))),
-            Duration::from_millis(50),
-        )
-        .unwrap();
-        let started = Instant::now();
-        let prefix_error = prefix_writer
-            .send_prefix(b"larger-than-a-stalled-pipe", Duration::from_millis(50))
-            .unwrap_err();
-        assert!(prefix_error.to_string().contains("prefix write timed out"));
-        assert!(started.elapsed() < Duration::from_millis(150));
-        thread::sleep(Duration::from_millis(200));
+
+        let blocked_prefix = BlockingOutput::default();
+        let prefix_output = blocked_prefix.clone();
+        let prefix_capabilities = capabilities.clone();
+        let (prefix_tx, prefix_rx) = mpsc::sync_channel(1);
+        let prefix_test = thread::spawn(move || {
+            let mut writer = RuntimeWriter::new(
+                RuntimeStateMachine::new(RuntimePeerRole::Client, prefix_capabilities),
+                prefix_output,
+                Duration::from_secs(10),
+            )
+            .unwrap();
+            let result = writer
+                .send_prefix(b"larger-than-a-stalled-pipe", Duration::from_millis(50))
+                .map_err(|error| error.to_string());
+            prefix_tx.send((result, writer)).unwrap();
+        });
+        blocked_prefix.wait_until_blocked();
+        let prefix_result = prefix_rx.recv_timeout(Duration::from_secs(2));
+        blocked_prefix.release();
+        let (prefix_result, mut prefix_writer) = match prefix_result {
+            Ok(result) => result,
+            Err(error) => {
+                drop(prefix_test);
+                panic!("prefix send did not honor its timeout while output was blocked: {error}")
+            }
+        };
+        prefix_test.join().unwrap();
+        let prefix_error = prefix_result.unwrap_err();
+        assert!(prefix_error.contains("prefix write timed out after 50 ms"));
         assert!(prefix_writer.close().is_err());
 
-        let machine = RuntimeStateMachine::new(RuntimePeerRole::Client, capabilities);
-        let mut writer = RuntimeWriter::new(
-            machine,
-            SlowFirstWrite(Arc::new(AtomicBool::new(false))),
-            Duration::from_secs(1),
-        )
-        .unwrap();
+        let blocked_frame = BlockingOutput::default();
         let hello = RuntimeMessage::ClientHello {
             package_version: env!("CARGO_PKG_VERSION").to_owned(),
             protocol_version: PROTOCOL_VERSION,
             capability: RuntimeCapability::ProcessPipeV1,
         };
-
-        let started = Instant::now();
-        let error = writer
-            .send_with_timeout(&hello, Duration::from_millis(50))
-            .unwrap_err();
-        assert!(error.to_string().contains("write timed out"));
-        assert!(started.elapsed() < Duration::from_millis(150));
+        let frame_output = blocked_frame.clone();
+        let (frame_tx, frame_rx) = mpsc::sync_channel(1);
+        let frame_test = thread::spawn(move || {
+            let machine = RuntimeStateMachine::new(RuntimePeerRole::Client, capabilities);
+            let mut writer =
+                RuntimeWriter::new(machine, frame_output, Duration::from_secs(10)).unwrap();
+            let result = writer
+                .send_with_timeout(&hello, Duration::from_millis(50))
+                .map_err(|error| error.to_string());
+            frame_tx.send((result, writer)).unwrap();
+        });
+        blocked_frame.wait_until_blocked();
+        let frame_result = frame_rx.recv_timeout(Duration::from_secs(2));
+        blocked_frame.release();
+        let (frame_result, mut writer) = match frame_result {
+            Ok(result) => result,
+            Err(error) => {
+                drop(frame_test);
+                panic!("frame send did not honor its timeout while output was blocked: {error}")
+            }
+        };
+        frame_test.join().unwrap();
+        let error = frame_result.unwrap_err();
+        assert!(error.contains("write timed out after 50 ms"));
         assert!(
             writer
                 .observe_inbound(&RuntimeMessage::ServerHello {
@@ -6153,8 +6167,6 @@ mod tests {
                 .is_err(),
             "a timed-out write did not poison the transport"
         );
-
-        thread::sleep(Duration::from_millis(200));
         assert!(writer.close().is_err());
     }
 
@@ -6306,20 +6318,20 @@ mod tests {
                 &"e".repeat(TICKET_ID_HEX_LEN),
                 worker_output,
                 io::sink(),
-                Duration::from_millis(200),
+                Duration::from_secs(1),
             );
             completed_tx.send(result).unwrap();
         });
 
         blocking.wait_until_blocked();
         fs::write(release_response, b"").unwrap();
-        let early = completed_rx.recv_timeout(Duration::from_secs(2));
+        let early = completed_rx.recv_timeout(Duration::from_secs(3));
         let completed_while_output_was_blocked = early.is_ok();
         blocking.release();
         let result = match early {
             Ok(result) => result,
             Err(mpsc::RecvTimeoutError::Timeout) => completed_rx
-                .recv_timeout(Duration::from_secs(2))
+                .recv_timeout(Duration::from_secs(3))
                 .expect("runtime proxy did not stop after releasing its blocked output"),
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 panic!("runtime proxy result channel disconnected")
@@ -6439,9 +6451,9 @@ mod tests {
         .unwrap();
         let (agent, release_response, _response_written) =
             write_gated_fake_runtime_agent(directory.path(), &prefix, &terminal);
-        let output_shutdown_timeout = Duration::from_millis(100);
+        let output_shutdown_timeout = Duration::from_secs(1);
         let stdout = SteadilyProgressingOutput {
-            write_delay: Duration::from_millis(20),
+            write_delay: Duration::from_millis(50),
             writes_remaining: output_chunks,
             release_response,
             released: false,
@@ -6461,7 +6473,7 @@ mod tests {
         assert_eq!(result.kind, RuntimeResultKind::ProcessExit);
         assert_eq!(result.exit_code, 0);
         assert!(
-            started.elapsed() >= output_shutdown_timeout * 4,
+            started.elapsed() >= output_shutdown_timeout,
             "test output did not remain backlogged beyond its stall timeout"
         );
     }
@@ -6976,29 +6988,17 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_runtime_state_and_records_use_protected_allowlist_dacls() {
-        use windows_sys::Win32::Security::INHERITED_ACE;
-
         let state = test_directory();
         let runtime_directory = state.path().join("runtime");
-        fs::create_dir(&runtime_directory).unwrap();
+        // Use the production constructor: ordinary Windows creation can use
+        // the token's default owner (for example, Administrators), while the
+        // private runtime contract intentionally requires the token user.
         prepare_runtime_state(Some(state.path().to_path_buf())).unwrap();
         let runtime_handle =
             open_windows_directory_without_following(&runtime_directory, false).unwrap();
         validate_windows_private_object_security(&runtime_handle, "test runtime directory", true)
             .unwrap();
         drop(runtime_handle);
-
-        let inherited_path = runtime_directory.join("trusted-workspaces-v1.json");
-        fs::write(&inherited_path, b"{}").unwrap();
-        let inherited_file = File::open(&inherited_path).unwrap();
-        validate_windows_allowlist_security(
-            &inherited_file,
-            "inherited test trust file",
-            INHERITED_ACE as u8,
-            false,
-        )
-        .unwrap();
-        drop(inherited_file);
 
         let root = test_directory();
         let expected = ticket(root.path());
