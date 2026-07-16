@@ -16,8 +16,10 @@ local original_chansend = vim.fn.chansend
 local original_jobstop = vim.fn.jobstop
 local original_notify = vim.notify
 local original_defer_fn = vim.defer_fn
+local test_sidecar = vim.fn.fnamemodify(vim.v.progpath, ":p")
 
 local job_opts = nil
+local job_command = nil
 local next_job_id = 40
 local stopped_jobs = {}
 
@@ -112,6 +114,7 @@ local function quiet_options(overrides)
     background_mirror = false,
     recover_local_edits_on_connect = false,
     flush_queue_on_connect = false,
+    sidecar = test_sidecar,
   }, overrides or {})
 end
 
@@ -147,8 +150,9 @@ end
 
 local function main()
   vim.notify = function() end
-  vim.fn.jobstart = function(_, opts)
+  vim.fn.jobstart = function(command, opts)
     next_job_id = next_job_id + 1
+    job_command = command
     job_opts = opts
     return next_job_id
   end
@@ -164,6 +168,7 @@ local function main()
     reply(request, workspace_info(automatic_capabilities()))
   end, "ssh://host/repo")
   assert_eq(disabled_methods, { "workspace_info" }, "registry-disabled connect attempted bootstrap")
+  assert_eq(job_command[1], test_sidecar, "test connection did not use its explicit sidecar fixture")
   assert_eq(nrm.connection_state().agent_bootstrap_state, "disabled")
   reset_client()
 
