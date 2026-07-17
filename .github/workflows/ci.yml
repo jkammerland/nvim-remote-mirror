@@ -15,6 +15,7 @@ env:
   SHELLCHECK_SHA256: "6c881ab0698e4e6ea235245f22832860544f17ba386442fe7e9d629f8cbedf87"
   SHELLCHECK_VERSION: "0.10.0"
   STYLUA_VERSION: "2.5.2"
+  TOGGLETERM_COMMIT: "50ea089fc548917cc3cc16b46a8211833b9e3c7c"
 
 jobs:
   check:
@@ -22,6 +23,13 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
+          persist-credentials: false
+      - name: Check out ToggleTerm v2.13.1 compatibility fixture
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          repository: akinsho/toggleterm.nvim
+          ref: ${{ env.TOGGLETERM_COMMIT }}
+          path: .ci/toggleterm.nvim
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@fa04a1451ff1842e2626ccb99004d0195b455a88 # master, 2026-06-30
         with:
@@ -72,6 +80,12 @@ jobs:
         run: selene lua plugin tests
       - name: Headless Neovim tests
         run: find tests -maxdepth 1 -name '*.lua' -print0 | sort -z | while IFS= read -r -d '' test; do nvim --headless -u NONE -l "$test"; done
+      - name: ToggleTerm v2.13.1 integration smoke
+        env:
+          NRM_TOGGLETERM_DIR: ${{ github.workspace }}/.ci/toggleterm.nvim
+        run: |
+          test "$(git -C "${NRM_TOGGLETERM_DIR}" rev-parse HEAD)" = "${TOGGLETERM_COMMIT}"
+          nvim --headless -u NONE -l tests/toggleterm_upstream_smoke.lua
       - name: Shell syntax
         run: bash -n scripts/*.sh
       - name: Shell lint

@@ -12,7 +12,8 @@ workspace through hydration, checksums, and the save queue.
 | Helper | Use |
 | --- | --- |
 | `current_workspace()` | Return the active workspace table, or `nil` |
-| `workspace(query)` | Resolve an immutable provider-neutral workspace API-v2 context |
+| `workspace(query)` | Resolve the remote-only compatibility API-v2 context |
+| `require("nvim_remote_mirror.workspace_runtime").resolve(query)` | Resolve an authority-aware local/NRM API-v2 context |
 | `mirror_root()` | Return the workspace mirror state root |
 | `files_root()` | Return the local mirror files root |
 | `remote_root()` | Return the remote workspace root |
@@ -57,7 +58,8 @@ root. This makes cwd-based plugins behave like they are inside the project:
 Plugins should not detect SSH targets, call `remote_health`, install an agent,
 or build remote shell commands. Workspace Runtime Readiness API v2 separates
 static provider support from current authority readiness. Resolve a
-provider-neutral context with `require("nvim_remote_mirror").workspace()`, use
+provider-neutral context with
+`require("nvim_remote_mirror.workspace_runtime").resolve()`, use
 `supports()` or `capability_status()` only for UI decisions, and call
 `prepare()` before execution. The returned prepared facade exposes the
 narrowest runtime surface:
@@ -76,12 +78,31 @@ failed v2 operation through legacy authorization or capability assumptions.
 | `prepared:open_pty(process, handlers)` | The integration needs a managed attached PTY |
 | `:RemoteTerminal [cmd...]` | A user wants a terminal split without writing an adapter |
 
+Explicit `authority = "local"` or `"remote"` overrides automatic selection.
+The broker's `authority = "auto"` precedence is remote buffer ownership,
+current-tab remote binding, then local. Connect binds its originating tab only
+after success. Disconnect retains an offline binding so runtime failures never
+fall back to local execution. `:RemoteUseLocal` clears only the current tab
+binding; it does not disconnect, undo `:RemoteCd`, or relabel remote buffers.
+Local commands after `:RemoteCd` may therefore run in the mirror cache. A
+remote-owned buffer still wins unless the caller uses `authority = "local"`.
+
+`require("nvim_remote_mirror").workspace()` remains remote-only for existing
+callers and retains its global active-workspace fallback.
+
 `prepared:job_spec()` returns authoritative local bridge `argv` plus a canonical
-`command` rendering for string-only APIs. Remote argv, cwd, and environment
-remain structured in a private single-use ticket until the sidecar bridge; do
-not append shell text to the returned command. This lets ToggleTerm and similar
-plugins consume one generic contract instead of requiring core patches for
-each terminal UI.
+`command` rendering for string-only APIs. Broker results also include
+broker-authored, validated authority metadata and the authority shell's
+`input.newline`. Remote argv, cwd,
+and environment remain structured in a private single-use ticket until the sidecar bridge; do
+not append shell text to the returned command. The optional
+`nvim_remote_mirror.integrations.toggleterm` module handles ticket refresh,
+pending-call coalescing, hide/reopen reuse, and Windows PowerShell newlines
+without making ToggleTerm a required dependency. Broker-owned terminals are
+hidden with IDs outside Neovim's Ex-count range, and the adapter replaces raw
+`:ToggleTerm` with a local-only path. ToggleTerm's own `setup()` must complete
+first; a lazy command stub is rejected rather than overwritten. The supported
+and CI-tested compatibility baseline is ToggleTerm v2.13.1.
 
 `prepare()` is read-only with respect to the authority: it may probe the agent
 and may persist an explicit decision in the private local trust store, but it

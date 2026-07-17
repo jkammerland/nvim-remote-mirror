@@ -17,9 +17,10 @@ prepared-facade enforcement, readiness revisions, and the callback rules below
 are one atomic contract. There is no additive API-v1 compatibility layer and
 no fallback after a v2 error.
 
-The current `nrm` provider supports attached pipe processes and attached PTYs
-on local, Linux SSH, macOS SSH, and native Windows SSH workspaces. Detached or
-reconnectable sessions and workspace watching are not advertised yet.
+The built-in `local` and `nrm` providers support attached pipe processes and
+attached PTYs on the editor host, Linux SSH, macOS SSH, and native Windows SSH
+workspaces. Detached or reconnectable sessions and workspace watching are not
+advertised yet.
 
 Connecting never runs an arbitrary workspace command, opens a terminal, or
 grants runtime trust. Runtime execution starts only after an explicit API call
@@ -57,13 +58,12 @@ v2 late-check path under the matrix below; it is not an API-v1 adapter.
 
 ## Resolve a context
 
-Use `require("nvim_remote_mirror").workspace(query)` to resolve an immutable
-API-v2 context:
+Use the authority-aware broker to resolve an immutable API-v2 context:
 
 ```lua
-local nrm = require("nvim_remote_mirror")
+local runtime = require("nvim_remote_mirror.workspace_runtime")
 
-local context, err = nrm.workspace({ bufnr = 0 })
+local context, err = runtime.resolve({ authority = "auto", bufnr = 0 })
 if not context then
   vim.notify(err.message, vim.log.levels.ERROR)
   return
@@ -73,7 +73,7 @@ vim.print({
   api_version = context.api_version, -- 2
   workspace_id = context.workspace_id,
   state = context.state,             -- online/offline/connecting/reconnecting/error
-  mode = context.mode,               -- mirror or remote_nvim
+  mode = context.mode,               -- local, mirror, or remote_nvim
   authority = context.authority,     -- kind, path_style, OS/CPU/shell/target hints
   roots = context.roots,             -- editor and authority roots
   process_supported = context:supports("process"),
@@ -81,23 +81,52 @@ vim.print({
 })
 ```
 
+The `authority` field is optional and accepts `auto`, `local`, or `remote`.
+An explicit `local` or `remote` choice overrides automatic selection. `auto`
+resolves in this order:
+
+1. remote ownership recorded on the selected/current buffer;
+2. the current tab's NRM binding; and
+3. the built-in local provider rooted at that tab's cwd.
+
+Once remote evidence is selected, every offline, malformed, untrusted, stale,
+or readiness error is authoritative. The broker never retries locally. A
+successful connection binds the tab where `connect()` started, not whichever
+tab happens to be current after its asynchronous handshake. Disconnect keeps
+that binding so it resolves offline and fails closed. `:RemoteUseLocal` clears
+the current tab's binding and invalidates pending authority-aware preparation;
+it does not disconnect, change cwd, or remove remote ownership from buffers.
+
+Explicit `authority = "local"` is the escape hatch for a remote-owned buffer.
+Explicit `authority = "remote"` chooses a remote buffer, then the current tab
+binding, then the active NRM workspace. `require("nvim_remote_mirror").workspace()`
+remains the remote-only compatibility resolver with its original active-NRM
+fallback.
+
+The local provider is rooted at the captured tab cwd. It is immediately ready
+and trusted because it starts processes directly as the editor user, without a
+sidecar or remote trust prompt. Local argv, contained cwd, and environment
+changes still pass through the same v2 validation. Changing that tab's cwd
+makes the retained local context stale.
+
 The query accepts at most one selector:
 
 | Selector | Meaning |
 | --- | --- |
-| none | Current remote buffer, falling back to the active workspace |
-| `bufnr` | Workspace recorded on that buffer, including an offline buffer |
-| `path` | A mirror-local path inside a known workspace |
-| `workspace_id` / `workspace_key` | A known workspace identity |
+| none | Current buffer, tab binding, or local tab cwd according to authority selection |
+| `bufnr` | Authority recorded on that buffer, including an offline remote buffer |
+| `path` | A contained mirror-local or local-tab path |
+| `workspace_id` / `workspace_key` | A known remote workspace identity |
 
 An offline buffer still provides static `supports()` information. Its local
 supported-capability status is `unchecked` (or `disabled` when runtime policy is
 off), while `prepare()` and every execution path fail with `workspace_offline`;
 resolving a context never implies that its authority is reachable.
 
-The context captures one provider epoch. Reconnect, disconnect, and transport
-replacement advance the epoch. Before retaining a context across asynchronous
-work, call `context:is_current()`; resolve a new context after a
+The context captures one provider epoch plus the broker's tab/buffer selection
+revision. Reconnect, disconnect, transport replacement, `:RemoteUseLocal`, and
+buffer authority changes can make it stale. Before retaining a context across
+asynchronous work, call `context:is_current()`; resolve a new context after a
 `stale_context` error. Readiness has a separate monotonically increasing
 revision because an authority can become unavailable without changing
 workspace identity. A readiness change does not advance the workspace epoch.
@@ -341,64 +370,50 @@ job/terminal lifecycle. It returns:
 
 - `argv`: authoritative local bridge argv;
 - `command`: a canonical shell-escaped rendering for string-only local APIs;
-- optional `cwd`; and
-- no remote environment or private lifecycle metadata.
+- optional local `cwd`, `env`, and `clear_env` launch fields;
+- broker-authored public `authority` identity; and
+- `input.newline` for the authority shell.
 
-The bridge contains only the local sidecar path and an opaque ticket ID. Each
-ticket is single-use, so create a new job spec for every start or restart. Use
-`argv` whenever the consumer accepts a list; use `command` only when its API is
-string-only. Do not reconstruct it or append remote/user-provided shell text.
-A string-only consumer may add only its own fixed local bookkeeping syntax
-according to that consumer's documented command rules.
+For NRM, the executable bridge contains only the local sidecar path and an
+opaque ticket ID. Remote cwd and environment remain private in that ticket;
+the exposed cwd is only the local editor root and no remote environment is
+returned. Local-provider environment changes are validated local job options.
+Each NRM ticket is single-use, so create a new job spec for every start or
+restart. Use `argv` whenever the consumer accepts a list; use `command` only
+when its API is string-only. Do not reconstruct it or append
+remote/user-provided shell text.
 
-For example, ToggleTerm can consume the generic bridge without an nrm-specific
-patch:
+The broker derives `input.newline` from the authority shell. In particular,
+Windows PowerShell uses `"\r"`, Windows cmd uses `"\r\n"`, and ordinary POSIX
+shells use `"\n"`. This is authority metadata, not remote input embedded in the
+local command.
+
+The optional ToggleTerm integration consumes this contract without making
+ToggleTerm a dependency of NRM:
 
 ```lua
-local Terminal = require("toggleterm.terminal").Terminal
-local nrm = require("nvim_remote_mirror")
-
-local function open_remote_toggleterm()
-  local context, resolve_err = nrm.workspace({ bufnr = 0 })
-  if not context then
-    vim.notify(resolve_err.message, vim.log.levels.ERROR)
-    return
-  end
-
-  context:prepare("terminal", function(prepare_err, prepared)
-    if prepare_err then
-      vim.notify(prepare_err.message, vim.log.levels.ERROR)
-      return
-    end
-
-    local bridge, bridge_err = prepared:job_spec({
-      command = { shell = "default" },
-      cwd = { space = "workspace", path = "" },
-      stdio = "pty",
-      persistence = "attached",
-    })
-    if not bridge then
-      vim.notify(bridge_err.message, vim.log.levels.ERROR)
-      return
-    end
-
-    Terminal:new({
-      cmd = bridge.command, -- ToggleTerm's command option is string-only
-      dir = bridge.cwd,
-      close_on_exit = true,
-    }):toggle()
-  end)
-end
+require("nvim_remote_mirror.integrations.toggleterm").toggle({
+  key = "shell",
+  direction = "float",
+  query = { authority = "auto" },
+})
 ```
 
-ToggleTerm appends its own fixed separator/comment marker to identify the local
-terminal buffer; it does not append remote data or change the private ticket.
-The ticket is one-shot, so every process respawn must call `job_spec()` again.
-If the prepared facade is still current it can mint the new ticket; otherwise
-the integration must call `prepare()` again. Construct a fresh `Terminal` for
-each ticket (the function above does this). The validation contract itself is
-provider-neutral. Public registration for third-party workspace providers is
-not exported by this contract yet.
+ToggleTerm's own `setup()` must have completed before the adapter is called. A
+lazy-loading command stub is not sufficient; the adapter returns
+`toggleterm_not_initialized` without replacing it. The adapter coalesces
+repeated actions while preparation is pending, passes
+`input.newline` as ToggleTerm's `newline_chr`, reuses one live attached PTY when
+hidden/reopened, and creates a fresh prepared facade, ticket, and `Terminal`
+after exit. The supported and CI-tested compatibility baseline is ToggleTerm
+v2.13.1. Authority or tab-selection changes fail closed before a terminal is
+created. It never falls back to a local shell. Broker-owned terminals are
+registered as hidden with IDs outside Neovim's Ex-count range, and the adapter
+replaces the raw `:ToggleTerm` command with a local-only path. That command
+remains an explicitly local escape hatch. Advanced upstream commands that
+explicitly include hidden terminals or a private managed ID are intentional
+low-level access, not part of that escape-hatch guarantee. Public registration
+for third-party workspace providers is not exported by this contract yet.
 
 ## Managed process and PTY handles
 
@@ -412,6 +427,13 @@ line/list job-callback semantics; they are not a binary-transparent byte API
 runtime protocol and the `job_spec()` bridge remain byte-preserving. Consumers
 that need raw bytes should own the bridge process through an argv-capable raw
 process API rather than use managed handlers.
+
+The built-in local provider enforces `timeout_ms` and the cumulative pipe
+`max_output_bytes` limit, and starts managed PTYs with the requested character
+dimensions. Neovim's local PTY primitive cannot set pixel dimensions, so a
+local managed spawn that supplies them returns `unsupported` before starting a
+process. A plugin using `job_spec()` owns the resulting bridge lifecycle and is
+responsible for applying lifecycle limits supported by its own process API.
 
 ```lua
 local handle, spawn_err = prepared:spawn({

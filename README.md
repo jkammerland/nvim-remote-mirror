@@ -283,6 +283,7 @@ Dashboard keys:
 | `:RemoteDisconnect` | Close the current client session |
 | `:RemoteReconnect` | Reconnect to the last target |
 | `:RemoteCd` | Set the current tab cwd to the mirror files root |
+| `:RemoteUseLocal` | Clear this tab's remote runtime binding; remote-owned buffers remain remote |
 | `:RemoteTrustWorkspace[!]` | Persist runtime trust for the current workspace; `[!]` skips confirmation |
 | `:RemoteUntrustWorkspace` | Remove persisted runtime trust for the current workspace |
 | `:RemoteTerminal [cmd...]` | Open an attached remote PTY; no arguments start the default remote shell |
@@ -378,13 +379,14 @@ Mirror files live under the sidecar state directory, typically below
 > `supports()`/`capability_status()`/`prepare()` surface is strict and atomic;
 > there is no API-v1 compatibility layer or fallback after a v2 error.
 
-The provider-neutral Lua API resolves an immutable workspace context and keeps
-static provider support separate from dynamic authority readiness and explicit
-trust. Plugins use `supports()` and `capability_status()` for local UI
-decisions, then call `prepare()` with a capability callback before execution:
+The authority-aware broker resolves either the built-in local provider or the
+NRM provider to the same immutable v2 context. Plugins use `supports()` and
+`capability_status()` for local UI decisions, then call `prepare()` with a
+capability callback before execution:
 
 ```lua
-local context = assert(require("nvim_remote_mirror").workspace({ bufnr = 0 }))
+local runtime = require("nvim_remote_mirror.workspace_runtime")
+local context = assert(runtime.resolve({ authority = "auto", bufnr = 0 }))
 
 context:prepare("process", function(err, prepared)
   if err then
@@ -400,12 +402,55 @@ context:prepare("process", function(err, prepared)
 end)
 ```
 
+Explicit `authority = "local"` or `"remote"` overrides automatic selection.
+`auto` chooses a remote-owned buffer, then the current tab's remote binding,
+and otherwise local execution.
+A successful `:RemoteConnect` binds the tab where it started, even if another
+tab is active when the handshake finishes. Disconnect keeps that binding
+offline and fail-closed. `:RemoteUseLocal` clears it for the current tab, but
+does not disconnect, change cwd, or relabel a remote-owned buffer. Use
+`authority = "local"` to override such a buffer explicitly.
+
+`require("nvim_remote_mirror").workspace()` remains the remote-only
+compatibility API. It deliberately keeps its active-NRM fallback and must not
+be used by integrations that need automatic local/remote selection.
+
+The local provider is rooted at the tab cwd, is immediately ready, and does
+not use the NRM trust prompt because it launches directly as the editor user.
+Its process argv, cwd, and environment still pass through the same v2
+validation and immutable context/prepared-facade rules.
+
 Use `prepared:job_spec()` when another plugin owns the local job lifecycle,
 including argv- or string-only terminal APIs, and `prepared:open_pty()` on a
 prepared terminal facade for a managed PTY. A prepared facade is bound to one
 workspace epoch, readiness revision, and capability; using it for another
 capability returns `unsupported`, and later epoch/readiness changes return
 `stale_preparation`.
+
+Broker job specs also contain validated `authority` metadata and
+`input.newline`. This lets a Linux Neovim drive a Windows PowerShell PTY using
+`"\r"` rather than inheriting the local shell's newline. The optional
+ToggleTerm adapter owns ticket refresh and terminal reuse:
+
+```lua
+require("nvim_remote_mirror.integrations.toggleterm").toggle({
+  key = "shell",
+  direction = "float",
+  query = { authority = "auto" },
+})
+```
+
+ToggleTerm's own `setup()` must finish before this adapter is called; a lazy
+command stub is rejected with `toggleterm_not_initialized` and is never
+overwritten. The adapter is loaded only when called, so ToggleTerm remains an
+optional dependency. The compatibility baseline is ToggleTerm v2.13.1; CI
+exercises its real terminal, command, UI, and configuration modules. The
+adapter keeps broker terminals hidden, allocates them outside
+Neovim's Ex-count range, and replaces the raw `:ToggleTerm` command with a
+local-only path. Raw `:ToggleTerm` therefore remains a deliberately local
+escape hatch. Hidden attached terminals keep their live PTY, while an exited
+process always prepares a new single-use ticket. Detached/reconnectable
+terminal persistence remains future work.
 
 Direct context execution remains as a strict v2 late-check path: it is allowed
 only for an `unchecked` capability or one known `ready` and effective, after
@@ -440,8 +485,8 @@ changing workspace identity or epoch. Only attached execution is available
 today: detached/reconnectable sessions and workspace watching are not
 advertised. See
 [Workspace Runtime Readiness API v2](docs/workspace-runtime.md) for the complete
-contract, migration table, callback rules, and a ToggleTerm example that needs
-no plugin-specific nrm patch.
+contract, migration table, callback rules, and a ToggleTerm example that works
+without patching ToggleTerm itself.
 
 ## Troubleshooting
 
