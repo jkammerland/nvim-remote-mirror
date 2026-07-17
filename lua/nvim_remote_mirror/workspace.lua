@@ -495,11 +495,28 @@ local function buffer_identity(bufnr)
   if not vim.api.nvim_buf_is_valid(bufnr) then
     return nil
   end
-  local path = optional_string(vim.b[bufnr].nrm_remote_path) or optional_string(vim.b[bufnr].nrm_hydrate_path)
+  local markers = {
+    nrm_remote_path = vim.b[bufnr].nrm_remote_path,
+    nrm_hydrate_path = vim.b[bufnr].nrm_hydrate_path,
+    nrm_workspace_key = vim.b[bufnr].nrm_workspace_key,
+    nrm_target_arg = vim.b[bufnr].nrm_target_arg,
+    nrm_files_root = vim.b[bufnr].nrm_files_root,
+  }
+  for name, value in next, markers do
+    if
+      value ~= nil
+      and (not optional_string(value) or #value > MAX_PATH_BYTES or contains_control(value) or not valid_utf8(value))
+    then
+      -- Preserve malformed reserved metadata as authoritative evidence. The
+      -- descriptor layer will reject it instead of allowing a local fallback.
+      return { _invalid_marker = name }
+    end
+  end
+  local path = markers.nrm_remote_path or markers.nrm_hydrate_path
   local identity = {
-    workspace_key = optional_string(vim.b[bufnr].nrm_workspace_key),
-    target_arg = optional_string(vim.b[bufnr].nrm_target_arg),
-    files_root = optional_string(vim.b[bufnr].nrm_files_root),
+    workspace_key = markers.nrm_workspace_key,
+    target_arg = markers.nrm_target_arg,
+    files_root = markers.nrm_files_root,
     relative_path = path,
   }
   local has_scope = identity.workspace_key ~= nil or identity.target_arg ~= nil or identity.files_root ~= nil
@@ -523,6 +540,12 @@ local function state_for_status(status)
 end
 
 local function descriptor_for_identity(nrm, identity)
+  if identity._invalid_marker then
+    return nil,
+      workspace_error("invalid_provider_state", "remote buffer contains malformed ownership metadata", {
+        marker = identity._invalid_marker,
+      })
+  end
   local active = active_identity(nrm)
   local matches_active = active and identity_matches(identity, active) or false
   local source = matches_active and active or identity
@@ -590,6 +613,9 @@ local function default_resolve(query)
     identity = buffer_identity(query.bufnr)
     if not identity then
       return nil, workspace_error("not_remote_buffer", "buffer is not associated with a remote workspace")
+    end
+    if identity._invalid_marker then
+      return descriptor_for_identity(nrm, identity)
     end
     if not identity.workspace_key and not identity.target_arg and not identity.files_root then
       local active = active_identity(nrm)
@@ -659,6 +685,25 @@ local function default_resolve(query)
         return nil, workspace_error("workspace_not_found", "no remote workspace is active")
       end
     end
+  end
+  return descriptor_for_identity(nrm, identity)
+end
+
+local function default_resolve_owned_buffer(query)
+  local nrm = package.loaded["nvim_remote_mirror"] or require("nvim_remote_mirror")
+  local bufnr = query.bufnr
+  if not is_integer(bufnr) or not vim.api.nvim_buf_is_valid(bufnr) then
+    return nil, workspace_error("invalid_argument", "bufnr must identify a valid buffer")
+  end
+  local identity = buffer_identity(bufnr)
+  if not identity then
+    return nil, workspace_error("not_remote_buffer", "buffer is not associated with a remote workspace")
+  end
+  if identity._invalid_marker then
+    return descriptor_for_identity(nrm, identity)
+  end
+  if not identity.workspace_key and not identity.target_arg and not identity.files_root then
+    return nil, workspace_error("workspace_not_found", "remote buffer has no stable workspace identity")
   end
   return descriptor_for_identity(nrm, identity)
 end
@@ -784,7 +829,7 @@ local function validate_descriptor(descriptor)
   if not states[descriptor.state] then
     return nil, workspace_error("invalid_provider_state", "workspace provider returned an invalid state")
   end
-  local modes = { mirror = true, remote_nvim = true }
+  local modes = { ["local"] = true, mirror = true, remote_nvim = true }
   if not modes[descriptor.mode] then
     return nil, workspace_error("invalid_provider_state", "workspace provider returned an invalid mode")
   end
@@ -1749,11 +1794,17 @@ local function canonical_bridge_command(argv)
   return table.concat(command, " ")
 end
 
-local function validate_bridge_spec(spec)
+local function validate_bridge_spec(record, spec)
   if type(spec) ~= "table" then
     return nil, workspace_error("provider_error", "workspace provider returned an invalid job specification")
   end
-  local fields_ok, unknown = has_only_fields(spec, { argv = true, command = true, cwd = true, env = true })
+  local fields_ok, unknown = has_only_fields(spec, {
+    argv = true,
+    command = true,
+    cwd = true,
+    env = true,
+    clear_env = true,
+  })
   if not fields_ok then
     return nil, workspace_error("provider_error", "workspace provider returned an unknown bridge field: " .. unknown)
   end
@@ -1794,13 +1845,45 @@ local function validate_bridge_spec(spec)
       return nil, workspace_error("provider_error", "workspace provider returned a non-absolute bridge cwd")
     end
   end
-  if spec.env ~= nil then
-    if type(spec.env) ~= "table" or next(spec.env) ~= nil then
+  local local_bridge = record.snapshot.provider == "local" and record.snapshot.authority.kind == "local"
+  if not local_bridge then
+    if spec.clear_env ~= nil or (spec.env ~= nil and (type(spec.env) ~= "table" or next(spec.env) ~= nil)) then
       return nil,
         workspace_error(
           "provider_error",
           "local bridge environment must be empty; remote values belong in the private runtime ticket"
         )
+    end
+  else
+    if spec.clear_env ~= nil and type(spec.clear_env) ~= "boolean" then
+      return nil, workspace_error("provider_error", "local bridge clear_env must be a boolean")
+    end
+    if spec.env ~= nil then
+      if type(spec.env) ~= "table" then
+        return nil, workspace_error("provider_error", "local bridge environment must be a table")
+      end
+      local count = 0
+      local env_text_bytes = 0
+      for key, value in next, spec.env do
+        count = count + 1
+        if type(key) == "string" and type(value) == "string" then
+          env_text_bytes = env_text_bytes + #key + #value
+        end
+        if
+          count > MAX_ENV_CHANGES * 16
+          or env_text_bytes > MAX_PROCESS_TEXT_BYTES
+          or type(key) ~= "string"
+          or key == ""
+          or contains_control(key)
+          or key:find("=", 1, true)
+          or not valid_utf8(key)
+          or type(value) ~= "string"
+          or value:find("%z")
+          or not valid_utf8(value)
+        then
+          return nil, workspace_error("provider_error", "local bridge environment contains an invalid entry")
+        end
+      end
     end
   end
   local result = copy(spec)
@@ -1835,7 +1918,7 @@ local function job_spec(record, opts, preparation)
   if not spec then
     return nil, normalize_provider_error(spec_err, "workspace process provider returned no job specification")
   end
-  return validate_bridge_spec(spec)
+  return validate_bridge_spec(record, spec)
 end
 
 function Context:job_spec(opts)
@@ -2047,7 +2130,7 @@ local CONTEXT_MT = {
   __metatable = "nrm workspace context",
 }
 
-function M.resolve(query)
+local function validate_query(query)
   if query == nil then
     query = {}
   end
@@ -2072,7 +2155,16 @@ function M.resolve(query)
   if selectors > 1 then
     return nil, workspace_error("invalid_argument", "workspace query accepts at most one selector")
   end
-  local provider, bind_err = bind_provider(backend())
+  return copy(query)
+end
+
+local function resolve_with_provider(provider_impl, query)
+  local normalized_query, query_err = validate_query(query)
+  if not normalized_query then
+    return nil, query_err
+  end
+  query = normalized_query
+  local provider, bind_err = bind_provider(provider_impl)
   if not provider then
     return nil, bind_err
   end
@@ -2116,6 +2208,10 @@ function M.resolve(query)
   return context
 end
 
+function M.resolve(query)
+  return resolve_with_provider(backend(), query)
+end
+
 -- Internal integration hooks. The main plugin owns persistence, prompts, and the
 -- sidecar process bridge; this module owns validation and fail-closed semantics.
 function M._set_backend(provider)
@@ -2131,6 +2227,82 @@ end
 
 function M._normalize_process_spec(context, opts)
   return normalize_process_spec(record_for(context), opts)
+end
+
+function M._normalize_absolute(path, style)
+  return normalize_absolute(path, style)
+end
+
+function M._relative_within(root, path, style)
+  return relative_within(root, path, style)
+end
+
+function M._join_absolute(root, relative, style)
+  return join_absolute(root, relative, style)
+end
+
+function M._resolve_with_provider(provider, query)
+  if type(provider) ~= "table" then
+    return nil, workspace_error("invalid_argument", "workspace provider must be a table")
+  end
+  return resolve_with_provider(provider, query)
+end
+
+function M._resolve_owned_buffer(bufnr)
+  local provider = backend()
+  if provider ~= default_backend then
+    return resolve_with_provider(provider, { bufnr = bufnr })
+  end
+  local strict_provider = {}
+  for _, name in ipairs(PROVIDER_METHODS) do
+    strict_provider[name] = default_backend[name]
+  end
+  strict_provider.resolve = default_resolve_owned_buffer
+  return resolve_with_provider(strict_provider, { bufnr = bufnr })
+end
+
+function M._capture_active_identity()
+  local nrm = package.loaded["nvim_remote_mirror"] or require("nvim_remote_mirror")
+  return copy(active_identity(nrm))
+end
+
+function M._resolve_captured_identity(identity)
+  if type(identity) ~= "table" then
+    return nil, workspace_error("invalid_argument", "captured workspace identity must be a table")
+  end
+  local nrm = package.loaded["nvim_remote_mirror"] or require("nvim_remote_mirror")
+  local descriptor, descriptor_err = descriptor_for_identity(nrm, copy(identity))
+  if not descriptor then
+    return nil, descriptor_err
+  end
+  local provider = {}
+  for _, name in ipairs(PROVIDER_METHODS) do
+    provider[name] = default_backend[name]
+  end
+  provider.resolve = function()
+    return descriptor
+  end
+  return resolve_with_provider(provider, {})
+end
+
+function M._selection_fingerprint(context)
+  local record = context_records[context]
+  if not record then
+    return nil, workspace_error("invalid_argument", "selection fingerprint requires a workspace context")
+  end
+  local snapshot = record.snapshot
+  return {
+    provider = snapshot.provider,
+    workspace_id = snapshot.workspace_id,
+    mode = snapshot.mode,
+    authority = {
+      id = snapshot.authority.id,
+      kind = snapshot.authority.kind,
+      path_style = snapshot.authority.path_style,
+    },
+    roots = copy(snapshot.roots),
+    relative_path = snapshot.relative_path,
+  }
 end
 
 function M._runtime_trust_snapshot(context)

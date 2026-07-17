@@ -115,6 +115,14 @@ delivers a revision-bound prepared facade. That recommended facade exposes:
 - a managed attached pipe process; and
 - a managed attached PTY.
 
+An authority-selection broker sits above that context contract. It has
+first-class local and NRM providers and resolves explicit authority, remote
+buffer ownership, tab binding, then local fallback in that order. A successful
+connection binds its originating tab with a revision token. Clearing a binding
+invalidates pending preparation, while disconnect retains an offline binding
+so execution cannot silently cross from remote to local. The legacy
+`nrm.workspace()` resolver remains remote-only.
+
 Direct context execution remains as a late-check v2 path. It allows
 only `unchecked` or ready-and-effective capability state after existing trust;
 known checking, unavailable, disabled, unsupported, and unnegotiated states
@@ -126,9 +134,11 @@ launch to close the race after preparation.
 Remote argv, cwd, environment changes, timeout, and terminal size remain
 structured until the sidecar consumes the private ticket and speaks the binary
 runtime protocol to the agent. The local bridge command contains only the
-sidecar and an opaque ticket ID. This is the generic extension point for
-ToggleTerm-like terminals and command runners; nrm core should not grow
-plugin-by-plugin execution branches.
+sidecar and an opaque ticket ID. Broker launch metadata adds only already-public
+authority identity and the authority shell's newline convention. This is the
+generic extension point for terminal UIs and command runners. Optional
+integration modules may manage a consumer's lifecycle, but the transport and
+trust core remains consumer-neutral.
 
 Workspace connect never starts an arbitrary runtime command or grants trust.
 The default policy prompts and persists an explicit per-authority decision in

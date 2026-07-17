@@ -49,6 +49,14 @@ vim.api.nvim_create_user_command("RemoteCd", function()
   nrm.cd()
 end, {})
 
+vim.api.nvim_create_user_command("RemoteUseLocal", function()
+  local ok, err = require("nvim_remote_mirror.workspace_runtime").use_local()
+  if not ok then
+    error(tostring(err))
+  end
+  vim.notify("cleared this tab's remote runtime binding; remote-owned buffers still select remote", vim.log.levels.INFO)
+end, {})
+
 vim.api.nvim_create_user_command("RemoteTrustWorkspace", function(opts)
   local ok, err = nrm.trust_workspace({ force = opts.bang })
   if not ok then

@@ -983,7 +983,13 @@ function M.job_spec(snapshot, request)
   end
   -- String-only consumers have no exit hook. Do not expose private lifecycle
   -- metadata; the sidecar bounds orphan results and unused ticket lifetime.
-  return { argv = bridge.argv }
+  return {
+    argv = bridge.argv,
+    -- The authority cwd remains private in the ticket. Starting the local
+    -- bridge from the editor root gives terminal UIs a deterministic existing
+    -- directory without exposing or emulating the remote path locally.
+    cwd = snapshot.roots and snapshot.roots.editor or nil,
+  }
 end
 
 local function callback(handlers, name, ...)

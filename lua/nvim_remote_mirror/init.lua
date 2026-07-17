@@ -1442,7 +1442,7 @@ local function fail_sidecar_send(client, message)
   end
   fail_pending(client, message)
   if reconnect then
-    schedule_reconnect(client.target_arg, generation, client.connection)
+    schedule_reconnect(client.target_arg, generation, client.connection, client.workspace_binding_token)
   end
 end
 
@@ -1785,7 +1785,7 @@ if vim.g.nvim_remote_mirror_test then
   M._test_validate_existing_socket = validate_existing_socket
 end
 
-function schedule_reconnect(target_arg, generation, connection)
+function schedule_reconnect(target_arg, generation, connection, workspace_binding_token)
   generation = generation or M.reconnect_generation
   connection = connection or M.last_connection or M.config.connection
   if not M.config.auto_reconnect then
@@ -1823,14 +1823,18 @@ function schedule_reconnect(target_arg, generation, connection)
     M.connection_status = "reconnecting"
     M.reconnect_pending = false
     notify("reconnecting remote session, attempt " .. tostring(attempt), vim.log.levels.WARN)
-    local ok, err = pcall(M.connect, target_arg, { reconnect = true, connection = connection })
+    local ok, err = pcall(M.connect, target_arg, {
+      reconnect = true,
+      connection = connection,
+      workspace_binding_token = workspace_binding_token,
+    })
     if not ok then
       M.connection_status = "reconnect_pending"
       M.reconnect_pending = true
       M.connection_reason = nil
       M.connection_error = tostring(err)
       notify("reconnect failed: " .. tostring(err), vim.log.levels.ERROR)
-      schedule_reconnect(target_arg, generation, connection)
+      schedule_reconnect(target_arg, generation, connection, workspace_binding_token)
     end
   end, M.config.reconnect_delay_ms)
 end
@@ -3142,7 +3146,7 @@ local function fail_workspace_info_connect(client, generation, message)
   M.connection_error = message
   M.reconnect_pending = M.config.auto_reconnect == true
   notify(message, vim.log.levels.ERROR)
-  schedule_reconnect(client.target_arg, generation, client.connection)
+  schedule_reconnect(client.target_arg, generation, client.connection, client.workspace_binding_token)
 end
 
 local function automatic_health_is_compatible(client, health)
@@ -3175,6 +3179,16 @@ local function finish_connect(client, target_arg, is_reconnect, generation)
   M.connection_error = nil
   M.reconnect_pending = false
   setup_mirror_autohydrate(client)
+  if client.workspace_binding_token then
+    local bound, bind_err =
+      require("nvim_remote_mirror.workspace_runtime")._bind_connected(client.workspace_binding_token)
+    if bound == nil then
+      notify(
+        "connected workspace could not be bound to its originating tab: " .. tostring(bind_err),
+        vim.log.levels.WARN
+      )
+    end
+  end
   emit_workspace_event("NrmWorkspaceConnected", client, { reconnect = is_reconnect == true })
   if is_reconnect then
     schedule_reconnect_stable_reset(client, generation)
@@ -3312,6 +3326,14 @@ end
 
 function M.connect(target, opts)
   opts = opts or {}
+  local workspace_binding_token = opts.workspace_binding_token
+  if workspace_binding_token == nil then
+    local token_err
+    workspace_binding_token, token_err = require("nvim_remote_mirror.workspace_runtime")._capture_binding_token()
+    if not workspace_binding_token then
+      error("failed to capture the originating tab: " .. tostring(token_err))
+    end
+  end
   target = parse_target(target)
   local resolved_sidecar, sidecar_err = resolve_local_executable(M.config.sidecar)
   if not resolved_sidecar then
@@ -3349,6 +3371,7 @@ function M.connect(target, opts)
     stdout_tail = "",
     target = target,
     target_arg = target_arg,
+    workspace_binding_token = workspace_binding_token,
     closing = false,
     connection = connection,
     agent_bootstrap_automatic = M.config.remote_agent_auto_install == true and optional_string(
@@ -3423,7 +3446,7 @@ function M.connect(target, opts)
           local exit_generation = bump_reconnect_generation("transport_exit", client)
           emit_workspace_event("NrmWorkspaceDisconnected", client, { reason = M.connection_error })
           notify("sidecar exited with code " .. tostring(code), vim.log.levels.ERROR)
-          schedule_reconnect(client.target_arg, exit_generation, client.connection)
+          schedule_reconnect(client.target_arg, exit_generation, client.connection, client.workspace_binding_token)
         else
           fail_pending(client, "disconnected")
         end
